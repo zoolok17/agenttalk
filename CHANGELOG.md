@@ -10,6 +10,241 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The coding skills now say to use the seat's pinned runtime when there is one.**
+  The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
+  `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
+  one rule: when `AGENTTALK_PY` is set, run agenttalk commands with
+  `"$AGENTTALK_PY" -m agenttalk` in Bash or `& "$env:AGENTTALK_PY" -m agenttalk` in PowerShell,
+  and otherwise use the form your project's agent manual gives (`python -m agenttalk`
+  under Codex, `agenttalk` elsewhere). The Claude lead skill's two lane lines use the plain
+  `agenttalk` it uses everywhere else. A reader without a pinned runtime sees no change. This
+  is wording only: a command form cannot say which release a runtime is, so nothing here
+  changes the version that runs.
+- **The skill lint now checks the rule.** A plain module form (`python`, `python3` or `py` with
+  `-m agenttalk`, with any spacing, in a code block, in a continued command or in text) is flagged
+  in a Claude skill, and in a Codex or devkit skill unless that skill states the rule itself: when
+  `AGENTTALK_PY` is set, give the pinned invocation in either shell, and otherwise the form the project's agent manual gives. A mention
+  of the name, or the name in a comment, does not count. The lint's ignore comments work as they
+  do for the command check.
+- **A team with only one AI vendor now has a written way to review and merge.** The merge gate
+  said the approving read comes "from another vendor when one is available". Read literally, a
+  read by the builder's own vendor passed whenever the other vendor was missing, with no limit,
+  no label and no later check. Now the procedures, the contributing guide, the README, the
+  review playbook, the assurance and secure-coding pages and both lead skills give one rule. The read still comes from another vendor by default. When none is
+  available, the lead waits if the change can wait; otherwise uses a second team's read by
+  another vendor; otherwise a same-vendor read by a fresh reader who had no part in the change,
+  backed by CI and, for code, a test that fails before the change plus deliberately broken
+  versions the tests must catch. Such a GO carries `review_independence=same-vendor` on the
+  reply and on the pull request, and another vendor reads the change again when one is
+  available. It is never enough for money or paid spend, security, credentials or privacy,
+  deletion or another irreversible step, a release, the settings of the automatic checks (CI
+  workflows, linters, scanners and secret-scan settings), or this review rule and the shipped
+  instructions that state it; with no other vendor at all, those need the operator's recorded approval. Nothing in the code
+  enforces this. Run `agenttalk install-skills` after upgrading so that your lead gets the new
+  text.
+
+### Fixed
+
+- **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
+  and the scratch janitor keep checkouts when Git could be hiding tracked work,
+  including unedited files marked assume-unchanged or present skipped files. Files
+  omitted by ordinary sparse checkout pass this new check. Both cleanup paths also
+  keep submodule folders with content, even when Git has not initialized them;
+  the janitor does not try to save nested work in a parent WIP commit. Inspect and
+  save the work before clearing flags or removing a submodule yourself. Deliberately
+  assumed files, including projects using `core.ignoreStat=true`, make live-checkout
+  close HOLD without a dirty artifact, even from a store below the Git top-level,
+  until inspected and the flags cleared, or a truthful dirty artifact is recorded.
+  Status now shows submodule changes hidden
+  by project settings: even one untracked build file can cause close HOLD; clean
+  the submodule or record a truthful dirty artifact. Scratch release keeps its
+  existing stricter rules.
+
+- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for dead-letter replies and control messages, retry the same requeue command to keep their original correlation.
+
+- **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
+  Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail
+  with an unclear message ("could not read worktree toplevel"), could leave a folder with
+  agenttalk's marker file in the wrong place, and a path with `../` could slip past the check
+  that the folder lies inside the store folder (the folder that holds `.agenttalk`). Now a
+  relative folder is always read from the store folder, every step and Git use that same
+  folder, and a new lane records it as a full path. A folder outside the store folder is
+  still refused, now checked against the right folder. Before anything is created, lane
+  assign now refuses a `..` path component or a folder whose location cannot be established
+  (for example one it may not read, or a broken link).
+  On Windows it also refuses path components made only of dots and spaces or ending in a
+  dot or space (except a single `.`), paths that depend on a drive's current folder or on
+  the current drive
+  (such as `C:x` or `\x`), and device, extended or stream spellings (such as `\\?\C:\x`
+  or `lanes:x`). These refusals apply to full paths too. Existing lanes are not changed.
+
+- **Lane cleanup checks the intended checkout and protects new files during removal (#782).**
+  When agenttalk removes a lane's folder, Git itself now also looks for new files, even if
+  the project normally hides them. A damaged checkout stays in place. If the folder is
+  already gone, Git is allowed to clear its record; the existing lane checks still decide
+  whether a removal is attempted.
+  If a new file appears between agenttalk's check and Git's removal check, the folder is kept.
+  After a failed lane setup, cleanup also clears Git's record of a checkout whose folder
+  is gone and the record still identifies that lane's branch, so the lane can be assigned again.
+  A locked checkout keeps its branch whether its folder is present or gone, and the message
+  explains how to unlock it before removal, after waiting for any timed-out setup to stop.
+  Cleanup leaves a folder alone if it cannot confirm that the checkout belongs to this
+  lane setup. It also keeps the lane branch while any other checkout is using it.
+  If another Git process changes the checkouts during this cleanup, a folder or branch
+  may stay behind and need manual cleanup; follow the message's steps where provided.
+  Git's own checks prevent this cleanup from removing a checkout with uncommitted changes
+  or new files that Git does not ignore, or deleting a branch that is checked out. Two
+  narrow cases remain (#792): if another process swaps a different clean checkout into the
+  planned folder at the moment of removal, that checkout's ignored files can be removed.
+  If the lane branch moves to a new commit between the tip check and deletion, that commit
+  can be left without a branch; it can still be recovered using its commit id.
+
+- **New files count as unfinished work even when Git hides them (#780).**
+  Before, a Git setting could hide files that had not been added to a commit,
+  so `close open` or `close reopen` could record the folder as clean. They now
+  record it as dirty. The scratch janitor also checks for these files before
+  cleanup and after its work-saving commit, so work left behind is not mistaken
+  for a clean folder.
+  Lane abandonment, garbage collection and cleanup after delivery also keep a
+  worktree that has uncommitted changes or new files, even when Git hides them.
+  If a failed lane setup leaves its folder in place, it keeps the lane branch too
+  and explains how to clean up. If no folder or checkout record was created, cleanup
+  still deletes the unused fresh branch so the same lane id can be assigned again.
+  A timed-out setup keeps its folder and branch because a hook may still be running.
+  Its recovery note explains when to rebuild an incomplete index and clear a leftover index lock,
+  then restore only missing tracked files without overwriting existing files. After removal,
+  an unreadable checkout list keeps the branch and the note reports that the folder was removed.
+  The branch steps check the tip against the full recorded base commit before forced deletion,
+  so a base not merged into the main checkout can be retried; the note prints its commit id.
+  Other changes can still block ordinary removal; force removal is a manual
+  choice only after inspecting the folder, saving work and explicitly confirming its deletion.
+  If your project used that setting to hide its agenttalk store, add `.agenttalk/`
+  to `.gitignore`; otherwise closes will now HOLD while those files are untracked.
+
+- **Running doctor in a folder that is not set up leaves it untouched (#769).**
+  The PowerShell check no longer creates a store lock there, so a later run in a
+  child folder still checks the child. Its result and exit code stay the same.
+  If an earlier doctor run left a `.agenttalk/` folder containing only
+  `.powershell-host.lock.generation`, you can safely delete that folder: it
+  holds no messages or roster, but can still make folders below it look like
+  part of the same project. Do not delete it if it contains anything else.
+
+- **The bundled skills no longer teach advice that went wrong (skills review of 0.105.0).**
+  A first read of the 0.105.0 skills against the real commands found four pieces of advice
+  that could mislead an agent, and a few smaller slips. All are fixed in both the Claude and
+  the Codex copies. The code is not changed.
+  - **Messages with accented letters could be stored garbled.** The send skills told agents
+    to pipe the text into `--file -`. When standard input uses the Windows code page (the
+    usual case on Windows), that text is read in it instead of UTF-8, so "ünïcødé" was stored as "Ã¼nÃ¯cÃ¸dÃ©", with no warning. The send
+    skills and the README now say: write the text to a UTF-8 file and pass `--file <path>`.
+    The piped form itself is a separate fix in the code (#779).
+  - **The listen skills overstated what the bus proves about a sender.** They called a
+    lead work order "authenticated" and said the bus skips "forged" senders. The bus checks
+    that the sender's name is on the roster; it does not prove who wrote the message unless
+    the store is signed (`agenttalk hmac-init`). The wording now says so. No safeguard is
+    removed.
+  - **The listen skills' table said an `end` message always ends the loop.** The same files
+    say, correctly, that an `end` without the full authority markers is ignored. The table
+    rows for `end` and `release` now say it too.
+  - **The "is the worker's folder clean?" check could miss new files (#93).** A git setting,
+    `status.showUntrackedFiles=no`, makes plain `git status --porcelain` print nothing even
+    when there are new files, so a commit that was missing files could pass. The lead skills
+    now use `git status --porcelain --untracked-files=all`, and put each worktree path in
+    quotes so a folder name with a space works.
+  - **Smaller slips.** Reply examples now carry `--from $SELF`, which the command needs when
+    `AGENTTALK_SELF` is not set. Longer briefs and answers in the lead and listen skills now
+    use a file. The risky case is a typed `-m "..."` with quotes inside it; a body held in a
+    PowerShell 7 variable and passed as `-m $body` is stored exactly. The evidence reference now says the bus does require a
+    reason for every `n/a` field (it accepts `na_reason_<field>`, `na_reason.<field>` or
+    `na_reason`) and that using the single `na_reason` is the skill's own habit.
+  - **The handoff skills no longer end a session on any `end` message.** They said "if the peer
+    sends `kind=end`, the session is over". A bare `end` has no authority and is ignored, as the
+    listen skills and the wrapper already say.
+  - **The propose skills now work inside a managed wrapper turn, and no longer misaddress a
+    proposal.** `propose` records no wait for a reply. In a managed turn the skills now send the
+    proposal with `send --kind proposal --await-reply` and return to the wrapper; a person at a
+    terminal still waits as before. The chosen decision-maker is no longer reset to the default
+    peer, and the "counter" example now names the proposal it closes (`--to-request`), so it
+    cannot close a newer, unrelated one. The handoff and propose reply examples carry `--from`,
+    and the handoff "git status" example uses `--untracked-files=all` for the same reason as the
+    lead skills (#93).
+  - **Four small fixes in the devkit skills.** The close recipe in `system-review-protocol` names
+    `--lane-artifact` and `--non-lane-isolation-not-asserted` and the `worktree_isolation_unverified`
+    HOLD it otherwise always hits. The `definition-of-done` pin check now compares file contents
+    with CRLF turned into LF, so a Windows install no longer reads as a mismatch. The
+    `review-release-readiness` skill says `risk_class` takes one value and where secondary risks
+    go. `routing.md` and `system-review-protocol` name the bus skills in both the Claude and the
+    Codex form.
+  - **A counter-proposal in a managed turn now waits for its answer.** The propose skills told an
+    agent to send a counter-proposal with plain `propose`, which records no wait. In a managed
+    wrapper turn they now send it with `send --kind proposal --await-reply`, linked to the old
+    proposal, and return to the wrapper; a person at a terminal still uses `propose`.
+  - **The assurance-scan skill no longer overpromises.** It said the scan never installs anything
+    and never uses the network by default. The release profile's `python-build` step runs
+    `python -m build` with build isolation, which can install build requirements (and so may use
+    the network) even when the manifest does not allow network; the skill now says so. It also
+    says the `deep` profile runs the same checks as `change` unless the manifest adds more. Three
+    reference pages are corrected: the runner can exit 1 and still leave its artifact in place,
+    `paths.include` is accepted but does not narrow a scan, and a baseline needs only
+    `schema_version` because the loader fills in `baseline_id` and `findings`. The refactor-code
+    description now fits both assistants.
+  - **Review stamps.** These now say `reviewed-against 0.105` because the review read them in
+    full: the send and listen skills for each assistant, the Codex lead skill, the shared devkit holder, the
+    evidence reference, the Claude challenge, consult, propose and overview skills, the devkit
+    review-code skill, and (from the later reads) the devkit migration, plain-language,
+    write-for-humans, write-docs, thinking-games, test-docs, qa-strategy, tester-qa,
+    test-coverage, test-integration, test-performance and test-security files. Every other file
+    keeps its older stamp, including the two handoff skills, the Codex propose skill, craft-code,
+    refactor-code, fix-ci and the assurance-scan files, which have an open finding or have not been
+    read again since a fix. The Claude lead skill, whose two plain `python -m agenttalk` lines now say `agenttalk`,
+    is stamped `reviewed-against 0.105` too.
+
+- **Message ids in diagnostics and notices stay on one line (#765).** Reply-refusal and dead-letter commands, doctor, and generated notices show line breaks and Unicode separators in an id as visible codes. This keeps an id from adding a misleading line. A shortened display of an id you typed points back to the text you supplied. `dead-letter resolve` also refuses an agent name containing a line break or line separator, just as `dead-letter show` does. Stored ids and lookups are unchanged, and JSON id fields keep their original values; nothing needs to be done.
+
+- **A seat that starts slowly is no longer refused as misconfigured (#714).**
+  Before it starts an assistant, the wrapper checks that agenttalk runs. Each check allowed
+  5 seconds, and a start without saved compiled Python files (a fresh checkout or virtual
+  environment, or `PYTHONDONTWRITEBYTECODE=1`) can take about that long, so a healthy seat
+  could be refused with "launch config-blocked". The checks now allow 30 seconds. When one
+  runs out of time, the refusal says that agenttalk took longer than 30 seconds to start,
+  names the usual cause and says what to try. A check of the bus Python that hangs is now
+  refused; before, it was let through. On Windows a check also ends on time when a program it
+  started keeps running (that program is not stopped). The one exception: if no temporary file
+  can be made (for example, the temporary folder is not writable), the check falls back to the
+  old way of reading its output, and on Windows such a program can then keep it waiting past
+  its limit. When a check refuses a lead's regular sweep, the wrapper now says why on its
+  error output and in its health, and the notice after repeated failures names the reason.
+
+- **`lane check` and `lane deliver` judge what a delivery really writes (#671).** Before, a lane that
+  merged its own target branch was held with `out_of_bounds_path` for files the target had changed,
+  and a lane that undid a target change, or whose edit a target rename carried outside the lane,
+  could be waved through. Now the lane is compared with its one merge base with the target, and the
+  paths Git's own merge result would write on the current target are judged too. What you will
+  notice: a lane that only merged its target is no longer held for the target's files, unless its
+  latest commit is already part of the target (then there is nothing newer to compare, so it is
+  still compared with the commit it started from and can still be held for files outside its
+  paths that came in through its own history); a lane whose
+  edit the target moved outside the lane is held, naming the real destination, and the remedy is to
+  merge the target and move the edit, widen the lane, or ask for the move to be reversed; a lane
+  that undoes a target change is held on that file. When the lane and its target have several merge
+  bases, the new hold `ambiguous_merge_base` says to merge the current target into the lane and
+  check again. A delivery interrupted under the old rule can still resume if its saved checks match
+  the new result. If the new checks differ, it is refused at its final re-check ("terminal evaluation
+  differs from the prepared GO snapshot"); if the lane is now held, it is refused with "terminal
+  verdict is HOLD". Retry the delivery, after clearing any hold `lane check` names. A saved
+  delivery's `changed_paths` can now name where a target rename moved the lane's edit. Existing
+  JSON gains one new `code` value and no new fields.
+
+- **The README first install keeps agenttalk in its own Python environment (#716).** Before, setup could install into another Python, and assistants could find an older agenttalk on PATH. Now both platform recipes keep using the environment's Python after changing folders and put its commands first on PATH in every assistant terminal. Quick setup links to the same recipe, and the README and lead setup brief name the Debian/Ubuntu venv package.
+
+## [0.105.0] - 2026-11-13
+
+This release makes agenttalk safer and clearer when something goes wrong, and shows more of what is really happening. For a Claude agent run by the wrapper, the status views now show how large its current conversation is (other agents still show the size as unknown), and an old size can no longer look current after a failed save. Commands that tell you to "run this" now print only values that are safe to paste, and new request ids are checked when they are made. A backup now skips the temporary files other commands write while they work and, when files vanish while it reads them, tries again within a short limit; if the store keeps changing, it stops, publishes nothing and asks you to run it again. A reset and the retry of a failed message now take turns, and a failed message can be put back in the queue only once. Release lanes are better protected: a lane that an agent is working in is no longer cleaned up underneath it, a lane whose checkout has gone can be retired on purpose, a held lane can be re-stamped, and the cleanup commands say what they refuse and why. The web console says "nothing checked" instead of a green GO when no gate applies, and the status overview no longer suggests that anyone can safely drain another agent's messages. Notes and gate files report their problems more clearly, and code is now written with a short security note first.
+
+After upgrading, preview the skill update with `agenttalk install-skills --dry-run --force`, back up any local edits you want to keep, then run `agenttalk install-skills --force`. The plain command keeps files that differ, so it cannot refresh changed skills. Before upgrading, stop every supervisor, wrapper, scheduled job and shell that uses the store, upgrade every entry point, then restart: an older version must never run against an upgraded store, because it can remove lane branches and checkouts that this version keeps.
+
 ### Added
 
 - **A held release lane can now be re-stamped (#672).** A lane with its own worktree
@@ -120,7 +355,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The README first install keeps agenttalk in its own Python environment (#716).** Before, setup could install into another Python, and assistants could find an older agenttalk on PATH. Now both platform recipes keep using the environment's Python after changing folders and put its commands first on PATH in every assistant terminal. Quick setup links to the same recipe, and the README and lead setup brief name the Debian/Ubuntu venv package.
+- **Printed commands are ready to run only when every value in them is a plain token, and new request ids are checked where they are created (#727).** Several messages tell a person or an automated seat "run this", with a stored value (a request id someone else chose, a file name, a path) pasted in as it is. A request id such as `fix login` split the command into two arguments, and one such as `a; echo hi` ran a second command; the Windows `agenttalk.cmd` launcher and Windows PowerShell 5.1 each re-read quotes in their own way, so no quoting is right everywhere. Now a command is printed ready to run only when every value is a plain token (ASCII letters, digits, `.`, `_`, `-`, starting with a letter or digit). Anything else (a space, a separator, a path, a leading hyphen) is never put into a command: the command is shown with a `<name>` placeholder and a note that shows the value escaped on one line, so it can be looked up but not pasted by accident. Ordinary ids and names print exactly as before. This covers the thread hints in `agenttalk sync`, the wrapper's reply command (an awkward request id gives way to the message id, and the header line shows the id escaped), `reply-refusal show`, the dead-letter, broadcast, doctor, PowerShell-host, scheduled-task and gateway recovery commands, and the other printed seat commands. New request ids made by `send`, `propose`, `task`, `escalate`, an opening `reply` (review-request, proposal, question, task) and a fresh `broadcast` must start with a letter or digit and then use letters, digits, `.`, `_` or `-` (at most 96 characters), and are refused with a clear message before anything is written. What counts is what the command does: answering an old question, a plain reply, a requeue, a retry and a broadcast resume carry an id that is already stored and keep working with any old id. The dead-letter advice that said to requeue "as-is" now says to inspect first and decide, and that the requeue command refuses, and says why, when a message cannot be retried. A new id is judged exactly as typed: one with a space, tab or line end around it is refused, never trimmed and stored changed. The relay hand-off command (a stored seat or result id used to be printed as it was) and the doctor's "full list" hint (it no longer puts the project folder in a command) follow the same rule, and a path in these commands is shown whole up to 260 characters, with a stated way to find the whole value when it is longer; that way names the real source (a refused new id was never stored, so its note says the whole value is the text that was typed, and the re-init warning for an inherited `AGENTTALK_ROOT` names that setting, not the folder the command was run in). A stored value that a message echoes next to these commands (the draft path and reason shown by `reply-refusal show`, a request id or subject in `sync`, a reason in a dead-letter or reply-refusal notice, the host path in the doctor) is now shown on one line, with line breaks and invisible characters written as codes, so it cannot print a line that looks like an instruction. When neither the request id nor the message id is a plain token, the wrapper's reply instructions print no reply command at all (a placeholder inside a command line is not safe to run: a shell reads it as a redirection) and say how to find the thread instead. The same one-line rule covers the other places that print values read from messages and records: the `status` warnings, the `threads` listing, the `sync` rows and wait hints, the header of every received message (subject and metadata), the reason shown for a rescinded request, the dead-letter lists and notices, the doctor's lists of stuck messages, and the wrapper prompt (the declared reply-draft path is shown on one line and the exact path stays in the structured record, which no longer lets a line break or separator in any value start a line of its own). Technical detail: one helper, `printed_commands`, decides; JSON shapes and stored formats are unchanged (a hint for an unusual id changes from broken to a placeholder).
+
+- **A checkout is kept if a file changes during its content check (#746).**
+  Before, a file could change after its contents had been checked while other files
+  were still being checked. Now `janitor --release` compares each tracked file's size
+  and modification time before and after checking the contents. A change, a missing
+  file or a file that cannot be read keeps the checkout.
+
+- **`agenttalk backup` no longer fails, keeps a stray lock helper, or misses a file that
+  vanishes while it is copied (#744).** When another command was publishing a file at the same
+  moment, the backup could stop with "file not found" or put a short-lived private file
+  (a name like `.<32 characters>.prepare`) into the snapshot. The backup now leaves those
+  private names out, and when a path it has already listed disappears it starts a fresh,
+  complete attempt (at most 3 attempts, and no new attempt after 3 seconds) instead of
+  skipping the file. A file that moves from a folder not yet listed into one already listed
+  can still be missed, because only messages are protected by the backup's lock; the manual
+  says so. If disappearances it detects use up the retry budget it stops with a message to
+  run it again (exit code 2) and publishes nothing; a folder it cannot read still refuses. Launch
+  requests and lane delivery records are now always copied rather than linked, because a
+  link could make the command that wrote them fail; so `mode:` now says which files were
+  copied on purpose instead of "copy (no hardlink support)", and `hardlink_used` still
+  means that every file was linked. A file operation already in progress can take longer
+  than the 3 seconds; the limit only decides whether a new attempt may start. The manual
+  (`docs/BACKUP.md`) now also says exactly what the backup's lock covers: messages and
+  their order are one point in time, other files can come from slightly different moments,
+  and a send during a backup waits and gives up after 10 seconds. The copy-only folders are
+  matched without regard to case (the same files on Windows and on case-insensitive Mac
+  disks), and `mode:` says `copy (every link failed: ...)` when links were tried and none
+  worked. Technical
+  detail: `store.is_lock_or_guard_artifact` matches `\.(?:.+\.)?[0-9a-f]{32}\.(?:prepare|unlink)`
+  with `fullmatch`; `recovery` lists the store with `os.scandir` (an error is never read as
+  an empty folder) and compares the snapshot with that listing.
+
+- **Reset and dead-letter retry now take turns (#728, item 2).** A reset that finishes no longer lets a retry repeat completed work while messages are being cleared. Stop agents before reset: sends wait, and a wait longer than 10 seconds fails. A send prepared before reset can fail when reset removes its temporary file or lock marker; restart agents and retry after reset. An interrupted plain reset and older reset writers that bypass the lock remain outside this protection.
+
+- **The web console's Gate wall says "nothing checked" instead of a green GO when no gate applies (#711).**
+  A project with no gates used to show a green GO chip above an empty list, which reads as
+  "everything passed". The chip now says NOTHING CHECKED in a neutral colour (hover text: "Nothing checked
+  (0 applicable gates)"), the same words `gate check`, `check --gates` and the overview have used since
+  #733. A project with at least one assessed gate, a single green blocker included, still shows its GO,
+  now with how many gates were assessed written beside it ("1 applicable gate", "3 applicable gates"),
+  and a HOLD still shows HOLD, with its count too. When the gate file cannot be read, the chip shows HOLD and no count
+  (its one row is the read error, not a gate, so the real number is unknown). Technical detail: `/api/gates` and the nested `gates` object in `agenttalk overview --json` get two additive booleans:
+  `nothing_checked` (true only when the verdict is GO and `count` is 0) and `gate_count_known` (false when the gate file
+  could not be read or is not valid, and always false in the error reply; the console shows the count only when it is true). `verdict`,
+  `count` and every other key are unchanged, and the console treats a `nothing_checked` that is not a real `true` on a GO
+  as before.
 
 - **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**
   The warning for a seat that has unread messages and has never acknowledged one used to end with
@@ -435,9 +716,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves no record the check can read; stop them first. The help of `lane abandon`, `lane gc` and
   `lane deliver` says so, and so does the output of the acknowledgement.
 
-- **A shortened list of notes-file problems now says where the rest is (#661).** `agenttalk knowledge search`, `pull` and `onboard` show at most five problems found in the notes file and then "and N more", and the doctor's text did the same with no "more" at all. Now the knowledge commands end with "and N more (full list: agenttalk --root '<the project>' doctor --json)" and the doctor's text ends with the same words. The command is printed only when the project's path is made of letters, digits, spaces and `- _ . / : \ ~ + @ , =`; for any other path (for example one with a quote, a `$` or a `;`) the line names the project in words (`run with --root set to the project at "..."`, other characters written as `\uXXXX`), so nothing in a folder name can be run by pasting the line. Either way it names the project, whether it was chosen with `--root`, `AGENTTALK_ROOT` or the current folder. Nothing is added when five or fewer problems are found (one damaged line can be more than one problem), and no `--json` output changes.
+- **A shortened list of notes-file problems now says where the rest is (#661).** `agenttalk knowledge search`, `pull` and `onboard` show at most five problems found in the notes file and then "and N more", and the doctor's text did the same with no "more" at all. Now the knowledge commands end with "and N more" and a "full list" hint, and the doctor's text ends with the same words. The hint says `agenttalk doctor --json` and names the project separately in words (`run with --root set to the project at "..."`). The folder is never put inside a command. Unusual characters and every backslash are written as `\uXXXX` with four hex digits, or `\UXXXXXXXX` with eight above U+FFFF, so nothing in a folder name can be run by pasting the line. It names the project whether it was chosen with `--root`, `AGENTTALK_ROOT` or the current folder. Nothing is added when five or fewer problems are found (one damaged line can be more than one problem), and no `--json` output changes.
 
-- **Two different folders no longer print the same in the "full list" hint (#669).** When a project folder's name has unusual characters, the hint added in #661 names the folder in words and writes those characters as codes. A backslash that was really part of the name was left as it was, so on Linux or macOS the two different folders `/tmp/a\u0024$` and `/tmp/a$\u0024` both printed as `/tmp/a\u0024\u0024`, and a person could not tell which project was meant. Now a literal backslash is written as `\u005c` too, so every backslash in the printed name starts a code and the name can be read back exactly: two different folders never print alike. The explanation in the printed line now names both code forms: `\uXXXX` with four hex digits, or `\UXXXXXXXX` with eight above U+FFFF. Nothing changes for ordinary folder names, which still get the copyable command, and nothing in the text form can be run when pasted into PowerShell or Git Bash.
+- **Two different folders no longer print the same in the "full list" hint (#669).** When a project folder's name has unusual characters, the hint added in #661 names the folder in words and writes those characters as codes. A backslash that was really part of the name was left as it was, so on Linux or macOS the two different folders `/tmp/a\u0024$` and `/tmp/a$\u0024` both printed as `/tmp/a\u0024\u0024`, and a person could not tell which project was meant. Now a literal backslash is written as `\u005c` too, so every backslash in the printed name starts a code and the name can be read back exactly: two different folders never print alike. The explanation in the printed line now names both code forms: `\uXXXX` with four hex digits, or `\UXXXXXXXX` with eight above U+FFFF. The folder is named separately from the command for ordinary names too, and nothing in the text form can be run when pasted into PowerShell or Git Bash.
 
 - **The "unsaved" size flag now ends at a wrapper start and at an idle fresh start (#660).** After an idle agent was asked to start fresh, its old size was gone, but the dashboard, `status` and the runtime view still showed the "unsaved" flag. The saves a wrapper makes at start and for an idle fresh start now follow the same rule as the others: the flag ends when a save stores a different size or none. Nothing changes on a healthy machine. Limit: a flag from an older agenttalk build, or one whose record of the size it is about is damaged, cannot be compared, so any good save ends it, including a restarted wrapper's own start save. A test for the scheduled-turn path now checks what it says.
 

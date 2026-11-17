@@ -41,6 +41,7 @@ from pathlib import PurePath
 from typing import Any
 
 from agenttalk import domains as dom
+from agenttalk import printed_commands as pc
 
 SCHEMA_VERSION = 1
 STATE_FILENAME = "lanes.json"          # under .agenttalk/state/
@@ -76,6 +77,7 @@ HOLD_STALE_EPOCH = "stale_epoch"
 HOLD_STALE_REGISTRY = "stale_registry"
 HOLD_DIFF_UNAVAILABLE = "diff_unavailable"
 HOLD_DIFF_PARSE_ERROR = "diff_parse_error"
+HOLD_AMBIGUOUS_MERGE_BASE = "ambiguous_merge_base"
 HOLD_CASEFOLD_COLLISION = "casefold_collision"
 HOLD_OUT_OF_BOUNDS = "out_of_bounds_path"
 HOLD_UNOWNED = "unowned_path"
@@ -483,13 +485,13 @@ def compute_verdict(lane: dict, *, changed: dict, classifications: dict,
         hold(
             HOLD_STALE_EPOCH,
             "a barrier moved the epoch since assign; re-stamp the lane: "
-            f"agenttalk lane restamp --id {lane['lane_id']} --reason <why>",
+            + pc.cmd("agenttalk lane restamp --id {i} --reason <why>", i=lane["lane_id"]),
         )
     if current_registry_hash != lane.get("registry_hash_at_assign"):
         hold(
             HOLD_STALE_REGISTRY,
             "the domain registry changed since assign; re-stamp the lane: "
-            f"agenttalk lane restamp --id {lane['lane_id']} --reason <why>",
+            + pc.cmd("agenttalk lane restamp --id {i} --reason <why>", i=lane["lane_id"]),
         )
 
     # diff availability / integrity
@@ -499,6 +501,10 @@ def compute_verdict(lane: dict, *, changed: dict, classifications: dict,
         return _verdict(holds)
     if err == "parse_error":
         hold(HOLD_DIFF_PARSE_ERROR, "could not parse the diff output")
+        return _verdict(holds)
+    if err == "ambiguous_base":
+        hold(HOLD_AMBIGUOUS_MERGE_BASE, "the lane and its target have several merge bases, so what a delivery "
+             "would write cannot be worked out; merge the current target into the lane and check again")
         return _verdict(holds)
 
     touched = [p for p in changed.get("paths", []) if p.get("touched")]
@@ -677,7 +683,77 @@ def deliveries_dir(store):
 
 def worktrees_root(store, configured: str | None = None):
     from pathlib import Path
-    return Path(configured) if configured else store.root / WORKTREE_DEFAULT_DIRNAME
+
+    if not configured:
+        return store.root / WORKTREE_DEFAULT_DIRNAME
+    raw = os.fspath(configured)
+    typed, location = '"' + pc.line(raw) + '"', pc.line(str(store.root))
+    drive, tail = ntpath.splitdrive(raw) if os.name == "nt" else ("", raw)
+    parts = re.split(r"[\\/]" if os.name == "nt" else r"/", tail)
+    if ".." in parts:
+        raise LaneError(
+            f'the worktrees root {typed} contains a ".." path component; nothing was created. '
+            f'Write the folder without a ".." path component: a full path, or a path relative to '
+            f"the store folder {location} (the folder that holds .agenttalk)."
+        )
+    if os.name == "nt":
+        if any(part != "." and part.endswith((".", " ")) for part in parts):
+            raise LaneError(
+                f"the worktrees root {typed} contains a path component made only of dots and spaces "
+                "or ending in a dot or space, other than a single dot; nothing was created. "
+                "Write that component as an ordinary folder name."
+            )
+        if (drive and not tail.startswith(("\\", "/"))) or (not drive and raw.startswith(("\\", "/"))):
+            raise LaneError(
+                f"the worktrees root {typed} depends on a drive's current folder or on the current drive "
+                "(such as C:x or \\x); nothing was created. Use a full path such as C:\\folder, or an ordinary "
+                f"relative path, which is read from the store folder {location}."
+            )
+        if _EXTENDED_PREFIX.match(raw) or ":" in tail:
+            raise LaneError(
+                f"the worktrees root {typed} uses a Windows device, extended or stream spelling, "
+                "which lane assign does not accept; nothing was created. Use a full path such as "
+                "C:\\folder, or an ordinary relative path."
+            )
+    path = Path(raw)
+    return path if path.is_absolute() else store.root / path
+
+
+def resolve_creation_folder(path) -> str:
+    """Resolve an existing directory ancestor strictly, then append missing creation names.
+
+    Unlike the idle-check policy, creation can follow a live link and make several new levels.
+    Only absence permits walking upward; other lookup errors must stop preparation.
+    Return the resolved host spelling; callers canonicalize it only for comparisons.
+    """
+    from pathlib import Path
+
+    try:
+        entry = Path(path)
+        missing = []
+        while True:
+            try:
+                os.lstat(entry)
+                break
+            except FileNotFoundError:
+                parent = entry.parent
+                if parent == entry:
+                    raise FileNotFoundError(errno.ENOENT, "no existing directory ancestor", str(path)) from None
+                missing.append(entry.name)
+                entry = parent
+        base = os.path.realpath(entry, strict=True)
+        if not stat.S_ISDIR(os.stat(base).st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "the existing ancestor is not a folder", base)
+        resolved = os.path.join(base, *reversed(missing))
+        token = _canonical_token(resolved)
+        if _EXTENDED_PREFIX.match(resolved) or _EXTENDED_PREFIX.match(token):
+            raise ValueError("an extended or device path spelling is not accepted")
+        return resolved
+    except (OSError, ValueError) as exc:
+        raise LaneError(
+            f'where the worktrees root "{pc.line(os.fspath(path))}" is could not be established '
+            f"({pc.line(str(exc))}); nothing was created."
+        ) from exc
 
 
 def _integrity_secret_path(store):

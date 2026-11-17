@@ -508,6 +508,37 @@ def test_610_an_empty_check_says_nothing_was_checked(tmp_path: Path, capsys, arg
     assert data["checked_count"] == 0 and type(data["checked_count"]) is int
 
 
+@pytest.mark.parametrize("argv", [(), ("--release",), ("--scope", "lane:none")], ids=["plain", "release", "scope"])
+def test_610_green_ci_blocker_stays_plain_go(tmp_path: Path, capsys, argv) -> None:
+    root = _root(tmp_path)
+    evidence = "https://ci.example.invalid/run/610"
+    gates.set_gate(
+        root,
+        name="ci",
+        status="green",
+        severity="blocker",
+        scope="global",
+        actor="alpha",
+        evidence_source="automation_ci",
+        evidence=[evidence],
+        required=True,
+    )
+
+    code, data = _gate_json(root, capsys, *argv)
+    assert code == 0 and data["verdict"] == "GO" and data["checked_count"] == 1 == len(data["gates"])
+    (gate,) = data["gates"]
+    assert (gate["name"], gate["status"], gate["severity"], gate["blocks"]) == ("ci", "green", "blocker", False)
+    recorded = gates.load_gate_state(root)["gates"]["ci"]
+    assert recorded["evidence_source"] == "automation_ci" and recorded["evidence"][-1]["refs"] == [evidence]
+
+    code, out = _gate_check(root, capsys, *argv)
+    assert code == 0 and out.splitlines()[0] == "GO" and "nothing checked" not in out
+
+    _opened(root, capsys)
+    code, out = _check_gates(root, capsys)
+    assert code == 0 and "  gates: GO" in out.splitlines() and "nothing checked" not in out
+
+
 @pytest.mark.parametrize(
     ("severities", "count", "code", "verdict"),
     [(["warn"], 1, 0, "GO"), (["blocker"], 1, 3, "HOLD"), (["warn", "blocker"], 2, 3, "HOLD")],

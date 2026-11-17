@@ -153,7 +153,10 @@ second time under the lane claims, just before removal); `--release-report` chec
 each candidate once, so its time adds up across the checkouts and nothing is printed
 until the checks return. Ctrl-C while the checks run, before removal begins, stops the
 command and keeps the checkout; so does a failed or timed-out call, a file whose size
-cannot be read, or an unexpected answer. Two earlier calls keep one fixed minute each
+cannot be read, a file whose size or modification time changes during the check,
+or an unexpected answer. An edit made after a file was hashed that preserves both its
+size and modification time is not seen by this re-check.
+Two earlier calls keep one fixed minute each
 for the whole checkout: `git status --porcelain --untracked-files=all` and
 `git ls-files -v -z` read the metadata of every file, so on a slow disk with very many
 small files they can time out first, which also keeps the checkout. A single huge file,
@@ -168,6 +171,39 @@ retry only after checking the remaining files. There is no force-delete fallback
 A concurrent path change during Git's deletion can also delete files outside the checkout.
 
 ### Batch scratch cleanup
+
+Batch cleanup keeps a checkout when Git may be hiding tracked files or it contains
+a materialized submodule: a repository checked out inside another repository.
+Save or inspect that work before clearing the relevant
+flags or removing the submodule yourself. A parent WIP commit cannot save changes
+inside a submodule, including files in a submodule folder without its metadata.
+Files deliberately omitted by sparse checkout do not trigger the new hidden-file
+check. Present skipped files and assume-unchanged files are kept even if unedited;
+cleanup does not change their flags or compare their contents.
+
+To inspect a kept checkout, replace the placeholders in these command templates:
+
+```text
+git -C <folder> ls-files -v
+git -C <folder> update-index --no-assume-unchanged -- <file>
+git -C <folder> update-index --no-skip-worktree -- <file>
+```
+
+Lowercase tags mean assume-unchanged, uppercase `S` means skip-worktree, and
+lowercase `s` means both. First save or inspect the work; clear only the flags you
+have inspected, then retry. If the index could not be checked, inspect the listing
+and resolve that failure before clearing anything. No command above runs automatically.
+
+Live-checkout close records are also conservative: deliberately assumed files,
+including those created with `core.ignoreStat=true`, cause HOLD without a dirty
+artifact until inspected and their flags cleared, or a truthful dirty artifact is
+recorded. Changed status reads show submodule changes even when project ignore
+settings hide them; an untracked build file in a submodule can therefore cause
+HOLD. Clean that submodule or record a truthful dirty artifact. Close does not
+recursively inspect hidden files inside submodules (follow-up #796). Lane and
+acceptance attestation parity (#797) and old malformed close records (#798) remain
+separate work. The stricter `janitor --release` flag and full-content checks above
+retain their existing sparse-checkout limits.
 
 ```
 agenttalk janitor                          # report only (default)

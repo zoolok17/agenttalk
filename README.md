@@ -162,7 +162,7 @@ assistant that talks to you.
 
 ## Get started
 
-New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/v0.104.0/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
+New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/v0.105.0/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
 agenttalk: it sets up a first team without the supervisor and tells you what only a person can decide.
 Once agenttalk is installed, the brief and the other guides for leads are on your machine too: `& $env:AGENTTALK_PY -m agenttalk doctor`
 prints the installed `module path`, and the brief is `docs/LEAD-SETUP-BRIEF.md` under it.
@@ -178,7 +178,7 @@ Windows (PowerShell):
 ```powershell
 python -m venv agenttalk-env
 $env:AGENTTALK_PY = (Resolve-Path .\agenttalk-env\Scripts\python.exe).Path
-& $env:AGENTTALK_PY -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.104.0"
+& $env:AGENTTALK_PY -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
 & $env:AGENTTALK_PY -m agenttalk install-skills
 ```
 
@@ -189,7 +189,7 @@ On Debian or Ubuntu, install the venv package first: `sudo apt install python3-v
 ```sh
 python3 -m venv agenttalk-env
 export AGENTTALK_PY="$(pwd)/agenttalk-env/bin/python"
-"$AGENTTALK_PY" -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.104.0"
+"$AGENTTALK_PY" -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
 "$AGENTTALK_PY" -m agenttalk install-skills
 ```
 
@@ -274,6 +274,27 @@ model vendors, rather than running two instances of the same one, is
 that a reviewer with a different training lineage (a model trained by a
 different company) is less likely to share the first agent's blind spots. The bus is symmetric; which agent
 plays which part on a given task is your call.
+
+**If you have only one vendor.** Some teams have assistants from one AI
+company only, and a team with two can lose one for a while, for example
+when its allowance runs out. agenttalk's procedures still give such a
+team a defined way to review and merge. Wait for another vendor if the
+work can wait. Otherwise ask a second team whose reader is from another
+vendor. Otherwise have the work read by a fresh assistant of the same
+vendor that had no part in it, backed by checks that no model judges:
+the automatic tests and, for a change to code, a test that fails before
+the change and deliberately broken versions the tests must catch. Such an approval is
+labelled `review_independence=same-vendor`, and another vendor reads the
+work again when one is available. It is never enough for money or paid
+spend; security, credentials or privacy; deleting data or another step
+that cannot be undone; a release; the settings of the automatic checks
+(CI workflows, linters, scanners and secret-scan settings); or this review
+rule and the shipped instructions that state it. Those need another vendor's read, or, for a team with no other
+vendor at all, the operator's recorded approval. The cost is real: a reviewer from the same company
+shares more of the builder's blind spots, so this review is weaker than
+one across companies, and the label says so. agenttalk does not enforce
+any of this by itself; the lead's instructions do. The full rule is in
+[the merge gate](https://github.com/zoolok17/agenttalk/blob/master/docs/ROLES-SKILLS-PROCEDURES.md#when-only-one-vendor-is-available).
 
 ### What it does well that you might not guess
 
@@ -451,7 +472,7 @@ Follow [Get started](#get-started) to create a private Python environment and in
 Use that same Python in every terminal. The examples below shorten the command to `agenttalk`; write
 `& $env:AGENTTALK_PY -m agenttalk` in PowerShell or `"$AGENTTALK_PY" -m agenttalk` on Linux and macOS.
 
-The install command pins a released tag (`@v0.104.0` in Get started), rather than a branch: commands and the message
+The install command pins a released tag (`@v0.105.0` in Get started), rather than a branch: commands and the message
 format can change between releases, and a tag keeps every agent in a project on the same version.
 
 The `install-skills` command installs the skills, the instructions each agent CLI
@@ -1901,9 +1922,14 @@ not remove the per-user items above.
   supervise --select-pwsh --pwsh "<absolute path>"` if you need a
   portable or nonstandard host.
 - Inline `-m "..."` bodies are fragile for multi-line text,
-  apostrophes, backslashes, and Windows paths. Prefer `--file <path>`,
-  or pipe a PowerShell here-string to `--file -`, for `send`, `reply`,
-  `propose`, and `broadcast` bodies.
+  apostrophes, backslashes, and Windows paths. Write the body to a UTF-8
+  file and pass `--file <path>` for `send`, `reply`, `propose`, and
+  `broadcast` bodies. Do not pipe text that has non-ASCII characters
+  (accented letters, an em dash, Japanese text) into `--file -` on
+  Windows: when standard input uses the Windows code page (the usual case)
+  it is read in that code page instead of UTF-8 and is stored garbled, with
+  no warning. A UTF-8 standard input is exact; a file given by path is read
+  as UTF-8 on every setup.
 - Supervised agents launch hidden by default on Windows so an
   unattended fleet doesn't open one console per agent. Set
   `"window_style": "minimized"` or `"normal"` in `supervisor.json`
@@ -1962,7 +1988,7 @@ automation to depend on):
 
 agenttalk follows [Semantic Versioning](https://semver.org/) and keeps
 a [Keep a Changelog](https://keepachangelog.com/)-formatted
-`CHANGELOG.md`. Install a specific tag (`@v0.104.0`, or whatever the
+`CHANGELOG.md`. Install a specific tag (`@v0.105.0`, or whatever the
 current release is) rather than a branch, since the CLI surface and
 message schema can change between releases. `agenttalk dev-gate
 --profile release` is the release-evidence gate itself: it builds the
@@ -1975,6 +2001,7 @@ can consume.
 
 This reference deliberately stays shallow. For more:
 
+- [docs/FEATURES.md](https://github.com/zoolok17/agenttalk/blob/master/docs/FEATURES.md) — every feature in plain words: what agenttalk does today and what is planned.
 - [docs/AGENTTALK-NEW-USER-MANUAL.md](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENTTALK-NEW-USER-MANUAL.md) — concept-first onboarding.
 - [docs/USER-MANUAL.md](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md) — operator-facing procedures and examples.
 - [docs/AGENT-MANUAL.md](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENT-MANUAL.md) — role-keyed operating guide for agents.

@@ -7,7 +7,7 @@ description: >-
   lens in a review. Do NOT use to chase a coverage percentage or mandate production
   tests (use test-coverage), to review code health (use review-code), or to write
   product code. This is an evidence-producing workflow, not a coverage rubric.
-reviewed-against: "0.43"
+reviewed-against: "0.105"
 category: assurance
 evidence-profile:
   - qa-result

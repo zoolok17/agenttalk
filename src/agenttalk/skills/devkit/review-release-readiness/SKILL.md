@@ -63,7 +63,9 @@ self-reported "tests pass". `tests_referenced` is inspected-only. If you could n
 confirm execution, HOLD; do not fabricate a green.
 
 **RISK (hard rule):** primary `risk_class=release`, but LIST every touched/secondary
-class (a release touching auth is also `security`). You do NOT decide the close's risk —
+class (a release touching auth is also `security`). `risk_class` takes exactly ONE value (a comma
+list is refused): put the secondary classes in the body or in `residual_risk`, and tell the lead,
+whose close inventory (`close open --risk-class`, repeatable) carries them. You do NOT decide the close's risk —
 the lead-owned risk inventory is authoritative for P3 routing.
 
 ## Evidence

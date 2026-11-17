@@ -4,7 +4,7 @@ description: >-
   Restructure existing production code while preserving behavior: simplify
   boundaries, reduce duplication, improve names/layout, extract or inline
   abstractions, and make code easier to maintain without changing the observable
-  contract. Use when Codex is asked for behavior-preserving cleanup, internal
+  contract. Use when an agent is asked for behavior-preserving cleanup, internal
   restructuring, simplification, or refactoring after scope is clear. Do NOT use
   for feature work, bug fixes or product changes that alter behavior (use
   craft-code), writing tests directly as the primary task (use test-coverage),
@@ -24,8 +24,8 @@ same, what files/modules are in scope, and what is explicitly out of scope.
 
 ## When To Use
 - [ ] If the assignment carries `lane_id`, run
-      `python -m agenttalk lane workspace --id <lane_id>` and work only in that
-      path. If no workspace resolves, STOP and ask the lead; never create or
+      `agenttalk lane workspace --id <lane_id>` and work only in that
+      path. When `AGENTTALK_PY` is set (the seat's pinned runtime), run agenttalk commands with `"$AGENTTALK_PY" -m agenttalk` in Bash or `& "$env:AGENTTALK_PY" -m agenttalk` in PowerShell; otherwise use the form your project's agent manual gives (`python -m agenttalk` under Codex, `agenttalk` elsewhere). If no workspace resolves, STOP and ask the lead; never create or
       reuse your own git worktree.
 - [ ] Behavior must stay unchanged and the goal is structure, duplication,
       boundaries, naming, module shape, or simplification.

@@ -2695,9 +2695,26 @@
     var data = gatesData;
     var errs = (data && isArray(data.errors)) ? data.errors : [];
     if (data && !errs.length) {
+      // #711: a GO with no gate assessed is "nothing checked", not a green GO. The server decides
+      // (build_gates.nothing_checked); anything but a real true on a GO (missing, a string, a HOLD)
+      // shows the verdict as before.
+      var nothingChecked = data.verdict === 'GO' && data.nothing_checked === true;  // never over a HOLD
       var verdictChip = el('span', 'tc-chip tc-gate-verdict gate-' +
-        (data.verdict === 'GO' ? 'green' : 'red'), data.verdict || 'HOLD');
+        (nothingChecked ? 'unknown gate-nothing-checked' : (data.verdict === 'GO' ? 'green' : 'red')),
+        nothingChecked ? 'NOTHING CHECKED' : (data.verdict || 'HOLD'));
+      if (nothingChecked) titled(verdictChip, 'Nothing checked (0 applicable gates)');
       header.appendChild(verdictChip);
+      // How many gates were assessed, as visible text beside the verdict (#711): the server's count
+      // (build_gates.count, the same word #733 uses: applicable gates), never a count of rows. A count
+      // that is missing or not a finite whole number >= 0 (Infinity and NaN included) shows nothing
+      // rather than a made-up number, and NOTHING CHECKED already says it. The server also says whether
+      // the count is known (gate_count_known): when the gate state could not be read the one row is a
+      // read-error diagnostic, not a gate, so no count is shown; only a real true shows one.
+      var gateCount = data.count;
+      if (!nothingChecked && data.gate_count_known === true && Number.isInteger(gateCount) && gateCount >= 0) {
+        header.appendChild(el('span', 'tc-gate-count',
+          gateCount + ' applicable gate' + (gateCount === 1 ? '' : 's')));
+      }
       if (!auxPayloadFresh(data)) {
         header.appendChild(titled(
           el('span', 'tc-chip tc-cap-confidence is-stale', 'STALE'),

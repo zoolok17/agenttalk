@@ -47,6 +47,8 @@ import subprocess  # nosec B404 - every call site below uses a resolved-path arg
 import tempfile
 from pathlib import Path
 
+from . import store as store_mod
+from . import git_index_safety as index_safety
 from .scratch import _read_scratch_config, default_scratch_root, resolve_keep_days
 
 DEFAULT_REPO_DIR_FAMILIES = [
@@ -429,10 +431,11 @@ def is_dirty_worktree(path: Path) -> bool:
     unconfirmed one through as "nothing to do here"."""
     if not (path / ".git").exists():
         return False
-    rc, out, _err = _run_git_checked(path, "status", "--porcelain")
+    # Include hidden new work; directory summaries are enough for this yes/no check.
+    rc, out, _err = _run_git_checked(path, *index_safety.STATUS_ARGS)
     if rc != 0:
         return True
-    return bool(out.strip())
+    return bool(out.strip()) or index_safety.check_hidden_index(path).state != "safe"
 
 
 def worktree_branch(path: Path) -> str | None:
@@ -754,6 +757,10 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
         f"registered worktrees: {len(report.registered_worktrees)}",
         f"dirty registered worktrees: {len(report.dirty_worktrees)}",
     ]
+    if report.dirty_worktrees:
+        lines.append(
+            "DIRTY includes checkouts that could not be fully checked; hidden tracked files are kept for inspection."
+        )
     for w in report.dirty_worktrees:
         lines.append(f"  DIRTY {w}")
     for f in report.foreign_kept:
@@ -771,19 +778,21 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
             lines.append(f"  ... and {len(report.candidates) - 15} more")
         lines.append("re-run with --apply to preserve dirty removal candidates as WIP commits, "
                       "delete, and prune.")
-    return "\n".join(lines)
+    return "\n".join(store_mod.report_line(line) for line in lines)
 
 
 @dataclasses.dataclass
 class WipCommitResult:
     message: str
-    refused: bool  # True: default branch or detached HEAD - not committed AND not removed
+    refused: bool  # True: preservation is not confirmed; the caller must keep the checkout.
 
 
 def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> WipCommitResult:
     """Commit ALL changes (tracked and untracked - P2) as a WIP commit on
     the worktree's own branch. Refuses (no commit, and the caller must not
     remove the directory either) if:
+    - Git could be hiding tracked files, or materialized submodule work cannot
+      be preserved by a commit in its parent repository.
     - the worktree is on a default branch OR is a detached HEAD (P1): a WIP
       commit made on a detached HEAD is reachable from no ref and becomes
       an unreachable object the moment the directory is removed -
@@ -806,6 +815,9 @@ def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> Wip
                      f"a default branch or a detached HEAD): {path}",
             refused=True,
         )
+    keep = index_safety.keep_reason(path)
+    if keep:
+        return _visibility_refusal(path, branch, keep)
     git = shutil.which("git")
     if git is None:
         return WipCommitResult(
@@ -834,7 +846,8 @@ def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> Wip
                      f"{commit_result.returncode}: {commit_result.stderr.strip()}): {path}",
             refused=True,
         )
-    status_rc, status_out, status_err = _run_git_checked(path, "status", "--porcelain")
+    # Check for hidden new work after the commit; directory summaries are enough.
+    status_rc, status_out, status_err = _run_git_checked(path, *index_safety.STATUS_ARGS)
     if status_rc != 0:
         return WipCommitResult(
             message=f"  REFUSED dirty worktree on {branch} (could not confirm clean after "
@@ -847,7 +860,22 @@ def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> Wip
                      f"refusing to remove): {path}",
             refused=True,
         )
+    keep = index_safety.keep_reason(path)
+    if keep:
+        return _visibility_refusal(path, branch, keep)
     return WipCommitResult(message=f"  WIP committed on {branch}: {path}", refused=False)
+
+
+def _visibility_guidance(path, reason):
+    if reason in {index_safety.HIDDEN, index_safety.UNKNOWN}:
+        return index_safety.inspection_guidance(path, uncertain=reason == index_safety.UNKNOWN)
+    return ""
+
+
+def _visibility_refusal(path, branch, reason):
+    text = f"  REFUSED dirty worktree on {branch} ({reason}): {path}"
+    guidance = _visibility_guidance(path, reason)
+    return WipCommitResult(message=text + ("\n" + guidance if guidance else ""), refused=True)
 
 
 def _make_tree_writable(path: Path) -> None:
@@ -1040,15 +1068,20 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     Returns the report text (same shape as report mode, plus the apply
     summary)."""
     report.apply_failed = bool(report.access_errors)
-    lines = [format_report(report, cfg, apply=True)]
+    lines = format_report(report, cfg, apply=True).splitlines()
 
     def refuse_ancestry(reason: str) -> str:
         report.apply_failed = True
-        return "\n".join(lines + [
-            "removed summary:", f"  FAILED: {max(1, len(report.candidates))}",
-            f"FAILED: {reason}; no worktree commit or prune was attempted after this failure",
-            *[f"  {_scanned_root_relative(c.path, cfg)}: {reason}" for c in report.candidates],
-        ])
+        return "\n".join(
+            store_mod.report_line(line)
+            for line in lines
+            + [
+                "removed summary:",
+                f"  FAILED: {max(1, len(report.candidates))}",
+                f"FAILED: {reason}; no worktree commit or prune was attempted after this failure",
+                *[f"  {_scanned_root_relative(c.path, cfg)}: {reason}" for c in report.candidates],
+            ]
+        )
 
     reason = _ancestor_change_reason(report.ancestor_ids)
     if reason is not None:
@@ -1079,7 +1112,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                     if _same_worktree(w, cfg.repo):
                         keep = "the main repository is never committed or removed"
                         break
-                    keep = ignored_worktree_keep_reason(w)
+                    keep = index_safety.keep_reason(w) or ignored_worktree_keep_reason(w)
                     if keep:
                         break
                     branch = worktree_branch(w)
@@ -1094,6 +1127,9 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         break
                 if keep:
                     lines.append(f"  REFUSED (kept) {c.path}: {keep}")
+                    guidance = _visibility_guidance(w, keep)
+                    if guidance:
+                        lines.append(guidance)
                     summary["refused"] = summary.get("refused", 0) + 1
                     continue
             except (OSError, RuntimeError) as exc:
@@ -1116,6 +1152,23 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                 summary["refused"] = summary.get("refused", 0) + 1
                 continue
             if reason is None:
+                reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+            if reason is None:
+                keep = None
+                for w in worktrees:
+                    keep = index_safety.keep_reason(w)
+                    if keep:
+                        break
+                if keep:
+                    lines.append(f"  REFUSED (kept) {c.path}: {keep}")
+                    guidance = _visibility_guidance(w, keep)
+                    if guidance:
+                        lines.append(guidance)
+                    summary["refused"] = summary.get("refused", 0) + 1
+                    continue
+            if reason is None:
+                # The read-only Git probes above may take time; retain the identity
+                # check immediately before the existing filesystem removal.
                 reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
             if reason is not None:
                 result = "FAILED"
@@ -1142,4 +1195,4 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                      "Look at each one, then remove it yourself:")
         for path, reason in failed:
             lines.append(f"  {_scanned_root_relative(path, cfg)}: {reason}")
-    return "\n".join(lines)
+    return "\n".join(store_mod.report_line(line) for line in lines)
