@@ -127,10 +127,11 @@ def test_the_wrap_loop_hands_the_form_to_the_turn_and_the_cadence_drive(tmp_path
                         lambda *a, **kw: seen.__setitem__("cadence", kw["reply_invocation"]) or (lambda *x: True))
     monkeypatch.setattr(loop, "run_loop", lambda store, agent, drive, **kw: 0)
 
+    invocation = '"/env/bin/python" -m agenttalk'
     cli._wrap_loop_mode(s, "beta", cli="codex", base_argv=["python", "-c", "pass"], sender="beta",
-                        min_interval=5.0, render=False, lead_loop=True, reply_invocation='"/env/bin/python" -m agenttalk')
+                        min_interval=5.0, render=False, lead_loop=True, reply_invocation=invocation)
 
-    assert seen == {"turn": '"/env/bin/python" -m agenttalk', "cadence": '"/env/bin/python" -m agenttalk'}
+    assert seen == {"turn": invocation, "cadence": invocation}
 
 
 def _wrap(tmp_path, monkeypatch, py, *tail):

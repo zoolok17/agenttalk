@@ -47,6 +47,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
+  Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
+  variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run
+  `"$AGENTTALK_PY" -m agenttalk ...` (issue #822). Before this, such a seat could not reply, report
+  progress or send by command. Now the wrapper writes the Python interpreter's full path into that
+  seat's instructions (`"<path with forward slashes>" -m agenttalk ...`), tells it to use the Bash tool,
+  and prints at start the allow rule the team can add, for example
+  `Bash("<env>/Scripts/python.exe" -m agenttalk *)`. The wrapper never adds the rule itself: in a
+  strict profile the team decides what a seat may run. Seats in the default `bypassPermissions` mode,
+  and Codex seats, see no change. A strict seat keeps the old form when the interpreter's path is not
+  an existing full path or is not safe inside double quotes. Not changed here: the skills (they keep
+  their `AGENTTALK_PY` rule), the supervisor's own resume rule `Bash(agenttalk *)`, the PowerShell
+  forms, and the lead setup brief (#826 changes it).
+
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,
   including unedited files marked assume-unchanged or present skipped files. Files
