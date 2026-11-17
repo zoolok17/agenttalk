@@ -233,12 +233,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ready to paste, and tells the reader to type the path themselves. The found path is shown for
   reading only; if it holds an unusual character, that is shown as a `\uXXXX` code, and doctor says
   the display is not the exact file name and how to get the real one for the place it was found. For a
-  file on the PATH it gives `(Get-Command pwsh -All -CommandType Application).Source`. A file under a
-  Program Files environment variable is not on the PATH, so doctor names that variable and gives one
-  expression for it, such as `Join-Path ${env:ProgramFiles} 'PowerShell\7\pwsh.exe'`. Both print the
-  full path as plain text on its own line (a table would cut a long path with an ellipsis), and each
-  shows only the one thing it names: doctor never recommends `Get-ChildItem Env:`, which prints every
-  environment variable, credentials included.
+  file on the PATH it gives a one-line expression that splits the PATH, trims each entry of spaces and
+  surrounding double quotes (as the search does, so a quoted entry is found too) and prints every
+  `pwsh.exe` that exists, one full path per line. A file under a Program Files environment variable is
+  not on the PATH, so doctor names that variable and gives one expression for it, such as
+  `Join-Path (${env:ProgramFiles}.Trim().Trim('"')) 'PowerShell\7\pwsh.exe'`, which also reads a quoted
+  value. Both print the full path as plain text on its own line (a table would cut a long path with an
+  ellipsis), and each reads only the one variable it names: doctor never recommends
+  `Get-ChildItem Env:`, which prints every environment variable, credentials included.
   Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
   has just been set up can still end with `overall: ERROR` on Windows until that step is done.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note

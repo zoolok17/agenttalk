@@ -614,14 +614,24 @@ _HOST_USERS = "the supervisor and the hang watchdog of a continuous Codex wrappe
 # How to get the exact path of a found file whose display is escaped. Both print plain strings, one per line, so a
 # long value is never cut with an ellipsis (a table such as `Get-Command pwsh -All` or `Get-ChildItem Env:` is), and
 # each shows only the one thing it is about: never a listing of the environment, which holds credentials.
-PATH_LOOKUP = "(Get-Command pwsh -All -CommandType Application).Source"
+# The expression that prints, one full path per line, every pwsh.exe the search finds on the PATH. It takes exactly what
+# the search takes: PATH split on the separator, each entry trimmed of whitespace and then of surrounding double quotes
+# (a quoted entry is legal on Windows), empty and non-absolute entries and network shares skipped. It prints a file
+# only if it exists, with Test-Path on the literal text so no wildcard in a folder name is expanded. Plain strings, so
+# nothing is cut with an ellipsis. It reads only the PATH variable.
+PATH_LOOKUP = (
+    "$env:PATH -split ';' | ForEach-Object { $e = $_.Trim().Trim('\"'); "
+    "if ($e -and [IO.Path]::IsPathFullyQualified($e) -and -not $e.StartsWith('\\\\')) "
+    "{ $p = Join-Path $e 'pwsh.exe'; if (Test-Path -LiteralPath $p -PathType Leaf) { $p } } }"
+)
 
 
 def env_root_lookup(variable: str) -> str:
     """The PowerShell expression that prints the full path of PowerShell\\7\\pwsh.exe under ONE Program Files
     variable. ``variable`` is one of the four fixed names, never a stored value; the braces let a name with
-    parentheses, such as ProgramFiles(x86), be read as a variable."""
-    return f"Join-Path ${{env:{variable}}} 'PowerShell\\7\\pwsh.exe'"
+    parentheses, such as ProgramFiles(x86), be read as a variable. The value is trimmed of whitespace and then of
+    surrounding double quotes, as the search does, so a quoted root is read as the folder it names."""
+    return f"Join-Path (${{env:{variable}}}.Trim().Trim('\"')) 'PowerShell\\7\\pwsh.exe'"
 
 
 def _found_pwsh_fix() -> str:
@@ -676,7 +686,7 @@ def _found_pwsh_fix() -> str:
         if source == "PATH":
             text += f"the real path is printed in full, one per line, by `{PATH_LOOKUP}`"
         else:
-            # not on the PATH, so Get-Command does not list it: name the one variable that found it, and print only
+            # not on the PATH, so the PATH lookup does not list it: name the one variable that found it, and print only
             # that variable's folder joined with the fixed place; never a listing of the environment
             text += (
                 f"it was found under the folder named by the environment variable {source}, as "

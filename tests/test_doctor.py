@@ -159,12 +159,16 @@ def test_doctor_powershell_check_says_found_not_verified_when_pwsh_is_present_bu
     assert check.details.endswith("; task status UNKNOWN")
 
 
-def _pwsh_only_on_a_temp_path(monkeypatch: pytest.MonkeyPatch, folder: Path) -> Path:
-    """A real pwsh.exe file in ``folder``, which is the whole PATH, and no Program Files variable."""
+_SPELLINGS = {"plain": "{}", "quoted": '"{}"', "quoted-and-padded": ' "{}" '}  # how an environment value may be written
+
+
+def _pwsh_only_on_a_temp_path(monkeypatch: pytest.MonkeyPatch, folder: Path, spelling: str = "plain") -> Path:
+    """A real pwsh.exe file in ``folder``, which is the whole PATH (written as ``spelling``), and no Program Files
+    variable."""
     folder.mkdir(parents=True)
     pwsh = folder / "pwsh.exe"
     pwsh.write_bytes(b"")
-    monkeypatch.setenv("PATH", str(folder))
+    monkeypatch.setenv("PATH", _SPELLINGS[spelling].format(folder))
     for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
         monkeypatch.delenv(name, raising=False)
     return pwsh
@@ -245,14 +249,16 @@ def test_doctor_powershell_check_says_when_the_shown_path_is_not_the_exact_file_
     assert f"found at {str(pwsh).replace(chr(0x202E), chr(92) + 'u202e')};" in check.fix
     assert "writes an unusual character as a \\uXXXX code, so it is not the exact file name" in check.fix
     assert f"the real path is printed in full, one per line, by `{doctor.PATH_LOOKUP}`" in check.fix
-    assert doctor.PATH_LOOKUP == "(Get-Command pwsh -All -CommandType Application).Source"
     assert "environment variable" not in check.fix
     assert "Get-ChildItem" not in check.fix
 
 
-def _pwsh_only_under_a_program_files_variable(monkeypatch: pytest.MonkeyPatch, root: Path, variable: str) -> Path:
-    """A real PowerShell\\7\\pwsh.exe under ``root``, named only by the environment variable ``variable``. The PATH
-    is a folder with no pwsh.exe in it, so the file is NOT on the PATH and Get-Command does not list it."""
+def _pwsh_only_under_a_program_files_variable(
+    monkeypatch: pytest.MonkeyPatch, root: Path, variable: str, spelling: str = "plain"
+) -> Path:
+    """A real PowerShell\\7\\pwsh.exe under ``root``, named only by the environment variable ``variable`` (its value
+    written as ``spelling``). The PATH is a folder with no pwsh.exe in it, so the file is NOT on the PATH and the PATH
+    lookup does not list it."""
     pwsh = root / "PowerShell" / "7" / "pwsh.exe"
     pwsh.parent.mkdir(parents=True)
     pwsh.write_bytes(b"")
@@ -261,7 +267,7 @@ def _pwsh_only_under_a_program_files_variable(monkeypatch: pytest.MonkeyPatch, r
     monkeypatch.setenv("PATH", str(empty))
     for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv(variable, str(root))
+    monkeypatch.setenv(variable, _SPELLINGS[spelling].format(root))
     return pwsh
 
 
@@ -279,7 +285,6 @@ def test_doctor_powershell_check_says_where_an_escaped_program_files_hit_came_fr
     assert f"it was found under the folder named by the environment variable {variable}, as " in check.fix
     lookup = doctor.env_root_lookup(variable)
     assert f"as PowerShell\\7\\pwsh.exe inside that folder; this prints the full path: `{lookup}`" in check.fix
-    assert doctor.env_root_lookup(variable) == f"Join-Path ${{env:{variable}}} 'PowerShell\\7\\pwsh.exe'"
     assert "Get-Command" not in check.fix  # the PATH advice would be untrue for this file
     assert "Get-ChildItem" not in check.fix  # and an environment listing shows every variable, credentials included
 
@@ -314,7 +319,7 @@ def _render_in_a_minimal_environment(expression: str, extra: dict[str, str]) -> 
     variable, so a lookup that prints more than it should shows it."""
     env = {
         "SystemRoot": os.environ["SystemRoot"],
-        "PATHEXT": ".COM;.EXE",  # without it Get-Command finds no .exe
+        "PATHEXT": ".COM;.EXE",  # an ordinary Windows value; the lookups do not depend on it
         "ATK_TEST_UNRELATED_SECRET": _SYNTHETIC_SECRET,
         **extra,
     }
@@ -326,6 +331,11 @@ def _render_in_a_minimal_environment(expression: str, extra: dict[str, str]) -> 
     return done.stdout.decode("utf-8").splitlines()
 
 
+def _without_the_host(lines: list[str]) -> list[str]:
+    """pwsh puts its own folder first on the PATH it runs with, so the lookup also lists the pwsh that runs it."""
+    return [line for line in lines if line.lower() != str(Path(_REAL_PWSH)).lower()]
+
+
 def _a_long_folder(tmp_path: Path) -> Path:
     # over 150 characters in all (the temp root makes up the rest), yet short enough for Windows' 260-character limit
     # even under a long CI temp root; U+202E is in the last folder name
@@ -333,47 +343,77 @@ def _a_long_folder(tmp_path: Path) -> Path:
 
 
 @_needs_real_pwsh
+@pytest.mark.parametrize("spelling", list(_SPELLINGS))
 def test_the_printed_path_lookup_prints_the_exact_long_path_and_no_secret(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
 ) -> None:
+    # The same PATH the search reads is given to the printed lookup, so a quoted or padded entry (which the search
+    # accepts) must be found by the lookup too.
     folder = _a_long_folder(tmp_path)
-    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, folder)
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, folder, spelling)
     assert len(str(pwsh)) > 150
     _windows_without_selection(monkeypatch, [], on_path=None)
     check = doctor._check_powershell_host(Store(tmp_path / "project"))
-    expression = _the_printed_lookup(check.fix, ("(Get-Command", "Get-Command"))
-    lines = _render_in_a_minimal_environment(expression, {"PATH": str(folder)})
+    expression = _the_printed_lookup(check.fix, ("$env:PATH", "(Get-Command", "Get-Command"))
+    lines = _render_in_a_minimal_environment(expression, {"PATH": _SPELLINGS[spelling].format(folder)})
     assert _SYNTHETIC_SECRET not in "\n".join(lines)  # first: a listing of the environment shows it
-    assert str(pwsh) in lines  # the whole path, on a line of its own (pwsh also lists the host it runs in)
-    assert all(line.lower().endswith("pwsh.exe") for line in lines)  # nothing but paths of pwsh.exe
-    assert not any("\u2026" in line or "..." in line for line in lines)  # no ellipsis
+    assert _without_the_host(lines) == [str(pwsh)]  # the whole path, on a line of its own, and nothing else
+    assert not any("…" in line or "..." in line for line in lines)  # no ellipsis
 
 
 @_needs_real_pwsh
+def test_the_printed_path_lookup_reads_the_path_the_way_the_search_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Several entries at once: quoted, padded, empty, relative, and one with no pwsh.exe; only the real file is printed.
+    folder = _a_long_folder(tmp_path)
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, folder)
+    other = tmp_path / "no-pwsh-here"
+    other.mkdir()
+    entries = [f' "{other}" ', "", "relative\\folder", f'"{folder}"', f"{folder}"]
+    path_value = ";".join(entries)
+    monkeypatch.setenv("PATH", path_value)
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    lines = _render_in_a_minimal_environment(_the_printed_lookup(check.fix, ("$env:PATH",)), {"PATH": path_value})
+    # the folder is on the PATH twice, spelled two ways; nothing else is printed
+    assert _without_the_host(lines) == [str(pwsh), str(pwsh)]
+    assert _SYNTHETIC_SECRET not in "\n".join(lines)
+
+
+@_needs_real_pwsh
+@pytest.mark.parametrize("spelling", list(_SPELLINGS))
 @pytest.mark.parametrize("variable", ["ProgramFiles", "ProgramFiles(x86)"])
 def test_the_printed_program_files_lookup_prints_the_exact_long_path_and_no_secret(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable: str, spelling: str
 ) -> None:
     root = _a_long_folder(tmp_path)
-    pwsh = _pwsh_only_under_a_program_files_variable(monkeypatch, root, variable)
+    pwsh = _pwsh_only_under_a_program_files_variable(monkeypatch, root, variable, spelling)
     assert len(str(pwsh)) > 150
     _windows_without_selection(monkeypatch, [], on_path=None)
     check = doctor._check_powershell_host(Store(tmp_path / "project"))
     expression = _the_printed_lookup(check.fix, ("Join-Path", "Get-ChildItem"))
     empty = root.parent / "empty-path-folder"
-    lines = _render_in_a_minimal_environment(expression, {"PATH": str(empty), variable: str(root)})
+    extra = {"PATH": str(empty), variable: _SPELLINGS[spelling].format(root)}  # the value as the search read it
+    lines = _render_in_a_minimal_environment(expression, extra)
     assert _SYNTHETIC_SECRET not in "\n".join(lines)  # first: a listing of the environment shows it
     assert lines == [str(pwsh)]
-    assert not any("\u2026" in line or "..." in line for line in lines)
+    assert not any("…" in line or "..." in line for line in lines)
 
 
 def test_the_hint_never_recommends_a_listing_that_shows_more_than_the_one_thing_it_names() -> None:
     # `Get-ChildItem Env:` prints every environment variable, credentials included; a table cuts long values.
-    assert "Get-ChildItem" not in doctor.PATH_LOOKUP and "-Format" not in doctor.PATH_LOOKUP
-    for variable in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
+    for expression in (doctor.PATH_LOOKUP, *(doctor.env_root_lookup(v) for v in _PROGRAM_FILES_VARIABLES)):
+        assert "Get-ChildItem" not in expression and "-Format" not in expression and "Get-Command" not in expression
+    assert doctor.PATH_LOOKUP.startswith("$env:PATH -split ';'")  # reads the PATH and nothing else
+    assert "${env:" not in doctor.PATH_LOOKUP
+    for variable in _PROGRAM_FILES_VARIABLES:
         expression = doctor.env_root_lookup(variable)
-        assert expression == f"Join-Path ${{env:{variable}}} 'PowerShell\\7\\pwsh.exe'"
-        assert "Get-ChildItem" not in expression and "Env:" not in expression.replace("${env:", "")
+        assert expression == f"Join-Path (${{env:{variable}}}.Trim().Trim('\"')) 'PowerShell\\7\\pwsh.exe'"
+        assert expression.count("${env:") == 1 and "$env:PATH" not in expression  # only that one variable is read
+
+
+_PROGRAM_FILES_VARIABLES = ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)")
 
 
 def test_doctor_powershell_check_runs_the_path_command_only_when_it_really_is_one(
