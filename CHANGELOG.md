@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The lead setup brief explains how to run a Claude seat in a strict permission mode (#826).**
+  Before this, the brief said that a wrapped Claude seat runs with no approval prompts and no
+  sandbox unless you choose another mode, and left the rest to the team. Now its step 10a gives a
+  starting set of allow and deny rules for Claude Code's `dontAsk` mode, which another team built
+  and tested on Windows with Claude Code 2.1.326 and agenttalk 0.105.0 (issue #823). It covers the
+  reply-command workaround until #822 is fixed, the rule that lets a seat write its reply drafts,
+  the rules that stop a seat from widening its own rights, and how to test your own rules. It is a
+  guardrail, not a sandbox: anything the rules allow runs with the user account's full rights.
+  Steps 4 and 5 gain two short notes: the user account's own Claude instructions reach wrapped
+  seats too, and on Windows the process number the start script saves belongs to a launcher.
+
 ### Changed
 
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
