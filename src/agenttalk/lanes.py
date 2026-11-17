@@ -228,7 +228,10 @@ def acknowledged_damage_remains(lane: dict) -> bool:
         for field in ("worktree_path", "worktree_toplevel_canonical"))
 
 
-def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
+def checkout_path_recovery(*, lane_id: str, lane: dict | None = None, owner: dict | None = None) -> str:
+    """The step to take for a damaged checkout field of `lane`. `owner` is the live row that holds `lane` when `lane`
+    is a saved copy inside it (the snapshot of a pending delivery): the delivery state is the live row's, so that is
+    what decides whether the delivery must be recovered first. Without `owner`, `lane` is the live row."""
     try:
         lane_id = validate_lane_id(lane_id)
     except LaneError:
@@ -252,7 +255,8 @@ def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
         repair = (f"replace worktree_path in lanes.json lane {lane_id!r} with the checkout's real absolute folder "
                   "(a relative path cannot be acknowledged as missing; if no folder with exactly that name exists "
                   'anywhere, set worktree_path to empty text ("") instead), then ')
-    if lane is not None and delivery_recovery_required(lane):
+    live = owner if owner is not None else lane
+    if live is not None and delivery_recovery_required(live):
         # `lane abandon` refuses a lane whose delivery is unfinished, so the first step is to recover it.
         return (f"this lane's delivery is not finished: run `lane recover --id {lane_id} --reason <why>` first "
                 "(it restores the lane to ACTIVE, or names `lane deliver` when a committed final exists), then "

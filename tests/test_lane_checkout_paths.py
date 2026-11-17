@@ -976,6 +976,94 @@ def test_release_checkout_damage_explains_recovery(damaged_lane, field, value):
     assert "lane abandon --id damaged --acknowledge-missing-worktree" in str(stopped.value)
 
 
+def _a_pending_delivery_with_a_blank_snapshot(tmp_path, monkeypatch):
+    """A delivery made by an older version: its committed final exists but its publication marker was never saved, and
+    the signed snapshot inside the pending delivery holds a blank canonical path. The live row has since been repaired
+    to an absolute path, so only the saved copy is damaged."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch, "")
+    _repair_the_row(store, lane_id, worktree)
+    row = lanes.load_lanes(store)["lanes"][lane_id]
+    snapshot = row["publish_pending"]["lane_snapshot"]
+    assert row["status"] == lanes.STATUS_DELIVERED and lanes.delivery_recovery_required(row)
+    assert lanes.checkout_issue(row, root=store.root) is None  # the live row is sound
+    assert snapshot["status"] == lanes.STATUS_ACTIVE and snapshot["worktree_toplevel_canonical"] == ""
+    return store, lane_id, worktree
+
+
+def _release_check_refusal(store) -> str:
+    """What the release check says about this store (it reads every lane row, so it refuses any release)."""
+    from agenttalk import janitor, worktree_release
+
+    with pytest.raises(worktree_release.Refused) as refused:
+        worktree_release._activity(janitor.JanitorConfig.load(store.root), store.root / "unrelated-checkout")
+    return str(refused.value)
+
+
+def test_release_advice_for_a_pending_delivery_names_recover_first(tmp_path, monkeypatch):
+    store, lane_id, _worktree = _a_pending_delivery_with_a_blank_snapshot(tmp_path, monkeypatch)
+    advice = _release_check_refusal(store)
+    recover = f"run `lane recover --id {lane_id} --reason <why>` first"
+    abandon = f"`lane abandon --id {lane_id} --acknowledge-missing-worktree`"
+    assert recover in advice and abandon in advice
+    assert advice.index(recover) < advice.index(abandon)  # recover is the step the delivery state allows first
+    assert "to retire this lane without using its checkout, run" not in advice  # the plain abandon-first advice
+
+
+def test_release_advice_for_a_pending_delivery_runs_step_by_step(tmp_path, monkeypatch, capsys):
+    """Every printed step is taken in order, and each does what the advice says."""
+    from agenttalk import janitor, worktree_release
+
+    store, lane_id, worktree = _a_pending_delivery_with_a_blank_snapshot(tmp_path, monkeypatch)
+    assert f"`lane recover --id {lane_id} --reason <why>` first" in _release_check_refusal(store)
+
+    def step(*argv):
+        capsys.readouterr()
+        code = cli.main(["--root", str(store.root), "lane", *argv])
+        return code, capsys.readouterr()
+
+    # 1. recover: accepted as the advice describes ("names `lane deliver` when a committed final exists")
+    code, out = step("recover", "--id", lane_id, "--reason", "follow the release advice")
+    assert code == 3 and "run `lane deliver`" in out.err
+    # 2. what it names: the delivery finishes, and its cleanup removes the checkout
+    code, out = step("deliver", "--id", lane_id, "--from", "dev")
+    assert code == 0 and f"delivered lane {lane_id}" in out.out
+    row = lanes.load_lanes(store)["lanes"][lane_id]
+    assert row["publish_pending"] is False and row["cleanup_pending"] is False and not worktree.exists()
+    # the delivery is no longer pending, so the release check has nothing left to refuse
+    worktree_release._activity(janitor.JanitorConfig.load(store.root), store.root / "unrelated-checkout")
+    # 3. retire the lane, as the advice ends: accepted, and the lane is retired
+    code, out = step("abandon", "--id", lane_id, "--acknowledge-missing-worktree")
+    assert code == 0 and f"abandoned lane {lane_id}" in out.out
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ABANDONED
+
+
+def test_the_recovery_step_follows_the_live_row_when_given_one_and_the_row_itself_otherwise():
+    pending = {"status": lanes.STATUS_DELIVERED, "publish_pending": {"lane_snapshot": {}}}
+    active = {"status": lanes.STATUS_ACTIVE, "worktree_path": "", "worktree_toplevel_canonical": ""}
+    # a saved copy (active, blank) inside a live row that is pending: recover first
+    held = lanes.checkout_path_recovery(lane_id="a", lane=active, owner=pending)
+    assert "this lane's delivery is not finished: run `lane recover --id a" in held
+    # the same copy inside a live row that is not pending: the plain retirement
+    plain = lanes.checkout_path_recovery(lane_id="a", lane=active, owner={"status": lanes.STATUS_ACTIVE})
+    assert plain.startswith("to retire this lane without using its checkout, run `lane abandon --id a")
+    # no owner: the row is judged by itself, exactly as before this change (every other caller)
+    assert lanes.checkout_path_recovery(lane_id="a", lane=active) == plain
+    assert "this lane's delivery is not finished" in lanes.checkout_path_recovery(lane_id="a", lane=pending)
+
+
+def test_the_live_row_is_carried_through_a_list_inside_the_row_too(tmp_path):
+    from agenttalk import worktree_release
+
+    blank = {"status": lanes.STATUS_ACTIVE, "worktree_path": "", "worktree_toplevel_canonical": ""}
+    row = {"status": lanes.STATUS_DELIVERED, "publish_pending": {"saved_copies": [blank]}}
+    with pytest.raises(worktree_release.Refused) as stopped:
+        worktree_release._names_checkout(
+            row, tmp_path / "other", tmp_path, lane_id="a", source="lanes.json lane a", lane=True
+        )
+    assert "run `lane recover --id a --reason <why>` first" in str(stopped.value)
+
+
 def test_workspace_damage_warning_is_once_per_lane_and_store(damaged_lane, monkeypatch, capsys):
     store = damaged_lane("worktree_path", "\t")
     monkeypatch.setattr(supervisor, "_workspace_damage_warned", set(), raising=False)

@@ -351,10 +351,14 @@ def _read_record(cfg: janitor.JanitorConfig, path: Path) -> dict:
 
 
 def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | None,
-                    source: str = "activity record", lane: bool = False) -> bool:
+                    source: str = "activity record", lane: bool = False, owner: dict | None = None) -> bool:
     """True when `value` names the checkout `target`. `lane_id` is the registry key of the lane row being read (None
     for a record that is not a lane row); it is passed by name and never taken from the row, which can name another
-    lane, so a recovery hint always names the row that was selected."""
+    lane, so a recovery hint always names the row that was selected. `owner` is that live row: the first lane-level
+    call sets it, and the recursion keeps it, so a saved copy inside the row (the lane snapshot of a pending delivery)
+    is judged for its advice by the state of the row that holds it, not by the copy's own old state."""
+    if lane and owner is None and isinstance(value, dict):
+        owner = value
     if lane and isinstance(value, dict):
         # One lexical rule, first: before any folder is chosen, matched or skipped (an earlier matching path, a
         # dictionary order, or an acknowledged retirement must not hide it). Only the canonical field has it.
@@ -379,7 +383,8 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
         if problem is not None:
             key, reason = problem
             recovery = lanes.checkout_path_recovery(
-                lane_id=lane_id if lane_id is not None else "", lane=value if isinstance(value, dict) else None)
+                lane_id=lane_id if lane_id is not None else "", lane=value if isinstance(value, dict) else None,
+                owner=owner)
             if reason == "is not a string":
                 raise Refused(f"{source}: could not read activity path {key}; "
                               f"{recovery}")
@@ -414,10 +419,10 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
                 if not isinstance(item, str):
                     raise Refused(f"{source}: could not read activity path {key}")
             elif isinstance(item, (dict, list)) and _names_checkout(
-                    item, target, repo, lane_id=lane_id, source=source, lane=lane):
+                    item, target, repo, lane_id=lane_id, source=source, lane=lane, owner=owner):
                 return True
     elif isinstance(value, list):
-        return any(_names_checkout(item, target, repo, lane_id=lane_id, source=source, lane=lane)
+        return any(_names_checkout(item, target, repo, lane_id=lane_id, source=source, lane=lane, owner=owner)
                    for item in value)
     return False
 
