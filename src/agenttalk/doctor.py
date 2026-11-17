@@ -611,6 +611,17 @@ def _check_ovh_qwen_gateway(store: Store) -> Check | None:
 
 
 _HOST_USERS = "the supervisor and the hang watchdog of a continuous Codex wrapper use the selected host"
+# How to get the exact path of a found file whose display is escaped. Both print plain strings, one per line, so a
+# long value is never cut with an ellipsis (a table such as `Get-Command pwsh -All` or `Get-ChildItem Env:` is), and
+# each shows only the one thing it is about: never a listing of the environment, which holds credentials.
+PATH_LOOKUP = "(Get-Command pwsh -All -CommandType Application).Source"
+
+
+def env_root_lookup(variable: str) -> str:
+    """The PowerShell expression that prints the full path of PowerShell\\7\\pwsh.exe under ONE Program Files
+    variable. ``variable`` is one of the four fixed names, never a stored value; the braces let a name with
+    parentheses, such as ProgramFiles(x86), be read as a variable."""
+    return f"Join-Path ${{env:{variable}}} 'PowerShell\\7\\pwsh.exe'"
 
 
 def _found_pwsh_fix() -> str:
@@ -629,8 +640,11 @@ def _found_pwsh_fix() -> str:
     the reader to type the path themselves. The path is only echoed for reading, through `pc.line`
     (never able to start a line of its own); when that display differs from the real path (an unusual
     character is written as a \\uXXXX code) the text says so and says how to get the real value FOR THE SOURCE THE
-    FILE CAME FROM: a PATH entry is listed by `Get-Command pwsh -All`, but a file under a Program Files variable is
-    not on the PATH, so that one is described by the variable's name and the fixed place inside its folder.
+    FILE CAME FROM: a PATH entry is printed in full by PATH_LOOKUP; a file under a Program Files variable is not on
+    the PATH, so that one gets `env_root_lookup(variable)`, which prints only that variable's folder joined with the
+    fixed place. The rule for both (security): the lookup prints plain strings, one per line, so a long value is not
+    cut with an ellipsis (a table is), and it shows ONLY the one thing named: never `Get-ChildItem Env:`, which
+    prints every environment variable, credentials included, into text people copy and share.
     Only a plain token is shown as a command to run."""
     try:
         for candidate in psh.program_files_candidates():
@@ -660,12 +674,13 @@ def _found_pwsh_fix() -> str:
             ". The path shown above writes an unusual character as a \\uXXXX code, so it is not the exact file name; "
         )
         if source == "PATH":
-            text += "the real path is listed by `Get-Command pwsh -All`"
+            text += f"the real path is printed in full, one per line, by `{PATH_LOOKUP}`"
         else:
-            # not on the PATH, so Get-Command does not list it: say which search found it, without the character
+            # not on the PATH, so Get-Command does not list it: name the one variable that found it, and print only
+            # that variable's folder joined with the fixed place; never a listing of the environment
             text += (
                 f"it was found under the folder named by the environment variable {source}, as "
-                "PowerShell\\7\\pwsh.exe inside that folder, and `Get-ChildItem Env:` lists the real folder"
+                f"PowerShell\\7\\pwsh.exe inside that folder; this prints the full path: `{env_root_lookup(source)}`"
             )
     return text
 
