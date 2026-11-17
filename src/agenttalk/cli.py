@@ -29,6 +29,7 @@ from pathlib import Path
 
 from agenttalk import __version__
 from agenttalk import printed_commands as pc
+from agenttalk import git_index_safety as index_safety
 from agenttalk import avatars as avatar_mod
 from agenttalk import health as health_schema
 from agenttalk import store as store_mod
@@ -44,6 +45,7 @@ from agenttalk.store import (
     OPENER_KINDS,
     Message,
     RequeueRefused,
+    PreparedMessageRefused,
     Store,
     _owner_identity_gone,
     escape_controls,
@@ -3202,7 +3204,12 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
         except (OSError, ValueError):
             return 1, "", "could not verify worktree status; the worktree was not removed"
         if present:
-            clean = _worktree_clean(target)
+            clean, index_reason = _worktree_clean_detail(target)
+            if index_reason is None and clean:
+                index_reason = index_safety.check_materialized_submodules(target).reason
+            if index_reason:
+                _print_index_recovery(target, index_reason)
+                return 1, "", f"{index_reason}; the worktree was not removed"
             if clean is None:
                 return 1, "", "could not verify worktree status; the worktree was not removed"
             if not clean:
@@ -3293,13 +3300,29 @@ def _resolve_revision(root, ref: str) -> tuple[str, str]:
 
 
 def _worktree_clean(root) -> bool | None:
-    """True/False if git could report; None if git is unavailable (caller then
-    relies on the operator's --dirty-artifact / explicit flags)."""
-    # Include hidden new work; directory summaries are enough for this yes/no check.
-    rc, out = _git(root, ["status", "--porcelain", "--untracked-files=normal"])
+    """None only for unavailable status; False also includes index uncertainty."""
+    return _worktree_clean_detail(root)[0]
+
+
+def _worktree_clean_detail(root) -> tuple[bool | None, str | None]:
+    rc, out = _git(root, index_safety.STATUS_ARGS)
     if rc != 0:
-        return None
-    return out.strip() == ""
+        return None, None
+    if out.strip():
+        return False, None
+    result = index_safety.check_hidden_index(root)
+    return result.state == "safe", result.reason
+
+
+def _print_index_recovery(root, reason, *, action=None):
+    if action:
+        sys.stderr.write(
+            f"agenttalk close {action}: WARNING - {reason}; this checkout is not recorded as clean.\n")
+    if reason in {index_safety.HIDDEN, index_safety.UNKNOWN}:
+        sys.stderr.write(index_safety.inspection_guidance(root, uncertain=reason == index_safety.UNKNOWN) + "\n")
+        if action:
+            sys.stderr.write("Close will HOLD without a dirty artifact until these files are inspected "
+                             "and the relevant flags are cleared.\n")
 
 
 def _close_lead_set(store) -> set[str]:
@@ -4172,7 +4195,9 @@ def cmd_close(args: argparse.Namespace) -> int:
         except (OSError, ValueError, TypeError, KeyError) as e:
             sys.stderr.write(f"agenttalk close open: invalid acceptance input: {e}\n")
             return 2
-        clean = True if prepared else _worktree_clean(store.root)
+        clean, index_reason = (True, None) if prepared else _worktree_clean_detail(store.root)
+        if index_reason:
+            _print_index_recovery(store.root, index_reason, action="open")
         if clean is None:  # git could not report; trust the explicit flags
             clean = not bool(args.dirty_artifact) if not args.allow_dirty else False
         opener = _resolve_self(getattr(args, "actor", None), roster=roster)
@@ -4190,7 +4215,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             # A crash before the freeze transaction must leave a HOLD-only close.
             record["schema_version"] = close_mod.ACCEPTANCE_SCHEMA_VERSION
             record["acceptance_route"] = {"pending": True}
-        if not clean and not args.dirty_artifact:
+        if not clean and not args.dirty_artifact and not index_reason:
             sys.stderr.write(
                 "agenttalk close open: WARNING - worktree is dirty and no "
                 "--dirty-artifact was recorded; close check will HOLD on revision "
@@ -4554,7 +4579,9 @@ def cmd_close(args: argparse.Namespace) -> int:
             except close_mod.CloseError as e:
                 sys.stderr.write(f"agenttalk close reopen: {e}\n")
                 return 2
-            wc = _worktree_clean(store.root)
+            wc, index_reason = _worktree_clean_detail(store.root)
+            if index_reason:
+                _print_index_recovery(store.root, index_reason, action="reopen")
             clean = True if wc is None else wc
         try:
             with close_mod.close_transaction(store, args.id) as transaction:
@@ -14668,6 +14695,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     cadence_hook = None
     if lead_loop and not one_shot_request_id:
         from . import lead_loop_cadence as _cad
+        cadence_refusals: list[str] = []  # why the last cadence turn was refused, for the controller's notice (#714)
         cadence_drive = wrapper_run.make_cadence_drive(
             store, agent, cli, state, base_argv, sender=sender,
             min_interval=min_interval, render=render, heartbeat=heartbeat,
@@ -14677,7 +14705,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             work_heartbeat=work_heartbeat,
             lifecycle_log=lifecycle_log,
             lease_lost_exceptions=(_LeadLoopLeaseLost,),
-            wrapper_generation=wrapper_generation, health_writer=health_writer)
+            wrapper_generation=wrapper_generation, health_writer=health_writer,
+            on_refused=cadence_refusals.append)
         cadence_health = _cadence_health_notifier(store, agent)
 
         def _cadence() -> "wloop.CadenceResult":
@@ -14692,13 +14721,13 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             # raise propagates out (run_loop -> _wrap_loop_mode handles lease-loss exit).
             _renew_or_lost()
 
-            def _fail() -> "wloop.CadenceResult":
+            def _fail(reason: str = "snapshot/sweep failure") -> "wloop.CadenceResult":
                 new, esc = _cad.apply_tick_failure(
                     cstate, now_epoch=now_epoch,
                     base=LEAD_LOOP_CADENCE_FAIL_BACKOFF_BASE,
                     max_backoff=LEAD_LOOP_CADENCE_FAIL_BACKOFF_MAX,
                     health_threshold=LEAD_LOOP_CADENCE_HEALTH_THRESHOLD)
-                if esc and cadence_health(new["cadence_fails"], "snapshot/sweep failure"):
+                if esc and cadence_health(new["cadence_fails"], reason):
                     # latch the controller-health escalation ONLY after it ROUTED. An
                     # unrouted notice (no operator-facing / sole-lead target) leaves
                     # health_escalated False so the NEXT failure RETRIES it - never
@@ -14739,6 +14768,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     cstate, now_epoch=now_epoch, reminded_keys=[], escalation_keys=[]))
                 _note_sweep()
                 return wloop.CadenceResult(ran=True, ok=True, drove_turn=False)
+            cadence_refusals.clear()
             try:
                 ok = bool(cadence_drive(_cad.snapshot_for_prompt(snap), items))
             except _LeadLoopLeaseLost:
@@ -14746,7 +14776,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             except Exception:  # noqa: BLE001 - any drive error is a cadence failure
                 ok = False
             if not ok:
-                return _fail()
+                return _fail(cadence_refusals[-1] if cadence_refusals else "snapshot/sweep failure")
             reminded_keys = [(it["request_id"], it.get("last_msg_id"))
                              for it in items if it.get("type") == "outbound_reminder"]
             escalation_keys = [it["key"] for it in items
@@ -16159,6 +16189,24 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 _refuse_live_request=True,
                 _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
             )
+        except PreparedMessageRefused as e:
+            if orig.get("kind") in _dl_tags.OPENERS:
+                route = _requeue_route(args, orig)
+            else:
+                template = "agenttalk dead-letter requeue --agent {agent} --id {id}"
+                values = {"agent": args.agent, "id": args.id}
+                if reopen_event is not None:
+                    template += " --force-resolved --from {actor} --reason {reason}"
+                    values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
+                route = (
+                    "After the reset has finished, retry the same dead letter to keep its original correlation:\n  "
+                    + pc.cmd(template, **values) + "."
+                )
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
+                + route + "\n"
+            )
+            return 2
         except RequeueRefused as e:
             # The advice is decided here, after the publication lock is released and from the resolution as it is now:
             # a retry is named only when the ordinary command would be accepted (a resolved one needs --force-resolved).

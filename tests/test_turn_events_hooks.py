@@ -712,33 +712,287 @@ def test_the_same_loop_scenario_behaves_identically_with_the_journal_on_or_off(t
     assert sink.kinds().count("dispatch_started") == sink.kinds().count("dispatch_ended") == off["spawns"]
 
 
+def _close_wait_problem(close_seconds, joins, took, deadline_origin=0.0):
+    """Why a close did not wait to one deadline for a stuck writer, or None when it did.
+
+    ``joins`` records each wait: (start relative to the close, requested timeout, actual elapsed time). ``took`` is the
+    whole close. The writer is still blocked, so requesting a wait is not enough: the waits must actually reach the
+    deadline. Time before and between waits counts too, including a scheduler pause that consumes the remaining time.
+
+    ``deadline_origin`` is the clock value used to create the deadline, relative to close entry. Time before that
+    value does not use up the budget. A request is computed before its join begins, so a pause between those steps
+    must not make the request look too large. Its clock sample cannot precede deadline creation or the recorded end
+    of the previous join: the sink cannot compute its next request until that join returns. Use that earlier observed
+    time as a lower bound for the sample, rather than assuming it is within 1 ms of join entry. Each request must fit
+    what remained then on the same absolute deadline; adding requests would reject valid retries after early returns.
+    Actual coverage must reach the deadline (with 50 ms of clock slack). A late timer can cover it even when its
+    request was short. Coverage is measured at the end of the last recorded join.
+
+    Time outside the waits is checked separately: tolerate a scheduler pause up to a second, but catch a 1.5 s sleep
+    before or after waiting, even when a timer also returns late. Waits that begin at or after the deadline count as
+    outside time too: many short waits must not extend the deadline. No timer of the test's own calibrates either rule.
+    Separately allow at most three joins to start at or after the deadline, including zero-time joins. The product
+    makes one join after the deadline; three leaves room without hiding a repeated-wait loop. Scheduler
+    lateness can delay a join's start or return, but cannot create repeated calls; the outside-time slack must not
+    admit a polling loop. A join that starts before the deadline can still return late without using this allowance.
+    """
+    if not joins:
+        return "close did not wait for the writer at all"
+    deadline = deadline_origin + close_seconds
+    outside = took - sum(spent for begin, _ask, spent in joins if begin < deadline)
+    if outside > 1.0:
+        return f"close spent {outside:.3f} s outside its wait for the writer"
+    late_joins = sum(begin >= deadline for begin, _ask, _spent in joins)
+    if late_joins > 3:
+        return f"close started {late_joins} joins at or after its deadline (at most 3 allowed)"
+    observed = deadline_origin
+    for begin, ask, spent in joins:
+        if ask is None or ask > max(0.0, deadline - observed) + 0.001:
+            return f"close asked to wait {ask} s at {begin:.3f} s, more than its one deadline of {close_seconds} s"
+        observed = begin + spent
+    covered = joins[-1][0] + joins[-1][2]
+    if covered < deadline - 0.05:
+        return (
+            f"close stopped waiting at {covered:.3f} s, which does not cover its deadline of {close_seconds} s: "
+            "the wait is shortened or missing"
+        )
+    return None
+
+
+@pytest.mark.parametrize(
+    "joins, took, problem",
+    [
+        pytest.param([(0.0, 0.3, 0.3)], 0.3, None, id="healthy"),
+        pytest.param([(0.0, 0.3, 1.1)], 1.1, None, id="healthy-the-timer-returned-late"),
+        pytest.param([(0.25, 0.049, 0.049)], 0.3, None, id="healthy-a-pause-ate-part-of-the-deadline"),
+        pytest.param([(0.25, 0.3, 0.3)], 0.55, None, id="healthy-a-pause-after-the-remaining-budget-read"),
+        pytest.param(
+            [(0.0, 0.1, 0.1), (0.35, 0.2, 0.2)],
+            0.55,
+            None,
+            id="healthy-a-pause-after-the-second-remaining-budget-read",
+        ),
+        pytest.param(
+            [(0.0, 0.05, 0.05), (0.05, 0.3, 0.3)],
+            0.35,
+            "more than its one deadline",
+            id="second-full-request-after-a-short-wait",
+        ),
+        pytest.param([(0.0, 0.3, 0.3)], 0.55, None, id="healthy-a-pause-after-the-wait"),
+        pytest.param(
+            [(0.0, 0.3, 0.3), (0.3, 0.0, 0.0)],
+            0.3,
+            None,
+            id="healthy-zero-wait-at-the-deadline",
+        ),
+        pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3, 0.0, 0.0)] * 3,
+            0.3,
+            None,
+            id="healthy-three-zero-waits-at-the-deadline",
+        ),
+        pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3 + i * 0.001, 0.001, 0.001) for i in range(3)],
+            0.303,
+            None,
+            id="healthy-three-short-waits-after-the-deadline",
+        ),
+        pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3, 0.0, 0.0)] * 4,
+            0.3,
+            "joins at or after its deadline",
+            id="four-zero-waits-at-the-deadline",
+        ),
+        pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3 + i * 0.001, 0.001, 0.001) for i in range(900)],
+            1.2,
+            "joins at or after its deadline",
+            id="fake-clock-900-one-millisecond-waits-after-deadline",
+        ),
+        pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3 + i * 0.001, 0.001, 0.001) for i in range(1500)],
+            1.8,
+            "outside its wait",
+            id="1500-short-waits-after-the-deadline",
+        ),
+        pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3 + i * 0.001, 0.001, 0.001) for i in range(3000)],
+            3.3,
+            "outside its wait",
+            id="3000-short-waits-after-the-deadline",
+        ),
+        pytest.param([(0.0, 0.3, 0.0001)], 0.0001, "does not cover", id="wait-returned-immediately"),
+        pytest.param(
+            [(i * 0.01, 0.01, 0.01) for i in range(30)],
+            0.3,
+            None,
+            id="healthy-split-waits",
+        ),
+        pytest.param(
+            [(0.0, 0.01, 0.16)] + [(0.16 + i * 0.01, 0.01, 0.01) for i in range(14)],
+            0.3,
+            None,
+            id="healthy-split-waits-first-timer-returned-late",
+        ),
+        pytest.param([(0.0, 0.3, 0.9)], 0.9, None, id="healthy-one-wait-returned-0.6-s-late"),
+        pytest.param(
+            [(0.0, 0.1, 0.1), (0.1, 0.2, 0.7)],
+            0.8,
+            None,
+            id="healthy-early-return-then-retry-0.5-s-late",
+        ),
+        pytest.param([(0.69, 0.3, 0.3)], 0.99, None, id="healthy-0.69-s-pause-before-join"),
+        pytest.param([(0.0, 0.3, 0.3)], 0.99, None, id="healthy-0.69-s-pause-after-join"),
+        pytest.param(
+            [(i * 0.03, 0.01, 0.01) for i in range(10)],
+            0.3,
+            None,
+            id="healthy-split-waits-with-time-between-them",
+        ),
+        pytest.param(
+            [(i * 0.01, min(0.3 - i * 0.01, 0.1), 0.01) for i in range(30)],
+            0.3,
+            None,
+            id="healthy-retries-after-early-returns",
+        ),
+        pytest.param([(0.0, 0.0, 0.0)], 0.0, "does not cover", id="wait-switched-off"),
+        pytest.param([(0.0, 0.1, 0.1)], 0.1, "does not cover", id="wait-shortened"),
+        pytest.param([], 0.3, "did not wait", id="wait-missing"),
+        pytest.param([(0.0, 1.8, 1.8)], 1.8, "more than its one deadline", id="deadline-1.5-s-too-long"),
+        pytest.param([(0.0, 0.3, 0.3), (0.3, 0.3, 0.3)], 0.6, "more than its one deadline", id="wait-restarted"),
+        pytest.param([(0.0, None, 0.3)], 0.3, "more than its one deadline", id="wait-without-a-limit"),
+        pytest.param([(0.0, 0.3, 0.3)], 1.8, "outside its wait", id="sleep-1.5-s-after-the-wait"),
+        pytest.param([(1.5, 0.3, 0.3)], 2.1, "outside its wait", id="sleep-1.5-s-before-the-wait"),
+        # codex-rev's control: the extra 1.5 s must stay visible when a timer returns late, as that timer is not counted
+        pytest.param([(0.0, 0.3, 1.1)], 2.6, "outside its wait", id="sleep-1.5-s-after-a-wait-that-returned-late"),
+    ],
+)
+def test_the_close_wait_accounting_tells_a_pause_from_a_wrong_wait(joins, took, problem):
+    found = _close_wait_problem(0.3, joins, took)
+    assert (found is None) if problem is None else (found is not None and problem in found)
+
+
+@pytest.mark.parametrize(
+    "spent, problem",
+    [
+        pytest.param(0.3, None, id="healthy-pause-before-the-deadline-exists"),
+        pytest.param(0.0001, "does not cover", id="early-return-after-pause-before-the-deadline-exists"),
+    ],
+)
+def test_the_close_wait_coverage_starts_when_the_deadline_exists(spent, problem):
+    found = _close_wait_problem(0.3, [(0.6, 0.3, spent)], 0.6 + spent, deadline_origin=0.6)
+    assert (found is None) if problem is None else (found is not None and problem in found)
+
+
+@pytest.mark.parametrize("post_deadline_joins", [3, 4])
+def test_the_close_join_limit_uses_the_absolute_deadline(post_deadline_joins):
+    origin = 0.5
+    deadline = origin + 0.3
+    joins = [(origin, 0.3, 0.3)] + [(deadline, 0.0, 0.0)] * post_deadline_joins
+    problem = _close_wait_problem(0.3, joins, deadline, deadline_origin=origin)
+    if post_deadline_joins == 3:
+        assert problem is None
+    else:
+        assert problem is not None and "joins at or after its deadline" in problem
+
+
 def test_a_writer_that_never_returns_leaves_the_loop_exactly_as_it_was(tmp_path):
+    """The journal's writer is stuck for the whole run. The loop must still behave exactly as without a journal, never
+    waiting for the writer, and closing the journal must take no longer than its own wait.
+
+    What is timed is only what the writer could hold up: each call the loop makes into the journal, and the close. The
+    rest of the scenario (the store's own files, process start, a busy machine) is not timed, so it cannot fail this
+    test (#766: a whole-turn limit of 10 s failed at 11.3 s on a loaded runner, with the loop never waiting for the
+    writer). The writer is stuck until the test frees it, and the test says if it ever freed itself."""
+    close_seconds = 0.3
+
     class Blocking(te.JournalFiles):
         def __init__(self):
             self.entered = threading.Event()
             self.unblock = threading.Event()
+            self.gave_up = threading.Event()  # the writer's own safety timeout ran out: it was not stuck all along
 
         def write(self, handle, data):
             if b'"seq"' in data:
                 self.entered.set()
-                self.unblock.wait(20)
+                # Stuck until the test frees it. The limit is only so a loop that really waits cannot hang the run for
+                # ever; once it has run out the writer stays free, so a failing run ends instead of waiting again.
+                if not self.gave_up.is_set() and not self.unblock.wait(120):
+                    self.gave_up.set()
             super().write(handle, data)
+
+    deadline_origins = []
+
+    # This recorder relies on close adding the budget object directly to a monotonic clock sample, in either order.
+    # A conversion such as float(seconds) bypasses it. If close changes that arithmetic, update this recorder;
+    # the deadline-origin assertion below intentionally fails loudly instead of guessing a different start time.
+    class RecordingBudget(float):
+        def __add__(self, origin):
+            return self.__radd__(origin)
+
+        def __radd__(self, origin):
+            # Capture the exact monotonic operand in the sink's deadline calculation, before close can shorten its
+            # deadline after an early join return. This also keeps a pause before creation outside the wait budget.
+            deadline_origins.append(origin - begin)
+            return origin + float(self)
 
     off = _scenario(tmp_path / "off", observe=False)
     files = Blocking()
-    sink = te.TurnEventSink(tmp_path / "journal", "beta", files=files, close_seconds=0.3, queue_max=4)
+    sink = te.TurnEventSink(
+        tmp_path / "journal", "beta", files=files, close_seconds=RecordingBudget(close_seconds), queue_max=4
+    )
     assert sink.start() is True
-    begin = time.monotonic()
-    on = _scenario(tmp_path / "on", observe=True, sink=sink)
-    assert time.monotonic() - begin < 10
-    assert files.entered.wait(5)  # the writer really was stuck while the loop ran
-    off.pop("disposed")
-    on.pop("disposed")
-    assert on == off
-    start = time.monotonic()
-    sink.close()
-    assert time.monotonic() - start < 2.0
-    files.unblock.set()
+    calls = []  # how long each call into the journal held the loop up
+    real_emit = sink.emit
+
+    def timed_emit(kind, **fields):
+        begin = time.monotonic()
+        try:
+            real_emit(kind, **fields)
+        finally:
+            calls.append(time.monotonic() - begin)
+
+    sink.emit = timed_emit
+    try:
+        on = _scenario(tmp_path / "on", observe=True, sink=sink)
+        assert files.entered.wait(60)  # the writer really was stuck while the loop ran
+        off.pop("disposed")
+        on.pop("disposed")
+        assert on == off
+        # More events than the queue holds went through while the writer was stuck, so a call that waited for the
+        # writer or for room in its queue would have waited. Together they must cost the loop less than one close wait:
+        # the only timeout the journal has, and so the least a call that waited for the writer could add. (A call
+        # costs microseconds; the bound leaves a loaded machine two orders of magnitude.)
+        assert len(calls) > 4
+        assert sum(calls) < close_seconds, f"the loop waited {sum(calls):.3f} s in {len(calls)} calls to the journal"
+        assert not files.gave_up.is_set(), "the writer freed itself during the run, so the run proved nothing"
+
+        # Closing waits for the stuck writer for its own deadline and no longer. What the wait asked for and when it
+        # began are recorded (the waits are `join`s on the writer's thread), and `_close_wait_problem` judges them
+        # without a fixed time for the whole close or a timer of this test's own, so a pause by the scheduler neither
+        # fails a correct close nor hides a wrong one.
+        joins = []
+        real_join = sink._thread.join
+
+        def recording_join(timeout=None):
+            began = time.monotonic()
+            try:
+                return real_join(timeout)
+            finally:
+                joins.append((began - begin, timeout, time.monotonic() - began))
+
+        sink._thread.join = recording_join
+        begin = time.monotonic()
+        sink.close()
+        took = time.monotonic() - begin
+        assert len(deadline_origins) == 1, (
+            "close did not create exactly one deadline by direct budget addition; "
+            "update RecordingBudget if close changes how it computes its deadline"
+        )
+        problem = _close_wait_problem(close_seconds, joins, took, deadline_origins[0])
+        assert problem is None, f"{problem} (waits: {joins})"
+    finally:
+        files.unblock.set()
 
 
 # --- privacy through the real hooks -----------------------------------------------------

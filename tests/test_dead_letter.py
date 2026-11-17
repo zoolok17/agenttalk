@@ -152,8 +152,15 @@ def test_728_reset_and_claimed_retry_take_turns(tmp_path, monkeypatch, archive, 
         reset_result = _728_finish(reset)
         retry_result = _728_finish(retry) if retry else None
     assert reset_result == ("ok", "")
-    assert retry_result[0] == "RequeueRefused" and "nothing was published" in retry_result[1]
-    assert "earlier session" in retry_result[1] or "archived" in retry_result[1]
+    if pause == "before-delete":
+        assert retry_result == (
+            "PreparedMessageRefused",
+            "The prepared message is missing or has changed while waiting to be published; "
+            "nothing was published. The store was reset; send it again.",
+        )
+    else:  # Preparation survives this pause, so requeue's own session barrier must still run.
+        assert retry_result[0] == "RequeueRefused" and "nothing was published" in retry_result[1]
+        assert "earlier session" in retry_result[1] or "archived" in retry_result[1]
     assert record.read_bytes() == before and s.load_config()["session_id"] != session_id
     assert not _706_published(s)
 
@@ -198,7 +205,11 @@ def test_728_prepared_operations_wait_through_reset(tmp_path, monkeypatch, actio
         sender_result = _728_finish(sender) if sender else None
     assert reset_result == ("ok", "")
     if action == "send":
-        assert sender_result[0] == "FileNotFoundError"  # reset removed the staged payload
+        assert sender_result == (
+            "PreparedMessageRefused",
+            "The prepared message is missing or has changed while waiting to be published; "
+            "nothing was published. The store may have been reset; send it again.",
+        )
     else:
         assert "could not release the" in sender_result[1]
         assert ("wrapper operation publication" if action == "operation" else "compaction batch") in sender_result[1]
