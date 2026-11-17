@@ -45,6 +45,7 @@ from agenttalk.store import (
     OPENER_KINDS,
     Message,
     RequeueRefused,
+    PreparedMessageRefused,
     Store,
     _owner_identity_gone,
     escape_controls,
@@ -15871,6 +15872,24 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 _refuse_live_request=True,
                 _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
             )
+        except PreparedMessageRefused as e:
+            if orig.get("kind") in _dl_tags.OPENERS:
+                route = _requeue_route(args, orig)
+            else:
+                template = "agenttalk dead-letter requeue --agent {agent} --id {id}"
+                values = {"agent": args.agent, "id": args.id}
+                if reopen_event is not None:
+                    template += " --force-resolved --from {actor} --reason {reason}"
+                    values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
+                route = (
+                    "After the reset has finished, retry the same dead letter to keep its original correlation:\n  "
+                    + pc.cmd(template, **values) + "."
+                )
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
+                + route + "\n"
+            )
+            return 2
         except RequeueRefused as e:
             # The advice is decided here, after the publication lock is released and from the resolution as it is now:
             # a retry is named only when the ordinary command would be accepted (a resolved one needs --force-resolved).
