@@ -181,3 +181,11 @@ def test_quick_setup_links_to_the_first_install_without_another_pip_recipe():
     quick = README.read_text(encoding="utf-8").split("\n## 2. Quick setup\n", 1)[1].split("\n## ", 1)[0]
     assert "[Get started](#get-started)" in quick
     assert "pip install" not in quick
+
+
+def test_get_started_never_says_to_activate_a_project_environment_after_the_path_step():
+    """Activating another venv would put its folder first on PATH and could run an older agenttalk."""
+    started = " ".join(README.read_text(encoding="utf-8").split("## Get started\n", 1)[1].split("\n## ", 1)[0].split())
+    assert "activate it after" not in started
+    assert "do not activate it in a terminal where an assistant runs" in started
+    assert "Call the project's Python by its full path instead" in started
