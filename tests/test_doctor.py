@@ -105,7 +105,7 @@ def test_doctor_powershell_check_keeps_result_and_locks_only_set_up_project(
     monkeypatch.setattr(doctor.sys, "platform", "win32")
     # This test is about locking, not about where PowerShell is installed: no host found.
     monkeypatch.setattr(doctor.psh, "program_files_candidates", lambda *a, **k: ())
-    monkeypatch.setattr(doctor.psh, "path_candidates", lambda *a, **k: ())
+    monkeypatch.setattr(doctor.psh, "path_candidate_sources", lambda *a, **k: ())
     check = doctor._check_powershell_host(store)
     assert check == doctor.Check(
         name="powershell_host",
@@ -125,11 +125,13 @@ def test_doctor_powershell_check_keeps_result_and_locks_only_set_up_project(
 def _windows_without_selection(monkeypatch: pytest.MonkeyPatch, program_files, on_path=()):
     """Windows branch forced (the check returns early on other platforms); the two candidate
     searches `supervise --select-pwsh` uses are replaced by what the test wants them to find.
-    ``on_path=None`` keeps the REAL PATH search (the test sets PATH itself)."""
+    ``on_path=None`` keeps the REAL PATH search (the test sets PATH itself); a path in ``on_path`` is found on the
+    PATH, a ``(path, variable name)`` pair under that Program Files variable."""
     monkeypatch.setattr(doctor.sys, "platform", "win32")
     monkeypatch.setattr(doctor.psh, "program_files_candidates", lambda *a, **k: tuple(program_files))
     if on_path is not None:
-        monkeypatch.setattr(doctor.psh, "path_candidates", lambda *a, **k: tuple(on_path))
+        found = tuple(item if isinstance(item, tuple) else (item, "PATH") for item in on_path)
+        monkeypatch.setattr(doctor.psh, "path_candidate_sources", lambda *a, **k: found)
 
 
 @pytest.mark.parametrize("content", [b"", b"not a real program"], ids=["zero-byte", "not-a-program"])
@@ -232,14 +234,57 @@ def test_doctor_powershell_check_says_when_the_shown_path_is_not_the_exact_file_
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # U+202E (right-to-left override) is shown as a code, not as the character: the display is safe on one line,
-    # but it is not the real name, and the text says so and says where the real path is listed.
-    odd = "C:\\tools\\a\u202eb\\pwsh.exe"
-    _windows_without_selection(monkeypatch, [], on_path=[odd])
+    # but it is not the real name, and the text says so and says where the real path is listed. The REAL search
+    # runs on a real folder whose name holds the character.
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, tmp_path / "a‮b")
+    _windows_without_selection(monkeypatch, [], on_path=None)
     check = doctor._check_powershell_host(Store(tmp_path / "project"))
-    assert "\u202e" not in check.fix
-    assert "found at C:\\tools\\a\\u202eb\\pwsh.exe;" in check.fix
+    assert "‮" not in check.fix
+    assert f"found at {str(pwsh).replace(chr(0x202E), chr(92) + 'u202e')};" in check.fix
     assert "writes an unusual character as a \\uXXXX code, so it is not the exact file name" in check.fix
-    assert "`Get-Command pwsh -All`" in check.fix
+    assert "the real path is listed by `Get-Command pwsh -All`" in check.fix
+    assert "environment variable" not in check.fix
+
+
+def _pwsh_only_under_a_program_files_variable(monkeypatch: pytest.MonkeyPatch, root: Path, variable: str) -> Path:
+    """A real PowerShell\\7\\pwsh.exe under ``root``, named only by the environment variable ``variable``. The PATH
+    is a folder with no pwsh.exe in it, so the file is NOT on the PATH and Get-Command does not list it."""
+    pwsh = root / "PowerShell" / "7" / "pwsh.exe"
+    pwsh.parent.mkdir(parents=True)
+    pwsh.write_bytes(b"")
+    empty = root.parent / "empty-path-folder"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(variable, str(root))
+    return pwsh
+
+
+@pytest.mark.parametrize("variable", ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"])
+def test_doctor_powershell_check_says_where_an_escaped_program_files_hit_came_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    # A file under a Program Files variable is not on the PATH, so "Get-Command pwsh -All" would not list it. For this
+    # source the text names the variable and the fixed place inside its folder, without the raw character.
+    pwsh = _pwsh_only_under_a_program_files_variable(monkeypatch, tmp_path / "pf‮", variable)
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "‮" not in check.fix
+    assert f"found at {str(pwsh).replace(chr(0x202E), chr(92) + 'u202e')};" in check.fix
+    assert f"it was found under the folder named by the environment variable {variable}, as " in check.fix
+    assert "PowerShell\\7\\pwsh.exe inside that folder, and `Get-ChildItem Env:` lists the real folder" in check.fix
+    assert "Get-Command" not in check.fix  # the PATH advice would be untrue for this file
+
+
+def test_doctor_powershell_check_has_no_lookup_sentence_for_an_ordinary_program_files_hit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _pwsh_only_under_a_program_files_variable(monkeypatch, tmp_path / "pf", "ProgramFiles")
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "unusual character" not in check.fix and "environment variable" not in check.fix
+    assert "it is checked and selected by" in check.fix
 
 
 def test_doctor_powershell_check_runs_the_path_command_only_when_it_really_is_one(

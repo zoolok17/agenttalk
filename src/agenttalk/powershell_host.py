@@ -697,14 +697,15 @@ def program_files_candidates(
     return tuple(out)
 
 
-def path_candidates(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    """The PowerShell 7 files found on the PATH or under the Program Files variables: the paths themselves, in the
-    order `supervise --select-pwsh` suggests them. A file-existence test only: nothing is run."""
+def path_candidate_sources(environ: Mapping[str, str] | None = None) -> tuple[tuple[str, str], ...]:
+    """The PowerShell 7 files found on the PATH or under the Program Files variables, each with where it was found:
+    ``(path, "PATH")`` or ``(path, "<the variable's name>")``. In the order `supervise --select-pwsh` suggests them.
+    A file-existence test only: nothing is run. A file under a Program Files variable need not be on the PATH."""
     env = os.environ if environ is None else environ
-    out: list[str] = []
+    out: list[tuple[str, str]] = []
     seen: set[str] = set()
 
-    def add(candidate: str) -> None:
+    def add(candidate: str, source: str) -> None:
         try:
             _validate_local_exe_shape(candidate, subject="PATH candidate")
         except PowerShellHostError:
@@ -718,19 +719,24 @@ def path_candidates(environ: Mapping[str, str] | None = None) -> tuple[str, ...]
         except OSError:
             exists = False
         if exists:
-            out.append(str(candidate))
+            out.append((str(candidate), source))
 
     for entry in (env.get("PATH") or "").split(os.pathsep):
         entry = entry.strip().strip('"')
         if not entry or not os.path.isabs(entry) or entry.startswith("\\\\"):
             continue
-        add(os.path.join(entry, "pwsh.exe"))
+        add(os.path.join(entry, "pwsh.exe"), "PATH")
     for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
         root = (env.get(name) or "").strip().strip('"')
         if not root or not os.path.isabs(root) or root.startswith("\\\\"):
             continue
-        add(os.path.join(root, "PowerShell", "7", "pwsh.exe"))
+        add(os.path.join(root, "PowerShell", "7", "pwsh.exe"), name)
     return tuple(out)
+
+
+def path_candidates(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The same files as `path_candidate_sources`, as plain paths."""
+    return tuple(path for path, _source in path_candidate_sources(environ))
 
 
 SELECT_PWSH_COMMAND = "agenttalk supervise --select-pwsh --pwsh {p}"

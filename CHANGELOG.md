@@ -232,7 +232,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command), so doctor shows that command with a `<path>` placeholder, says plainly that it is not
   ready to paste, and tells the reader to type the path themselves. The found path is shown for
   reading only; if it holds an unusual character, that is shown as a `\uXXXX` code, and doctor says
-  the display is not the exact file name and that `Get-Command pwsh -All` lists the real path.
+  the display is not the exact file name and how to get the real one for the place it was found: a
+  file on the PATH is listed by `Get-Command pwsh -All`; a file under a Program Files environment
+  variable is not on the PATH, so doctor names that variable and says the file is `PowerShell\7\pwsh.exe`
+  inside its folder (`Get-ChildItem Env:` lists the folder).
   Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
   has just been set up can still end with `overall: ERROR` on Windows until that step is done.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note
