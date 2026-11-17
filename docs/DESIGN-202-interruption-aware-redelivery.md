@@ -120,8 +120,11 @@ actually fit:
   once with the remedy:
   "this message's turns were killed <k> times by <kind> after <budget>s
   each; raise turn_watchdog.turn_elapsed_seconds for <agent>, split the
-  task, or requeue as-is: `agenttalk dead-letter requeue --agent <a> --id
-  <id>`" (threading the REAL reason into `_escalate_once` — review finding
+  task, or inspect it first and decide whether to send it again (the requeue
+  command refuses, and says why, when the message cannot be retried):
+  `agenttalk dead-letter show --agent <a> --id <id>`, then
+  `agenttalk dead-letter requeue --agent <a> --id <id>`" (threading the REAL
+  reason into `_escalate_once` — review finding
   9: today it hardcodes the class into the operator notification).
 - Dead-letter is self-clearing (cursor advances, the seat keeps serving the
   queue), preserves the original bytes, and ALREADY has the recovery verb:

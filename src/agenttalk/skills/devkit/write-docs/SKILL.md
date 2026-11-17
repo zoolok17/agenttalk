@@ -8,7 +8,7 @@ description: >-
   or when a code change alters how users build/configure/call the software.
   Do NOT use for inline code comments (use craft-code) or for reviewing existing
   docs (use review-docs).
-reviewed-against: "0.43"
+reviewed-against: "0.105"
 category: production
 evidence-profile:
   - production-handoff

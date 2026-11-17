@@ -13,8 +13,8 @@ unique evidence).
 
 | Task | Skill |
 |---|---|
-| Coordinate a team / route / collect evidence / close | the bus skill agenttalk-lead (do NOT create team-lead) |
-| Listen for and handle bus messages | the bus skill agenttalk-listen |
+| Coordinate a team / route / collect evidence / close | the bus skill agenttalk-lead (Claude: /agenttalk.lead) (do NOT create team-lead) |
+| Listen for and handle bus messages | the bus skill agenttalk-listen (Claude: /agenttalk.listen) |
 | New production code | craft-code |
 | Behavior-preserving cleanup (no behavior change) | refactor-code |
 | Diagnose + fix a failing local/CI check | fix-ci |
@@ -37,7 +37,8 @@ unique evidence).
 
 ## Core precedence
 
-1. Bus/team coordination uses agenttalk-lead/-listen/-handoff/-send. Never team-lead.
+1. Bus/team coordination uses agenttalk-lead/-listen/-handoff/-send (Claude: /agenttalk.lead,
+   /agenttalk.listen, /agenttalk.handoff, /agenttalk.send). Never team-lead.
 2. New production code uses craft-code; behavior-preserving cleanup uses refactor-code;
    if behavior changes it is craft-code.
 3. Architecture / security / performance are SUB-LENSES under review-code unless routed as

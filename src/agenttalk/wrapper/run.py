@@ -24,6 +24,7 @@ import shutil
 # subprocess spawns ONLY the operator-provided CLI launch command; never shell=True.
 import subprocess  # nosec B404
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -238,6 +239,11 @@ _AGENTTALK_IMPORT_PROBE = (
     "import agenttalk,json; "
     "print(json.dumps({'file': getattr(agenttalk, '__file__', None)}))"
 )
+# Both start-up checks (#714). Without saved compiled files Python recompiles agenttalk on every start: measured
+# up to 3.7 s for `-m agenttalk --version` (Windows, Python 3.14) and 5.1 s on a contributor's machine, against
+# about 0.3 s warm. 30 s clears that several times over and still ends a check that hangs (one exception on Windows:
+# see _run_startup_check).
+STARTUP_CHECK_TIMEOUT = 30.0
 _AGENTTALK_MISSING_MODULE_RE = re.compile(
     r"(modulenotfounderror:.*no module named ['\"]?agenttalk['\"]?|"
     r"no module named ['\"]?agenttalk['\"]?)",
@@ -839,6 +845,47 @@ def _launch_cli_remediation(cli: str, *, is_windows: bool) -> str:
     return f"pass the full path of the {cli} executable after --"
 
 
+def _startup_timeout_summary(command: str, timeout: float) -> str:
+    """A start-up check ran out of time: say so, and name the usual cause, not a configuration fault (#714)."""
+    return _launch_blocked_summary(
+        command,
+        f"TimeoutExpired: agenttalk took longer than {timeout:g} seconds to start, which is usually a cold start "
+        "without saved compiled Python files (a fresh checkout or virtual environment, or PYTHONDONTWRITEBYTECODE=1)",
+        f"start the seat again. If it keeps happening, run '{command}' once by hand without "
+        "PYTHONDONTWRITEBYTECODE set, so Python saves its compiled files. If that hangs too, fix that Python first",
+    )
+
+
+def _run_startup_check(argv: list[str], cwd: str, env: dict[str, str], timeout: float) -> tuple[int | None, str]:
+    """Run one start-up check: (exit code, stdout + stderr); TimeoutExpired once ``timeout`` has passed.
+
+    The output goes to temporary files, not pipes. On Windows the wait for piped output lasts until every process
+    holding the pipe has closed it, so a process the check started could hold the check far past its limit (#714).
+    Such a process is not stopped. Where no temporary file can be made (for example, the temporary folder is not
+    writable), the output is piped as before, and on Windows such a process can then keep the check waiting past
+    its limit."""
+    with contextlib.ExitStack() as files:
+        try:
+            out = files.enter_context(tempfile.TemporaryFile())
+            err = files.enter_context(tempfile.TemporaryFile())
+        except OSError:
+            proc = subprocess.run(  # noqa: S603  # nosec B603
+                argv, cwd=cwd, env=env, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout,
+            )
+            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        proc = subprocess.run(  # noqa: S603  # nosec B603
+            argv, cwd=cwd, env=env, stdout=out, stderr=err, timeout=timeout,
+        )
+        return proc.returncode, _check_output_text(out) + _check_output_text(err)
+
+
+def _check_output_text(file) -> str:
+    """What a check wrote, read as text mode would have (UTF-8, undecodable bytes replaced, universal newlines)."""
+    file.seek(0)
+    return file.read().decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _self_probe_blocked_summary(argv: list[str], rc: int | None, output: str) -> str | None:
     if rc == 0:
         return None
@@ -858,7 +905,7 @@ def preflight_launch_runtime(
     child_env: dict[str, str] | None = None,
     *,
     runner: Callable[[list[str], str, dict[str, str], float], tuple[int | None, str]] | None = None,
-    timeout: float = 5.0,
+    timeout: float = STARTUP_CHECK_TIMEOUT,
     is_windows: bool | None = None,
 ) -> LaunchPreflightResult:
     """Resolve the per-turn CLI and probe the pinned agenttalk interpreter before any turn."""
@@ -915,18 +962,19 @@ def preflight_launch_runtime(
 
     def _default_runner(a: list[str], cwd: str, e: dict[str, str], t: float):
         try:
-            proc = subprocess.run(  # noqa: S603  # nosec B603
-                a, cwd=cwd, env=e, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=t,
-            )
-            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+            return _run_startup_check(a, cwd, e, t)
         except OSError as exc:
             return None, f"{type(exc).__name__}: {exc}"
+        except subprocess.TimeoutExpired:
+            raise  # reported below in its own words
         except subprocess.SubprocessError as exc:
             return None, f"{type(exc).__name__}: {exc}"
 
     run_probe = runner or _default_runner
-    rc, out = run_probe(probe_argv, str(workspace), env, timeout)
+    try:
+        rc, out = run_probe(probe_argv, str(workspace), env, timeout)
+    except subprocess.TimeoutExpired:
+        return LaunchPreflightResult(resolved_argv, _startup_timeout_summary(_format_argv(probe_argv), timeout))
     blocked = _self_probe_blocked_summary(probe_argv, rc, out)
     return LaunchPreflightResult(resolved_argv, blocked)
 
@@ -963,7 +1011,7 @@ def preflight_agenttalk_runtime(
     *,
     workspace_root: str | os.PathLike[str] | None = None,
     runner: Callable[[list[str], str, dict[str, str], float], tuple[int | None, str]] | None = None,
-    timeout: float = 5.0,
+    timeout: float = STARTUP_CHECK_TIMEOUT,
 ) -> str | None:
     """Probe the pinned Python the child will use for bus commands."""
     workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
@@ -972,19 +1020,19 @@ def preflight_agenttalk_runtime(
 
     def _default_runner(a: list[str], cwd: str, e: dict[str, str], t: float):
         try:
-            proc = subprocess.run(  # noqa: S603,S607  # nosec B603
-                a, cwd=cwd, env=e, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=t,
-            )
-            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+            return _run_startup_check(a, cwd, e, t)
         except OSError as exc:
             return None, f"{type(exc).__name__}: {exc}"
+        except subprocess.TimeoutExpired:
+            raise  # reported below in its own words
         except subprocess.SubprocessError as exc:
             return None, f"{type(exc).__name__}: {exc}"
 
     run_probe = runner or _default_runner
     try:
         rc, out = run_probe(argv, str(workspace), env, timeout)
+    except subprocess.TimeoutExpired:  # a hang is refused, never let through (#714)
+        return _startup_timeout_summary(_format_argv([argv[0], "-c", "import agenttalk"]), timeout)
     except OSError as exc:
         blocked = _runtime_config_blocked_summary(str(exc))
         return blocked
@@ -3499,6 +3547,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                        lease_lost_exceptions: tuple = (),
                        wrapper_generation: str | None = None,
                        health_writer: WrapperHealthWriter | None = None,
+                       on_refused: Callable[[str], None] | None = None,
                        ) -> Callable[[dict, list], bool]:
     """Build the SYNTHETIC cadence-turn drive for the managed lead-loop controller (WP3).
 
@@ -3515,7 +3564,9 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
     ``thread_id`` / claude session-id continuity holds across BOTH message and cadence
     turns. ``make_drive`` is intentionally left untouched (the reviewed message hot path).
     ``heartbeat`` is the lead-loop combined renew+stamp - it RAISES on a lost lease, which
-    propagates out so a lost-lease controller stops sweeping at once."""
+    propagates out so a lost-lease controller stops sweeping at once. A config-blocked turn (a start-up check that
+    hangs or fails, a refused spawn) is reported as the message drive reports it - health and the wrapper's stderr -
+    and its reason goes to ``on_refused``, since the caller sees only False (#714)."""
     from . import prompt as _prompt
     from . import session as _session
     from .loop import CLASS_CONFIG_BLOCKED
@@ -3713,6 +3764,13 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         ok = bool(sig["ok"])
         if not ok:
             _session.record_dispatch(session_state, sig["conversation_fold"], finished=False)
+        if not ok and sig["config_blocked"]:
+            summary = sig["config_blocked_text"] or str(sig["error"] or "config blocked")
+            if health_writer is not None:
+                health_writer.failure(sig, CLASS_CONFIG_BLOCKED)
+            sys.stderr.write(f"agenttalk wrap: cadence turn config-blocked: {summary}\n")
+            if on_refused is not None:
+                on_refused(summary)
         if not ok and attempted_resume:
             resume_failure_class, resume_summary = _classify_drive_failure(sig)
             attributable = _session.resume_failure_is_session_attributable(

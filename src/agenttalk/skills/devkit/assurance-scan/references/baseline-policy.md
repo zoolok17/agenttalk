@@ -5,7 +5,10 @@ Path: `.agenttalk/assurance/baseline.json`.
 The baseline is a reviewed snapshot of known findings. It is not a suppression
 trash bin and it is not updated automatically by the scanner.
 
-Required fields:
+Fields of a reviewed baseline (the authoring policy). The loader itself requires only
+`schema_version: 1`; when `baseline_id` is missing it uses `baseline`, and when
+`findings` is missing it uses an empty list. Each finding it is given must have a
+`fingerprint`:
 
 - `schema_version`: `1`
 - `baseline_id`

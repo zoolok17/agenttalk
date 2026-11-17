@@ -23,6 +23,7 @@ import threading
 import time
 import types
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -37,12 +38,12 @@ pytestmark = pytest.mark.subprocess
 GRACE = getattr(run, "OUTPUT_GRACE_AFTER_EXIT_SECONDS", 2.0)
 HARD_TIMEOUT = GRACE + 10.0
 SLOW = GRACE + 2.0  # longer than the grace, so a grace started too early ends the read too soon
-
 # A stand-in model: it prints a `codex exec --json` turn, then does what its mode asks.
-MODEL = textwrap.dedent(r'''
-    import json, subprocess, sys, time
+MODEL = textwrap.dedent(r"""
+    import json, os, subprocess, sys, time
 
     mode, pidfile, slow = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    KEPT = []  # a started helper's stdin pipe closes when its Popen object is dropped, so keep them
     SLEEPER = [sys.executable, "-c", "import time; time.sleep(120)"]
     # Logs a line every 0.3 s, like a dev server. Once nobody reads its output it ignores the failed
     # writes and keeps running, so a test can see that the wrapper did not stop it.
@@ -64,6 +65,7 @@ MODEL = textwrap.dedent(r'''
 
     def spawn(argv, **kwargs):
         child = subprocess.Popen(argv, **kwargs)
+        KEPT.append(child)
         with open(pidfile, "a", encoding="utf-8") as handle:
             handle.write(f"{child.pid}\n")
 
@@ -120,10 +122,23 @@ MODEL = textwrap.dedent(r'''
         say({"type": "turn.completed"})
     elif mode == "late-tail":         # a helper still writing after the model has exited
         turn()
-        spawn(again("tail-after"))
+        # The helper reads our stdin, so it sees end of file exactly when this process has exited. It says
+        # so once it is running: a slow start-up on a loaded machine must not make its output miss the grace.
+        spawn(again("tail-after"), stdin=subprocess.PIPE)
+        for _ in range(6000):         # at most 300 s
+            if os.path.exists(pidfile + ".ready"):
+                break
+            time.sleep(0.05)
     elif mode == "tail-after":
-        time.sleep(0.5)
-        message("late")
+        open(pidfile + ".ready", "w").close()
+        sys.stdin.read()              # returns when the model has exited
+        time.sleep(0.3)
+        try:
+            message("late")
+        finally:                      # when the line was written, on the clock the wrapper's grace also uses
+            with open(pidfile + ".late.tmp", "w") as handle:
+                handle.write(repr(time.monotonic()))
+            os.replace(pidfile + ".late.tmp", pidfile + ".late")
     elif mode == "quiet-then-tail":   # the model finishes its turn but keeps running, quietly
         turn()
         time.sleep(slow)
@@ -133,14 +148,98 @@ MODEL = textwrap.dedent(r'''
         sys.stdout.write("partial")
         sys.stdout.flush()
         spawn(SLEEPER)
-''')
+    if mode not in ("handoff", "claude-handoff", "tail-after"):  # those hand the turn on; the rest end it here
+        open(pidfile + ".finished", "w").close()  # the test judges how long the wrapper takes from this point
+""")
 
 SURVIVORS = [
-    "survivor-nofds-null",      # close_fds=False, stdio on null: shares the pipe on Windows
-    "survivor-nofds-inherit",   # close_fds=False, stdio inherited
+    "survivor-nofds-null",  # close_fds=False, stdio on null: shares the pipe on Windows
+    "survivor-nofds-inherit",  # close_fds=False, stdio inherited
     "survivor-default-inherit",  # default close_fds, stdio inherited: Windows, and stdout on POSIX
 ]
 CONTROL = "survivor-default-null"  # stdio on null: never shares the pipe
+
+
+class _OutputWaitBudget:
+    """Record requested output waits, excluding startup and scheduler delays.
+
+    The survivor budget starts at the wrapper's observation of exit AND completion,
+    not the child's earlier turn marker. One 50 ms poll may straddle the deadline.
+    The real-clock HARD_TIMEOUT still bounds a blocked or unscheduled attempt.
+    """
+
+    def __init__(self, monkeypatch):
+        self.graces = []
+        self.polls = []
+        self.after_eof = []
+        self.eof = False
+        original_grace, original_read = run._ExitGrace, run._read_ready_pipe_chunk
+        original_time, original_threading = run.time, run.threading
+        record = self
+
+        class Grace(original_grace):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                record.graces.append(self)
+
+        def read(pipe):
+            chunk = original_read(pipe)
+            if chunk == b"":
+                self.eof = True
+            return chunk
+
+        def sleep(seconds):
+            self.record(seconds)
+            original_time.sleep(seconds)
+
+        class Condition:
+            def __init__(self):
+                self.inner = original_threading.Condition()
+
+            def __enter__(self):
+                self.inner.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+
+            def wait(self, timeout=None):
+                if timeout is not None:
+                    record.record(timeout)
+                return self.inner.wait(timeout)
+
+            def notify_all(self):
+                return self.inner.notify_all()
+
+        # Keep other modules' clocks and threading primitives real. In particular,
+        # the attempt deadline and process cleanup never use the recording proxies.
+        monkeypatch.setattr(run, "_ExitGrace", Grace)
+        monkeypatch.setattr(run, "_read_ready_pipe_chunk", read)
+        monkeypatch.setattr(run, "time", types.SimpleNamespace(**{**vars(original_time), "sleep": sleep}))
+        monkeypatch.setattr(
+            run, "threading", types.SimpleNamespace(**{**vars(original_threading), "Condition": Condition})
+        )
+
+    def record(self, seconds):
+        if self.eof:
+            self.after_eof.append(seconds)
+        elif any(grace._since is not None for grace in self.graces):
+            self.polls.append(seconds)
+
+    def assert_bounded(self, mode):
+        requested = sum(self.polls) + sum(self.after_eof)
+        if mode == CONTROL:
+            assert requested < GRACE, f"CONTROL waited for the grace after a normal EOF: {requested:g} s requested"
+        else:
+            # Fixed allowance, independent of the production poll constant: a 5 s
+            # poll must fail this check even when the hard timeout has not expired.
+            assert requested <= GRACE + 0.05 + 1e-9, f"output wait exceeded grace plus one 50 ms poll: {requested:g} s"
+            assert all(0 <= seconds <= 0.05 for seconds in self.polls), "output wait poll must be at most 50 ms"
+
+
+@pytest.fixture
+def output_waits(monkeypatch):
+    return _OutputWaitBudget(monkeypatch)
 
 
 @pytest.fixture
@@ -530,8 +629,35 @@ def test_the_posix_probe_reads_a_permission_error_as_alive_and_any_other_error_a
     assert _state(1) == expected
 
 
-def _bounded(call):
-    """Run call in a thread for at most HARD_TIMEOUT; a wrapper still waiting is a failure, not a hang."""
+class _Attempt(NamedTuple):
+    """One bounded run of the wrapper. ``finished`` is taken right after the deadline, BEFORE any clean-up: a read
+    that only a clean-up releases (it kills the survivor, which closes the pipe) is not finished. ``started`` and
+    ``box["done_at"]`` are the monotonic times of the start and of the call's return, taken in the worker thread
+    before any process is inspected or stopped."""
+
+    worker: threading.Thread
+    box: dict
+    elapsed: float
+    started: float
+    finished: bool
+
+
+LOADED_CEILING = 300.0  # a stand-in model that never reaches its end is still cut off, however slow the machine
+
+
+def _ended_marker(pidfile: Path) -> Path:
+    """The file the stand-in model writes when its own part of the turn is over (see MODEL)."""
+    return pidfile.with_name(pidfile.name + ".finished")
+
+
+def _attempt(call, ended: Path | None = None) -> _Attempt:
+    """Run call in a thread; a wrapper still waiting is a failure, not a hang.
+
+    With ``ended`` (the model's end marker) the HARD_TIMEOUT counts from the moment the model has ended, not from the
+    start: starting the model and its helper processes can take longer than any fixed limit on a loaded machine, but
+    once the model is done the wrapper has the full HARD_TIMEOUT to return, even if the marker came just before
+    LOADED_CEILING. LOADED_CEILING applies only while the marker is absent: it cuts off a model that never gets there.
+    Without a marker argument the limit counts from the start."""
     box: dict = {}
 
     def target() -> None:
@@ -539,18 +665,51 @@ def _bounded(call):
             box["result"] = call()
         except BaseException as exc:  # noqa: BLE001 - reported by the test
             box["error"] = exc
+        finally:
+            box["done_at"] = time.monotonic()
 
     worker = threading.Thread(target=target, daemon=True)
     started = time.monotonic()
     worker.start()
-    worker.join(HARD_TIMEOUT)
-    return worker, box, time.monotonic() - started
+    limit, seen = started + (HARD_TIMEOUT if ended is None else LOADED_CEILING), False
+    while worker.is_alive():
+        now = time.monotonic()
+        if ended is not None and not seen and ended.exists():
+            seen, limit = True, now + HARD_TIMEOUT  # the full time after the end, however late it came
+        if now >= limit:
+            break
+        worker.join(min(0.05, limit - now))
+    finished = not worker.is_alive()
+    return _Attempt(worker, box, time.monotonic() - started, started, finished)
+
+
+def _bounded(call, ended: Path | None = None):
+    attempt = _attempt(call, ended)
+    return attempt.worker, attempt.box, attempt.elapsed
+
+
+def _assert_completed_before_cleanup(attempt: _Attempt) -> None:
+    """Cleanup must never turn a blocked read into a successful attempt."""
+    assert attempt.finished, f"wrap was still reading {HARD_TIMEOUT:.0f} s after the model ended, taken before clean-up"
+    assert "error" not in attempt.box, f"wrap raised: {attempt.box.get('error')!r}"
+
+
+def test_completion_after_cleanup_cannot_manufacture_a_pass() -> None:
+    attempt = _Attempt(threading.Thread(), {"result": 0, "done_at": 1.0}, 12.0, 0.0, False)
+    with pytest.raises(AssertionError, match="taken before clean-up"):
+        _assert_completed_before_cleanup(attempt)
 
 
 def _run_plain(model: Path, mode: str, pidfile: Path, seen: list, cli: str = "codex") -> int:
-    return run.run_wrapper(cli=cli, agent="worker", argv=_argv(model, mode, pidfile), render=False,
-                           min_interval=0.0, heartbeat_fn=lambda event, now: seen.append(event),
-                           restart_fn=lambda sig: None)
+    return run.run_wrapper(
+        cli=cli,
+        agent="worker",
+        argv=_argv(model, mode, pidfile),
+        render=False,
+        min_interval=0.0,
+        heartbeat_fn=lambda event, now: seen.append(event),
+        restart_fn=lambda sig: None,
+    )
 
 
 def _finished_messages(seen: list) -> tuple[bool, list[str]]:
@@ -560,53 +719,72 @@ def _finished_messages(seen: list) -> tuple[bool, list[str]]:
 
 @pytest.mark.parametrize("mode", [*SURVIVORS, CONTROL])
 def test_plain_wrap_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe(
-        model: Path, tmp_path: Path, mode: str) -> None:
+    model: Path, tmp_path: Path, mode: str, output_waits
+) -> None:
     pidfile, seen = tmp_path / "pids.txt", []
     try:
-        worker, box, elapsed = _bounded(lambda: _run_plain(model, mode, pidfile, seen))
+        attempt = _attempt(lambda: _run_plain(model, mode, pidfile, seen), _ended_marker(pidfile))
+        worker, box = attempt.worker, attempt.box
         survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    assert not worker.is_alive() and elapsed < HARD_TIMEOUT, "wrap was still waiting for end of output"
+    _assert_completed_before_cleanup(attempt)
+    output_waits.assert_bounded(mode)
+    assert not worker.is_alive()
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, ["done"])
     assert len(survivors_alive) == 1, "the survivor is left running, not killed"
-    if mode == CONTROL:
-        assert elapsed < GRACE, f"a normal end of output must not wait for the grace ({elapsed:.2f} s)"
 
 
 def _drive(store: Store, model: Path, mode: str, pidfile: Path, *, watchdog=None, cli: str = "codex"):
     def spawn(argv, stdin):  # the stand-in ignores the prompt, so none is written to it
-        return run._ProcStream(_argv(model, mode, pidfile), None, watchdog=watchdog,
-                               watchdog_snapshot_fn=lambda: None, watchdog_kill_fn=lambda pids: [])
+        return run._ProcStream(
+            _argv(model, mode, pidfile),
+            None,
+            watchdog=watchdog,
+            watchdog_snapshot_fn=lambda: None,
+            watchdog_kill_fn=lambda pids: [],
+        )
 
     state = session.SessionState(cli=cli, claude_session_id="sid-1" if cli == "claude" else None)
-    drive = run.make_drive(store, "beta", cli, state, [cli], spawn=spawn,
-                           clock=time.monotonic, render=False)
-    return drive({"id": "msg-1", "from": "alpha", "to": "beta", "kind": "question", "subject": "s",
-                  "body": "b", "correlation_id": "q-1", "request_id": "q-1", "broadcast_id": None,
-                  "meta": {"request_id": "q-1"}})
+    drive = run.make_drive(store, "beta", cli, state, [cli], spawn=spawn, clock=time.monotonic, render=False)
+    return drive(
+        {
+            "id": "msg-1",
+            "from": "alpha",
+            "to": "beta",
+            "kind": "question",
+            "subject": "s",
+            "body": "b",
+            "correlation_id": "q-1",
+            "request_id": "q-1",
+            "broadcast_id": None,
+            "meta": {"request_id": "q-1"},
+        }
+    )
 
 
 @pytest.mark.parametrize("watchdog", [None, TurnWatchdogConfig(enabled=True)], ids=["plain-stream", "watchdog"])
 @pytest.mark.parametrize("mode", [*SURVIVORS, CONTROL])
 def test_loop_turn_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe(
-        model: Path, tmp_path: Path, mode: str, watchdog) -> None:
+    model: Path, tmp_path: Path, mode: str, watchdog, output_waits
+) -> None:
     store = Store(tmp_path / "store")
     store.init(["alpha", "beta"])
     pidfile = tmp_path / "pids.txt"
     try:
-        worker, box, elapsed = _bounded(lambda: _drive(store, model, mode, pidfile, watchdog=watchdog))
+        attempt = _attempt(lambda: _drive(store, model, mode, pidfile, watchdog=watchdog), _ended_marker(pidfile))
+        worker, box = attempt.worker, attempt.box
         survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    assert not worker.is_alive() and elapsed < HARD_TIMEOUT, "wrap --loop was still waiting for end of output"
+    _assert_completed_before_cleanup(attempt)
+    output_waits.assert_bounded(mode)
+    assert not worker.is_alive()
     assert box.get("result") is not None and box["result"].ok is True, box
     assert len(survivors_alive) == 1, "the survivor is left running, not killed"
-    if mode == CONTROL:
-        assert elapsed < GRACE + 1.0, f"a normal turn must not wait for the grace ({elapsed:.2f} s)"
 
 
 def test_plain_wrap_reads_a_handed_off_turn_to_its_end(model: Path, tmp_path: Path) -> None:
@@ -614,7 +792,7 @@ def test_plain_wrap_reads_a_handed_off_turn_to_its_end(model: Path, tmp_path: Pa
     grace, or the turn would be cut off while the real model is still working."""
     pidfile, seen = tmp_path / "pids.txt", []
     try:
-        worker, box, elapsed = _bounded(lambda: _run_plain(model, "handoff", pidfile, seen))
+        worker, box, elapsed = _bounded(lambda: _run_plain(model, "handoff", pidfile, seen), _ended_marker(pidfile))
     finally:
         _end_all(pidfile)
         worker.join(10.0)
@@ -627,10 +805,12 @@ def test_plain_wrap_reads_a_handed_off_turn_to_its_end(model: Path, tmp_path: Pa
 @pytest.mark.parametrize("how", ["plain", "loop"])
 @pytest.mark.parametrize("cli", ["codex", "claude"])
 def test_an_event_whose_type_is_a_list_or_an_object_is_ignored_as_on_master(
-        model: Path, tmp_path: Path, cli: str, how: str) -> None:
+    model: Path, tmp_path: Path, cli: str, how: str
+) -> None:
     """The end-of-run check reads a raw JSON value: a list or an object there must not raise."""
     pidfile, seen, mode = tmp_path / "pids.txt", [], f"odd-{cli}"
     if how == "plain":
+
         def call():
             return _run_plain(model, mode, pidfile, seen, cli=cli)
     else:
@@ -639,8 +819,9 @@ def test_an_event_whose_type_is_a_list_or_an_object_is_ignored_as_on_master(
 
         def call():
             return _drive(store, model, mode, pidfile, cli=cli)
+
     try:
-        worker, box, _elapsed = _bounded(call)
+        worker, box, _elapsed = _bounded(call, _ended_marker(pidfile))
     finally:
         _end_all(pidfile)
         worker.join(10.0)
@@ -650,11 +831,13 @@ def test_an_event_whose_type_is_a_list_or_an_object_is_ignored_as_on_master(
 
 @pytest.mark.parametrize("how", ["plain", "loop"])
 def test_a_handed_off_claude_turn_is_read_past_its_tool_use_to_the_final_answer(
-        model: Path, tmp_path: Path, how: str) -> None:
+    model: Path, tmp_path: Path, how: str
+) -> None:
     """Claude reports turn_finished for each assistant message, a tool-use one too. Only the final
     `result` ends the invocation, so a tool that runs longer than the grace must not end the read."""
     pidfile, seen = tmp_path / "pids.txt", []
     if how == "plain":
+
         def call():
             return _run_plain(model, "claude-handoff", pidfile, seen, cli="claude")
     else:
@@ -663,8 +846,9 @@ def test_a_handed_off_claude_turn_is_read_past_its_tool_use_to_the_final_answer(
 
         def call():
             return _drive(store, model, "claude-handoff", pidfile, cli="claude")
+
     try:
-        worker, box, elapsed = _bounded(call)
+        worker, box, elapsed = _bounded(call, _ended_marker(pidfile))
     finally:
         _end_all(pidfile)
         worker.join(10.0)
@@ -678,10 +862,13 @@ def test_a_handed_off_claude_turn_is_read_past_its_tool_use_to_the_final_answer(
 
 
 @pytest.mark.parametrize("how", ["plain", "loop", "loop-watchdog"])
-def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, tmp_path: Path, how: str) -> None:
-    """The grace is a hard bound from the turn's end: output still arriving then belongs to the survivor."""
+def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(
+    model: Path, tmp_path: Path, how: str, output_waits
+) -> None:
+    """The fixed grace ends the read even while the surviving helper keeps writing."""
     pidfile, seen = tmp_path / "pids.txt", []
     if how == "plain":
+
         def call():
             return _run_plain(model, "writing", pidfile, seen)
     else:
@@ -691,35 +878,52 @@ def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, t
 
         def call():
             return _drive(store, model, "writing", pidfile, watchdog=watchdog)
+
     try:
-        worker, box, elapsed = _bounded(call)
+        attempt = _attempt(call, _ended_marker(pidfile))
+        worker, box = attempt.worker, attempt.box
         survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    assert not worker.is_alive() and elapsed < GRACE + 3.0, f"wrap kept reading a writing survivor ({elapsed:.2f} s)"
+    _assert_completed_before_cleanup(attempt)
+    output_waits.assert_bounded("writing")
+    assert not worker.is_alive()
     assert box.get("result") == 0 if how == "plain" else box["result"].ok is True, box
     assert len(survivors_alive) == 1, "the writing survivor is left running, not stopped"
 
 
-def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path) -> None:
+def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path, output_waits) -> None:
     pidfile, seen = tmp_path / "pids.txt", []
     try:
-        worker, box, elapsed = _bounded(lambda: _run_plain(model, "burst-then-writing", pidfile, seen))
+        attempt = _attempt(lambda: _run_plain(model, "burst-then-writing", pidfile, seen), _ended_marker(pidfile))
+        worker, box = attempt.worker, attempt.box
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    assert not worker.is_alive() and elapsed < GRACE + 3.0, f"wrap kept reading a writing survivor ({elapsed:.2f} s)"
+    _assert_completed_before_cleanup(attempt)
+    output_waits.assert_bounded("burst-then-writing")
+    assert not worker.is_alive()
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, [f"line {i}" for i in range(3000)])
 
 
-def _read_lines(model: Path, mode: str, pidfile: Path) -> tuple[bool, dict]:
-    """Read the stand-in's output as the wrapper does, with the turn already finished."""
+def _read_lines(model: Path, mode: str, pidfile: Path, settle: Path | None = None) -> tuple[bool, dict]:
+    """Read the stand-in's output as the wrapper does, with the turn already finished.
+
+    ``settle``: a file the stand-in writes last; it is waited for (at most LOADED_CEILING) before the stand-in is
+    stopped and the pipe closed, so a helper that is still writing is not cut off by the test itself."""
     proc = subprocess.Popen(_argv(model, mode, pidfile), stdout=subprocess.PIPE, text=True, encoding="utf-8")
     try:
-        worker, box, _elapsed = _bounded(lambda: list(run._iter_output_lines(proc, lambda: True)))
+
+        def read_all():
+            return list(run._iter_output_lines(proc, lambda: True))
+
+        worker, box, _elapsed = _bounded(read_all, _ended_marker(pidfile))
         timed_out = worker.is_alive()
+        limit = time.monotonic() + LOADED_CEILING
+        while settle is not None and not settle.exists() and time.monotonic() < limit:
+            time.sleep(0.05)
     finally:
         _end_all(pidfile)
         proc.wait(10.0)
@@ -728,10 +932,110 @@ def _read_lines(model: Path, mode: str, pidfile: Path) -> tuple[bool, dict]:
     return timed_out, box
 
 
-def test_output_still_arriving_after_the_model_exits_is_kept(model: Path, tmp_path: Path) -> None:
-    timed_out, box = _read_lines(model, "late-tail", tmp_path / "pids.txt")
-    assert not timed_out
-    assert any('"late"' in line for line in box["result"]), "output that arrived within the grace was dropped"
+LATE_WINDOW = 1.0  # a line written this soon after the wrapper saw the exit must be kept (the grace is longer)
+STALL = 0.5  # a separate process that went this long without ticking shows the machine was not scheduling it
+
+# It writes the time every 50 ms, from a process of its own, so nothing the wrapper does in the test's process
+# (a wait, a wait that holds the GIL) can stop it. Both sides read time.monotonic(), which is one system-wide clock.
+_TICKER = textwrap.dedent("""
+    import sys, time
+    with open(sys.argv[1], "w") as out:
+        while True:
+            out.write(repr(time.monotonic()) + chr(10))
+            out.flush()
+            time.sleep(0.05)
+""")
+
+
+def _longest_silence(times: list[float], start: float, end: float) -> float:
+    """The longest time without a tick, counting only the part between start and end.
+
+    A silence counts only once a tick has ended it: a silence that is still going on after the last tick is not
+    counted (the ticker may be dead), so a caller that wants it counted waits for one more tick first."""
+    pairs = zip(times, times[1:], strict=False)
+    gaps = [min(later, end) - max(earlier, start) for earlier, later in pairs]
+    return max([gap for gap in gaps if gap > 0], default=0.0)
+
+
+class _Ticker:
+    """A separate process that notes the time every 50 ms in a file.
+
+    What it can show: if it stopped ticking while the wrapper's reader was going, the machine was not running
+    processes (it is no wrapper code, so no pause in the wrapper can stop it). What it cannot show: that this
+    test's own process was starved while the ticker was not. That case is not excused."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._proc: subprocess.Popen | None = None
+
+    def __enter__(self) -> _Ticker:
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c", _TICKER, str(self.path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return self
+
+    def __exit__(self, *args) -> None:
+        self._proc.kill()
+        self._proc.wait(10.0)
+
+    def times(self) -> list[float]:
+        lines = self.path.read_text().split("\n")[:-1] if self.path.exists() else []  # the last line may be partial
+        return [float(line) for line in lines]
+
+    def require_baseline_tick(self, timeout: float = 30.0) -> None:
+        """Wait for the ticker's first tick, so it is known to be running before the reader starts. Without it a stall
+        from the start of the grace to a late first tick would not be seen (silence is measured between ticks). If
+        no tick comes this FAILS, it does not skip: a skip could hide a broken ticker."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.times():
+                return
+            time.sleep(0.05)
+        pytest.fail(
+            f"the ticker process never ticked within {timeout:g} s: it is broken, or the machine is not running it"
+        )
+
+    def wait_for_tick_after(self, moment: float, timeout: float = 10.0) -> bool:
+        """Wait until a tick at or after ``moment`` is on file. A ticker that was stalled over ``moment`` shows its
+        silence only by ticking again, so stop it only after this. False: no such tick came in time."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ticks = self.times()
+            if ticks and ticks[-1] >= moment:
+                return True
+            time.sleep(0.05)
+        return False
+
+
+def test_output_still_arriving_after_the_model_exits_is_kept(model: Path, tmp_path: Path, output_waits) -> None:
+    """Whether the helper really wrote within the grace is established, not assumed: the helper records when it
+    wrote, on the same clock as the wrapper's grace. A missing line is no verdict on the wrapper in two cases only:
+    the helper wrote it after LATE_WINDOW, or a separate ticker process, which nothing in the wrapper can stop, was
+    silent for STALL while the reader was running (the machine was not running processes). A wrapper that pauses,
+    even in a native call that holds the GIL, does not stop that process, so its dropped line fails the test."""
+    pidfile = tmp_path / "pids.txt"
+    wrote = Path(str(pidfile) + ".late")
+    with _Ticker(tmp_path / "ticks.txt") as ticker:
+        ticker.require_baseline_tick()  # the ticker runs before the reader does, so a stall at its start shows too
+        timed_out, box = _read_lines(model, "late-tail", pidfile, settle=wrote)
+        assert not timed_out
+        if any('"late"' in line for line in box["result"]):
+            return
+        # A ticker stalled right up to the reader's end shows it only by ticking again: do not stop it before that.
+        ticker.wait_for_tick_after(box["done_at"])
+    assert wrote.exists(), "the helper never wrote its line"
+    (grace,) = output_waits.graces
+    assert grace._since is not None, "the grace never started"
+    delay = float(wrote.read_text()) - grace._since
+    silent = _longest_silence(ticker.times(), grace._since, box["done_at"])
+    if delay > LATE_WINDOW:
+        pytest.skip(f"the helper wrote {delay:.2f} s after the wrapper saw the exit: no verdict on the wrapper")
+    if silent > STALL:
+        pytest.skip(f"the machine did not run the ticker process for {silent:.2f} s: no verdict on the wrapper")
+    pytest.fail(f"output written {delay:.2f} s after the exit was dropped; the ticker process ran throughout")
 
 
 def test_the_grace_does_not_start_while_the_model_is_still_running(model: Path, tmp_path: Path) -> None:
@@ -751,7 +1055,8 @@ FD_SETSIZE = 1024  # select.select refuses a descriptor at or above this
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor numbers; Windows checks the pipe with PeekNamedPipe")
 def test_plain_wrap_reads_a_turn_whose_pipe_descriptor_is_above_fd_setsize(
-        model: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    model: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import resource
 
     need = FD_SETSIZE + 64
@@ -772,7 +1077,7 @@ def test_plain_wrap_reads_a_turn_whose_pipe_descriptor_is_above_fd_setsize(
     try:
         while not fillers or fillers[-1] < FD_SETSIZE + 8:  # every lower number taken: the pipe gets a higher one
             fillers.append(os.open(os.devnull, os.O_RDONLY))
-        worker, box, _elapsed = _bounded(lambda: _run_plain(model, CONTROL, pidfile, seen))
+        worker, box, _elapsed = _bounded(lambda: _run_plain(model, CONTROL, pidfile, seen), _ended_marker(pidfile))
     finally:
         for fd in fillers:
             os.close(fd)

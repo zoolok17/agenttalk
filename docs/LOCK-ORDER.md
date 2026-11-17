@@ -63,6 +63,20 @@ rename and launch-request writes acquire config **before** retirement. This
 preserves principal validation while allowing close publication to retain
 acceptance and its ID lock through the release-barrier message.
 
+Reset holds acceptance (110), then publication (160), from before its config read
+through the new session and cursor writes. CLI reset first takes lane-reset (70).
+A requeue keeps its recovery decision, record writes and publication inside
+retirement (150), then publication (160); it always re-reads config there.
+Reset never takes acceptance underneath publication. The persistent publication
+mutex lives outside the folders reset clears. The census is now 215 sites,
+including 70 in `store.py`; all other per-file counts are unchanged.
+
+Stop agents before reset: every sender waits for its publication hold, and a wait
+longer than 10 seconds fails. Wrapper operation sends and compaction batches can
+also fail when releasing their deleted `state/operation-publication.lock` marker.
+This barrier does not make an interrupted plain reset recoverable, and an older
+reset writer that bypasses it is outside the protection.
+
 The acquisition-site census covers `store`, `close`, `cli`, `assurance`,
 `attention`, `checkpoint`, `gates`, `knowledge`, `lanes`, `lesson_context`,
 `onboarding`, `recovery`, `supervisor`, `supervisor_lifecycle`, `work_board_facts`,

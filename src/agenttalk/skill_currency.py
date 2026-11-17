@@ -13,6 +13,10 @@ lead-loop/relay refresh exposed). This module adds a DETERMINISTIC source-conten
     warns (patch-lag does not), forcing periodic re-read.
   * frontmatter well-formedness - required fields present (name/description/reviewed-against
     + category/evidence-profile for devkit).
+  * pinned-runtime rule - a plain ``python -m agenttalk`` (``python``/``python3``/``py``, any
+    spacing, continued lines joined) is flagged in a Claude skill (whose own form is the bare
+    ``agenttalk``), and in a Codex or devkit skill unless that skill states the rule itself: use
+    ``"$AGENTTALK_PY" -m agenttalk`` when ``AGENTTALK_PY`` is set, otherwise the project's form.
 
 It is MECHANICAL: it proves referenced commands/flags EXIST and metadata is present. It does
 NOT prove the surrounding prose is semantically correct (that stays a human review job). The
@@ -31,6 +35,32 @@ from pathlib import Path
 _PLACEHOLDER_RE = re.compile(r"^(<.*>|REPLACE:.*|[A-Z][A-Z0-9_]{1,}|\.{3}|\$\{.*\}|%.*%)$")
 _IGNORE_NEXT = "agenttalk-skill-lint: ignore-next"
 _IGNORE_LINE = "agenttalk-skill-lint: ignore-line"
+# The plain module form in any spelling of the interpreter and the spaces (`python`, `python3`, `python3.14`,
+# `python.exe`, `py`, `py.exe`, a quoted name, a path ending in the name; also `python -m agenttalk.assurance`), with
+# flags that take no value between the interpreter and `-m` (`py -3.14`, `python -I`). A shell continuation is joined
+# before this is applied, so it is one command here. Known limit: a flag WITH a separate value (`python -X utf8 -m
+# agenttalk`, `python -W ignore -m agenttalk`) and an interpreter under another name are not recognised.
+_PLAIN_PYTHON_RE = re.compile(
+    r"""(?:^|[\s(;&|"'\\/])"""
+    r"""(?:python[\d.]*(?:\.exe)?|py(?:\.exe)?)["']?"""
+    r"""(?:\s+-(?!m\s)[\w.-]+)*"""
+    r"""\s+-m\s+agenttalk(?![\w-])"""
+)
+_PLAIN_PYTHON_FORM = "python -m agenttalk"
+# A rule needs the condition, a Bash or PowerShell invocation, then the fallback nearby.
+# Reject negation between the condition and invocation; require the invocation before the fallback.
+# PowerShell accepts both quoted and unquoted executable variables after its call operator.
+# Conditions may wrap at a line end or quote the name in backticks; bare mentions and
+# HTML comments do not state the rule.
+_RULE_RE = re.compile(
+    r"\b(?:if|when)\b[^.]{0,60}?(?<![\w])AGENTTALK_PY(?![\w])`?\s+is\s+set"
+    r"(?:(?!\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b|"
+    r"\b(?:not|never|avoid|without|refrain|cannot|no|don['’]t|mustn['’]t|shouldn['’]t|can['’]t)\b)[\s\S]){0,600}?"
+    r'(?:"\$AGENTTALK_PY"|&\s+(?:"\$env:AGENTTALK_PY"|\$env:AGENTTALK_PY))\s+-m\s+agenttalk(?![\w-])'
+    r"[\s\S]{0,600}?(?:\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b)",
+    re.IGNORECASE,
+)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -139,7 +169,21 @@ def _command_spans(text: str) -> tuple[list[tuple[int, str]], list[int]]:
     LATER fenced command is hidden - the cascade both delta reviewers caught). It stops, flags
     the dangling line, and leaves the delimiter for the outer loop to toggle the fence.
     Honors ``ignore-next`` / ``ignore-line`` comments."""
+    candidates, dangling = _scan_candidates(text)
     spans: list[tuple[int, str]] = []
+    for start_line, cand in candidates:
+        m = _CMD_RE.search(cand)
+        if m:
+            spans.append((start_line, m.group(1).strip()))
+    return spans, dangling
+
+
+def _scan_candidates(text: str, *, prose: bool = False) -> tuple[list[tuple[int, str]], list[int]]:
+    """The scanner behind ``_command_spans``: ``(candidates, dangling_lines)`` where a candidate is
+    ``(first_line_no, text)``: a fenced command with its shell continuations joined, or an inline-backtick span (and,
+    with ``prose``, the whole prose line as well). Fences, continuations, boundaries and the ignore comments are decided
+    here, once, so every lint that reads commands out of a skill sees the same thing."""
+    candidates_found: list[tuple[int, str]] = []
     dangling: list[int] = []
     in_fence = False
     ignore_next = False
@@ -183,12 +227,11 @@ def _command_spans(text: str) -> tuple[list[tuple[int, str]], list[int]]:
             candidates.append(joined)
         else:
             candidates.extend(re.findall(r"`([^`]*)`", raw))
-        for cand in candidates:
-            m = _CMD_RE.search(cand)
-            if m:
-                spans.append((start_line, m.group(1).strip()))
+            if prose:
+                candidates.append(raw)
+        candidates_found.extend((start_line, cand) for cand in candidates)
         i += 1
-    return spans, dangling
+    return candidates_found, dangling
 
 
 def _is_placeholder(tok: str) -> bool:
@@ -315,6 +358,38 @@ def current_major_minor(version: str) -> tuple[int, int]:
 
 
 # --------------------------------------------------------------------------- per-file
+
+def _states_pinned_rule(text: str) -> bool:
+    """True when the skill states the pinned-runtime rule itself: a condition on ``AGENTTALK_PY`` being set, with
+    what to do otherwise close by. A mention, the name inside an HTML comment or inside a longer name, or the
+    condition without its fallback does not count."""
+    return bool(_RULE_RE.search(_HTML_COMMENT_RE.sub("", text)))
+
+
+def _pinned_runtime_findings(rel: str, text: str, kind: str) -> list[Finding]:
+    """The pinned-runtime rule. A Claude skill uses the bare ``agenttalk``, so a plain module form (``python``,
+    ``python3`` or ``py`` with ``-m agenttalk``, any spacing, continued lines joined) is flagged on every line it
+    appears. A Codex or devkit skill may use it only when it states the rule (``_states_pinned_rule``); otherwise one
+    finding for the file, at the first such line. Fences, continuations and the ignore comments are read by the same
+    scanner as the CLI-token lint. This checks what the skills SAY; it cannot make any agenttalk newer or prove which
+    release a runtime is."""
+    if kind not in {"claude", "codex", "devkit"}:
+        return []
+    candidates, _dangling = _scan_candidates(text, prose=True)
+    hits = sorted({line for line, cand in candidates if _PLAIN_PYTHON_RE.search(cand)})
+    if not hits:
+        return []
+    if kind == "claude":
+        return [Finding(rel, n, _PLAIN_PYTHON_FORM,
+                        "plain `python -m agenttalk` in a Claude skill: use the bare `agenttalk` form this skill "
+                        "family uses (the seat's shim resolves its pinned runtime)") for n in hits]
+    if _states_pinned_rule(text):
+        return []
+    return [Finding(rel, hits[0], _PLAIN_PYTHON_FORM,
+                    "plain `python -m agenttalk` without the pinned-runtime rule: state it once, in a sentence: run "
+                    'agenttalk commands as `"$AGENTTALK_PY" -m agenttalk` when AGENTTALK_PY is set, otherwise the form '
+                    "your project's agent manual gives")]
+
 
 _DEVKIT_CATEGORIES = {"coordination", "production", "assurance", "reference"}
 
@@ -492,6 +567,7 @@ def check_skill_file(path: Path, *, kind: str, inventory: _Node,
     for line_no, tail in spans:
         for reason in _validate_command(tail, inventory):
             findings.append(Finding(rel, line_no, "agenttalk", reason))
+    findings.extend(_pinned_runtime_findings(rel, text, kind))
     return findings
 
 

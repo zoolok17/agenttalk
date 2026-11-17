@@ -1,7 +1,7 @@
 ---
 name: agenttalk-lead
 description: Coordinate a named multi-agent team over agenttalk as a lead. Use when Codex should decompose work, dispatch to named agents or groups, track replies with threads, and report back without starting a teammate's assistant directly.
-reviewed-against: "0.75"
+reviewed-against: "0.105"
 ---
 
 # agenttalk-lead - Coordinate a named team (codex side)
@@ -17,7 +17,8 @@ it honours the project's chosen planning authority rather than overriding it.
 
 This installed agenttalk carries the guides written for leads, at the version you run. To
 find them, run `python -m agenttalk doctor` in the project's top folder (a wrapped seat runs
-`"$AGENTTALK_PY" -m agenttalk doctor`) and read its `module path` line, whatever its exit
+`"$AGENTTALK_PY" -m agenttalk doctor` in Bash or
+`& "$env:AGENTTALK_PY" -m agenttalk doctor` in PowerShell) and read its `module path` line, whatever its exit
 code; `python -m agenttalk doctor --json` gives the same path as `agenttalk_module_path`. The guides
 are under that path:
 
@@ -119,7 +120,13 @@ in a separate shell without it, as CONTRIBUTING.md describes.
 
 ## Invoking agenttalk under the Codex sandbox
 
-Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter:
+Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter. In Bash:
+
+```bash
+"$AGENTTALK_PY" -m agenttalk <subcommand> ...
+```
+
+In PowerShell:
 
 ```powershell
 & "$env:AGENTTALK_PY" -m agenttalk <subcommand> ...
@@ -482,23 +489,25 @@ the agents you plan.
      --meta work_item=<slug> \
      --meta stage=<stage> \
      --meta lane_id=<lane-id> \
-     -m "<goal, scope, verification, expected reply>"
+     --file "<brief-file>"
    ```
+   `<brief-file>` is a UTF-8 text file you wrote first (see `$agenttalk-send`, step 3). Use a file for a
+   body that has quotes in it, and do not pipe it into `--file -`.
    Ask for the reply in this form. A task response needs a closing `status`
    next to its `verdict`; without one, the task can stay open:
    ```bash
-   python -m agenttalk reply --to-request <request_id> --kind task-response \
-     --meta status=done --meta verdict=<verdict> -m "<result>"
+   python -m agenttalk reply --from "$SELF" --to-request <request_id> --kind task-response \
+     --meta status=done --meta verdict=<verdict> --file "<result-file>"
    ```
 5. Use broadcast for shared awareness or parallel input:
    ```bash
    python -m agenttalk broadcast --from "$SELF" --to-group <group> --kind question \
      --subject "<decision/input needed>" \
-     -m "<what each recipient should answer>"
+     --file "<question-file>"
    ```
    Broadcast fan-out creates one message per recipient with the same
    `request_id` / `broadcast_id`. Recipients reply to you with
-   `python -m agenttalk reply --to-request <b-id>`. There is no special
+   `python -m agenttalk reply --from "$SELF" --to-request <b-id>`. There is no special
    reply-all primitive in this pass; a follow-up to everyone is a new
    `python -m agenttalk broadcast`.
 6. Track open work:
@@ -514,7 +523,7 @@ the agents you plan.
    python -m agenttalk wait --for "$SELF" --to-request <request_id>
    ```
    If a worker is unsure where a reply will route, tell them to run
-   `python -m agenttalk reply --to-request <request_id> --dry-run` first; dry-run
+   `python -m agenttalk reply --from "$SELF" --to-request <request_id> --dry-run` first; dry-run
    prints the recipient, request id, and kind without sending.
 7. Collect results, request cross-review for implemented pieces, and
    summarize the outcome to the user with unresolved blockers called
@@ -589,7 +598,24 @@ inventing one.
 4. **Open reviews and pull requests.** Read each review's verdict and the code
    host's inline review comments (see "Read the host's AUTOMATED review
    findings" above). Merge only with a GO that covers the exact head commit
-   (`work_head`); a GO on an earlier head does not count. If the project uses
+   (`work_head`); a GO on an earlier head does not count. The GO comes from a
+   reader of another vendor than the builder. When none is available, follow
+   the single-vendor fallback of the merge gate (docs/ROLES-SKILLS-PROCEDURES.md,
+   section 4.3), in order: wait if the change can wait; else a second team's
+   read by another vendor; else a same-vendor read by a seat that did not
+   build, design or advise on the change, in a fresh context, at the strongest
+   model tier, with a brief that states no expected outcome, backed by CI and,
+   for code, a test that fails before the change plus planted faults. Such a
+   GO carries `review_independence=same-vendor` on the reply and in your
+   pull-request comment; list it for a re-read by another vendor, and reopen
+   the work on any finding. A same-vendor GO is never enough for money or paid
+   spend, security, credentials or privacy, deletion or another irreversible
+   step, a release, gate configuration (CI workflows, linters, scanners,
+   secret-scan settings), or this review rule and the shipped instructions
+   that state it: those need another vendor's read, or, when the team
+   has no other vendor at all, the operator's recorded approval after the
+   same-vendor read. A cheap-model reader (a Qwen seat) never gives the GO
+   alone. If the project uses
    the work board, run `python -m agenttalk board verify-merges` after each merge.
 5. **Capacity, before handing out more work.**
    - Model budgets and context: `python -m agenttalk capacity` shows the budgets and
@@ -798,12 +824,15 @@ lead publishes on its behalf. Three failures live in that one step, and the
 first two are silent.
 
 1. **Require a clean-SHA handoff.** The worker's reply must carry the final
-   full SHA and an empty `git status --porcelain` for its worktree. Pushing a
+   full SHA and an empty `git status --porcelain --untracked-files=all` for its
+   worktree (`--untracked-files=all` is needed because a git setting,
+   `status.showUntrackedFiles=no`, makes plain `git status --porcelain` hide new
+   files). Pushing a
    branch publishes the committed HEAD, never uncommitted edits — so a dirty
    worktree publishes a tree nobody tested.
    ```bash
-   git -C <worktree> status --porcelain     # must be empty
-   git -C <worktree> log -1 --format=%H     # must equal the reported SHA
+   git -C "<worktree>" status --porcelain --untracked-files=all     # must be empty
+   git -C "<worktree>" log -1 --format=%H     # must equal the reported SHA
    ```
 
 2. **Never let the current directory choose which commit is pushed.** This is
@@ -819,7 +848,7 @@ first two are silent.
    ```bash
    git push origin <full-sha>:refs/heads/<branch>
    ```
-   `git -C <worktree> push origin HEAD:<branch>` also works. Prefer the
+   `git -C "<worktree>" push origin HEAD:<branch>` also works. Prefer the
    explicit SHA.
 
    **`--force-with-lease` does not protect you here.** The lease asserts what

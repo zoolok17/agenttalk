@@ -29,6 +29,14 @@ hash. `--json` emits a machine-readable equivalent (`project_id`,
 `destination`, `manifest_path`, `manifest_hash`, `file_count`,
 `total_bytes`, `hardlink_used`, `sequence_at_snapshot`, `fence_seconds`).
 
+The `mode:` line says how the files were made. `hardlink` means every file was linked.
+Launch requests and lane delivery records are always copied (see below), so a store that
+has any shows `hardlink (2 launch-request and lane-delivery files are always copied)`.
+`copy (no hardlink support)` is for a disk that cannot link files, and a file whose link
+failed is counted as `copied because a link failed` (if every link failed, the
+line says `copy (every link failed: ...)`, not "no hardlink support"). In `--json`, `hardlink_used` is true
+only when every file in the snapshot was linked; copying some files on purpose makes it false.
+
 ## Where backups live
 
 `%LOCALAPPDATA%\agenttalk\recovery\<project_id>\<timestamp>\` on Windows,
@@ -56,13 +64,20 @@ will be able to pick a specific one or default to the latest.
 
 ## What it guarantees
 
-- **The snapshot is a real point-in-time view, not a torn read.** Writers
-  are briefly fenced (the same lock `send()` uses) around a hardlink clone
-  of the store tree - not a copy while things keep changing underneath it.
-  Every file this codebase writes to `.agenttalk/` uses a write-temp-then-
-  `os.replace` pattern, which never mutates the inode a hardlink already
-  points to - so once cloned, a file is frozen even after the fence is
-  released and live writes resume.
+- **No file in the snapshot is a torn read, and the messages and their
+  publication order are one point in time.** The backup takes the lock
+  `send()` uses (the message publication lock) around a hardlink clone of
+  the store tree, so messages cannot be published while it runs, and it
+  reads the publication order under the same lock. That lock is the only
+  thing the backup shares with the writers: other files (cursors, config,
+  health and other state, launch requests, lane delivery records) are
+  written under their own locks or none, so while the clone runs one of
+  them can change, and the snapshot can hold files from slightly different
+  moments within that short time. Each file is whole, though: every file
+  this codebase writes to `.agenttalk/` uses a write-temp-then-`os.replace`
+  pattern, which never mutates the inode a hardlink already points to - so
+  once cloned, a file is frozen even after the lock is released and live
+  writes resume.
 - **Every file's hash in the manifest matches its actual snapshot bytes.**
   Verified twice: once when the manifest is written, once more as a
   self-check before the backup is published. A hash mismatch raises and
@@ -72,10 +87,17 @@ will be able to pick a specific one or default to the latest.
   complete.** The clone is staged under a temp name and only renamed into
   its final timestamped directory after the manifest is written and
   self-verified.
-- **Concurrent `send()` calls do not queue up behind the backup.** The
-  fence covers only the hardlink clone step (bounded by file count -
-  directory-entry creation, not the aggregate size of the store), never
-  the hashing or manifest-write. This is a deliberate design choice made
+- **A `send()` during a backup waits for the lock, briefly, and gives up
+  after 10 seconds.** The backup holds the lock while it clones the store
+  (making hard links; the launch requests and lane delivery records, any file
+  whose link fails, and a disk without hard links are copied byte by byte
+  instead, which takes longer the more data there is) and while it reads and
+  checks the publication order. Only creating hard links that succeed takes
+  time that depends on the number of files and not on their size. The lock is
+  not held for the hashing or the manifest write. A send that has to wait gets
+  the lock when the backup lets go, and fails with a timeout only if that
+  takes more than 10 seconds. Keeping the hashing outside the lock is a
+  deliberate design choice made
   in response to issue #154 (still open): a fence around the WHOLE
   operation, including a full validation/hash pass, would reproduce that
   issue's lock-timeout-under-contention at snapshot scale. A load test
@@ -111,8 +133,29 @@ will be able to pick a specific one or default to the latest.
   `.lock`/`.generation`-suffixed name, plus two legacy bare exceptions),
   not a separately hand-maintained list in the backup code, so a new
   lock added to `store.py` is covered automatically rather than needing
-  a matching edit here. A restored store creates fresh lock files on
-  first use; it never needs the old ones.
+  a matching edit here. The same rule leaves out the short-lived private
+  names the lock code gives a file while it publishes or removes it (a dot,
+  an optional name, 32 hexadecimal characters, then `.prepare` or `.unlink`;
+  `store._LOCK_HELPER_NAME`). Such a name can be there when the backup lists
+  the folder and gone a moment later; copying it would fail the backup or put
+  a stray file in the snapshot. A private `.unlink` leftover that a crash
+  kept is left out of the snapshot too and is not deleted. A restored store
+  creates fresh lock files on first use; it never needs the old ones.
+- **Launch requests and lane delivery records are copied, never linked.**
+  These files (`state/launch-requests/<name>` and everything under
+  `lane-deliveries/`, the `.prepared` folder included) are written under
+  their own locks (a launch request under the config and retirement locks, a
+  committed delivery under its lane's transaction lock), not under the
+  backup's message publication lock, so a backup can run while one is being
+  written. The writer checks right after writing that the file has exactly
+  one name. A link made by a backup in that moment would add a second name
+  and make the writer fail, so the backup copies them (`store.
+  is_copy_only_backup_path`). The folder names are matched without regard to
+  case: on Windows and on a case-insensitive Mac volume `STATE/Launch-Requests`
+  is the same folder, and on a case-sensitive disk a folder that only differs
+  in case is another folder, which is merely copied instead of linked. The
+  `archive/` folder of launch requests is ordinary and is linked. Anyone
+  adding another file written the same way must add its folder to that rule.
 - **This command does not restore, delete-protect, or detect a vanished
   store.** Those are #156 increments 2-4, designed (see the issue) but
   deferred to a later release. Today, `agenttalk backup` only writes the
@@ -123,9 +166,40 @@ will be able to pick a specific one or default to the latest.
   boundary). When it isn't - or the filesystem doesn't support hardlinks
   at all - `agenttalk backup` falls back to a byte copy automatically
   (`hardlink_used: false` in `--json` output). Still correct, just
-  slower, and the fence duration becomes proportional to store size in
-  that mode - the same tradeoff #154 already describes, now bounded to
-  only the (much rarer) no-hardlink case instead of every backup.
+  slower, and the lock is held for as long as the copying takes, which grows
+  with the amount of data - the same tradeoff #154 already describes. Files
+  that are always copied (launch requests and lane delivery records) and any
+  file whose link fails add their copying time to the lock in the same way,
+  even when the rest of the store is linked.
+
+## When the store changes while it is copied
+
+A file can be moved or removed after the backup listed the folder (a launch
+request moving to its `archive/` folder is an example). When a path the backup
+has already listed disappears, it throws that attempt away completely, empties
+its staging folder and lists the store again, so nothing stale from the first
+attempt stays in. A folder or file that cannot be listed or read for any other
+reason, such as "access denied", is not retried: the backup refuses.
+
+This does not make the snapshot a whole-store point in time. The backup only
+notices a change when it runs into an error. A file that moves from a folder
+the backup has not listed yet into one it has already listed is seen in
+neither place, so the snapshot can hold neither copy. A lane delivery record
+can do this: it is published into its parent folder and then removed from
+`.prepared`. Only messages and their publication order are protected by the
+backup's lock (see "What it guarantees"); other files can still change while
+the backup runs, so check a snapshot of a busy store before relying on it, or
+take the backup again when nothing is being delivered.
+
+All attempts share one budget that starts inside the lock, before the first
+listing, and is never reset: at most 3 attempts, and no new attempt starts
+once 3 seconds have passed (throwing an attempt away counts). The budget
+decides when a new attempt may start. It does not limit how long the lock is
+held, and a file operation that is already running (a slow disk, a large file)
+can take longer than the budget; senders waiting for the lock give up after 10
+seconds as before. When the disappearances it detected use up the attempts,
+`agenttalk backup` prints that the store kept changing, exits 2, publishes
+nothing and releases the lock: run it again.
 
 ## Failure behavior
 

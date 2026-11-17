@@ -28,6 +28,8 @@ from fractions import Fraction
 from pathlib import Path
 
 from agenttalk import __version__
+from agenttalk import printed_commands as pc
+from agenttalk import git_index_safety as index_safety
 from agenttalk import avatars as avatar_mod
 from agenttalk import health as health_schema
 from agenttalk import store as store_mod
@@ -43,6 +45,7 @@ from agenttalk.store import (
     OPENER_KINDS,
     Message,
     RequeueRefused,
+    PreparedMessageRefused,
     Store,
     _owner_identity_gone,
     escape_controls,
@@ -278,6 +281,29 @@ def _refuse_bad_work_tags(command: str, kind: str, meta: dict) -> int | None:
     except ValueError as exc:
         sys.stderr.write(f"agenttalk {command}: refusing - {exc}\n")
         return 2
+    return None
+
+
+def _raw_meta_values(items: list[str] | None, key: str) -> list[str]:
+    """Every value supplied for ``key`` with --meta, exactly as typed: _parse_meta trims key and value, so a new id
+    must be judged here, before that, or `id` with a trailing newline would be stored as a different id."""
+    return [v for k, _eq, v in (item.partition("=") for item in items or []) if _eq and k.strip() == key]
+
+
+def _refuse_bad_new_request_id(
+    command: str, kind: str, meta: dict, raw_items: list[str] | None = None
+) -> int | None:
+    """#727: an operation that OPENS a new request (a send, propose, task, escalate or opening reply of an opener
+    kind) with a request id supplied by the caller must use an id of the new-id shape. What counts is what the
+    operation does, not its command name: send --kind message answering an old question, requeue, retry and
+    broadcast --resume carry an id that is already stored (any shape) and are never checked here."""
+    if kind not in store_mod.OPENER_KINDS or "request_id" not in meta:
+        return None
+    for supplied in _raw_meta_values(raw_items, "request_id") or [meta["request_id"]]:
+        text = pc.new_id_refusal(command, supplied)
+        if text is not None:
+            sys.stderr.write(text + "\n")
+            return 2
     return None
 
 
@@ -547,7 +573,7 @@ def _init_load_packs(store: Store) -> None:
             continue
         count = len(report.published) + len(report.updated) + len(report.unchanged)
         print(f"  packs:      {name} v{report.version} ({count} lessons; turn off with --no-packs "
-              f"or `agenttalk knowledge pack unload {name}`)")
+              f"or `{pc.cmd('agenttalk knowledge pack unload {n}', n=name)}`)")
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -570,7 +596,11 @@ def cmd_init(args: argparse.Namespace) -> int:
                 f"agenttalk init: the store at {root} already exists, and this shell only "
                 f"inherited it through AGENTTALK_ROOT, so nothing was changed.\n"
                 f"  For a throwaway store to try commands in: agenttalk scratch store\n"
-                f"  To re-init that store on purpose: agenttalk --root {root} init ...\n")
+                "  To re-init that store on purpose: "
+                + pc.cmd("agenttalk --root {r} init ...", r=str(root), shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+                         lookup="the project folder is the one this shell inherited through AGENTTALK_ROOT",
+                         source="is the store folder named in the first line above")
+                + "\n")
             return 2
     else:
         root = Path.cwd().resolve()
@@ -1068,8 +1098,8 @@ def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bo
 def _drain_advice(name: str) -> str:
     """What `drain` does and who should run it (#726): it is not a repair anyone can run for another seat."""
     return (
-        f"`agenttalk drain --for {name}` reads and consumes the messages for whoever runs it, so only {name} "
-        "itself, or someone who will hand the messages on, should run it."
+        f"`{pc.cmd('agenttalk drain --for {n}', n=name)}` reads and consumes the messages for whoever runs it, "
+        f"so only {name} itself, or someone who will hand the messages on, should run it."
     )
 
 
@@ -1094,7 +1124,7 @@ def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = fr
                     f"were moved or removed. {_drain_advice(name)}"
                     + (  # #726: the row shows a snapshot, so say why the line above still stands
                         " Its capacity snapshot is not counted as a sign that it ran, because anyone can publish one "
-                        f"for a seat (`agenttalk capacity refresh --for {name}`)."
+                        f"for a seat (`{pc.cmd('agenttalk capacity refresh --for {n}', n=name)}`)."
                         if a.get("capacity")
                         else ""
                     )
@@ -1539,12 +1569,12 @@ def _thread_warnings(
                                  grouped=grouped)
         waiting = [t for t in rows if t.state == "reply-waiting"]
         if waiting:
-            ids = ", ".join(t.request_id for t in waiting[:3])
+            ids = ", ".join(pc.meta_text(t.request_id) for t in waiting[:3])
             more = "" if len(waiting) <= 3 else f" (+{len(waiting) - 3} more)"
             out.append(
                 f"{a}: {len(waiting)} unconsumed response(s) in inbox "
-                f"[{ids}{more}] — run `agenttalk drain --for {a}` then act "
-                f"(see `agenttalk threads --for {a}`)."
+                f"[{ids}{more}] — run `{pc.cmd('agenttalk drain --for {n}', n=a)}` then act "
+                f"(see `{pc.cmd('agenttalk threads --for {n}', n=a)}`)."
             )
         stale = [
             t for t in rows
@@ -1559,13 +1589,13 @@ def _thread_warnings(
         if stale:
             t0 = stale[0]
             if t0.is_broadcast:
-                who = f"{len(t0.pending)}/{len(t0.audience)} ({', '.join(t0.pending)})"
+                who = f"{len(t0.pending)}/{len(t0.audience)} ({pc.line(', '.join(t0.pending))})"
             else:
-                who = t0.peer
+                who = pc.line(t0.peer)
             out.append(
-                f"{a}: outbound {t0.opener_kind} {t0.request_id} still "
+                f"{a}: outbound {t0.opener_kind} {pc.meta_text(t0.request_id)} still "
                 f"awaiting {who} after {_age_span(t0.age_seconds)} — "
-                f"check `agenttalk threads --for {a}`."
+                f"check `{pc.cmd('agenttalk threads --for {n}', n=a)}`."
             )
         # #18: stale pending escalations are operator questions nobody is
         # answering — the loudest possible diagnostic, addressed to the
@@ -1579,7 +1609,7 @@ def _thread_warnings(
                 and t.age_seconds > OPEN_OUTBOUND_STALE_SECONDS
             ]
             if stale_esc:
-                ids = ", ".join(t.request_id for t in stale_esc[:3])
+                ids = ", ".join(pc.meta_text(t.request_id) for t in stale_esc[:3])
                 out.append(
                     f"{a}: {len(stale_esc)} operator escalation(s) pending "
                     f"past {_age_span(OPEN_OUTBOUND_STALE_SECONDS)} "
@@ -1609,11 +1639,12 @@ def _thread_warnings(
                         break
                 missed = [x for x in planned if x not in trow.audience]
                 out.append(
-                    f"{a}: incomplete fan-out {trow.request_id} - "
+                    f"{a}: incomplete fan-out {pc.meta_text(trow.request_id)} - "
                     f"{len(trow.audience)}/{trow.batch_total} copies exist"
-                    + (f", missed: {', '.join(missed)}" if missed else "")
-                    + f". Recover with `agenttalk broadcast --from {a} "
-                      f"--resume {trow.request_id}`, or rescind the thread."
+                    + (f", missed: {pc.line(', '.join(missed))}" if missed else "")
+                    + ". Recover with `"
+                    + pc.cmd("agenttalk broadcast --from {n} --resume {r}", n=a, r=trow.request_id)
+                    + "`, or rescind the thread."
                 )
     if pending_escalations_exist and liaison is None:
         out.append(
@@ -1696,17 +1727,17 @@ def cmd_threads(args: argparse.Namespace) -> int:
     for t in shown:
         age = _format_age(t.age_seconds) if t.age_seconds is not None else "?"
         flag = " (unread)" if t.unread else ""
-        subj = f'  "{t.subject}"' if t.subject else ""
+        subj = f'  "{pc.line(t.subject)}"' if t.subject else ""
         bcast = ""
         if t.is_broadcast:
             bcast = f"  responded={len(t.responded)}/{len(t.audience)}"
             if t.pending:
-                bcast += f" pending=[{', '.join(t.pending)}]"
+                bcast += f" pending=[{pc.line(', '.join(t.pending))}]"
         extra = ""
         if t.state == "closed-superseded":
-            extra = f"  rescinded-by={t.rescinded_by}"
+            extra = f"  rescinded-by={pc.line(str(t.rescinded_by))}"
         if t.is_broadcast and t.responded_na:
-            extra += f"  na=[{', '.join(t.responded_na)}]"
+            extra += f"  na=[{pc.line(', '.join(t.responded_na))}]"
         if t.na_response:
             extra += "  (n/a)"
         if t.needs_operator:
@@ -1714,8 +1745,8 @@ def cmd_threads(args: argparse.Namespace) -> int:
         if t.state == "open-outbound" and _reply_in_flight(store, t):
             extra += "  (reply in flight)"
         print(
-            f"  [{label.get(t.state, t.state)}] {t.request_id:<16} "
-            f"{t.opener_kind:<15} peer={t.peer:<10} age={age:<8}{subj}{flag}{bcast}{extra}"
+            f"  [{label.get(t.state, t.state)}] {pc.meta_text(t.request_id):<16} "
+            f"{t.opener_kind:<15} peer={pc.line(t.peer):<10} age={age:<8}{subj}{flag}{bcast}{extra}"
         )
     return 0
 
@@ -1819,7 +1850,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
         lpn = a.get("last_progress_note")
         if isinstance(lpn, dict) and isinstance(lpn.get("text"), str):
-            text = lpn["text"].splitlines()[0][:60] if lpn["text"] else ""
+            text = pc.line(lpn["text"].splitlines()[0][:60]) if lpn["text"] else ""
             age = lpn.get("age_seconds")
             age_str = _format_age(age) if isinstance(age, (int, float)) else "unknown age"
             seen += f' progress="{text}" ({age_str})'
@@ -2052,7 +2083,7 @@ def _owed_decision_notice(store, sender: str, recipient: str,
             return None
         labels = ", ".join(
             f"{'operator escalation' if t.needs_operator else 'proposal'} "
-            f"{t.request_id}"
+            f"{pc.meta_text(t.request_id)}"
             for t in owed
         )
         return (
@@ -2136,6 +2167,10 @@ def _register_await_reply(store: Store, record: dict | None, *, quiet: bool) -> 
         print(f"await_reply_token={record['wait_token']}")
 
 
+# What a thread hint says when the request id is not a plain token (#727): the id is shown, escaped, in the note.
+_THREAD_LOOKUP = "list the threads with: agenttalk threads --json"
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     # rescind/end have dedicated commands that handle multi-recipient fan-out
     # and anchoring; a hand-rolled `send --kind rescind` would only address one
@@ -2181,6 +2216,9 @@ def cmd_send(args: argparse.Namespace) -> int:
         sys.stderr.write("agenttalk send: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
         return 2
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("send", args.kind, meta, args.meta)
+    if refused is not None:
+        return refused
     refused = _refuse_bad_work_tags("send", args.kind, meta)
     if refused is not None:
         return refused
@@ -2275,7 +2313,7 @@ def cmd_composing(args: argparse.Namespace) -> int:
         if row is None:
             sys.stderr.write(
                 f"agenttalk composing: no thread {rid!r} is visible to "
-                f"{sender} — check `agenttalk threads --for {sender} --all`.\n")
+                f"{sender} — check `{pc.cmd('agenttalk threads --for {n} --all', n=sender)}`.\n")
             return 2
         if row.state != "owed-inbound":
             sys.stderr.write(
@@ -2373,7 +2411,7 @@ def cmd_progress(args: argparse.Namespace) -> int:
     anchor = next((m for m in inbox if m.id == to_id), None)
     if anchor is None:
         sys.stderr.write(
-            f"agenttalk progress: --to-id {to_id} not found: no validated "
+            f"agenttalk progress: --to-id {pc.meta_text(to_id)} not found: no validated "
             f"message with that id is addressed to {sender}.\n")
         return 2
     recipient = anchor.sender
@@ -2456,7 +2494,7 @@ def cmd_rescind(args: argparse.Namespace) -> int:
             print(render(msg, header=f"AGENTTALK :: RESCIND  {sender} -> {r}"))
     if already:
         sys.stderr.write(
-            f"agenttalk rescind: note — thread {rid} was already superseded; "
+            f"agenttalk rescind: note — thread {pc.meta_text(rid)} was already superseded; "
             f"state unchanged (this rescind is recorded for audit only).\n"
         )
     return 0
@@ -2519,10 +2557,11 @@ def cmd_check(args: argparse.Namespace) -> int:
             print(json.dumps({"request_id": rid, "state": "unknown",
                               "rescind": None}, indent=2))
         else:
-            print(f"unknown     {rid}")
+            shown_rid = rid if pc.is_plain(rid) else pc.shown(rid, source=pc.SUPPLIED_SOURCE)
+            print(f"unknown     {shown_rid}")
             sys.stderr.write(
                 f"agenttalk check: no thread {rid!r} is visible to {agent} — "
-                f"check the id (`agenttalk threads --for {agent} --all`) and "
+                f"check the id (`{pc.cmd('agenttalk threads --for {n} --all', n=agent)}`) and "
                 f"the root (`agenttalk whoami`).\n"
             )
         return 4
@@ -2537,11 +2576,11 @@ def cmd_check(args: argparse.Namespace) -> int:
             print(json.dumps({"request_id": rid, "state": "superseded",
                               "rescind": rescind}, indent=2))
         else:
-            print(f"superseded  {rid}")
+            print(f"superseded  {pc.meta_text(rid)}")
             print(f"  rescinded by {row.rescinded_by} at {row.rescind_at}  "
                   f"(msg {row.rescind_msg_id})")
             if row.rescind_reason:
-                print(f"  reason: {row.rescind_reason}")
+                print(f"  reason: {pc.line(row.rescind_reason)}")
             print("  do NOT act on this request — a fresh exchange needs a new request_id.")
         return 3
     # Rescind dimension is current. With --epoch, ALSO check the global epoch
@@ -2570,13 +2609,13 @@ def cmd_check(args: argparse.Namespace) -> int:
         epoch_state = epoch_obj["state"] if epoch_obj is not None else "current"
         gates_hold = gate_obj is not None and gate_obj["verdict"] == "HOLD"
         if exit_code == 0:
-            print(f"current     {rid}")
+            print(f"current     {pc.meta_text(rid)}")
         elif epoch_state == "previous-epoch":
-            print(f"previous-epoch  {rid}")
+            print(f"previous-epoch  {pc.meta_text(rid)}")
         elif epoch_state == "unknown-pre-epoch":
-            print(f"pre-epoch   {rid}")
+            print(f"pre-epoch   {pc.meta_text(rid)}")
         else:
-            print(f"hold        {rid}")
+            print(f"hold        {pc.meta_text(rid)}")
         if epoch_state == "previous-epoch":
             print(f"  this request predates the current global epoch "
                   f"({epoch_obj['current_epoch']}) — do NOT act on it; re-ask "
@@ -2660,7 +2699,7 @@ def _comprehension_escalate(
         return 2
     sys.stderr.write(
         f"agenttalk: attended confirmation required for {action}; escalated to "
-        f"{result.recipient} (request {result.request_id})\n"
+        f"{result.recipient} (request {pc.meta_text(result.request_id)})\n"
     )
     return 2
 
@@ -3140,16 +3179,53 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
+    execution_argv = argv
+    if argv[:3] == ["worktree", "remove", "--"]:
+        try:
+            if not argv[3]:
+                raise ValueError("empty worktree path")
+            target = Path(argv[3])
+            absolute = target.is_absolute()
+            if not absolute:
+                target = Path(root).absolute() / target
+            present = _lane_entry_present(target)
+            if not present and not absolute:
+                raise ValueError("missing relative worktree path")
+            if present:
+                rc, toplevel = _git(target, ["rev-parse", "--show-toplevel"])
+                toplevel = toplevel.strip()
+                if (
+                    rc != 0
+                    or not toplevel
+                    or not Path(toplevel).is_absolute()
+                    or not _same_folder(toplevel, str(target))
+                ):
+                    raise ValueError("worktree root could not be verified")
+        except (OSError, ValueError):
+            return 1, "", "could not verify worktree status; the worktree was not removed"
+        if present:
+            clean, index_reason = _worktree_clean_detail(target)
+            if index_reason is None and clean:
+                index_reason = index_safety.check_materialized_submodules(target).reason
+            if index_reason:
+                _print_index_recovery(target, index_reason)
+                return 1, "", f"{index_reason}; the worktree was not removed"
+            if clean is None:
+                return 1, "", "could not verify worktree status; the worktree was not removed"
+            if not clean:
+                return 1, "", "worktree has uncommitted changes or untracked files; the worktree was not removed"
+        # Git gets its own final untracked-file check; callers still submit only the narrow allowed shape.
+        execution_argv = ["-c", "status.showUntrackedFiles=all", *argv[:3], str(target)]
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"
     for key in ("GIT_ASKPASS", "SSH_ASKPASS", "GIT_EDITOR"):
         env.pop(key, None)
-    cmd = ["git", "-c", "core.editor=false", "-C", str(root), *argv]
+    cmd = ["git", "-c", "core.editor=false", "-C", str(root), *execution_argv]
     try:
         proc = subprocess.Popen(  # noqa: S603,S607  # nosec B603 B607
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace", env=env)
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env
+        )
     except OSError as e:
         raise GitWriteError(f"mutating git failed to start: {e}") from e
     try:
@@ -3224,12 +3300,29 @@ def _resolve_revision(root, ref: str) -> tuple[str, str]:
 
 
 def _worktree_clean(root) -> bool | None:
-    """True/False if git could report; None if git is unavailable (caller then
-    relies on the operator's --dirty-artifact / explicit flags)."""
-    rc, out = _git(root, ["status", "--porcelain"])
+    """None only for unavailable status; False also includes index uncertainty."""
+    return _worktree_clean_detail(root)[0]
+
+
+def _worktree_clean_detail(root) -> tuple[bool | None, str | None]:
+    rc, out = _git(root, index_safety.STATUS_ARGS)
     if rc != 0:
-        return None
-    return out.strip() == ""
+        return None, None
+    if out.strip():
+        return False, None
+    result = index_safety.check_hidden_index(root)
+    return result.state == "safe", result.reason
+
+
+def _print_index_recovery(root, reason, *, action=None):
+    if action:
+        sys.stderr.write(
+            f"agenttalk close {action}: WARNING - {reason}; this checkout is not recorded as clean.\n")
+    if reason in {index_safety.HIDDEN, index_safety.UNKNOWN}:
+        sys.stderr.write(index_safety.inspection_guidance(root, uncertain=reason == index_safety.UNKNOWN) + "\n")
+        if action:
+            sys.stderr.write("Close will HOLD without a dirty artifact until these files are inspected "
+                             "and the relevant flags are cleared.\n")
 
 
 def _close_lead_set(store) -> set[str]:
@@ -4102,7 +4195,9 @@ def cmd_close(args: argparse.Namespace) -> int:
         except (OSError, ValueError, TypeError, KeyError) as e:
             sys.stderr.write(f"agenttalk close open: invalid acceptance input: {e}\n")
             return 2
-        clean = True if prepared else _worktree_clean(store.root)
+        clean, index_reason = (True, None) if prepared else _worktree_clean_detail(store.root)
+        if index_reason:
+            _print_index_recovery(store.root, index_reason, action="open")
         if clean is None:  # git could not report; trust the explicit flags
             clean = not bool(args.dirty_artifact) if not args.allow_dirty else False
         opener = _resolve_self(getattr(args, "actor", None), roster=roster)
@@ -4120,7 +4215,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             # A crash before the freeze transaction must leave a HOLD-only close.
             record["schema_version"] = close_mod.ACCEPTANCE_SCHEMA_VERSION
             record["acceptance_route"] = {"pending": True}
-        if not clean and not args.dirty_artifact:
+        if not clean and not args.dirty_artifact and not index_reason:
             sys.stderr.write(
                 "agenttalk close open: WARNING - worktree is dirty and no "
                 "--dirty-artifact was recorded; close check will HOLD on revision "
@@ -4484,7 +4579,9 @@ def cmd_close(args: argparse.Namespace) -> int:
             except close_mod.CloseError as e:
                 sys.stderr.write(f"agenttalk close reopen: {e}\n")
                 return 2
-            wc = _worktree_clean(store.root)
+            wc, index_reason = _worktree_clean_detail(store.root)
+            if index_reason:
+                _print_index_recovery(store.root, index_reason, action="reopen")
             clean = True if wc is None else wc
         try:
             with close_mod.close_transaction(store, args.id) as transaction:
@@ -4567,22 +4664,45 @@ def _git_dir(root) -> str:
 
 
 def _prepare_worktrees_root(store, configured: str | None) -> Path:
-    root = lane_mod.worktrees_root(store, configured)
-    root_c = lane_mod.canonical_host_path(root)
-    repo_c = lane_mod.canonical_host_path(store.root)
-    git_c = lane_mod.canonical_host_path(store.root / ".git")
+    raw = configured if configured else str(store.root / lane_mod.WORKTREE_DEFAULT_DIRNAME)
+    typed = '"' + pc.line(raw) + '"'
+    try:
+        root = lane_mod.worktrees_root(store, configured)
+        resolved = lane_mod.resolve_creation_folder(root)
+        root_c = lane_mod._canonical_token(resolved)
+        repo_c = lane_mod.canonical_host_path_checked(store.root)
+        # .git is an exclusion boundary, and can be a file in a linked checkout.
+        git_c = lane_mod.canonical_host_path_checked(store.root / ".git")
+    except lane_mod.LaneError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise lane_mod.LaneError(
+            f"where the worktrees root {typed} is could not be established ({pc.line(str(exc))}); nothing was created."
+        ) from exc
+    folder, location = pc.line(str(Path(resolved))), pc.line(str(store.root))
     if root_c == repo_c or root_c == git_c or root_c.startswith(git_c + "/"):
-        raise lane_mod.LaneError("worktrees root cannot be the repo root or inside .git")
+        raise lane_mod.LaneError(
+            f"the worktrees root {typed} is the folder {folder}, which is the store folder itself "
+            "or inside its .git folder; nothing was created."
+        )
     if not root_c.startswith(repo_c + "/"):
-        raise lane_mod.LaneError("worktrees root must be inside the locked store root")
+        raise lane_mod.LaneError(
+            f"the worktrees root {typed} is the folder {folder}, which is outside the store folder "
+            f"{location} (the folder that holds .agenttalk); nothing was created. Give a folder inside it; "
+            "a relative path is read from the store folder."
+        )
     marker = root / lane_mod.WORKTREE_MARKER_FILENAME
-    if root.exists():
-        if not marker.exists() and any(root.iterdir()):
-            raise lane_mod.LaneError(
-                "worktrees root exists and is non-empty but lacks the agenttalk marker")
-    else:
-        root.mkdir(parents=True, exist_ok=True)
-    marker.write_text("agenttalk managed worktrees\n", encoding="utf-8")
+    try:
+        if root.exists():
+            if not marker.exists() and any(root.iterdir()):
+                raise lane_mod.LaneError("worktrees root exists and is non-empty but lacks the agenttalk marker")
+        else:
+            root.mkdir(parents=True, exist_ok=True)
+        marker.write_text("agenttalk managed worktrees\n", encoding="utf-8")
+    except lane_mod.LaneError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise lane_mod.LaneError(f"could not prepare the worktrees root {folder} ({pc.line(str(exc))}).") from exc
     return root
 
 
@@ -4623,29 +4743,235 @@ def _lane_assignment_fingerprint(store) -> tuple:
     )
 
 
-def _cleanup_failed_provision(store, *, lane_id: str, base_sha: str,
-                              created_path: Path | None,
-                              cleanup_branch: bool) -> str | None:
-    notes: list[str] = []
+def _cleanup_failed_provision(
+    store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool,
+    add_timed_out: bool = False,
+) -> str | None:
     if created_path is not None:
-        try:
-            rc, _out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
-            if rc != 0:
-                notes.append(f"worktree cleanup failed: {err.strip() or rc}")
-        except GitWriteError as e:
-            notes.append(f"worktree cleanup failed: {e}")
-    if cleanup_branch:
+        created_path = Path(created_path)
+        if not created_path.is_absolute():
+            created_path = Path(store.root).absolute() / created_path
+    branch_steps = [
+        "git -C {repo} rev-parse --verify {branch}",
+        "git -C {repo} branch -D -- {branch}",
+        "git -C {repo} branch -d -- {branch}",
+    ]
+
+    def branch_advice(commands):
+        tip, force_delete, delete = commands[-3:]
+        return (
+            f"run `{tip}`; only if it succeeds and prints exactly {pc.line(base_sha)}, "
+            + f"run `{force_delete}`; otherwise use `{delete}`; "
+            + f"the base commit {pc.line(base_sha)} remains reachable by its id"
+        )
+
+    if add_timed_out:
+        # Killing Git does not establish that a hook stopped or that checkout finished its index.
+        commands, command_note = pc.cmds(
+            [
+                "git -C {repo} worktree list --porcelain",
+                "git -C {repo} worktree unlock -- {folder}",
+                "git -C {folder} status --short --untracked-files=all",
+                "git -C {folder} reset --mixed HEAD",
+                "git -C {folder} checkout-index -a",
+                "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+                "git -C {repo} -c status.showUntrackedFiles=all worktree remove --force -- {folder}",
+                *branch_steps,
+            ],
+            repo=str(store.root), folder=str(created_path), branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
+        )
+        listing, unlock, status, reset, restore, remove, force_remove = commands[:-3]
+        return (
+            "branch kept: setup timed out; a hook or checkout may still be running; automatic folder cleanup "
+            "was skipped; wait until nothing is running in " + pc.line(str(created_path))
+            + f", save or move any work, and check Git's records with `{listing}`; "
+            + "a line beginning with locked in that checkout's record means it is locked; "
+            + f"if Git still lists the checkout as locked once nothing is running, first run `{unlock}`; "
+            + 'if unlock answers "is not locked", go on with the next step; '
+            + "in short status, D in the first column means a staged deletion, "
+            + "D in the second column means a missing tracked file, and ?? means an untracked file; "
+            + f"inspect with `{status}`; if it shows staged deletions of files that are present "
+            + "and you have confirmed this setup left an incomplete index, "
+            + f"run `{reset}` to rebuild only the index (working files are unchanged), then inspect with `{status}` "
+            + "again; a mixed reset does not recreate missing files or save your work; "
+            + 'if reset reports "Unable to create ... index.lock" while status works, '
+            + "a lock file may be left from the stopped setup; only once nothing is running in the folder, "
+            + "remove only that index.lock file named in the error, then repeat the reset; "
+            + f"inspect with `{status}`; if status shows only ' D' lines (missing tracked files), "
+            + f"run `{restore}` and inspect with `{status}` again; it creates only missing tracked files, "
+            + "refuses existing files and leaves untracked files alone; existing-file refusals do not mean "
+            + "missing files were not restored, so check status again; "
+            + "only a successful status command with no output counts as clean; "
+            + "inspect the planned folder directly to confirm whether it is gone; "
+            + f"if the folder is gone or status shows no changes or untracked files, run `{remove}`; "
+            + "if changes or untracked files remain, save anything of yours outside the folder, "
+            + "verify the saved copies contain everything you want to keep, "
+            + f"inspect with `{status}` again, and only after you explicitly confirm all work is saved "
+            + f"and this folder may be deleted, run `{force_remove}`; after removal succeeds, "
+            + f"check `{listing}` again: each worktree line names a folder and each branch line names its branch; "
+            + f"no record may contain {pc.line('branch ' + lane_mod.lane_ref(lane_id))}; "
+            + "only a successful listing can confirm this; "
+            + f"if `{listing}` no longer lists this checkout and no checkout uses the lane branch, "
+            + branch_advice(commands)
+            + (f"; {command_note}" if command_note else "")
+        )
+    notes: list[str] = []
+    ref = lane_mod.lane_ref(lane_id)
+
+    def registrations():
+        rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
+        # NUL framing preserves unusual paths. Incomplete reads cannot establish ownership or absence.
+        if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
+            records = [record.split("\0") for record in listing[:-2].split("\0\0")]
+            if all(record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute() for record in records):
+                return records
+        return None
+
+    worktree_removed = created_path is None
+    removal_succeeded = False
+    checkout_locked = False
+    ownership_uncertain = False
+    branch_elsewhere: list[str] = []
+    if created_path is not None:
+        absent_before_removal = False
+        with contextlib.suppress(OSError):
+            absent_before_removal = not _lane_entry_present(created_path)
+        before = registrations()
+        matches = (
+            None if before is None else [record for record in before if _same_folder(record[0][9:], str(created_path))]
+        )
+        # Only the registration's exact lane branch proves ownership, even when the folder is gone.
+        owned = matches is not None and len(matches) == 1 and f"branch {ref}" in matches[0][1:]
+        if matches is None:
+            ownership_description = "could not read Git's checkout records"
+        elif not matches:
+            ownership_description = "not a registered checkout"
+        else:
+            branches = [field[7:] for record in matches for field in record[1:] if field.startswith("branch ")]
+            ownership_description = (
+                "checkout on " + ", ".join(pc.line(branch) for branch in branches)
+                if branches
+                else "detached checkout"
+                if any("detached" in record[1:] for record in matches)
+                else "registration does not name a branch"
+            )
+        # An absent, unregistered path has no folder to protect; branch users are still checked below.
+        ownership_uncertain = not owned and not (absent_before_removal and matches == [])
+        removal_error = None
+        not_a_worktree = False
+        if owned:
+            try:
+                rc, out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+                removal_succeeded = rc == 0
+                worktree_removed = removal_succeeded
+                if rc != 0:
+                    removal_error = err.strip() or str(rc)
+                    not_a_worktree = not out.strip() and err.strip() in {
+                        f"fatal: '{created_path}' is not a working tree",
+                        f"fatal: '{created_path.as_posix()}' is not a working tree",
+                    }
+            except GitWriteError as e:
+                removal_error = str(e)
+        # Check branch users even when removal succeeded: another checkout can use the same ref.
+        after = registrations()
+        if after is None:
+            worktree_removed = False
+        else:
+            matches = [record for record in after if _same_folder(record[0][9:], str(created_path))]
+            branch_checkouts = [record[0][9:] for record in after if f"branch {ref}" in record[1:]]
+            branch_elsewhere = [path for path in branch_checkouts if not _same_folder(path, str(created_path))]
+            if not worktree_removed:
+                absent_after_removal = False
+                with contextlib.suppress(OSError):
+                    absent_after_removal = not _lane_entry_present(created_path)
+                worktree_removed = absent_after_removal and not matches
+            worktree_removed = worktree_removed and not branch_checkouts and not ownership_uncertain
+            checkout_locked = any(
+                field == "locked" or field.startswith("locked ") for record in matches for field in record[1:]
+            )
+        if removal_error is not None and not (absent_before_removal and worktree_removed and not_a_worktree):
+            notes.append(f"worktree cleanup failed: {pc.line(removal_error)}")
+    elif cleanup_branch:
+        after = registrations()
+        worktree_removed = after is not None
+        if after is not None:
+            branch_elsewhere = [record[0][9:] for record in after if f"branch {ref}" in record[1:]]
+        else:
+            notes.append("branch kept: could not verify Git's checkout records")
+            return "; ".join(notes)
+    if cleanup_branch and ownership_uncertain:
+        notes.append(
+            "branch kept: checkout ownership could not be confirmed at "
+            + pc.line(str(created_path))
+            + f" ({ownership_description})"
+            + ("; nothing is at the planned folder" if absent_before_removal else "; the folder was left in place")
+            + "; inspect Git's checkout records before cleaning it up"
+            + (
+                "; the lane branch is checked out at "
+                + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
+                if branch_elsewhere
+                else ""
+            )
+        )
+    elif cleanup_branch and branch_elsewhere:
+        notes.append(
+            "branch kept: the lane branch is checked out at "
+            + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
+        )
+    elif cleanup_branch and removal_succeeded and after is None:
+        commands, command_note = pc.cmds(
+            ["git -C {repo} worktree list --porcelain", *branch_steps],
+            repo=str(store.root), branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
+        )
+        notes.append(
+            "branch kept: the worktree was removed; could not read Git's checkout records; "
+            + f"check `{commands[0]}` for users of {pc.line(lane_mod.lane_branch(lane_id))}; "
+            + "only if that listing succeeds and no checkout uses the lane branch, "
+            + branch_advice(commands)
+            + (f"; {command_note}" if command_note else "")
+        )
+    elif cleanup_branch and not worktree_removed:
+        steps = [
+            "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+            *branch_steps,
+        ]
+        if checkout_locked:
+            steps.insert(0, "git -C {repo} worktree unlock -- {folder}")
+        commands, command_note = pc.cmds(
+            steps,
+            repo=str(store.root),
+            folder=str(created_path),
+            branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+            source="comes from this failed lane setup",
+        )
+        unlock_note = (
+            f"Git still has a locked record of this checkout; run `{commands[0]}` first, then "
+            if checkout_locked
+            else ""
+        )
+        notes.append(
+            "branch kept: the worktree was not removed; "
+            + unlock_note
+            + f"save or move any work in {pc.line(str(created_path))}, then run `{commands[-4]}`; "
+            + "only after removal succeeds, " + branch_advice(commands)
+            + " (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
+        )
+    elif cleanup_branch:
         ref = lane_mod.lane_ref(lane_id)
         rc, out = _git(store.root, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
         tip = out.strip()
         if rc == 0:
             if tip == base_sha:
                 try:
-                    rc2, _out, err = _git_write(store.root, ["update-ref", "-d", ref])
+                    # Git refuses deletion if a checkout appeared after our registration snapshot.
+                    rc2, _out, err = _git_write(store.root, ["branch", "-D", "--", lane_mod.lane_branch(lane_id)])
                     if rc2 != 0:
-                        notes.append(f"branch cleanup failed: {err.strip() or rc2}")
+                        notes.append(f"branch kept: Git refused branch cleanup: {pc.line(err.strip() or str(rc2))}")
                 except GitWriteError as e:
-                    notes.append(f"branch cleanup failed: {e}")
+                    notes.append(f"branch kept: Git refused branch cleanup: {pc.line(str(e))}")
             else:
                 notes.append("branch cleanup skipped: lane branch tip changed after failed provision")
     return "; ".join(notes) if notes else None
@@ -6033,6 +6359,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         casefold = dom.default_casefold_paths()
         created_path: Path | None = None
         cleanup_branch = False
+        add_timed_out = False
         provision_error: str | None = None
         try:
             with store._config_lock():
@@ -6109,9 +6436,13 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     if not lane_mod._FULL_SHA_RE.match(base):
                         raise lane_mod.LaneError("resolved worktree base is not a full 40-char SHA")
                     cleanup_branch = True
-                    rc, _out, err = _git_write(
-                        store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
                     created_path = wt_path
+                    try:
+                        rc, _out, err = _git_write(
+                            store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
+                    except GitWriteError as e:
+                        add_timed_out = isinstance(e.__cause__, subprocess.TimeoutExpired)
+                        raise
                     if rc != 0:
                         raise lane_mod.LaneError(f"git worktree add failed rc={rc}: {err.strip()}")
                     worktree = {
@@ -6157,7 +6488,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         if provision_error:
             cleanup_note = _cleanup_failed_provision(
                 store, lane_id=lane_id, base_sha=base,
-                created_path=created_path, cleanup_branch=cleanup_branch)
+                created_path=created_path, cleanup_branch=cleanup_branch, add_timed_out=add_timed_out)
             if cleanup_note:
                 sys.stderr.write(f"agenttalk lane assign: cleanup note: {cleanup_note}\n")
             sys.stderr.write(f"agenttalk lane assign: {provision_error}\n")
@@ -7474,7 +7805,8 @@ def _kn_print_note(note: dict, verdict: dict) -> None:
     body0 = (note.get("body", "") or "").splitlines()
     print(f"  [{note.get('type')}] {note.get('domain_id')}/{note.get('key')} ({tag}){flags}")
     print(f"      {(body0[0] if body0 else '')[:200]}")
-    print(f"      -> {a.get('kind')}:{a.get('path') or a.get('request_id') or a.get('sha') or a.get('wp_id') or ''}")
+    ref = a.get("path") or a.get("request_id") or a.get("sha") or a.get("wp_id") or ""
+    print(f"      -> {a.get('kind')}:{pc.line(str(ref))}")
 
 
 def _kn_pack_registry(store):
@@ -7684,8 +8016,8 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
         scope_hint = (
             f" (--scope {scope} labels the lesson; it does not choose the domain)"
             if scope and scope != domain_id else "")
-        print(f"stored in domain {domain_id}{scope_hint}. To verify it: agenttalk "
-              f"knowledge curate verify --domain {domain_id} --key {args.key}")
+        print(f"stored in domain {domain_id}{scope_hint}. To verify it: "
+              + pc.cmd("agenttalk knowledge curate verify --domain {d} --key {k}", d=domain_id, k=args.key))
         return 0
 
     if action == "curate":
@@ -7946,7 +8278,7 @@ def _onboarding_print_run(run: dict, *, detail: bool = False) -> None:
     counts = run.get("counts") or {}
     state = run.get("state") or "unknown"
     title = run.get("title") or run.get("id") or "onboarding"
-    print(f"{run.get('id')}: {title} [{state}]")
+    print(f"{pc.meta_text(run.get('id'))}: {pc.line(str(title))} [{state}]")
     if run.get("objective"):
         print(f"  objective: {run.get('objective')}")
     if run.get("base_ref"):
@@ -7983,7 +8315,10 @@ def _onboarding_print_run(run: dict, *, detail: bool = False) -> None:
             if row.get("blocking"):
                 extras.append("blocking")
             suffix = f" ({', '.join(extras)})" if extras else ""
-            print(f"    - {row.get('key')} [{row.get('status')}]{suffix}: {row.get('summary')}")
+            print(
+                f"    - {pc.line(str(row.get('key')))} [{row.get('status')}]{suffix}: "
+                f"{pc.line(str(row.get('summary')))}"
+            )
 
 
 def cmd_onboarding(args: argparse.Namespace) -> int:
@@ -8146,7 +8481,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     verb = "would move" if args.dry_run else "moved"
     if not args.quiet:
         for r in records:
-            print(f"  {r['id']}  {verb} -> {r['to']}   ({r['reason']})")
+            print(f"  {pc.meta_text(r['id'])}  {verb} -> {r['to']}   ({pc.line(str(r['reason']))})")
     print(f"({len(records)} file(s) {verb}; quarantine is recoverable — "
           f"restore by moving the file back into messages/)")
     return 0
@@ -8207,6 +8542,9 @@ def cmd_escalate(args: argparse.Namespace) -> int:
     # the lead ..." notice - that notice must never appear ahead of a bad
     # work_item/stage that goes on to refuse the whole send.
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("escalate", "question", meta, args.meta)
+    if refused is not None:
+        return refused
     meta["needs_operator"] = "true"  # force-set: the bucket discriminator
     from agenttalk import work_tags
     try:
@@ -8327,7 +8665,7 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         _after_durable_write(True, None, fallback_notice)
         if not args.quiet:
             print(f"(escalation operation already recorded: id={existing.id})")
-        print(f"request_id={(existing.meta or {}).get('request_id', meta['request_id'])}")
+        print(f"request_id={pc.meta_text((existing.meta or {}).get('request_id', meta['request_id']))}")
         return 0
     try:
         if operation_nonce is not None:
@@ -8358,14 +8696,14 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         _after_durable_write(True, None, fallback_notice)
         if not args.quiet:
             print(f"(escalation operation already recorded: id={msg.id})")
-        print(f"request_id={(msg.meta or {}).get('request_id', meta['request_id'])}")
+        print(f"request_id={pc.meta_text((msg.meta or {}).get('request_id', meta['request_id']))}")
         return 0
     rid = _after_durable_write(True, meta["request_id"], fallback_notice)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: ESCALATE  {sender} -> {target}"))
     # Always print the machine-parseable correlation line: the caller's
     # next move is `agenttalk wait --to-request <this>`.
-    print(f"request_id={rid}")
+    print(f"request_id={pc.meta_text(rid)}")
     return 0
 
 
@@ -8725,7 +9063,7 @@ def _print_attention(rows: list[dict], summary: dict, for_agent: str | None,
     for it in rows:
         prio = it.get("priority", "unknown")
         title = it.get("title") or it.get("decision") or it["item_id"]
-        line = f"  [{prio:<6}] {it['source']:<15} {title}"
+        line = f"  [{prio:<6}] {it['source']:<15} {pc.line(str(title))}"
         if it.get("state") != "active":
             line += f"  ({it['state']})"
         dups = len(it.get("duplicates", []))
@@ -8915,7 +9253,7 @@ def _relay_operator_answer(store, sender: str, roster: list, args) -> int:
     target = msg.recipient                           # back to the asking lead-loop / agent
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: RELAY operator-answer  {sender} -> {target}"))
-    print(f"request_id={rid}")
+    print(f"request_id={pc.meta_text(rid)}")
     return 0
 
 
@@ -9002,7 +9340,7 @@ def _relay_operator_command(store, sender: str, roster: list, args) -> int:
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: RELAY operator-command  {sender} -> {target}"))
     if meta.get("request_id"):
-        print(f"request_id={meta['request_id']}")
+        print(f"request_id={pc.meta_text(meta['request_id'])}")
     return 0
 
 
@@ -9055,7 +9393,7 @@ def _relay_waiting(store, sender: str, args) -> int:
         return 0
     for o in obligations:
         extra = f" ({lead_relay.UNRESOLVED_TEXT})" if o.state == lead_relay.UNRESOLVED else ""
-        print(f"  {o.request_id}: {o.state}{extra}; lead {o.lead}; since {o.since}")
+        print(f"  {pc.meta_text(o.request_id)}: {o.state}{extra}; lead {o.lead}; since {o.since}")
     return 0
 
 
@@ -9133,6 +9471,9 @@ def cmd_propose(args: argparse.Namespace) -> int:
         )
         return 2
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("propose", "proposal", meta, args.meta)
+    if refused is not None:
+        return refused
     if args.in_reply_to:
         meta.setdefault("in_reply_to", args.in_reply_to)
     refused = _refuse_bad_work_tags("propose", "proposal", meta)
@@ -9153,7 +9494,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
     if args.print_id:
         # Print the correlation id (the "proposal id"), not the message
         # id — that's the token a counter references via --in-reply-to.
-        print(msg.meta.get("request_id", msg.id))
+        print(pc.meta_text(msg.meta.get("request_id", msg.id)))
     return 0
 
 
@@ -9274,6 +9615,9 @@ def cmd_task(args: argparse.Namespace) -> int:
             "stdin) — a work order needs actual instructions.\n")
         return 2
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("task", "task", meta, args.meta)
+    if refused is not None:
+        return refused
     from agenttalk import work_tags
     try:
         meta = work_tags.task_metadata(meta, args)
@@ -9349,7 +9693,7 @@ def cmd_task(args: argparse.Namespace) -> int:
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: TASK  {msg.sender} -> {msg.recipient}"))
     if args.print_id:
-        print(msg.meta.get("request_id", msg.id))
+        print(pc.meta_text(msg.meta.get("request_id", msg.id)))
     return 0
 
 
@@ -9432,7 +9776,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         if not copies:
             sys.stderr.write(
                 f"agenttalk broadcast: no broadcast {resume!r} is visible - "
-                f"check the id (`agenttalk threads --for {sender}`).\n")
+                f"check the id (`{pc.cmd('agenttalk threads --for {n}', n=sender)}`).\n")
             return 2
         proto = copies[0]
         if proto.sender != sender:
@@ -9618,6 +9962,14 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # reject a conflicting pair.
     supplied_bid = meta_base.pop("broadcast_id", None)
     supplied_rid = meta_base.pop("request_id", None)
+    for _what, _key, _supplied in (
+        ("broadcast id", "broadcast_id", supplied_bid), ("request id", "request_id", supplied_rid)
+    ):
+        for _raw in _raw_meta_values(args.meta, _key) or ([_supplied] if _supplied is not None else []):
+            _refusal = pc.new_id_refusal("broadcast", _raw, _what)
+            if _refusal is not None:
+                sys.stderr.write(_refusal + "\n")
+                return 2
     if supplied_bid and supplied_rid and supplied_bid != supplied_rid:
         sys.stderr.write(
             "agenttalk broadcast: --meta request_id and --meta broadcast_id "
@@ -9718,9 +10070,9 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 f"agenttalk broadcast: PARTIAL fan-out — copy for "
                 f"{missed[0]!r} failed: {failure}\n"
-                f"  Recover with `agenttalk broadcast --from {sender} "
-                f"--resume {bid}` (re-sends the missing frozen copies), or "
-                f"rescind the thread (`agenttalk rescind --to-request {bid}`).\n"
+                f"  Recover with `{pc.cmd('agenttalk broadcast --from {n} --resume {r}', n=sender, r=bid)}` "
+                "(re-sends the missing frozen copies), or "
+                f"rescind the thread (`{pc.cmd('agenttalk rescind --to-request {r}', r=bid)}`).\n"
             )
         else:
             # Zero copies landed: there is nothing on disk to resume or
@@ -9987,7 +10339,7 @@ def cmd_roster(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 f"agenttalk roster remove: removing {args.name!r} breaks "
                 f"historical readability for its messages. Use "
-                f"`agenttalk roster retire {args.name}` to keep history valid "
+                f"`{pc.cmd('agenttalk roster retire {n}', n=args.name)}` to keep history valid "
                 f"(recommended), or pass --force to remove anyway.\n")
             return 2
         store.remove_agent(args.name)
@@ -10017,8 +10369,8 @@ def cmd_roster(args: argparse.Namespace) -> int:
                     f"{len(owed)} open thread(s) owed to/from it:\n")
                 for r in owed:
                     sys.stderr.write(
-                        f"  {r.get('request_id')}  {r.get('state')}  "
-                        f"(peer {r.get('peer')})\n")
+                        f"  {pc.meta_text(r.get('request_id'))}  {r.get('state')}  "
+                        f"(peer {pc.line(str(r.get('peer')))})\n")
                 sys.stderr.write(
                     "drain them, or omit --drain-check to rename anyway.\n")
                 return 2
@@ -10034,7 +10386,7 @@ def cmd_roster(args: argparse.Namespace) -> int:
             args.name, args.to, args.to_request,
             from_agent=getattr(args, "from_agent", None),
             reason=getattr(args, "reason", None))
-        print(f"roster: forwarded {args.name}'s request {args.to_request} "
+        print(f"roster: forwarded {args.name}'s request {pc.meta_text(args.to_request)} "
               f"to {args.to} (sender {msg.sender}; note {msg.id}).")
         return 0
     if action == "set-model-vendor":
@@ -10368,7 +10720,7 @@ def _do_recv(
         # inspection) and when --ack already consumed.
         sys.stderr.write(
             f"hint: recv only peeks — cursor[{agent}] did NOT move. "
-            f"Use `agenttalk drain --for {agent}` (or `recv --ack`) to "
+            f"Use `{pc.cmd('agenttalk drain --for {n}', n=agent)}` (or `recv --ack`) to "
             f"consume + advance.\n"
         )
     return 0
@@ -10521,8 +10873,7 @@ def _wait_was_superseded(store: Store, agent: str, wait_token: str) -> bool:
 def _print_wait_superseded(agent: str, *, rid: str | None) -> None:
     if rid:
         sys.stderr.write(
-            f"(superseded: wait on thread {rid} for {agent} "
-            "was replaced by a newer waiter)\n"
+            f"(superseded: wait on thread {pc.meta_text(rid)} for {agent} was replaced by a newer waiter)\n"
         )
     else:
         sys.stderr.write(
@@ -10570,7 +10921,7 @@ def _clamp_sleep(desired: float, now: float, deadline: float | None,
 
 def _print_rescinded(store: Store, rid: str, row) -> None:
     """Render the RESCINDED wake: banner + the deciding rescind message."""
-    print(f"AGENTTALK :: RESCINDED (thread {rid}) — do not act on this request")
+    print(f"AGENTTALK :: RESCINDED (thread {pc.meta_text(rid)}) — do not act on this request")
     deciding = next(
         (m for m in store.valid_messages() if m.id == row.rescind_msg_id), None,
     )
@@ -10581,7 +10932,7 @@ def _print_rescinded(store: Store, rid: str, row) -> None:
         print(f"  rescinded by {row.rescinded_by} at {row.rescind_at} "
               f"(msg {row.rescind_msg_id})")
         if row.rescind_reason:
-            print(f"  reason: {row.rescind_reason}")
+            print(f"  reason: {pc.line(row.rescind_reason)}")
 
 
 def _print_requester_terminal(terminal: dict) -> int:
@@ -10737,16 +11088,25 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace, wait_token:
                 match = m
                 break
             if match is not None:
-                print(render(match, header=f"AGENTTALK :: RECEIVED (thread {rid})  "
-                                           f"{match.sender} -> {match.recipient}"))
+                print(
+                    render(
+                        match,
+                        header=(
+                            f"AGENTTALK :: RECEIVED (thread {pc.meta_text(rid)})  "
+                            f"{match.sender} -> {match.recipient}"
+                        ),
+                    )
+                )
                 store.mark_thread_seen(agent, rid, match.id)  # thread pointer only
                 return 0
             if deadline is not None and time.time() >= deadline:
                 if grace_used or grace <= 0:
                     if not args.quiet:
                         suffix = f" + {total_extended:.0f}s extended" if total_extended else ""
-                        print(f"(timeout: no new messages on thread {rid} for "
-                              f"{agent} in {args.timeout}s{suffix})")
+                        print(
+                            f"(timeout: no new messages on thread {pc.meta_text(rid)} "
+                            f"for {agent} in {args.timeout}s{suffix})"
+                        )
                     return 1
                 grace_used = True
                 time.sleep(grace)
@@ -11012,10 +11372,12 @@ def cmd_ack(args: argparse.Namespace) -> int:
         seen = matches[-1].id if matches else None
         store.close_thread(agent, rid, seen_msg_id=seen, reason="manual")
         if matches:
-            print(f"thread[{agent}:{rid}] closed")
+            print(f"thread[{agent}:{pc.meta_text(rid)}] closed")
         else:
-            print(f"thread[{agent}:{rid}] closed (note: no messages found for "
-                  f"request_id {rid} — recorded closure anyway)")
+            print(
+                f"thread[{agent}:{pc.meta_text(rid)}] closed (note: no messages found for "
+                f"request_id {pc.meta_text(rid)} — recorded closure anyway)"
+            )
         return 0
     if args.id:
         store.advance_cursor(agent, args.id)
@@ -11069,14 +11431,16 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     def _hint(t) -> str:
         if t.needs_operator and t.operator_state == "pending" and t.state == "owed-inbound":
-            return (f"agenttalk reply --to-request {t.request_id}   "
-                    f"# OPERATOR INPUT NEEDED — ask your human, then relay")
+            return (pc.cmd("agenttalk reply --to-request {r}", r=t.request_id, lookup=_THREAD_LOOKUP)
+                    + "   # OPERATOR INPUT NEEDED — ask your human, then relay")
         if t.state == "reply-waiting":
-            return f"agenttalk drain --for {agent}   # a reply landed — read it first"
+            return pc.cmd("agenttalk drain --for {n}", n=agent) + "   # a reply landed — read it first"
         if t.state == "owed-inbound":
-            return f"agenttalk reply --to-request {t.request_id}   # you owe a response"
+            return (pc.cmd("agenttalk reply --to-request {r}", r=t.request_id, lookup=_THREAD_LOOKUP)
+                    + "   # you owe a response")
         if t.state == "open-outbound":
-            return f"agenttalk wait --to-request {t.request_id}    # awaiting {t.peer}"
+            return (pc.cmd("agenttalk wait --to-request {r}", r=t.request_id, lookup=_THREAD_LOOKUP)
+                    + f"    # awaiting {pc.line(t.peer)}")
         return ""
 
     thread_payload = []
@@ -11179,15 +11543,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"RESCINDED ({len(rescinded)} — do NOT act on these):")
         for d in rescinded:
             r = d.get("rescind") or {}
-            reason = f' — "{r.get("reason")}"' if r.get("reason") else ""
-            print(f"  {d['request_id']}  {d['opener_kind']}  rescinded by "
+            reason = f' — "{pc.line(r.get("reason"))}"' if r.get("reason") else ""
+            print(f"  {pc.meta_text(d['request_id'])}  {d['opener_kind']}  rescinded by "
                   f"{r.get('by')}{reason}")
     if agent == liaison and escalations:
         print(f"OPERATOR INPUT NEEDED ({len(escalations)} pending):")
         for d in escalations:
             age = _format_age(d["age_seconds"]) if d["age_seconds"] is not None else "?"
-            subj = f' "{d["subject"]}"' if d["subject"] else ""
-            print(f"  {d['request_id']}  from {d['peer']}  age={age}{subj}")
+            subj = f' "{pc.line(d["subject"])}"' if d["subject"] else ""
+            print(f"  {pc.meta_text(d['request_id'])}  from {pc.line(d['peer'])}  age={age}{subj}")
             print(f"      -> {d['hint']}")
     if lesson_warnings:
         for warning in lesson_warnings:
@@ -11204,9 +11568,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
             if d["last_decision"]:
                 ld = d["last_decision"]
                 dec = f"  last={ld['kind']}={ld.get('status') or '?'}"
-            subj = f' "{d["subject"]}"' if d["subject"] else ""
-            print(f"  [{d['state']}] {d['request_id']}  {d['opener_kind']}  "
-                  f"peer={d['peer']}  owe={d['owe']}  age={age}{subj}{dec}")
+            subj = f' "{pc.line(d["subject"])}"' if d["subject"] else ""
+            print(f"  [{d['state']}] {pc.meta_text(d['request_id'])}  {d['opener_kind']}  "
+                  f"peer={pc.line(d['peer'])}  owe={d['owe']}  age={age}{subj}{dec}")
             print(f"      -> {d['hint']}")
     else:
         print("  (no actionable threads — you're caught up)")
@@ -11214,9 +11578,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"unread FYI (not owed work; {len(fyi)} recent):")
         for f in fyi:
             tag = "broadcast " if f["broadcast"] else ""
-            subj = f' "{f["subject"]}"' if f["subject"] else ""
+            subj = f' "{pc.line(f["subject"])}"' if f["subject"] else ""
             print(f"  {f['id']}  {tag}{f['kind']} from {f['from']}{subj}")
-        print(f"  (consume with `agenttalk drain --for {agent}`)")
+        print(f"  (consume with `{pc.cmd('agenttalk drain --for {n}', n=agent)}`)")
     return 0
 
 
@@ -11640,7 +12004,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
     print(f"  manifest:   {result.manifest_path}")
     print(f"  hash:       {result.manifest_hash}")
     print(f"  files:      {result.file_count} ({result.total_bytes} bytes)")
-    print(f"  mode:       {'hardlink' if result.hardlink_used else 'copy (no hardlink support)'}")
+    print(f"  mode:       {recovery_mod.mode_summary(result)}")
     print(f"  sequence:   {result.sequence_at_snapshot}")
     print(f"  fence:      {result.fence_seconds:.3f}s")
     return 0
@@ -12120,7 +12484,7 @@ def _resolve_reply_anchor(
             if m.id == to_id:
                 return m, None
         return None, (
-            f"--to-id {to_id} not found: no validated message with that id "
+            f"--to-id {pc.meta_text(to_id)} not found: no validated message with that id "
             f"is addressed to {sender}."
         )
     if to_request:
@@ -12132,7 +12496,7 @@ def _resolve_reply_anchor(
         if matches:
             return matches[-1], None
         return None, (
-            f"--to-request {to_request}: no validated message addressed to "
+            f"--to-request {pc.meta_text(to_request)}: no validated message addressed to "
             f"{sender} carries that request_id."
         )
     last = store.last_received_for(sender)
@@ -12239,6 +12603,9 @@ def cmd_reply(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk reply: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
             return 2
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("reply", kind, meta, args.meta)
+    if refused is not None:
+        return refused
     if na:
         meta["response"] = "not-applicable"  # the display discriminator
     # Correlation echo lives in reply_transport so the wrapper's draft
@@ -12285,9 +12652,8 @@ def cmd_reply(args: argparse.Namespace) -> int:
         # wrong request_id when multiple threads are open. The reply routes
         # to the ANCHOR's sender, which for a broadcast is the thread
         # originator (who may not be the agent that needs the answer).
-        rid = meta.get("request_id", "(none)")
-        print(f"(dry-run) reply {sender} -> {anchor.sender}  thread={rid}  "
-              f"kind={kind}; nothing sent.")
+        rid = pc.meta_text(meta["request_id"]) if "request_id" in meta else "(none)"
+        print(f"(dry-run) reply {sender} -> {anchor.sender}  thread={rid}  kind={kind}; nothing sent.")
         return 0
     gate_mod.validate_response_status(kind, meta)
     gate_mod.validate_review_result_evidence(kind, meta)
@@ -12391,13 +12757,13 @@ def cmd_tail(args: argparse.Namespace) -> int:
                     # Valid shape but failed roster/kind check — surface
                     # as a warning, never render the body.
                     sys.stderr.write(
-                        f"AGENTTALK :: TAIL INVALID  id={m.id}  reason={e}\n"
+                        f"AGENTTALK :: TAIL INVALID  id={pc.meta_text(m.id)}  reason={pc.line(str(e))}\n"
                     )
                     continue
                 if require_sig:
                     if sig_key is None:
                         sys.stderr.write(
-                            f"AGENTTALK :: TAIL INVALID  id={m.id}  "
+                            f"AGENTTALK :: TAIL INVALID  id={pc.meta_text(m.id)}  "
                             f"reason=signatures enforced but no key file loadable\n"
                         )
                         continue
@@ -12407,7 +12773,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
                         )
                     except ValueError as e:
                         sys.stderr.write(
-                            f"AGENTTALK :: TAIL INVALID  id={m.id}  reason={e}\n"
+                            f"AGENTTALK :: TAIL INVALID  id={pc.meta_text(m.id)}  reason={pc.line(str(e))}\n"
                         )
                         continue
                 print(render(m, header=f"AGENTTALK :: TAIL  {m.sender} -> {m.recipient}"))
@@ -12417,7 +12783,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
                     continue
                 seen.add(mid)
                 sys.stderr.write(
-                    f"AGENTTALK :: TAIL INVALID  id={mid}  reason={reason}\n"
+                    f"AGENTTALK :: TAIL INVALID  id={pc.meta_text(mid)}  reason={pc.line(str(reason))}\n"
                 )
             if deadline is not None and time.time() >= deadline:
                 return 0
@@ -13005,9 +13371,11 @@ def cmd_session_fresh(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk session fresh: a request for {agent!r} is already "
                          "pending; the wrapper has not applied it yet (see `agenttalk status`)\n")
         return 1
-    print(f"session fresh: queued a fresh start for {agent!r} [{rid}]; its wrapper applies it "
-          "between turns (a turn that is running finishes first). The old conversation is "
-          "not resumed afterwards.")
+    print(
+        f"session fresh: queued a fresh start for {agent!r} [{pc.meta_text(rid)}]; its wrapper applies it "
+        "between turns (a turn that is running finishes first). The old conversation is "
+        "not resumed afterwards."
+    )
     return 0
 
 
@@ -13073,7 +13441,7 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
     store.write_restart_request(agent, marker)
     if clear_budget:
         print(
-            f"request-restart: queued restart-budget clear for {agent!r} [{rid}]; "
+            f"request-restart: queued restart-budget clear for {agent!r} [{pc.meta_text(rid)}]; "
             "the supervisor re-arms the budget when it assesses the request and "
             "does not restart the seat for it."
         )
@@ -13092,14 +13460,14 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
         blocked = False
     if blocked:
         print(
-            f"request-restart: recorded request for {agent!r} [{rid}]{extra}, "
+            f"request-restart: recorded request for {agent!r} [{pc.meta_text(rid)}]{extra}, "
             "but automatic recovery is currently refused by a process-tree "
             "HOLD. This request is blocked, not pending progress; see "
             "`agenttalk attention`."
         )
     else:
         print(
-            f"request-restart: queued request for {agent!r} [{rid}]{extra} "
+            f"request-restart: queued request for {agent!r} [{pc.meta_text(rid)}]{extra} "
             "for supervisor assessment; recording the request does not establish "
             "that relaunch is currently admissible."
         )
@@ -13168,8 +13536,10 @@ def cmd_request_launch(args: argparse.Namespace) -> int:
     except ValueError as e:
         sys.stderr.write(f"agenttalk request-launch: {e}\n")
         return 2
-    print(f"request-launch: queued ephemeral review [{rid}] for {revision[:12]} "
-          f"(profile={args.profile}, skill={args.skill})")
+    print(
+        f"request-launch: queued ephemeral review [{pc.meta_text(rid)}] for {revision[:12]} "
+        f"(profile={args.profile}, skill={args.skill})"
+    )
     return 0
 
 
@@ -13194,7 +13564,7 @@ def _usage_limit_notice_body(info: dict) -> str:
         state = (f"its Claude {window} allowance is used up and no usable reset time was stated. "
                  "It tries once more each time it is started again.")
     return (
-        f"[usage-limit-parked] {head}Seat {ag} is parked: {state} Message {mid} from "
+        f"[usage-limit-parked] {head}Seat {ag} is parked: {state} Message {pc.meta_text(mid)} from "
         f"{info.get('from')} was NOT lost and was NOT dead-lettered. " + usage_park.recovery_text(ag, mid)
     )
 
@@ -13213,7 +13583,8 @@ def _provider_wait_notice_body(info: dict, facts: dict, kind: str) -> str:
     # Only the saved next try: the wait after it depends on the step, so no schedule is attached to it.
     first = f"at {when}" if when else "shortly"
     return (
-        f"[provider-wait-parked] Seat {ag} is waiting: {cause}. Message {mid} from {info.get('from')} was NOT "
+        f"[provider-wait-parked] Seat {ag} is waiting: {cause}. Message {pc.meta_text(mid)} from "
+        f"{info.get('from')} was NOT "
         f"lost and was NOT dead-lettered. It tries again {first}. "
         + usage_park.recovery_text(ag, mid, kind)
     )
@@ -13287,12 +13658,12 @@ def _dead_letter_notifier(store, agent: str):
             if info.get("failure_class") == "config_blocked":
                 summary = str(info.get("summary") or "deterministic exec/permission denial")
                 body = (
-                    f"[wrapper-config-blocked] agent {ag} is PARKED on message {mid} "
+                    f"[wrapper-config-blocked] agent {ag} is PARKED on message {pc.meta_text(mid)} "
                     f"from {info.get('from')} (kind={info.get('kind')}, "
                     f"attempts={info.get('attempts')}). Cursor is unchanged; the message "
                     "was NOT committed or disposed. "
-                    f"Command/error/remediation: {summary}. After repairing the child "
-                    f"bus invocation/config, run: agenttalk request-restart --for {ag}"
+                    f"Command/error/remediation: {pc.line(summary)}. After repairing the child "
+                    f"bus invocation/config, run: {pc.cmd('agenttalk request-restart --for {n}', n=ag)}"
                 )
                 store.send(sender=agent, recipient=target, kind="question",
                            subject="wrapper config-blocked", body=body,
@@ -13319,13 +13690,15 @@ def _dead_letter_notifier(store, agent: str):
             # #202 D3 (review finding 9): carry the REAL reason/remedy, not only the
             # class - e.g. the interruption-budget escalation's concrete remedy.
             reason = str(info.get("summary") or "")
-            body = (f"[dead-letter] agent {ag} {verb} message {mid} from "
+            body = (f"[dead-letter] agent {ag} {verb} message {pc.meta_text(mid)} from "
                     f"{info.get('from')} (kind={info.get('kind')}, "
                     f"attempts={info.get('attempts')}, class={info.get('failure_class')}). "
-                    + (f"Reason: {reason}  " if reason else "")
-                    + f"Inspect: agenttalk dead-letter show --agent {ag} --id {mid}")
+                    + (f"Reason: {pc.line(reason)}  " if reason else "")
+                    + "Inspect: " + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=ag, i=mid))
             if disposed:
-                body += f"  Requeue: agenttalk dead-letter requeue --agent {ag} --id {mid}"
+                body += ("  If it still makes sense to send it again (the requeue command refuses, and says why, "
+                         "when the message cannot be retried): "
+                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid))
             store.send(sender=agent, recipient=target, kind="question",
                        subject="dead-letter notice", body=body,
                        meta={"needs_operator": "true", "dead_letter": "true",
@@ -13367,8 +13740,8 @@ def _cadence_health_notifier(store, agent: str):
             body = (f"[controller-health] lead-loop controller {agent} cadence sweep has "
                     f"FAILED {fails} consecutive times ({reason}). This is a CONTROLLER "
                     f"health problem, not a poisoned message. Inspect: agenttalk doctor / "
-                    f"agenttalk status --json; consider agenttalk request-restart "
-                    f"--for {agent} if it does not recover.")
+                    f"agenttalk status --json; consider {pc.cmd('agenttalk request-restart --for {n}', n=agent)} "
+                    "if it does not recover.")
             store.send(sender=agent, recipient=target, kind="question",
                        subject="cadence controller-health notice", body=body,
                        meta={"needs_operator": "true", "cadence_health": "true",
@@ -13401,7 +13774,7 @@ def _launch_config_blocked_notifier(store, agent: str):
             # the agent, so without one it would do nothing.
             if _supervisor_running(store):
                 next_step = ("After repairing the launch config, run: "
-                             f"agenttalk request-restart --for {agent}")
+                             + pc.cmd("agenttalk request-restart --for {n}", n=agent))
             else:
                 next_step = (
                     "No supervisor is running, so agenttalk request-restart would "
@@ -13813,7 +14186,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         if not store.is_managed_lead_loop(agent):
             sys.stderr.write(
                 f"agenttalk wrap --lead-loop: {agent!r} is not a configured managed "
-                f"lead-loop identity (run `agenttalk managed-lead-loop set {agent}`)\n")
+                f"lead-loop identity (run `{pc.cmd('agenttalk managed-lead-loop set {n}', n=agent)}`)\n")
             return _wrapper_exit(2, "managed_lead_loop_not_configured")
         timing = lead_loop_runtime.resolve_timing(
             store, agent, supervisor_config=supervisor_config)
@@ -14009,6 +14382,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     cadence_hook = None
     if lead_loop and not one_shot_request_id:
         from . import lead_loop_cadence as _cad
+        cadence_refusals: list[str] = []  # why the last cadence turn was refused, for the controller's notice (#714)
         cadence_drive = wrapper_run.make_cadence_drive(
             store, agent, cli, state, base_argv, sender=sender,
             min_interval=min_interval, render=render, heartbeat=heartbeat,
@@ -14018,7 +14392,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             work_heartbeat=work_heartbeat,
             lifecycle_log=lifecycle_log,
             lease_lost_exceptions=(_LeadLoopLeaseLost,),
-            wrapper_generation=wrapper_generation, health_writer=health_writer)
+            wrapper_generation=wrapper_generation, health_writer=health_writer,
+            on_refused=cadence_refusals.append)
         cadence_health = _cadence_health_notifier(store, agent)
 
         def _cadence() -> "wloop.CadenceResult":
@@ -14033,13 +14408,13 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             # raise propagates out (run_loop -> _wrap_loop_mode handles lease-loss exit).
             _renew_or_lost()
 
-            def _fail() -> "wloop.CadenceResult":
+            def _fail(reason: str = "snapshot/sweep failure") -> "wloop.CadenceResult":
                 new, esc = _cad.apply_tick_failure(
                     cstate, now_epoch=now_epoch,
                     base=LEAD_LOOP_CADENCE_FAIL_BACKOFF_BASE,
                     max_backoff=LEAD_LOOP_CADENCE_FAIL_BACKOFF_MAX,
                     health_threshold=LEAD_LOOP_CADENCE_HEALTH_THRESHOLD)
-                if esc and cadence_health(new["cadence_fails"], "snapshot/sweep failure"):
+                if esc and cadence_health(new["cadence_fails"], reason):
                     # latch the controller-health escalation ONLY after it ROUTED. An
                     # unrouted notice (no operator-facing / sole-lead target) leaves
                     # health_escalated False so the NEXT failure RETRIES it - never
@@ -14080,6 +14455,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     cstate, now_epoch=now_epoch, reminded_keys=[], escalation_keys=[]))
                 _note_sweep()
                 return wloop.CadenceResult(ran=True, ok=True, drove_turn=False)
+            cadence_refusals.clear()
             try:
                 ok = bool(cadence_drive(_cad.snapshot_for_prompt(snap), items))
             except _LeadLoopLeaseLost:
@@ -14087,7 +14463,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             except Exception:  # noqa: BLE001 - any drive error is a cadence failure
                 ok = False
             if not ok:
-                return _fail()
+                return _fail(cadence_refusals[-1] if cadence_refusals else "snapshot/sweep failure")
             reminded_keys = [(it["request_id"], it.get("last_msg_id"))
                              for it in items if it.get("type") == "outbound_reminder"]
             escalation_keys = [it["key"] for it in items
@@ -15090,7 +15466,8 @@ def _close_dead_letter_notice_threads(
     """
     if resolution is None:
         sys.stderr.write(
-            f"agenttalk dead-letter: no recorded resolution for {agent}/{msg_id}; notices left open.\n"
+            f"agenttalk dead-letter: no recorded resolution for {agent}/"
+            f"{pc.meta_text(msg_id)}; notices left open.\n"
         )
         return 0
     actor = resolution["actor"]
@@ -15118,7 +15495,8 @@ def _close_dead_letter_notice_threads(
                 recipient=agent,
                 kind="message",
                 subject=f"dead-letter resolved ({msg_id})",
-                body=f"Dead-letter {agent}/{msg_id} was resolved by {actor}: {reason}",
+                body=f"Dead-letter {agent}/{pc.meta_text(msg_id)} "
+                     f"was resolved by {actor}: {reason}",
                 meta=meta,
             )
             closed += 1
@@ -15137,6 +15515,7 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
     if not (getattr(args, "agent", None) and getattr(args, "id", None)):
         sys.stderr.write("agenttalk dead-letter resolve: --agent and --id are required.\n")
         return 2
+    validate_agent_name(args.agent)
     reason = getattr(args, "reason", None)
     if not reason or not reason.strip():
         sys.stderr.write("agenttalk dead-letter resolve: --reason is required.\n")
@@ -15148,13 +15527,13 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
         return 2
     if not _is_listed_dead_letter(store, args.agent, args.id):
         sys.stderr.write(f"agenttalk dead-letter resolve: no dead-letter "
-                         f"{args.agent}/{args.id}.\n")
+                         f"{args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n")
         return 2
     entry = next((m for m in store.list_dead_letters(args.agent)
                   if m.get("message_id") == args.id), None)
     if entry is None:
         sys.stderr.write(f"agenttalk dead-letter resolve: no dead-letter "
-                         f"{args.agent}/{args.id}.\n")
+                         f"{args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n")
         return 2
     src_hash = A.dead_letter_entry_source_hash(entry)
     recorded = _recorded_dead_letter_resolution(store, agent=args.agent, msg_id=args.id)
@@ -15170,7 +15549,7 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
         _close_dead_letter_notice_threads(
             store, agent=args.agent, msg_id=args.id, resolution=recorded,
         )
-        print(f"dead-letter {args.agent}/{args.id} already resolved")
+        print(f"dead-letter {args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} already resolved")
         return 0
     event_id = "att-" + uuid.uuid4().hex[:12]
     A.append_disposition(store, {
@@ -15198,7 +15577,7 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
         resolution=_recorded_dead_letter_resolution(store, agent=args.agent, msg_id=args.id),
     )
     extra = f"; closed {closed} related escalation thread(s)" if closed else ""
-    print(f"resolved dead-letter {args.agent}/{args.id} by {actor} "
+    print(f"resolved dead-letter {args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} by {actor} "
           f"(payload preserved; requeue with --force-resolved --reason to reopen{extra})")
     return 0
 
@@ -15252,8 +15631,12 @@ def _cmd_dead_letter_purge(store: Store, args: argparse.Namespace) -> int:
             )
             pending = _pending_dead_letter_notices(store, agent=ag, msg_id=mid)
             if recorded is None or pending:
-                detail = ", ".join(m.meta["request_id"] for m in pending) if recorded else "no recorded resolution"
-                blocked.append(f"{ag}/{mid} ({detail})")
+                detail = (
+                    ", ".join(pc.meta_text(m.meta["request_id"]) for m in pending)
+                    if recorded
+                    else "no recorded resolution"
+                )
+                blocked.append(f"{ag}/{pc.meta_text(mid)} ({detail})")
         if blocked:
             sys.stderr.write(
                 "agenttalk dead-letter purge: refusing to archive resolved item(s) "
@@ -15340,9 +15723,10 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             return 0
         print(f"dead-letter ({len(items)}):")
         for m in items:
-            print(f"  {m.get('agent')}/{m.get('message_id')}  from={m.get('from')} "
-                  f"kind={m.get('kind')} attempts={m.get('attempts')} "
-                  f"class={m.get('class')} reason={(m.get('last_reason') or '')[:60]}")
+            print(f"  {pc.meta_text(m.get('agent'))}/{pc.meta_text(m.get('message_id'))}  "
+                  f"from={pc.meta_text(m.get('from'))} "
+                  f"kind={pc.meta_text(m.get('kind'))} attempts={m.get('attempts')} "
+                  f"class={pc.meta_text(m.get('class'))} reason={pc.line(str(m.get('last_reason') or '')[:60])}")
         # A `requeue` re-injects a FRESH copy but PRESERVES the original here, so a handled
         # dead-letter keeps showing until you `resolve` it. We deliberately do NOT auto-quiet
         # (that could hide a real unhandled poison) - we point at the flow instead (fable-max #2).
@@ -15359,7 +15743,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         raw = store.read_dead_letter_payload(args.agent, args.id)
         if meta is None and raw is None:
             sys.stderr.write(
-                f"agenttalk dead-letter show: no dead-letter {args.agent}/{args.id}.\n")
+                f"agenttalk dead-letter show: no dead-letter {args.agent}/"
+                f"{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n")
             return 2
         body = ""
         if raw is not None:
@@ -15405,14 +15790,14 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if not _is_listed_dead_letter(store, args.agent, args.id):   # F5 traversal/typo guard
             sys.stderr.write(
                 "agenttalk dead-letter requeue: no dead-letter "
-                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                f"{escape_controls(args.agent)}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n"
             )
             return 2
         raw = store.read_dead_letter_payload(args.agent, args.id)
         if raw is None:
             sys.stderr.write(
                 "agenttalk dead-letter requeue: no dead-letter "
-                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                f"{escape_controls(args.agent)}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n"
             )
             return 2
         # A RESOLVED dead-letter requires an explicit --force-resolved + a non-empty --reason
@@ -15445,7 +15830,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             if entry is None:
                 sys.stderr.write(
                     "agenttalk dead-letter requeue: no dead-letter "
-                    f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                    f"{escape_controls(args.agent)}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n"
                 )
                 return 2
             reopen_event = {
@@ -15470,8 +15855,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
                 for m in store.valid_messages()):
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: {escape_controls(orig.get('to'))} already has a live copy of request "
-                f"{escape_controls(rid)}; "
+                f"agenttalk dead-letter requeue: {pc.line(orig.get('to'))} already has a live copy "
+                f"of request {pc.meta_text(rid)}; "
                 "nothing was published. Use the existing copy, or resend by hand with a new request id.\n"
             )
             return 2
@@ -15487,6 +15872,24 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 _refuse_live_request=True,
                 _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
             )
+        except PreparedMessageRefused as e:
+            if orig.get("kind") in _dl_tags.OPENERS:
+                route = _requeue_route(args, orig)
+            else:
+                template = "agenttalk dead-letter requeue --agent {agent} --id {id}"
+                values = {"agent": args.agent, "id": args.id}
+                if reopen_event is not None:
+                    template += " --force-resolved --from {actor} --reason {reason}"
+                    values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
+                route = (
+                    "After the reset has finished, retry the same dead letter to keep its original correlation:\n  "
+                    + pc.cmd(template, **values) + "."
+                )
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
+                + route + "\n"
+            )
+            return 2
         except RequeueRefused as e:
             # The advice is decided here, after the publication lock is released and from the resolution as it is now:
             # a retry is named only when the ordinary command would be accepted (a resolved one needs --force-resolved).
@@ -15495,16 +15898,17 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             # ...and only when its stored message passes the same checks that command runs before publishing
             problem = _retry_problem(store, args.agent, retry) if retry else None
             attention = (
-                f"The copy {escape_controls(retry)} cannot be retried as it is ({escape_controls(problem)}); it needs "
+                f"The copy {pc.meta_text(retry)} cannot be retried as it is ({pc.line(str(problem))}); it needs "
                 "attention. "
                 if problem
                 else ""
             )
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: {escape_controls(e)} "
+                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
                 + (
-                    "Retry that copy instead: agenttalk dead-letter requeue "
-                    f"--agent {escape_controls(args.agent)} --id {escape_controls(retry)}."
+                    "Retry that copy instead: "
+                    + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=args.agent, i=retry)
+                    + "."
                     if retry and not problem
                     else attention + _requeue_route(args, orig)
                 )
@@ -15512,7 +15916,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             )
             return 2
         except (ValueError, FileNotFoundError) as e:
-            sys.stderr.write(f"agenttalk dead-letter requeue: {escape_controls(e)}\n")
+            sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))}\n")
             return 2
         # Send SUCCEEDED - NOW record the reopen audit (ordering closes fable-max #6).
         if reopen_event is not None:
@@ -15521,11 +15925,11 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if getattr(store, "requeue_mark_failure", None):
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: warning: the copy was published, but its record could not be marked "
-                f"published ({escape_controls(store.requeue_mark_failure)}); it stays claimed. Do not requeue "
-                f"{escape_controls(args.id)} again "
+                f"published ({pc.line(str(store.requeue_mark_failure))}); it stays claimed. Do not requeue "
+                f"{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} again "
                 f"while the copy is in the store.\n"
             )
-        print(f"requeued dead-letter {escape_controls(args.id)} as fresh message {new.id} "
+        print(f"requeued dead-letter {pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
@@ -15607,7 +16011,7 @@ def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
     need one that is not plain is left out."""
 
     def plain(*words: object) -> bool:
-        return all(isinstance(w, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", w) for w in words)
+        return all(pc.is_plain(w) for w in words)
 
     show = (
         f"agenttalk dead-letter show --agent {args.agent} --id {args.id} --json" if plain(args.agent, args.id) else None
@@ -15672,9 +16076,9 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
             return 0
         print(f"reply-refusal ({len(items)}):")
         for m in items:
-            print(f"  {m.get('_agent')}/{m.get('original_message_id')}  "
-                  f"from={m.get('original_from')} kind={m.get('intended_kind')} "
-                  f"reason={(m.get('reason') or '')[:60]}")
+            print(f"  {pc.meta_text(m.get('_agent'))}/{pc.meta_text(m.get('original_message_id'))}  "
+                  f"from={pc.meta_text(m.get('original_from'))} kind={pc.meta_text(m.get('intended_kind'))} "
+                  f"reason={pc.line((m.get('reason') or '')[:60])}")
         if not show_resolved:
             print("  tip: `agenttalk reply-refusal show --agent A --id ID` for the full "
                   "reason + draft path; `resolve --reason ...` once handled to quiet it.")
@@ -15686,7 +16090,8 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
         record = reply_refusals.read_reply_refusal(store, args.agent, args.id)
         if record is None:
             sys.stderr.write(
-                f"agenttalk reply-refusal show: no reply-refusal {args.agent}/{args.id}.\n")
+                f"agenttalk reply-refusal show: no reply-refusal {args.agent}/"
+                f"{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n")
             return 2
         resolved = reply_refusals.is_resolved(store, args.agent, args.id)
         out = {"record": record, "resolved": resolved}
@@ -15695,11 +16100,13 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
             return 0
         print(json.dumps(record, indent=2))
         print(f"---- resolved: {resolved} ----")
-        print(f"reason: {record.get('reason')}")
-        print(f"draft path: {record.get('draft_path')}")
+        print(f"reason: {pc.line(record.get('reason'))}")
+        print(f"draft path: {pc.line(record.get('draft_path'))}")
         print("---- re-publish recipe (run as the affected seat) ----")
-        print(f"agenttalk reply --from {args.agent} --to-id {record.get('original_message_id')} "
-              f"--file {record.get('draft_path')}")
+        print(pc.cmd("agenttalk reply --from {a} --to-id {m} --file {f}", a=args.agent,
+                     m=record.get("original_message_id"), f=record.get("draft_path"),
+                     lookup="the whole path is on the draft path: line above",
+                     source="is on the draft path: line above", shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS))
         return 0
     if action == "resolve":
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):
@@ -15722,7 +16129,7 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
         except FileNotFoundError as e:
             sys.stderr.write(f"agenttalk reply-refusal resolve: {e}\n")
             return 2
-        print(f"resolved reply-refusal {args.agent}/{args.id}")
+        print(f"resolved reply-refusal {args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}")
         return 0
     sys.stderr.write("agenttalk reply-refusal: expected list, show, or resolve.\n")
     return 2
@@ -16769,9 +17176,12 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         # clear restarts nothing, so it never supersedes one either.
         if cleared and not budget_only:
             store.clear_lead_loop_exit(args.agent)
-        print(f"cleared restart-request for {args.agent!r}" if cleared
-              else f"no matching restart-request for {args.agent!r} "
-                   f"[{args.request_id}] (already cleared or superseded)")
+        print(
+            f"cleared restart-request for {args.agent!r}"
+            if cleared
+            else f"no matching restart-request for {args.agent!r} "
+            f"[{pc.meta_text(args.request_id)}] (already cleared or superseded)"
+        )
         return 0
     try:
         config = _load_supervisor_config(
@@ -17821,12 +18231,21 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Repo-relative path PREFIX in scope (repeatable; omit = whole domain).")
     lassign.add_argument("--notes", help="Free-text notes.")
     lassign.add_argument("--force", action="store_true", help="Overwrite an existing lane id.")
-    lassign.add_argument("--worktrees-root",
-                         help="Managed worktree root (default: <repo>/.worktrees).")
     lassign.add_argument(
-        "--advisory", action="store_true",
-        help="Non-release coordination lane; may use --no-worktree but can never "
-             "satisfy release isolation.",
+        "--worktrees-root",
+        help="Managed worktree root (default: <store folder>/.worktrees; "
+        "the store folder holds .agenttalk). "
+        "A relative path is read from the store folder wherever the command runs. "
+        "The folder must lie inside the store folder. A .. path component is refused. "
+        "On Windows, components made only of dots and spaces or ending in a dot or space "
+        "(except a single dot), "
+        "drive-relative (C:x), rooted-without-drive (\\x), device, extended and stream "
+        "spellings are refused.",
+    )
+    lassign.add_argument(
+        "--advisory",
+        action="store_true",
+        help="Non-release coordination lane; may use --no-worktree but can never satisfy release isolation.",
     )
     lassign.add_argument("--no-worktree", action="store_true",
                          help="Assign an --advisory lane without isolation (requires reason).")
@@ -19439,6 +19858,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     prst = sub.add_parser(
         "reset",
+        description="Stop the agents first: while reset runs, every send waits, "
+                    "and one that waits longer than 10 seconds fails.",
         help="Clear active bus state (messages + cursors + heartbeats); "
              "preserves historical transcripts in .agenttalk/sessions/. "
              "Preserves config (roster). Use --archive to move EVERYTHING "
@@ -19717,9 +20138,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="(#156) Write a verified out-of-tree snapshot of the store to "
              "the per-user recovery directory (same base as hmac-init's "
              "keys dir), keyed by project identity - survives `rm -rf "
-             ".agenttalk` / `git clean -fdx`. Briefly fences writers for a "
-             "hardlink clone only (bounded by file count, not store size), "
-             "then hashes and writes the manifest unlocked.",
+             ".agenttalk` / `git clean -fdx`. Holds the message publication lock "
+             "while the store is cloned (hard links; launch requests, lane delivery "
+             "records, any file whose link fails and disks without hard links are "
+             "copied byte by byte, which takes longer with more data) and while the "
+             "publication order is read and checked; hashing and the manifest are "
+             "written outside the lock. Launch requests and "
+             "lane delivery records are always copied, not linked, so \"hardlink_used\" "
+             "means every file was linked. If disappearances it detects use up the "
+             "retry budget, it stops with exit code 2 and no snapshot: run it again.",
     )
     pbk.add_argument("--json", action="store_true", help="Machine-readable output.")
     pbk.set_defaults(func=cmd_backup)

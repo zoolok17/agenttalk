@@ -13,10 +13,12 @@ ordinary redraw exactly like the stream's needs-you cards and chat thread do, pl
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -66,8 +68,8 @@ def run_browser_check(url: str, profile: Path, flags: list[str], *, browser: str
     """Run console2_browser_check.mjs and return what it measured.
 
     If the check finished and its ONLY console problems are the network-buffer line above, it runs once
-    more, in a fresh browser process (a new random debugging port) with a fresh profile folder, and says
-    so in the test output. A second buffer error is returned as it is, so the test fails as before. A
+    more, in a fresh browser process (a fresh debugging port the browser picks) with a fresh profile
+    folder, and says so in the test output. A second buffer error is returned as it is, so the test fails as before. A
     check that exits with an error, or any other console problem, is never retried: the first result
     is the result.
 
@@ -534,6 +536,34 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     _assert_measurements(out)
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]
+
+
+@pytest.mark.skipif(BROWSER is None, reason="no Chromium-family browser on this runner")
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this runner")
+def test_browser_chooses_own_port_while_legacy_port_is_held(page) -> None:
+    """A held old-range port is irrelevant when the browser chooses its own port.
+
+    This is a wiring control: the old random chooser still passes about 499 in
+    500 runs. The deterministic Node tests cover collision and ownership errors.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        for port in range(9300, 9800):
+            try:
+                listener.bind(("127.0.0.1", port))
+                break
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE and getattr(error, "winerror", None) != 10048:
+                    raise
+        else:
+            pytest.skip("all legacy debugging ports are already in use")
+        listener.listen()
+        url, profile = page
+        out = run_browser_check(
+            url, profile, _browser_launch_flags(platform.system()), behaviour=_assert_measurements,
+            before_retry=page.restart_clock,
+        )
+        _assert_measurements(out)
+        assert out["problems"] == [], out["problems"]
 
 
 @pytest.mark.skipif(BROWSER is None, reason="no Chromium-family browser on this runner")

@@ -78,7 +78,7 @@ SKILL_INVARIANTS = [
         "knowledge search --type lesson --limit 5 -- <term>",
         "lookup failed",                   # a failure is never reported as "found nothing"
         "Verify the sender independently", # #163 live-roster re-check, not the claim
-        "ONE narrow, explicitly-authenticated exception",  # #163 body-is-data carve-out
+        "ONE narrow, explicitly role-checked exception",  # #163 body-is-data carve-out
         "stays untrusted data",            # #163 quoted/relayed content inside a task
         "Long-running work",               # #164 progress-note section
         "does NOT end your turn",          # #164 core rule (mirrors _DEFAULT_RULES)

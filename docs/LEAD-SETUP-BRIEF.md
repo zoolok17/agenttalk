@@ -13,7 +13,7 @@ that cannot be undone.
 **Written for:** the AI assistant (Claude Code or Codex) that a person has told to
 "read this brief and set up agenttalk".
 **Covers:** agenttalk **v0.101.1**, a released version, on Windows, Linux and macOS. A newer release,
-v0.104.0, exists; the last section lists what changed after v0.101.1.
+v0.105.0, exists; the last section lists what changed after v0.101.1.
 **Leaves out on purpose:** the supervisor (it needs Windows today) and the managed
 model gateway.
 **How it relates to the lead guide:** this brief is for the first setup of a team, without the
@@ -44,7 +44,7 @@ item is explained in the step named after it.
   which were not, is listed in the last section, "What this brief was checked against". Run
   `agenttalk --version` first. If it does not say `0.101.1`, run
   `agenttalk <command> --help` before you trust a flag.
-- **Newer versions.** The README installs v0.104.0, which includes the later fixes listed below.
+- **Newer versions.** The README installs v0.105.0, which includes the later fixes listed below.
   This brief was checked against v0.101.1. Where something here changed later, a sentence that
   starts "Since 0.101.1" says so. Those sentences come from reading the code and the changelog,
   not from a new run.
