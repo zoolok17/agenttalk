@@ -1017,6 +1017,10 @@ def report_line(value: object) -> str:
     return escape_controls(value)
 
 
+class PreparedMessageRefused(ValueError):
+    """The prepared payload no longer belongs to this send."""
+
+
 class RequeueRefused(ValueError):
     """A requeue refused because the dead letter was already requeued. ``retry`` is a failed copy that may be
     retried instead, or None; the caller adds the advice, after the lock is released."""
@@ -3971,6 +3975,7 @@ class Store:
         path = self.messages_dir / f"{msg.id}.json"
         payload = json.dumps(msg.to_dict(), indent=2, ensure_ascii=False)
         pending = self.messages_dir / f".{msg.id}.{uuid.uuid4().hex}.pending"
+        prepared_session = cfg.get("session_id")
         pending_identity = _write_text_exclusive(pending, payload)
         try:
             lock = (
@@ -4020,6 +4025,22 @@ class Store:
                     )
                 if meta.get("external_deliverable") is True and kind in work_tags.OPENERS:
                     work_tags._external_opener(self, sender, kind, meta)
+                # Reset can remove preparation while this sender waits for publication.
+                # Compare identity, not size/mtime: the identity predates payload writing.
+                try:
+                    prepared_survived = _same_file(os.lstat(pending), pending_identity)
+                except FileNotFoundError:
+                    prepared_survived = False
+                if not prepared_survived:
+                    cause = (
+                        "The store was reset"
+                        if prepared_session != cfg.get("session_id")
+                        else "The store may have been reset"
+                    )
+                    raise PreparedMessageRefused(
+                        "The prepared message is missing or has changed while waiting to be published; "
+                        f"nothing was published. {cause}; send it again."
+                    )
                 claimed = None
                 if _requeue_source is not None:
                     claimed = self._claim_requeue(_requeue_source, msg.id, str(cfg.get("session_id") or ""))

@@ -28,8 +28,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AGENTTALK_PY` is set, give the pinned invocation in either shell, and otherwise the form the project's agent manual gives. A mention
   of the name, or the name in a comment, does not count. The lint's ignore comments work as they
   do for the command check.
+- **A team with only one AI vendor now has a written way to review and merge.** The merge gate
+  said the approving read comes "from another vendor when one is available". Read literally, a
+  read by the builder's own vendor passed whenever the other vendor was missing, with no limit,
+  no label and no later check. Now the procedures, the contributing guide, the README, the
+  review playbook, the assurance and secure-coding pages and both lead skills give one rule. The read still comes from another vendor by default. When none is
+  available, the lead waits if the change can wait; otherwise uses a second team's read by
+  another vendor; otherwise a same-vendor read by a fresh reader who had no part in the change,
+  backed by CI and, for code, a test that fails before the change plus deliberately broken
+  versions the tests must catch. Such a GO carries `review_independence=same-vendor` on the
+  reply and on the pull request, and another vendor reads the change again when one is
+  available. It is never enough for money or paid spend, security, credentials or privacy,
+  deletion or another irreversible step, a release, the settings of the automatic checks (CI
+  workflows, linters, scanners and secret-scan settings), or this review rule and the shipped
+  instructions that state it; with no other vendor at all, those need the operator's recorded approval. Nothing in the code
+  enforces this. Run `agenttalk install-skills` after upgrading so that your lead gets the new
+  text.
 
 ### Fixed
+
+- **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
+  and the scratch janitor keep checkouts when Git could be hiding tracked work,
+  including unedited files marked assume-unchanged or present skipped files. Files
+  omitted by ordinary sparse checkout pass this new check. Both cleanup paths also
+  keep submodule folders with content, even when Git has not initialized them;
+  the janitor does not try to save nested work in a parent WIP commit. Inspect and
+  save the work before clearing flags or removing a submodule yourself. Deliberately
+  assumed files, including projects using `core.ignoreStat=true`, make live-checkout
+  close HOLD without a dirty artifact, even from a store below the Git top-level,
+  until inspected and the flags cleared, or a truthful dirty artifact is recorded.
+  Status now shows submodule changes hidden
+  by project settings: even one untracked build file can cause close HOLD; clean
+  the submodule or record a truthful dirty artifact. Scratch release keeps its
+  existing stricter rules.
+
+- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for dead-letter replies and control messages, retry the same requeue command to keep their original correlation.
 
 - **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
   Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail

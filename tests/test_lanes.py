@@ -7654,6 +7654,7 @@ def test_786_failed_setup_keeps_worktree_file_and_branch_then_allows_operator_re
     _git(root, "config", "status.showUntrackedFiles", "no")
     real_verify, real_read = cli._verify_lane_worktree, cli._git
     created = []
+    status_failures = []
     with monkeypatch.context() as fault:
 
         def fail_after_add(store, lane, **kwargs):
@@ -7664,7 +7665,9 @@ def test_786_failed_setup_keeps_worktree_file_and_branch_then_allows_operator_re
             raise lanes.LaneError("injected provisioning failure")
 
         def read(path, argv):
-            if failure == "unreadable-status" and created and Path(path) == created[0] and argv[:1] == ["status"]:
+            if (failure == "unreadable-status" and created and Path(path) == created[0]
+                    and argv == cli.index_safety.STATUS_ARGS):
+                status_failures.append(Path(path))
                 return 128, ""
             return real_read(path, argv)
 
@@ -7672,6 +7675,9 @@ def test_786_failed_setup_keeps_worktree_file_and_branch_then_allows_operator_re
         fault.setattr(cli, "_git", read)
         assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
     error = capsys.readouterr().err
+    assert len(status_failures) == (1 if failure == "unreadable-status" else 0)
+    if failure == "unreadable-status":
+        assert "could not verify worktree status" in error
     assert "injected provisioning failure" in error and "worktree cleanup failed:" in error
     assert "was not removed" in error and "branch kept: the worktree was not removed" in error
     assert len(created) == 1
@@ -7989,13 +7995,13 @@ def test_786_relative_failed_provision_from_subfolder_keeps_checkout_and_branch(
 
 def _782_late_file(monkeypatch, target: Path):
     """Place new work after the real final status read, synchronously."""
-    real_clean, real_write = cli._worktree_clean, cli._git_write
+    real_clean, real_write = cli._worktree_clean_detail, cli._git_write
     sentinel, injected, removals = target / "precious-late.txt", [], []
 
     def clean(path):
         result = real_clean(path)
         if cli._same_folder(str(path), str(target)):
-            assert result is True, "the injection must follow a genuinely clean status"
+            assert result == (True, None), "the injection must follow a genuinely clean status and index inspection"
             assert not injected
             sentinel.write_text("unfinished late work\n", encoding="utf-8")
             injected.append(True)
@@ -8006,7 +8012,7 @@ def _782_late_file(monkeypatch, target: Path):
             removals.append(list(argv))
         return real_write(root, argv, **kwargs)
 
-    monkeypatch.setattr(cli, "_worktree_clean", clean)
+    monkeypatch.setattr(cli, "_worktree_clean_detail", clean)
     monkeypatch.setattr(cli, "_git_write", write)
     return sentinel, injected, removals
 
