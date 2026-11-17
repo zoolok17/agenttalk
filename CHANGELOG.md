@@ -225,11 +225,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names `claude,codex`.
   On Windows, when a PowerShell 7 file is found where `agenttalk supervise --select-pwsh` looks,
   `powershell_host` no longer says to install it: it says where it found it and gives the one missing
-  step, `agenttalk supervise --select-pwsh`, which checks the file and selects it (only the
-  supervisor needs it). A file found only on the PATH needs the same command with `--pwsh` and its
-  path; a real path is not a plain token, so doctor does not print that as a ready command to copy,
-  and says to type the path after `--pwsh` instead. Doctor only checks that the file exists and runs
-  nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
+  step, `agenttalk supervise --select-pwsh`, which checks the file and selects it (the supervisor and
+  the hang watchdog of a continuous Codex wrapper use the selected host). A file found only on the
+  PATH needs the same command with `--pwsh` and its path. A real path is not a plain token, and no
+  quoting is right in every shell (an unquoted `&` or `|` in a folder name would start a second
+  command), so doctor shows that command with a `<path>` placeholder, says plainly that it is not
+  ready to paste, and tells the reader to type the path themselves. The found path is shown for
+  reading only; if it holds an unusual character, that is shown as a `\uXXXX` code, and doctor says
+  the display is not the exact file name and that `Get-Command pwsh -All` lists the real path.
+  Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
   has just been set up can still end with `overall: ERROR` on Windows until that step is done.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note
   for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report

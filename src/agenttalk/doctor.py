@@ -610,6 +610,9 @@ def _check_ovh_qwen_gateway(store: Store) -> Check | None:
     )
 
 
+_HOST_USERS = "the supervisor and the hang watchdog of a continuous Codex wrapper use the selected host"
+
+
 def _found_pwsh_fix() -> str:
     """The fix text when a PowerShell 7 file is found but none is selected, else "".
 
@@ -617,16 +620,22 @@ def _found_pwsh_fix() -> str:
     search, then the PATH hints it prints). A file-existence test only: nothing is executed, so
     the file is reported as found, never as a working install; `--select-pwsh` is what checks it.
 
-    A found path is echoed through `pc.line` (it came from the machine, not from us). The command
-    that names it is shown as a command to run only when it really is one: a real absolute path is
-    never a plain token, so it is not, and the text then says to type the path after `--pwsh`
-    instead of presenting a placeholder as something to paste (the printed-commands rule)."""
+    The rule for a found path (the safety point): it came from the machine, so it is never put in a
+    command the reader is told to paste. No quoting is right in every shell (cmd.exe expands `%` even
+    inside double quotes, PowerShell runs `$(...)` inside them, and an unquoted `&` starts a second
+    command), and the printed-commands rule is the same: a value that is not a plain token is not
+    printed in a command. A real absolute path is never a plain token, so the PATH-only text shows the
+    command with a `<path>` placeholder, says in words that it is not ready to paste and why, and tells
+    the reader to type the path themselves. The path is only echoed for reading, through `pc.line`
+    (never able to start a line of its own); when that display differs from the real path (an unusual
+    character is written as a \\uXXXX code) the text says so and says where the real value is listed.
+    Only a plain token is shown as a command to run."""
     try:
         for candidate in psh.program_files_candidates():
             if os.path.isfile(candidate):
                 return (
                     f"PowerShell 7 found at {pc.line(candidate)}; run `agenttalk supervise --select-pwsh` "
-                    "to check and select it (only the supervisor needs this)"
+                    f"to check and select it ({_HOST_USERS})"
                 )
         path = next(iter(psh.path_candidates()), "")
     except (OSError, ValueError):
@@ -635,15 +644,21 @@ def _found_pwsh_fix() -> str:
         return ""
     command, note = psh.select_pwsh_commands(path)
     if note is None:
-        return (
-            f"PowerShell 7 found at {pc.line(path)}; run `{command}` to check and select it "
-            "(only the supervisor needs this)"
-        )
-    return (
-        f"PowerShell 7 found at {pc.line(path)}; to check and select it, run agenttalk supervise "
-        "--select-pwsh --pwsh followed by that path (in quotes if it has a space). It is not printed as "
-        "a ready command, because a path is not a plain token. Only the supervisor needs this"
+        return f"PowerShell 7 found at {pc.line(path)}; run `{command}` to check and select it ({_HOST_USERS})"
+    text = (
+        f"PowerShell 7 found at {pc.line(path)}; it is checked and selected by "
+        "`agenttalk supervise --select-pwsh --pwsh <path>`, where <path> is that file's full path. "
+        "That line is not ready to paste: a path is not a plain token, and a character in it such as "
+        "& | ^ % $ ; ( ) or a backtick would be read by your shell as part of a command, so agenttalk "
+        "does not print the path for you to paste. Type the path yourself, in the quotes your shell needs "
+        f"({_HOST_USERS})"
     )
+    if pc.line(path) != path:
+        text += (
+            ". The path shown above writes an unusual character as a \\uXXXX code, so it is not the exact "
+            "file name; the real path is listed by `Get-Command pwsh -All`"
+        )
+    return text
 
 
 def _check_powershell_host(store: Store) -> Check:

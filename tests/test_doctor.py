@@ -171,18 +171,75 @@ def test_doctor_powershell_check_names_the_found_path_for_a_path_only_install(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder_name: str
 ) -> None:
     # The REAL search runs on a real temp PATH. A real absolute path is never a plain token, so what it prints is
-    # not a ready command: doctor shows the path itself and says how to use it, and never shows a placeholder as
-    # something to run.
+    # not a ready command: doctor shows the path for reading and the command with a placeholder, and never asks
+    # the reader to paste the raw path.
     pwsh = _pwsh_only_on_a_temp_path(monkeypatch, tmp_path / folder_name)
     _windows_without_selection(monkeypatch, [], on_path=None)
     check = doctor._check_powershell_host(Store(tmp_path / "project"))
     assert check.status == "error"
     assert f"found at {pwsh};" in check.fix
-    assert "--select-pwsh --pwsh followed by that path" in check.fix
-    assert "not printed as a ready command" in check.fix
-    assert "<p>" not in check.fix and "`agenttalk supervise --select-pwsh --pwsh" not in check.fix
+    assert "`agenttalk supervise --select-pwsh --pwsh <path>`" in check.fix
+    assert "not ready to paste" in check.fix
+    assert "Type the path yourself" in check.fix
+    assert "<p>" not in check.fix
     assert "installed" not in check.fix
     assert "aka.ms" not in check.fix
+    # an ordinary path is shown as it is, so there is nothing to explain
+    assert "unusual character" not in check.fix
+
+
+# Paths with shell metacharacters. A command line that holds one of them unquoted runs another command in cmd.exe
+# (& | ^), or is expanded (% $ ` and $(...) in PowerShell), and no quoting is right in every shell. So doctor must
+# never put the raw path in a command: it appears exactly once, in the "found at" echo, and never after --pwsh.
+_ODD_PATHS = {
+    "ampersands": "C:\\tools\\host&ver&tail\\pwsh.exe",
+    "pipe": "C:\\tools\\a|b\\pwsh.exe",
+    "caret": "C:\\tools\\a^b\\pwsh.exe",
+    "percent": "C:\\tools\\%PATH%\\pwsh.exe",
+    "semicolon": "C:\\tools\\a;b\\pwsh.exe",
+    "parentheses": "C:\\tools\\a(b)c\\pwsh.exe",
+    "dollar-subexpression": "C:\\tools\\$(calc)\\pwsh.exe",
+    "backtick": "C:\\tools\\a`b\\pwsh.exe",
+    "space-and-ampersand": "C:\\tools dir\\a & b\\pwsh.exe",
+}
+
+
+@pytest.mark.parametrize("path", list(_ODD_PATHS.values()), ids=list(_ODD_PATHS))
+def test_doctor_powershell_check_never_puts_a_found_path_in_a_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    _windows_without_selection(monkeypatch, [], on_path=[path])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert f"found at {path};" in check.fix
+    assert check.fix.count(path) == 1  # only the echo: it is in no command and nowhere else
+    assert "--pwsh <path>`" in check.fix and "--pwsh " + path not in check.fix
+    assert '--pwsh "' not in check.fix and "--pwsh '" not in check.fix
+    assert "not ready to paste" in check.fix and "Type the path yourself" in check.fix
+
+
+def test_doctor_powershell_check_never_puts_a_real_path_with_ampersands_in_a_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the codex-rev case: a real folder and the real search
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, tmp_path / "host&ver&tail")
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert f"found at {pwsh};" in check.fix
+    assert check.fix.count(str(pwsh)) == 1 and "--pwsh " + str(pwsh) not in check.fix
+
+
+def test_doctor_powershell_check_says_when_the_shown_path_is_not_the_exact_file_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # U+202E (right-to-left override) is shown as a code, not as the character: the display is safe on one line,
+    # but it is not the real name, and the text says so and says where the real path is listed.
+    odd = "C:\\tools\\a\u202eb\\pwsh.exe"
+    _windows_without_selection(monkeypatch, [], on_path=[odd])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "\u202e" not in check.fix
+    assert "found at C:\\tools\\a\\u202eb\\pwsh.exe;" in check.fix
+    assert "writes an unusual character as a \\uXXXX code, so it is not the exact file name" in check.fix
+    assert "`Get-Command pwsh -All`" in check.fix
 
 
 def test_doctor_powershell_check_runs_the_path_command_only_when_it_really_is_one(
@@ -193,7 +250,7 @@ def test_doctor_powershell_check_runs_the_path_command_only_when_it_really_is_on
     check = doctor._check_powershell_host(Store(tmp_path))
     assert "found at pwsh.exe;" in check.fix
     assert "run `agenttalk supervise --select-pwsh --pwsh pwsh.exe` to check and select it" in check.fix
-    assert "not printed as a ready command" not in check.fix
+    assert "not ready to paste" not in check.fix
 
 
 def test_doctor_powershell_check_echoes_a_found_path_safely(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -212,6 +269,25 @@ def test_doctor_powershell_check_echoes_a_path_only_hit_safely(tmp_path: Path, m
     check = doctor._check_powershell_host(Store(tmp_path / "project"))
     assert "\n" not in check.fix
     assert "found at C:\\tools\\pw\\u000ash\\pwsh.exe;" in check.fix
+
+
+@pytest.mark.parametrize("where", ["program-files", "path-plain-token", "path-real-path"])
+def test_doctor_powershell_check_names_everything_that_uses_the_selected_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    # The Windows turn watchdog of a continuous Codex wrapper reads the selected host too, so "only the supervisor
+    # needs this" would be untrue in all three texts.
+    if where == "program-files":
+        pwsh = tmp_path / "pf" / "PowerShell" / "7" / "pwsh.exe"
+        pwsh.parent.mkdir(parents=True)
+        pwsh.write_bytes(b"")
+        _windows_without_selection(monkeypatch, [str(pwsh)])
+    else:
+        found = "pwsh.exe" if where == "path-plain-token" else "C:\\t\\pwsh.exe"
+        _windows_without_selection(monkeypatch, [], on_path=[found])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "the supervisor and the hang watchdog of a continuous Codex wrapper use the selected host" in check.fix
+    assert "only the supervisor" not in check.fix.lower()
 
 
 def test_doctor_powershell_check_keeps_install_advice_when_no_pwsh_exists(
