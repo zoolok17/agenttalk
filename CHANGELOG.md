@@ -47,14 +47,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Two first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
+- **Three first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
   line for every seat; now it names the seat and the change, for example "roster: worker model vendor
   set to openai (operator-configured, not provider attestation)." or "... cleared ...", so a script
-  that sets several seats can tell them apart. `install-skills --claude-only` installed the
-  dev-discipline pack into both the Claude and the Codex skills folders without saying so; now its
-  output adds one line that says this and that `--no-devkit` leaves the pack out, and its help says
-  the same. What gets installed is unchanged, and neither command has a `--json` output (issue #824,
-  items 1 and 2).
+  that sets several seats can tell them apart. `install-skills --claude-only` and `--codex-only`
+  installed the dev-discipline pack into both the Claude and the Codex skills folders without saying
+  so; now their output adds one line that says this and that `--no-devkit` leaves the pack out, and
+  their help says the same. What gets installed is unchanged. A Claude seat with no capacity reading
+  yet read like a fault: `status` showed `capacity=unknown(claude_source_not_configured)` and
+  `capacity` said "Claude capacity source not configured", even for a seat that had simply not had its
+  first turn. Now `status` shows `capacity=unknown(no reading yet)`, and `capacity` explains that a
+  new seat usually gets a reading after its first turn and when to set up a status line. The reason
+  code `claude_source_not_configured` is unchanged wherever programs read it (`status --json`, the
+  capacity file, the dashboard data), and the dashboard page still shows the code as it is (issue
+  #824, items 1 to 3).
 
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,

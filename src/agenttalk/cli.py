@@ -1873,9 +1873,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         cap = a.get("capacity")
         if isinstance(cap, dict):
             age = capmod.age_seconds(cap.get("observed_at") or "")
+            reason = cap.get("reason") or "no signal"
+            if reason == "claude_source_not_configured":  # #824: usually a new seat, not a fault; --json keeps the code
+                reason = "no reading yet"
             seen += {"observed": " capacity=current",
                      "stale": f" capacity=stale(last reading {_format_age(age or 0)})"
-                     }.get(cap["state"], f" capacity=unknown({cap.get('reason') or 'no signal'})")
+                     }.get(cap["state"], f" capacity=unknown({pc.line(str(reason))})")
         if isinstance(a.get("conversation_size"), dict):
             seen += " " + convsize.format_size(a["conversation_size"])
         role = f" role={a['role']}" if a.get("role") else ""
@@ -12035,8 +12038,9 @@ def _fmt_pct(used: object) -> str:
 
 
 _CAPACITY_REASONS = {
-    "claude_source_not_configured": "Claude capacity source not configured: no status-line "
-                                    "dump and no rate-limit event from the seat yet",
+    "claude_source_not_configured": "no Claude reading yet: no rate-limit event from the seat's turns so far "
+                                    "and no status-line dump. A new seat usually gets one after its first "
+                                    "turn. If it stays this way after turns, set up a status line",
     "codex_no_thread_yet": "no Codex session of its own yet in the shared Codex home",
     "codex_no_reading": "no readable Codex session file",
     "claude_seat_source_unknown": "this shell cannot see another seat's Claude folder, and the "
@@ -12132,7 +12136,9 @@ def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
     snap = capmod.current_view(snap)
     conf = snap["confidence"]
     if conf == "unknown":
-        return f"budget unknown ({_CAPACITY_REASONS.get(snap.get('reason'), 'no readable signal on its side')})"
+        reason = snap.get("reason")  # read from a file anyone can edit: a list or an object must not crash the table
+        text = _CAPACITY_REASONS.get(reason) if isinstance(reason, str) else None
+        return f"budget unknown ({text or 'no readable signal on its side'})"
     if conf == "stale":
         last_known = f"; last known: {'; '.join(older.values())}" if older else ""
         return f"stale: last reading {age} ({source}); no current figures{last_known}"
@@ -12391,8 +12397,9 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
     counts = res.counts()
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     print(f"\nagenttalk install-skills: {summary or 'no actions'}")
-    if args.claude_only and devkit:
-        print("--claude-only covers only the agenttalk bus skills: the dev-discipline pack still goes to both "
+    if devkit and (args.claude_only or args.codex_only):
+        flag = "--claude-only" if args.claude_only else "--codex-only"
+        print(f"{flag} covers only the agenttalk bus skills: the dev-discipline pack still goes to both "
               "the Claude and the Codex skills folders. Add --no-devkit to leave it out.")
 
     if res.retired:
@@ -20184,7 +20191,9 @@ def build_parser() -> argparse.ArgumentParser:
     pis.add_argument("--claude-only", action="store_true",
                      help="Install only Claude-side bus skills (the dev-discipline pack still goes to both "
                           "the Claude and the Codex skills folders unless --no-devkit)")
-    pis.add_argument("--codex-only", action="store_true", help="Install only Codex-side bus skills")
+    pis.add_argument("--codex-only", action="store_true",
+                     help="Install only Codex-side bus skills (the dev-discipline pack still goes to both "
+                          "the Claude and the Codex skills folders unless --no-devkit)")
     pis.add_argument("--no-devkit", action="store_true",
                      help="Skip the dev-discipline pack; install only the agenttalk bus skills")
     pis.add_argument("--devkit-only", action="store_true",

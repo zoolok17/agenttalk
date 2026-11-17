@@ -309,22 +309,24 @@ def test_cli_no_devkit_skips_pack(tmp_path: Path) -> None:
     assert not cl.exists() and not cx.exists()  # devkit skipped
 
 
-_CLAUDE_ONLY_NOTE = ("--claude-only covers only the agenttalk bus skills: the dev-discipline pack still goes to both "
-                     "the Claude and the Codex skills folders. Add --no-devkit to leave it out.\n")
+_ONE_SIDE_NOTE = (" covers only the agenttalk bus skills: the dev-discipline pack still goes to both "
+                  "the Claude and the Codex skills folders. Add --no-devkit to leave it out.\n")
 
 
 @pytest.mark.parametrize("flags,noted", [
-    (["--claude-only"], True),
-    (["--claude-only", "--dry-run"], True),
-    (["--claude-only", "--no-devkit"], False),
-    (["--codex-only"], False),
-    ([], False),
+    (["--claude-only"], "--claude-only"),
+    (["--claude-only", "--dry-run"], "--claude-only"),
+    (["--codex-only"], "--codex-only"),
+    (["--codex-only", "--dry-run"], "--codex-only"),
+    (["--claude-only", "--no-devkit"], None),
+    (["--codex-only", "--no-devkit"], None),
+    ([], None),
 ])
-def test_cli_claude_only_says_the_devkit_still_goes_to_both_folders(
-    tmp_path: Path, capsys, flags: list[str], noted: bool,
+def test_cli_one_side_flags_say_the_devkit_still_goes_to_both_folders(
+    tmp_path: Path, capsys, flags: list[str], noted: str | None,
 ) -> None:
-    """#824: the flag name suggests nothing for Codex; the note says what still goes there, and the install
-    itself is unchanged."""
+    """#824: a one-side flag suggests nothing for the other assistant; the note says what still goes there, and
+    the install itself is unchanged."""
     bus_cl, bus_cx, cl, cx = (tmp_path / name for name in ("buscl", "buscx", "cl", "cx"))
     rc = cli.main([
         "install-skills", *flags,
@@ -334,20 +336,22 @@ def test_cli_claude_only_says_the_devkit_still_goes_to_both_folders(
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert (_CLAUDE_ONLY_NOTE in out) is noted
-    assert out.count("--claude-only covers only") == int(noted)
+    assert out.count(_ONE_SIDE_NOTE) == (1 if noted else 0)
+    if noted:
+        assert f"{noted}{_ONE_SIDE_NOTE}" in out
     if noted and "--dry-run" not in flags:
-        assert (cx / "craft-code" / "SKILL.md").is_file() and not bus_cx.exists()
+        other_bus, other_devkit = (bus_cx, cx) if noted == "--claude-only" else (bus_cl, cl)
+        assert (other_devkit / "craft-code" / "SKILL.md").is_file() and not other_bus.exists()
 
 
-def test_claude_only_help_names_the_devkit_folders() -> None:
+@pytest.mark.parametrize("flag,side", [("--claude-only", "Claude"), ("--codex-only", "Codex")])
+def test_one_side_flag_help_names_the_devkit_folders(flag: str, side: str) -> None:
     # The option's own help string, not the printed --help: argparse wraps that to the terminal width, also
     # right after a hyphen, so the printed text depends on COLUMNS.
     commands = next(action for action in cli.build_parser()._actions if action.dest == "cmd")
-    claude_only = next(action for action in commands.choices["install-skills"]._actions
-                       if "--claude-only" in action.option_strings)
-    assert claude_only.help == ("Install only Claude-side bus skills (the dev-discipline pack still goes to both "
-                                "the Claude and the Codex skills folders unless --no-devkit)")
+    option = next(action for action in commands.choices["install-skills"]._actions if flag in action.option_strings)
+    assert option.help == (f"Install only {side}-side bus skills (the dev-discipline pack still goes to both "
+                           "the Claude and the Codex skills folders unless --no-devkit)")
 
 
 # ---------------------------------------------------- retired skills (sk-loop)
