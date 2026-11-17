@@ -210,7 +210,7 @@ Linux and macOS (sh):
 export PATH="$(dirname "$AGENTTALK_PY"):$PATH"
 ```
 
-This also makes `python` and `pip` in that terminal the ones in `agenttalk-env`. If your project has its own Python environment, do not activate it in a terminal where an assistant runs: activating puts that environment's folder first on PATH, and an older agenttalk installed there would then run instead of this one. Call the project's Python by its full path instead, for example `& <project-env>\Scripts\python.exe` in PowerShell or `"<project-env>/bin/python"` in sh, where `<project-env>` is that environment's folder.
+This also makes `python` and `pip` in that terminal the ones in `agenttalk-env`. If your project has its own Python environment, do not activate it in any terminal where you or an assistant run agenttalk: activating puts that environment's folder first on PATH, and an older agenttalk installed there would then run instead of this one, against the same team folder. Call the project's Python by its full path instead, for example `& "<project-env>\Scripts\python.exe"` in PowerShell or `"<project-env>/bin/python"` in sh, where `<project-env>` stands for the full path of that environment's folder. To check which agenttalk a terminal runs, type `(Get-Command agenttalk).Source` in PowerShell or `command -v agenttalk` in sh: the path it shows must be inside `agenttalk-env`.
 
 The steps below show PowerShell; on Linux or macOS, replace `& $env:AGENTTALK_PY` with `"$AGENTTALK_PY"`.
 

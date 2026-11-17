@@ -187,5 +187,8 @@ def test_get_started_never_says_to_activate_a_project_environment_after_the_path
     """Activating another venv would put its folder first on PATH and could run an older agenttalk."""
     started = " ".join(README.read_text(encoding="utf-8").split("## Get started\n", 1)[1].split("\n## ", 1)[0].split())
     assert "activate it after" not in started
-    assert "do not activate it in a terminal where an assistant runs" in started
+    assert "do not activate it in any terminal where you or an assistant run agenttalk" in started
     assert "Call the project's Python by its full path instead" in started
+    # a full path with spaces must still be one command in PowerShell
+    assert r'`& "<project-env>\Scripts\python.exe"`' in started
+    assert "`(Get-Command agenttalk).Source`" in started and "`command -v agenttalk`" in started
