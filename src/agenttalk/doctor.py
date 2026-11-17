@@ -615,25 +615,34 @@ def _found_pwsh_fix() -> str:
 
     Looks in the places `agenttalk supervise --select-pwsh` looks (its standard Program Files
     search, then the PATH hints it prints). A file-existence test only: nothing is executed, so
-    the file is reported as found, never as a working install; `--select-pwsh` is what checks it."""
+    the file is reported as found, never as a working install; `--select-pwsh` is what checks it.
+
+    A found path is echoed through `pc.line` (it came from the machine, not from us). The command
+    that names it is shown as a command to run only when it really is one: a real absolute path is
+    never a plain token, so it is not, and the text then says to type the path after `--pwsh`
+    instead of presenting a placeholder as something to paste (the printed-commands rule)."""
     try:
         for candidate in psh.program_files_candidates():
             if os.path.isfile(candidate):
                 return (
-                    f"PowerShell 7 found at {candidate}; run `agenttalk supervise --select-pwsh` "
+                    f"PowerShell 7 found at {pc.line(candidate)}; run `agenttalk supervise --select-pwsh` "
                     "to check and select it (only the supervisor needs this)"
                 )
-        command = next(iter(psh.path_candidate_remediations()), "")
+        path = next(iter(psh.path_candidates()), "")
     except (OSError, ValueError):
         return ""
-    if not command:
+    if not path:
         return ""
-    # the command names the file it found: ... --pwsh "<path>"
-    found = re.search(r'--pwsh "(.*)"$', command)
-    where = f" at {found.group(1)}" if found else ""
+    command, note = psh.select_pwsh_commands(path)
+    if note is None:
+        return (
+            f"PowerShell 7 found at {pc.line(path)}; run `{command}` to check and select it "
+            "(only the supervisor needs this)"
+        )
     return (
-        f"PowerShell 7 found{where}; run `{command}` to check and select it "
-        "(only the supervisor needs this)"
+        f"PowerShell 7 found at {pc.line(path)}; to check and select it, run agenttalk supervise "
+        "--select-pwsh --pwsh followed by that path (in quotes if it has a space). It is not printed as "
+        "a ready command, because a path is not a plain token. Only the supervisor needs this"
     )
 
 

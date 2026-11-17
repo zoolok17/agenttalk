@@ -395,6 +395,18 @@ def test_path_diagnostics_are_data_only(tmp_path: Path) -> None:
     )
 
 
+def test_path_candidates_are_the_paths_themselves_and_the_commands_are_built_from_them(tmp_path: Path) -> None:
+    candidate = tmp_path / "pwsh.exe"
+    candidate.write_bytes(b"")
+    environ = {"PATH": str(tmp_path)}
+    assert psh.path_candidates(environ) == (str(candidate),)
+    command, note = psh.select_pwsh_commands(str(candidate))
+    assert command == "agenttalk supervise --select-pwsh --pwsh <p>" and note.startswith("not a ready command: <p> is ")
+    assert psh.path_candidate_remediations(environ) == (f"{command}  ({note})",)
+    # a plain token is the one ready command
+    assert psh.select_pwsh_commands("pwsh.exe") == ("agenttalk supervise --select-pwsh --pwsh pwsh.exe", None)
+
+
 def test_environment_program_files_root_is_diagnostic_only(tmp_path: Path) -> None:
     candidate = tmp_path / "PowerShell" / "7" / "pwsh.exe"
     candidate.parent.mkdir(parents=True)

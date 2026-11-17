@@ -697,7 +697,9 @@ def program_files_candidates(
     return tuple(out)
 
 
-def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+def path_candidates(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The PowerShell 7 files found on the PATH or under the Program Files variables: the paths themselves, in the
+    order `supervise --select-pwsh` suggests them. A file-existence test only: nothing is run."""
     env = os.environ if environ is None else environ
     out: list[str] = []
     seen: set[str] = set()
@@ -716,12 +718,7 @@ def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tup
         except OSError:
             exists = False
         if exists:
-            out.append(pc.cmd(
-                "agenttalk supervise --select-pwsh --pwsh {p}", p=str(candidate),
-                shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
-                lookup="the whole path is listed by: Get-Command pwsh -All, or in the Program Files folders",
-                source="is listed by: Get-Command pwsh -All, or is in the Program Files folders",
-            ))
+            out.append(str(candidate))
 
     for entry in (env.get("PATH") or "").split(os.pathsep):
         entry = entry.strip().strip('"')
@@ -733,6 +730,32 @@ def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tup
         if not root or not os.path.isabs(root) or root.startswith("\\\\"):
             continue
         add(os.path.join(root, "PowerShell", "7", "pwsh.exe"))
+    return tuple(out)
+
+
+SELECT_PWSH_COMMAND = "agenttalk supervise --select-pwsh --pwsh {p}"
+
+
+def select_pwsh_commands(path: str) -> tuple[str, str | None]:
+    """The `--select-pwsh --pwsh <path>` command for a found file, and the note (None when it is a ready command).
+
+    A real absolute path is never a plain token, so in practice this is the placeholder form with its note: the
+    text is not a command to paste (see printed_commands)."""
+    (command,), note = pc.cmds(
+        [SELECT_PWSH_COMMAND],
+        p=path,
+        shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+        lookup="the whole path is listed by: Get-Command pwsh -All, or in the Program Files folders",
+        source="is listed by: Get-Command pwsh -All, or is in the Program Files folders",
+    )
+    return command, note
+
+
+def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    out: list[str] = []
+    for candidate in path_candidates(environ):
+        command, note = select_pwsh_commands(candidate)
+        out.append(command if note is None else f"{command}  ({note})")
     return tuple(out)
 
 

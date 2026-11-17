@@ -105,7 +105,7 @@ def test_doctor_powershell_check_keeps_result_and_locks_only_set_up_project(
     monkeypatch.setattr(doctor.sys, "platform", "win32")
     # This test is about locking, not about where PowerShell is installed: no host found.
     monkeypatch.setattr(doctor.psh, "program_files_candidates", lambda *a, **k: ())
-    monkeypatch.setattr(doctor.psh, "path_candidate_remediations", lambda *a, **k: ())
+    monkeypatch.setattr(doctor.psh, "path_candidates", lambda *a, **k: ())
     check = doctor._check_powershell_host(store)
     assert check == doctor.Check(
         name="powershell_host",
@@ -124,10 +124,12 @@ def test_doctor_powershell_check_keeps_result_and_locks_only_set_up_project(
 
 def _windows_without_selection(monkeypatch: pytest.MonkeyPatch, program_files, on_path=()):
     """Windows branch forced (the check returns early on other platforms); the two candidate
-    searches `supervise --select-pwsh` uses are replaced by what the test wants them to find."""
+    searches `supervise --select-pwsh` uses are replaced by what the test wants them to find.
+    ``on_path=None`` keeps the REAL PATH search (the test sets PATH itself)."""
     monkeypatch.setattr(doctor.sys, "platform", "win32")
     monkeypatch.setattr(doctor.psh, "program_files_candidates", lambda *a, **k: tuple(program_files))
-    monkeypatch.setattr(doctor.psh, "path_candidate_remediations", lambda *a, **k: tuple(on_path))
+    if on_path is not None:
+        monkeypatch.setattr(doctor.psh, "path_candidates", lambda *a, **k: tuple(on_path))
 
 
 @pytest.mark.parametrize("content", [b"", b"not a real program"], ids=["zero-byte", "not-a-program"])
@@ -153,18 +155,63 @@ def test_doctor_powershell_check_says_found_not_verified_when_pwsh_is_present_bu
     assert check.details.endswith("; task status UNKNOWN")
 
 
-def test_doctor_powershell_check_names_the_path_command_for_a_path_only_install(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _pwsh_only_on_a_temp_path(monkeypatch: pytest.MonkeyPatch, folder: Path) -> Path:
+    """A real pwsh.exe file in ``folder``, which is the whole PATH, and no Program Files variable."""
+    folder.mkdir(parents=True)
+    pwsh = folder / "pwsh.exe"
+    pwsh.write_bytes(b"")
+    monkeypatch.setenv("PATH", str(folder))
+    for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
+        monkeypatch.delenv(name, raising=False)
+    return pwsh
+
+
+@pytest.mark.parametrize("folder_name", ["tools", "tools dir"], ids=["no-space", "with-space"])
+def test_doctor_powershell_check_names_the_found_path_for_a_path_only_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder_name: str
 ) -> None:
-    where = "C:\\tools\\pwsh.exe"
-    command = f'agenttalk supervise --select-pwsh --pwsh "{where}"'
-    _windows_without_selection(monkeypatch, [], on_path=[command])
-    check = doctor._check_powershell_host(Store(tmp_path))
+    # The REAL search runs on a real temp PATH. A real absolute path is never a plain token, so what it prints is
+    # not a ready command: doctor shows the path itself and says how to use it, and never shows a placeholder as
+    # something to run.
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, tmp_path / folder_name)
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
     assert check.status == "error"
-    assert f"found at {where}" in check.fix
-    assert f"`{command}` to check and select it" in check.fix
+    assert f"found at {pwsh};" in check.fix
+    assert "--select-pwsh --pwsh followed by that path" in check.fix
+    assert "not printed as a ready command" in check.fix
+    assert "<p>" not in check.fix and "`agenttalk supervise --select-pwsh --pwsh" not in check.fix
     assert "installed" not in check.fix
     assert "aka.ms" not in check.fix
+
+
+def test_doctor_powershell_check_runs_the_path_command_only_when_it_really_is_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A plain token is the one case where the command is ready; no real path is one, so the search is replaced here.
+    _windows_without_selection(monkeypatch, [], on_path=["pwsh.exe"])
+    check = doctor._check_powershell_host(Store(tmp_path))
+    assert "found at pwsh.exe;" in check.fix
+    assert "run `agenttalk supervise --select-pwsh --pwsh pwsh.exe` to check and select it" in check.fix
+    assert "not printed as a ready command" not in check.fix
+
+
+def test_doctor_powershell_check_echoes_a_found_path_safely(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The path came from the machine: it goes through the echo rule, so it cannot start a line of its own.
+    odd = "C:\\pf\\Power\nShell\\7\\pwsh.exe"
+    _windows_without_selection(monkeypatch, [odd])
+    monkeypatch.setattr(doctor.os.path, "isfile", lambda path: path == odd)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "\n" not in check.fix
+    assert "found at C:\\pf\\Power\\u000aShell\\7\\pwsh.exe;" in check.fix
+
+
+def test_doctor_powershell_check_echoes_a_path_only_hit_safely(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    odd = "C:\\tools\\pw\nsh\\pwsh.exe"
+    _windows_without_selection(monkeypatch, [], on_path=[odd])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "\n" not in check.fix
+    assert "found at C:\\tools\\pw\\u000ash\\pwsh.exe;" in check.fix
 
 
 def test_doctor_powershell_check_keeps_install_advice_when_no_pwsh_exists(

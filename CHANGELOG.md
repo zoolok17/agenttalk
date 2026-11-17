@@ -226,8 +226,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   On Windows, when a PowerShell 7 file is found where `agenttalk supervise --select-pwsh` looks,
   `powershell_host` no longer says to install it: it says where it found it and gives the one missing
   step, `agenttalk supervise --select-pwsh`, which checks the file and selects it (only the
-  supervisor needs it). Doctor only checks that the file exists and runs nothing, so "found" is not a
-  promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
+  supervisor needs it). A file found only on the PATH needs the same command with `--pwsh` and its
+  path; a real path is not a plain token, so doctor does not print that as a ready command to copy,
+  and says to type the path after `--pwsh` instead. Doctor only checks that the file exists and runs
+  nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
   has just been set up can still end with `overall: ERROR` on Windows until that step is done.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note
   for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report
