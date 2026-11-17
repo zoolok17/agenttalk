@@ -14,6 +14,8 @@
 // What the DOM stub cannot show and this does: a detached element has no scroll layout (the thread
 // must be scrolled after insertion), and a redraw that replaces a focused control drops focus to <body>.
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -61,7 +63,7 @@ export class FatalExitError extends Error {
 // (a makeDeadline() - never its own fresh timeout, see above).
 //
 // CONTRACT: `fn(remainingMs)` must bound ITSELF to (at most) the `remainingMs` it is given - e.g.
-// via its own AbortSignal.timeout(min(remainingMs, someCap)), like fetchJsonOnce below. This loop
+// via its own AbortSignal.timeout(min(remainingMs, someCap)), like makeFetchJson below. This loop
 // does not race attempts against anything; it awaits each one fully, then sleeps one poll interval,
 // then repeats. A never-settling `fn` is not this loop's problem to solve - it is `fn`'s, by
 // actually releasing whatever resource it is waiting on.
@@ -122,6 +124,85 @@ export async function waitForPageTarget(listTargetsOnce, opts) {
   }, { intervalMs: 150, describe: 'a page target appearing in /json/list', ...opts });
 }
 
+export function browserLaunchArgs(profile, extraFlags) {
+  return [...extraFlags, `--user-data-dir=${profile}`,
+    '--remote-debugging-port=0', '--window-size=1240,780', 'about:blank'];
+}
+
+export function parseDevToolsActivePort(text) {
+  if (typeof text !== 'string') return undefined;
+  const lines = text.split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop();
+  if (lines.length !== 2 || !/^[1-9][0-9]{0,4}$/.test(lines[0]) || Number(lines[0]) > 65535) return undefined;
+  if (!/^\/devtools\/browser\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(lines[1])) return undefined;
+  return { port: Number(lines[0]), browserPath: lines[1] };
+}
+
+export class NotThisBrowserError extends Error {
+  constructor(port) {
+    super(`the DevTools endpoint on port ${port} belongs to a different program`);
+    this.name = 'NotThisBrowserError';
+  }
+}
+
+export function assertOwnEndpoint(version, { port, browserPath }) {
+  let url;
+  try {
+    if (!version || typeof version !== 'object' || typeof version.webSocketDebuggerUrl !== 'string') throw new TypeError();
+    url = new URL(version.webSocketDebuggerUrl);
+  } catch {
+    throw new NotThisBrowserError(port);
+  }
+  if (url.protocol !== 'ws:' || url.hostname !== '127.0.0.1' || url.port !== String(port)
+      || url.pathname !== browserPath || url.search !== '' || url.hash !== '') throw new NotThisBrowserError(port);
+}
+
+export function makeReadActivePort(fsPromises, profile) {
+  return async () => {
+    try { return await fsPromises.readFile(join(profile, 'DevToolsActivePort'), 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+  };
+}
+
+export async function clearActivePort(fsPromises, profile) {
+  try { await fsPromises.rm(join(profile, 'DevToolsActivePort'), { force: true }); }
+  catch (error) { throw new Error(`could not remove the stale DevToolsActivePort before starting the browser: ${error.message}`); }
+}
+
+export function makeFetchJson(fetchImpl) {
+  return async (url, remainingMs) => {
+    const capMs = Math.max(1, Math.min(remainingMs, PER_REQUEST_CAP_MS));
+    const r = await fetchImpl(url, { signal: AbortSignal.timeout(capMs) });
+    return r.ok ? await r.json() : undefined;
+  };
+}
+
+export function makeFetchText(fetchImpl) {
+  return async (url, capMs) => {
+    const r = await fetchImpl(url, { signal: AbortSignal.timeout(capMs) });
+    return { ok: r.ok, status: r.status, body: await r.text() };
+  };
+}
+
+export async function startDevToolsSession({ readActivePort, fetchJson, fetchText, checkExited, deadline, sleep: sleepFn = sleep, getDiagnostics }) {
+  const info = await waitForDeadline(async () => parseDevToolsActivePort(await readActivePort()), {
+    deadline, checkExited, sleep: sleepFn, describe: 'the DevToolsActivePort file in the browser profile', getDiagnostics,
+  });
+  const base = `http://127.0.0.1:${info.port}`;
+  const version = await waitForDeadline((ms) => fetchJson(base + '/json/version', ms), {
+    deadline, checkExited, sleep: sleepFn, describe: `the DevTools endpoint (${base}/json/version)`, getDiagnostics,
+  });
+  assertOwnEndpoint(version, info);
+  const page = await waitForPageTarget((ms) => fetchJson(base + '/json/list', ms), {
+    deadline, checkExited, sleep: sleepFn, getDiagnostics,
+  });
+  const activate = async (id) => {
+    const r = await fetchText(base + '/json/activate/' + id, PER_REQUEST_CAP_MS);
+    if (!r.ok) throw new Error(`could not activate the browser target: http ${r.status} ${r.body}`);
+  };
+  return { base, info, page, activate };
+}
+
 // Everything below this line is the check's own entrypoint - spawning a real browser and driving
 // it over CDP - guarded so importing the pure helpers above (for a unit test) never also does that.
 async function main() {
@@ -145,45 +226,18 @@ const sabotageScrollScript = sabotage === 'scroll'
   ? `window.__sabotageObserver = new MutationObserver(() => { window.__thread.scrollTop = 999999; });
      window.__sabotageObserver.observe(document.querySelector('${WATCHED_AGE_SELECTOR}'), { childList: true, characterData: true, subtree: true });`
   : '';
-const PORT = 9300 + Math.floor(Math.random() * 500);
 
-// `profile` is a fresh, unique directory per test run - the caller's job
-// (test_console2_browser.py's `page` fixture uses pytest's own tmp_path); a reused or
-// already-open profile directory makes Chromium refuse to start outright.
-const child = spawn(exe, [
-  ...extraFlags, `--user-data-dir=${profile}`,
-  `--remote-debugging-port=${PORT}`, '--window-size=1240,780', 'about:blank',
-], { stdio: ['ignore', 'ignore', 'pipe'] });
+// The caller supplies a private profile (the page fixture uses pytest's tmp_path).
+// A previous process may have left its port file behind; remove it before launch.
+// An already-open profile is still unsupported.
+await clearActivePort(fs.promises, profile);
+const child = spawn(exe, browserLaunchArgs(profile, extraFlags), { stdio: ['ignore', 'ignore', 'pipe'] });
 
 let childStderr = '';
 child.stderr.on('data', (chunk) => { childStderr += chunk.toString(); });
 let childExit = null;
 child.on('exit', (code, signal) => { childExit = { code, signal }; });
 const checkChildExited = () => childExit && { ...childExit, stderr: childStderr };
-
-// ONE bounded GET, returning parsed JSON or `undefined` if the endpoint is not ready yet (any
-// connection failure, non-OK status, or the request itself timing out) - NEVER a retry loop of
-// its own (PR #230 delta review, F2: that is exactly what nested two independent deadlines).
-// Retrying is the CALLER's job, against ONE shared budget. `remainingMs` bounds this ONE attempt
-// via AbortSignal, capped at PER_REQUEST_CAP_MS, so a single stalled connection can never eat the
-// whole shared budget - the real fix for a never-settling fetch (waitForDeadline's own race is a
-// backstop for a stub `fn` in general, not a substitute for actually releasing the socket).
-async function fetchJsonOnce(path, remainingMs) {
-  const capMs = Math.max(1, Math.min(remainingMs, PER_REQUEST_CAP_MS));
-  const r = await fetch(`http://127.0.0.1:${PORT}${path}`, { signal: AbortSignal.timeout(capMs) });
-  return r.ok ? await r.json() : undefined;
-}
-
-// A ONE-SHOT DevTools HTTP action (never a "wait for ready" read like fetchJsonOnce above): brings
-// `id` to the front. The endpoint replies text/plain, not JSON - reading it as text and surfacing
-// any real failure is the whole N4 fix (never silently retried, never swallowed). Bounded by its
-// own short, fixed cap (PR #230 delta review, F2: "the fetch has no abort signal") - this call
-// happens well after startup, so it does not draw on the shared startup budget.
-async function activateTarget(id) {
-  const r = await fetch(`http://127.0.0.1:${PORT}/json/activate/${id}`, { signal: AbortSignal.timeout(PER_REQUEST_CAP_MS) });
-  const body = await r.text();
-  if (!r.ok) throw new Error(`could not activate the browser target: http ${r.status} ${body}`);
-}
 
 let seq = 0;
 const pending = new Map();
@@ -220,11 +274,12 @@ async function evaluate(expression) {
 // keepAliveTargetId (module-scoped, set once `page` is known) is re-activated every iteration -
 // a single local DevTools HTTP GET, cheap even at up to ~120 calls over a full 30s timeout.
 let keepAliveTargetId = null;
+let session;
 
 async function waitForTextChange(selector, previousText, { timeoutMs = 30000, intervalMs = 250 } = {}) {
   const start = Date.now();
   for (;;) {
-    if (keepAliveTargetId !== null) await activateTarget(keepAliveTargetId).catch(() => {});
+    if (keepAliveTargetId !== null) await session.activate(keepAliveTargetId).catch(() => {});
     const current = await evaluate(
       `(() => { const a = document.querySelector('${selector}'); return a ? a.textContent : null; })()`,
     );
@@ -284,23 +339,22 @@ async function pressKey(name, opts = {}) {
 }
 
 try {
-  // PR #230 delta review, F2: ONE shared budget for the WHOLE startup sequence (DevTools coming
-  // up, then a page target appearing) - the previous code gave each phase its own independent 90s
-  // timeout, which composed to a measured 180s worst case. Both phases below draw on this SAME
-  // `startupDeadline`; whatever the first phase spent is no longer available to the second.
-  const startupDeadline = makeDeadline(STARTUP_BUDGET_MS);
-  const getDiagnostics = () => `stderr:\n${childStderr}`;
-  await waitForDeadline((remainingMs) => fetchJsonOnce('/json/version', remainingMs), {
-    deadline: startupDeadline, intervalMs: 150,
-    checkExited: checkChildExited, describe: 'the DevTools endpoint (/json/version)', getDiagnostics,
+  const getDiagnostics = () => {
+    let activePort;
+    try {
+      activePort = 'first 80 bytes: ' + JSON.stringify(fs.readFileSync(join(profile, 'DevToolsActivePort')).subarray(0, 80).toString('utf8'));
+    } catch (error) {
+      activePort = error.code === 'ENOENT' ? 'file not written' : `could not read file: ${error.message}`;
+    }
+    return `DevToolsActivePort: ${activePort}; stderr:\n${childStderr}`;
+  };
+  // File discovery, version and page readiness all draw from this one budget.
+  session = await startDevToolsSession({
+    readActivePort: makeReadActivePort(fs.promises, profile), fetchJson: makeFetchJson(fetch),
+    fetchText: makeFetchText(fetch), checkExited: checkChildExited,
+    deadline: makeDeadline(STARTUP_BUDGET_MS), sleep, getDiagnostics,
   });
-  // Issue #229: `/json/list` can answer OK before any `type === 'page'` target exists yet - the
-  // old code took whatever the FIRST list response held unconditionally and crashed reading
-  // `.id` off `undefined`. Wait for one to actually appear instead, still on the SAME budget.
-  const page = await waitForPageTarget(
-    (remainingMs) => fetchJsonOnce('/json/list', remainingMs),
-    { deadline: startupDeadline, checkExited: checkChildExited, getDiagnostics },
-  );
+  const { page } = session;
   keepAliveTargetId = page.id;
   ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
@@ -330,8 +384,8 @@ try {
   // seconds on every browser scenario - while also hiding a genuine activation failure behind the
   // same swallowed catch. A single plain GET, and an explicit post-navigate visibility check that
   // FAILS CLEARLY rather than silently proceeding, replaces it.
-  await activateTarget(page.id);
-  try { await send('Page.setWebLifecycleState', { state: 'active' }); } catch (e) { /* older targets lack this; activateTarget above is the primary mechanism */ }
+  await session.activate(page.id);
+  try { await send('Page.setWebLifecycleState', { state: 'active' }); } catch (e) { /* older targets lack this; session.activate above is the primary mechanism */ }
   await send('Page.navigate', { url: pageUrl });
   const stillHidden = await evaluate('document.hidden');
   if (stillHidden) {
@@ -538,7 +592,7 @@ try {
   // otherwise stall it forever): a headless target has been observed drifting back to backgrounded
   // after enough prior CDP interaction (overlay/keyboard steps above), so re-assert activation
   // right here rather than trust the very first one (top of this script) to still hold this far in.
-  await activateTarget(page.id);
+  await session.activate(page.id);
   if (await evaluate('document.hidden')) {
     throw new Error('the page went hidden again before the board section; target activation did not hold');
   }

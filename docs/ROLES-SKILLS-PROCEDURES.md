@@ -73,7 +73,7 @@ flowchart TB
     UA -->|"other work, recorded"| DN
     UA -->|"money, security, irreversible"| DEC
     DN --> BU["Build (developer, in its own worktree)"]
-    BU --> RD["Read by an agent of the other vendor (when available)"]
+    BU --> RD["Read by an agent of another vendor, or the single-vendor fallback (4.3)"]
     RD -->|"FIX"| FX["Fix round (developer)"]
     FX -->|"read again"| RD
     RD -->|"HOLD"| DEC
@@ -86,7 +86,7 @@ flowchart TB
 - **The challenge comes first.** Before major work starts, the lead asks an independent challenger, in a fresh context and ideally from another vendor (the company that makes the AI model), whether the work should be done at all. The answer is one of: proceed, reshape (change the plan), probe (run a small experiment first, and wait for its result before going on), replace, defer (not now), stop or unassessed (no usable answer). A late, missing or unusable answer counts as unassessed, never as proceed: for money, security or irreversible work the team waits or asks the operator, and other work may go ahead with the gap recorded. Only the operator can override replace, defer or stop. Small, clear work such as a fix with a failing test, or a change to documents only, skips the challenge and says why.
 - **A design note** is written only where a design is needed. The architect drafts it, asks a builder and a reader to pick it apart, and gives it to the lead for a go-ahead before anything is built.
 - **The build** is done by a developer in its own copy of the code (a git worktree), never in the main one. For every bug fix the developer writes a test that fails on the old code first. It replies "done" with the full ID of the commit it pushed (a commit is a saved version of the code).
-- **The read** is done by a reader who did not build or design the change, and who works for another vendor when one is available. The reader checks the exact commit it was given and answers GO (good to merge), FIX (change these things) or HOLD (stop; the lead or operator decides). A GO counts only for the commit it names.
+- **The read** is done by a reader who did not build or design the change, and who works for another vendor than the builder. When no reader of another vendor is available, the merge gate's [single-vendor fallback](#when-only-one-vendor-is-available) applies: wait, use a second team's read, or, as the last resort, a labelled read by the same vendor that another vendor repeats later. The reader checks the exact commit it was given and answers GO (good to merge), FIX (change these things) or HOLD (stop; the lead or operator decides). A GO counts only for the commit it names.
 - **Fix rounds repeat the read.** On FIX the developer fixes each finding with a test, pushes one new commit, and the reader checks that every earlier finding is really fixed. This repeats until GO.
 - **The final read.** The lead can say that one read is the final one. Before it, every serious finding is fixed or disproved in writing. After it, only a true blocker holds the change: a P0 or P1 (the two most serious levels), or a finding of any level that shows a stated requirement is not met or is a safety or privacy problem. A blocker found later goes to the operator instead of into another round.
 - **The gates** are three checks that must all pass for the exact head of the change. CI (automatic checks) runs the tests on Linux, macOS and Windows. A change that touches only eligible documents, which no test reads, runs a lighter set of document checks instead; [the contributing guide](https://github.com/zoolok17/agenttalk/blob/master/CONTRIBUTING.md#which-checks-a-change-gets) says which changes are eligible. The client-reference check makes sure no private name has slipped into the text; for a change from a fork it cannot run, so the lead runs it. The merge gate is the lead's own list: a recorded GO for this exact commit, an answer to every serious automated comment, and a request that is still current.
@@ -392,7 +392,7 @@ flowchart TD
 ```
 
 1. **Build.** The developer builds in its own worktree, runs the relevant tests, pushes, and replies `done` with `work_head`.
-2. **Cold read.** Before the read starts, the lead posts "hold, review coming" on the pull request, so the author does not push meanwhile; the verdict comment ends the hold. The lead sends a `read` task, for the exact `work_head`, to a reviewer who did not build or design the change. Give it the commit and the scope, not the builder's reasoning or the verdict you expect. The reviewer:
+2. **Cold read.** Before the read starts, the lead posts "hold, review coming" on the pull request, so the author does not push meanwhile; the verdict comment ends the hold. The lead sends a `read` task, for the exact `work_head`, to a reviewer who did not build or design the change and who works for another vendor than the builder; when none is available, the [single-vendor fallback](#when-only-one-vendor-is-available) says what to do. Give it the commit and the scope, not the builder's reasoning or the verdict you expect. The reviewer:
    - reproduces each blocking finding;
    - checks the builder's security lines: for each `executed` line, removes its protection and sees the named command fail ([the standard](SECURE-CODING.md), section 2, step 3);
    - files findings by severity;
@@ -410,7 +410,7 @@ flowchart TD
    Repeat steps 3 and 4 until GO.
 5. **Sweep.** For a wider final pass, for example over a whole release or a set of documents, the lead sends a `sweep` task. Its verdicts are the same.
 6. **Final read.** The lead may say that an existing read is the final one, in a comment on the pull request; that labels the read and needs no extra approval and no extra read. The late-findings rule applies, in the same words as [the checklist](https://github.com/zoolok17/agenttalk/blob/master/CONTRIBUTING.md#the-pull-request-checklist): before the final read, every P0, P1 and P2 finding (ours or the automated reviewer's) is fixed, already closed or disproved, in writing. After a read is named final, only a P0 or P1 blocks; a P2 or P3 gets a written disposition (fixed, disproved, or moved to a linked follow-up issue with a reason). A finding of any tag always blocks if it shows that a stated requirement is not met, or if it is a safety or privacy problem. A blocker found after the final read goes to the operator to decide, rather than into another round. After the final read the author pushes only for a P0 or P1, or because the lead asks.
-7. **A read supplied by the second team** (the second team of agents on another machine, with its own lead; it is in the checklist) counts as the cold read or the delta read only when it meets the same eligibility as step 2: its reader is not the change's author, designer or builder, it is from another vendor than the author when one is available, and it names the exact commit. The lead records the accepted outside GO as typed evidence (a recorded GO as defined in [4.3](#43-the-merge-gate), naming the outside reader and the commit) and says so on the pull request. The contributor needs no private tools and no extra review, and the lead does not send a duplicate read task automatically. The lead sends one when the supplied read does not meet the bar, or when a later push changes what it covered.
+7. **A read supplied by the second team** (the second team of agents on another machine, with its own lead; it is in the checklist) counts as the cold read or the delta read only when it meets the same eligibility as step 2: its reader is not the change's author, designer or builder, it is from another vendor than the author, and it names the exact commit. When our own team has no reader of another vendor, such a read is the second choice of the [single-vendor fallback](#when-only-one-vendor-is-available). A second team's read by the author's own vendor counts only where that fallback allows a same-vendor read, and then carries its label. The lead records the accepted outside GO as typed evidence (a recorded GO as defined in [4.3](#43-the-merge-gate), naming the outside reader and the commit) and says so on the pull request. The contributor needs no private tools and no extra review, and the lead does not send a duplicate read task automatically. The lead sends one when the supplied read does not meet the bar, or when a later push changes what it covered.
 
 A GO counts only for the commit it names: a GO on an earlier commit does not cover a later one. The one exception, a push that only brings the target branch in, is defined in [4.3](#43-the-merge-gate), step 1.
 
@@ -418,7 +418,7 @@ A GO counts only for the commit it names: a GO on an earlier commit does not cov
 
 This is the rule as the team practises it now; [the pull-request checklist](https://github.com/zoolok17/agenttalk/blob/master/CONTRIBUTING.md#the-pull-request-checklist) shows the same path to contributors, with what GitHub enforces and what only the team does. An ordinary change merges only when all of these hold:
 
-1. **One recorded GO for the exact head commit,** from a reviewer who did not build it, and from another vendor when one is available. "Recorded" means a typed reply whose verdict is GO and that finishes the review: a task reply with `status=done`, or an approved review result. A reply with `status=accepted` and a GO verdict leaves the review task open and does not count. Earlier GOs and prose do not count. The one exception: after a push that only brings the target branch into the pull request, an earlier GO stands only if the lead records that the pull request's own changed lines are byte-identical before and after, for example by comparing `git patch-id --verbatim` of both diffs, each against its merge base, or by a byte comparison of the changed lines. Plain `git patch-id` ignores whitespace, and whitespace can change what code does, so it is not proof. Any difference, or any doubt, means the change is read again. GitHub's own approval is renewed as the ruleset requires.
+1. **One recorded GO for the exact head commit,** from a reviewer who did not build it, and from another vendor than the builder (the vendor is the company that makes the reader's AI model). When no reader of another vendor is available, the rule [when only one vendor is available](#when-only-one-vendor-is-available), below, decides. "Recorded" means a typed reply whose verdict is GO and that finishes the review: a task reply with `status=done`, or an approved review result. A reply with `status=accepted` and a GO verdict leaves the review task open and does not count. Earlier GOs and prose do not count. The one exception: after a push that only brings the target branch into the pull request, an earlier GO stands only if the lead records that the pull request's own changed lines are byte-identical before and after, for example by comparing `git patch-id --verbatim` of both diffs, each against its merge base, or by a byte comparison of the changed lines. Plain `git patch-id` ignores whitespace, and whitespace can change what code does, so it is not proof. Any difference, or any doubt, means the change is read again. GitHub's own approval is renewed as the ruleset requires.
 2. **Every automated P0, P1 and P2 comment has a disposition, by the late-findings rule.** This includes the code host's automated comments on changed lines. Before the final read, each one is fixed, already closed, or the premise is wrong (with the reason, from the code), in writing. After a read is named final (see [4.2](#42-the-review-cycle), step 6), only a P0 or P1 blocks: a P2 or P3 gets a written disposition (fixed, disproved, or moved to a linked follow-up issue with a reason), and a finding of any tag that shows a stated requirement is not met, or a safety or privacy problem, always blocks. The other review comments are read and answered.
 3. **CI green for that head.** On a pull request, CI tests a temporary merge of the head into the target branch, not the head commit by itself, so a green run shows that this merge passes. If the target branch has moved since the run, that result is for the older merge and does not count: run CI again against the current target (for example by updating the branch) before merging. This is the one rule. Its only exception: the lead writes on the pull request, before merging, why the change cannot interact with what moved (the files it touches, compared with the files that changed on the target branch). A push that only brings the target branch in is a new head, so CI runs on it with no exception; whether the earlier GO stands is a separate question, answered in step 1. GitHub does not enforce this; its "branch must be up to date" setting is off on purpose.
    - **The full gate:** the test workflow runs the dev gate, agenttalk's own test run (`agenttalk dev-gate`), on Linux, macOS and Windows with Python 3.10 to 3.13: twelve legs and one aggregate. A single green leg is not a pass; only the full aggregate is.
@@ -439,6 +439,35 @@ Then the lead:
 6. **Records the merge,** if the project uses the work board: `agenttalk board verify-merges`. It refuses until the project's configuration names its repository as a `work_repos` entry.
 7. **Releases the finished checkout,** when its author has finished with it (see [4.9](#49-scratch-hygiene)).
 8. **Tells the other open pull requests** that master moved, with one comment on each saying what changed on it, which other pull requests touch the same files, and the merge order as one line, posted again whenever the order changes. The later sender rebases and runs the checks again, unless the lead has recorded why the change cannot interact. A second-team author is told through its lead.
+
+#### When only one vendor is available
+
+The default does not change: the read that gives the merge GO comes from a reader of another vendor than the builder. But some teams have assistants from one vendor only, and a team with two can lose one for a while, for example when its allowance runs out. Then the lead takes the first of these that fits:
+
+1. **Wait,** when the change can wait until a reader of another vendor is available.
+2. **Otherwise, a read from a second team** by a reader of another vendor, under the second-team rule ([4.2](#42-the-review-cycle), step 7).
+3. **Otherwise, a same-vendor read.** Its reader:
+   - did not build, design or advise on the change;
+   - works in a fresh context, at the strongest model tier the team has;
+   - gets a brief that states no expected outcome.
+
+   The read rests on evidence that no model judges: CI, and for a change to code, a test that fails before the change and passes after it, plus planted faults (deliberately broken versions that the tests must catch).
+
+**The label.** A GO given under item 3 carries `review_independence=same-vendor`, as a meta field on the reviewer's reply and in the lead's comment on the pull request. The lead keeps such GOs on a list of reads to redo. When a reader of another vendor becomes available, it reads the change again, and a finding in that read reopens the work.
+
+**What a same-vendor GO is never enough for:**
+- money or paid spend;
+- security, credentials or privacy;
+- deleting data, or any other step that cannot be undone;
+- a release;
+- gate configuration: CI workflows, linters, scanners and secret-scan settings;
+- this review rule and the shipped instructions that state it.
+
+These need a read by another vendor, a second team's read included. When the team has no other vendor at all, they need the operator's explicit, recorded approval after the same-vendor read.
+
+**Cheap models.** A Qwen seat, or any other cheap-model reader, never gives the GO alone ([the review playbook](playbook/review.md), R9).
+
+**What it costs.** A reader of the same vendor shares more of the builder's blind spots, so a same-vendor GO is weaker evidence than one from another vendor. The label keeps that visible. Where another vendor becomes available later, its read makes up for it; a team that never has another vendor carries that cost for good.
 
 ### 4.4 The release ritual
 
