@@ -491,7 +491,7 @@ Version 1 adds no scanner, no hosted service and no check that runs while agentt
 | The client-reference check | the `security` workflow; for a fork, the lead runs it | private client names in added text and in the whole tree | none: it protects other people's private data, which the SSDF does not cover |
 | The security pass of `review-code` (`references/security.md`) | the independent reader, on every change that touches a sensitive area | an OWASP-based checklist: access control (including object-level checks on reads), input, output, secrets, errors, dependencies, paths, resources | PW.7 |
 | [SECURITY.md](../SECURITY.md) | public | how to report a vulnerability privately; the trust model; four threat scenarios | RV.1, PW.1 |
-| The review cycle and the merge rules ([CONTRIBUTING.md](../CONTRIBUTING.md#the-pull-request-checklist)) | every pull request | an independent reader from another AI vendor when one is available, fix rounds, required checks, merges by the lead only | PW.2, PW.7, PS.1 |
+| The review cycle and the merge rules ([CONTRIBUTING.md](../CONTRIBUTING.md#the-pull-request-checklist)) | every pull request | an independent reader from another AI vendor (or [the single-vendor rule](ROLES-SKILLS-PROCEDURES.md#when-only-one-vendor-is-available) when none is available), fix rounds, required checks, merges by the lead only | PW.2, PW.7, PS.1 |
 
 ## 9. How this maps to outside frameworks
 
