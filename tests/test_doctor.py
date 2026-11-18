@@ -314,6 +314,22 @@ def _the_printed_lookup(fix: str, marker: tuple[str, ...]) -> str:
 
 
 _LANGUAGE_MODES = ["FullLanguage", "ConstrainedLanguage"]  # the printed lookups must behave the same in both
+_HOST_MODE: list[str] = []  # the language mode a fresh pwsh starts in on this machine, read once
+
+
+def _host_language_mode(env: dict[str, str]) -> str:
+    """The mode a new pwsh starts in here. A machine (or a sandbox) can enforce Constrained Language mode; there a
+    session cannot set its own mode at all, not even to the mode it already has, so the helper must not try."""
+    if not _HOST_MODE:
+        done = subprocess.run(
+            [_REAL_PWSH, "-NoProfile", "-NonInteractive", "-Command", "$ExecutionContext.SessionState.LanguageMode"],
+            env=env,
+            capture_output=True,
+            timeout=120,
+        )
+        assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
+        _HOST_MODE.append(done.stdout.decode("ascii").strip())
+    return _HOST_MODE[0]
 
 
 def _render_in_a_minimal_environment(expression: str, extra: dict[str, str], mode: str = "FullLanguage") -> list[str]:
@@ -321,10 +337,12 @@ def _render_in_a_minimal_environment(expression: str, extra: dict[str, str], mod
 
     The environment is built from scratch (never the seat's own, which holds credentials): SystemRoot, PATHEXT, what the
     test needs, and a synthetic secret in an unrelated variable, so a lookup that prints more than it should shows it.
-    Nothing here is refused by Constrained Language mode: the mode is switched with one assignment on the session state
-    (which that mode allows), and the output is read back as hex code units of each printed line, so no console
-    encoding has to be set (an assignment to [Console]::OutputEncoding is refused there). stderr must be empty: a
-    method call refused in Constrained Language mode prints its error and leaves the output empty."""
+    Nothing here is refused by Constrained Language mode: from Full Language mode the mode is switched with one
+    assignment on the session state; a host that already enforces Constrained Language mode is used as it is (it
+    refuses any such assignment), and there the Full Language case is skipped. The output is read back as hex code
+    units of each printed line, so no console encoding has to be set (an assignment to [Console]::OutputEncoding is
+    refused there). stderr must be empty: a method call refused in Constrained Language mode prints its error and
+    leaves the output empty."""
     env = {
         "SystemRoot": os.environ["SystemRoot"],
         "PATHEXT": ".COM;.EXE",
@@ -332,7 +350,11 @@ def _render_in_a_minimal_environment(expression: str, extra: dict[str, str], mod
         **extra,
     }
     hex_of_each_line = "ForEach-Object { ($_.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ' }"
-    switch = f"$ExecutionContext.SessionState.LanguageMode = '{mode}'; " if mode != "FullLanguage" else ""
+    host = _host_language_mode(env)
+    if host == "ConstrainedLanguage" and mode == "FullLanguage":
+        pytest.skip("this machine enforces Constrained Language mode, so Full Language mode cannot be tested here")
+    # switch only when the host starts in Full Language mode; an enforced Constrained Language host is already there
+    switch = f"$ExecutionContext.SessionState.LanguageMode = '{mode}'; " if mode != host else ""
     script = f"{switch}$ExecutionContext.SessionState.LanguageMode; {expression} | {hex_of_each_line}"
     done = subprocess.run(
         [_REAL_PWSH, "-NoProfile", "-NonInteractive", "-Command", script], env=env, capture_output=True, timeout=120
