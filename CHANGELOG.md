@@ -217,8 +217,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exists, and so is a plain `lane abandon` while a field is damaged): it says to set the damaged field to
   the folder's real absolute path in `lanes.json`, then run `lane abandon`. The advice says only what was
   found: a real folder is called a folder; a file or a link (a link is never offered as the value to set) is
-  called that, with the two ways out (name the real checkout folder in both fields, then `lane abandon`, or
-  move that entry away by hand and repeat the command); an entry that could not be examined is said to be
+  called that, with the two ways out, both of which repair the lane's own record in `lanes.json` and leave
+  that entry alone, since a damaged record can name a file that is not the lane's (name the real checkout
+  folder in both fields, then `lane abandon`, or, with no checkout, set the field that names it to empty
+  text and repeat the command); an entry that could not be examined is said to be
   unexamined, with the reason, and is not claimed to exist. In none of these is the missing-worktree
   acknowledgement offered. For a lane whose delivery is unfinished it says to run `lane recover` first and
   then repeat the command, which names what is left.

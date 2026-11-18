@@ -295,12 +295,15 @@ def _surviving_entry_advice(entry: tuple[str, str, str], *, damaged: str, lane_i
                 "it names the step that then runs")
     what = {"file": "a file", "link": "a link (the record must name the real folder, not a link to it)"}.get(
         kind, "an entry that is neither a file nor a folder")
+    # Never tell the reader to move, delete or change the entry: the record only NAMES it, and a damaged record can name
+    # an unrelated file (another project's data, a system file). Neither looking at it nor knowing that the lane has no
+    # checkout shows that it belongs to the lane. The way out is to repair the RECORD, which is the lane's own.
     return (f"the lane's other saved checkout path ({field}) names {what}, not a folder, so retiring it as missing is "
-            f"refused: inspect it, then repair the lane record in {row}: set both worktree_path and "
-            "worktree_toplevel_canonical to the checkout's real absolute folder and run "
-            f"`lane abandon --id {lane_id}`; if the lane has no checkout folder, move that entry out of the way by "
-            "hand and repeat this command, "
-            "which then names the retirement as missing")
+            "refused. The record only names that entry and it may not belong to this lane: leave it as it is and "
+            f"repair the lane record in {row} instead: if the lane has a checkout, set both worktree_path and "
+            "worktree_toplevel_canonical to its real absolute folder and run "
+            f"`lane abandon --id {lane_id}`; if it has none, set {field} to empty text (\"\") and repeat this "
+            "command, which then names the retirement as missing")
 
 
 def checkout_path_recovery(*, lane_id: str, lane: dict | None = None, owner: dict | None = None, root=None) -> str:

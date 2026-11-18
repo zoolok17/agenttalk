@@ -1232,15 +1232,21 @@ def _the_advice(store, lane_id):
     return lanes.checkout_issue_advice(row, lane_id=lane_id, root=store.root)[2]
 
 
-def _not_a_folder_advice(lane_id, what):
-    """The advice for a surviving path (the row's worktree_path) that exists but is not a folder."""
+def _not_a_folder_advice(lane_id, what, field="worktree_path"):
+    """The advice for a surviving path (by default the row's worktree_path) that exists but is not a folder. It never
+    tells the reader to touch the entry: the record only names it, and may name something that is not the lane's."""
     return (
-        f"the lane's other saved checkout path (worktree_path) names {what}, not a folder, so retiring it as missing "
-        f"is refused: inspect it, then repair the lane record in lanes.json lane {lane_id!r}: set both worktree_path "
-        "and worktree_toplevel_canonical to the checkout's real absolute folder and run "
-        f"`lane abandon --id {lane_id}`; if the lane has no checkout folder, move that entry out of the way by hand "
-        "and repeat this command, which then names the retirement as missing"
+        f"the lane's other saved checkout path ({field}) names {what}, not a folder, so retiring it as missing is "
+        "refused. The record only names that entry and it may not belong to this lane: leave it as it is and repair "
+        f"the lane record in lanes.json lane {lane_id!r} instead: if the lane has a checkout, set both worktree_path "
+        f"and worktree_toplevel_canonical to its real absolute folder and run `lane abandon --id {lane_id}`; if it "
+        f'has none, set {field} to empty text ("") and repeat this command, which then names the retirement as missing'
     )
+
+
+def _never_tells_the_reader_to_touch_the_entry(advice):
+    assert not any(word in advice.lower() for word in ("move", "delete", "remove", "rename", "unlink"))
+    assert "leave it as it is" in advice
 
 
 def _unexamined_advice(lane_id, why):
@@ -1259,27 +1265,37 @@ def _the_missing_worktree_retirement(lane_id):
     )
 
 
-def test_a_file_at_the_surviving_path_is_called_a_file_and_no_acknowledgement_is_offered(damaged_lane, capsys):
-    store = damaged_lane("worktree_toplevel_canonical", "")
-    stray = store.root / "checkout"  # the lane's worktree_path names this
-    stray.write_text("not a folder")
+@pytest.mark.parametrize("damaged", ["worktree_toplevel_canonical", "worktree_path"])
+def test_a_file_the_record_merely_names_is_left_alone_and_the_record_is_repaired_instead(damaged_lane, capsys, damaged):
+    """A damaged record can name an unrelated file (another project's data). The advice must not tell the reader to
+    move it; the lane has no checkout, and the way out is to repair the RECORD. Every printed step is accepted."""
+    store = damaged_lane(damaged, "")
+    named = "worktree_path" if damaged == "worktree_toplevel_canonical" else "worktree_toplevel_canonical"
+    unrelated = store.root / "checkout"  # the record names this file; it is independent data, not this lane's
+    unrelated.write_text("independent data")
     advice = _the_advice(store, "damaged")
-    assert advice == _not_a_folder_advice("damaged", "a file")
+    assert advice == _not_a_folder_advice("damaged", "a file", named)
+    _never_tells_the_reader_to_touch_the_entry(advice)
     assert "acknowledge" not in advice and "names a folder" not in advice and "that folder" not in advice
     # what the commands really do with it: both refuse and change nothing
     code, out = _step(store, capsys, "abandon", "--id", "damaged", "--acknowledge-missing-worktree")
     assert code == 2 and "still exists" in out.err
     code, out = _step(store, capsys, "abandon", "--id", "damaged")
     assert code == 2 and "repair the damaged field" in out.err
-    assert stray.read_text() == "not a folder"
     assert lanes.load_lanes(store)["lanes"]["damaged"]["status"] == lanes.STATUS_ACTIVE
-    # "move that entry out of the way by hand and repeat this command": it then names the retirement, which runs
-    stray.unlink()
+    # "if it has none, set <the field that names it> to empty text and repeat this command" (the record is the lane's
+    # own): the repeat names the retirement as missing, and it runs
+    data = lanes.load_lanes(store)
+    data["lanes"]["damaged"][named] = ""
+    lanes.save_lanes(store, data)
     advice = _the_advice(store, "damaged")
     assert advice == _the_missing_worktree_retirement("damaged")
     for argv in _printed_abandon_steps(advice):
         code, out = _step(store, capsys, *argv)
         assert code == 0 and "abandoned lane damaged" in out.out, (argv, out.err)
+    assert lanes.load_lanes(store)["lanes"]["damaged"]["status"] == lanes.STATUS_ABANDONED
+    # and the file the record named was never touched, by the advice or by the commands
+    assert unrelated.is_file() and unrelated.read_text() == "independent data"
 
 
 def test_a_file_at_one_path_and_a_real_checkout_elsewhere_end_in_the_plain_abandon(tmp_path, monkeypatch, capsys):
@@ -1294,6 +1310,7 @@ def test_a_file_at_one_path_and_a_real_checkout_elsewhere_end_in_the_plain_aband
     lanes.save_lanes(store, data)
     advice = _the_advice(store, lane_id)
     assert advice == _not_a_folder_advice(lane_id, "a file")
+    _never_tells_the_reader_to_touch_the_entry(advice)
     assert _printed_abandon_steps(advice) == [["abandon", "--id", lane_id]]  # no acknowledgement is printed
     assert _step(store, capsys, "abandon", "--id", lane_id, "--acknowledge-missing-worktree")[0] == 2
     assert _step(store, capsys, "abandon", "--id", lane_id)[0] == 2
@@ -1308,6 +1325,7 @@ def test_a_file_at_one_path_and_a_real_checkout_elsewhere_end_in_the_plain_aband
         code, out = _step(store, capsys, *argv)
         assert code == 0 and f"abandoned lane {lane_id}" in out.out, (argv, out.err)
     assert not worktree.exists()
+    assert stray.read_text() == "not a folder"  # the file the record named is still there, unchanged
 
 
 def test_a_link_at_the_surviving_path_is_a_link_even_when_it_leads_to_a_folder(damaged_lane, capsys):
@@ -1322,12 +1340,15 @@ def test_a_link_at_the_surviving_path_is_a_link_even_when_it_leads_to_a_folder(d
         pytest.skip("this machine does not allow creating a symbolic link")
     advice = _the_advice(store, "damaged")
     assert advice == _not_a_folder_advice("damaged", "a link (the record must name the real folder, not a link to it)")
+    _never_tells_the_reader_to_touch_the_entry(advice)
     assert "names a folder" not in advice and "acknowledge" not in advice
     code, out = _step(store, capsys, "abandon", "--id", "damaged", "--acknowledge-missing-worktree")
     assert code == 2 and "still exists" in out.err and target.is_dir()
-    link.unlink()  # the entry (not what it led to) is moved out of the way by hand, as the advice says
-    assert target.is_dir()
+    data = lanes.load_lanes(store)  # the record is repaired; the link and what it leads to are left alone
+    data["lanes"]["damaged"]["worktree_path"] = ""
+    lanes.save_lanes(store, data)
     assert _the_advice(store, "damaged") == _the_missing_worktree_retirement("damaged")
+    assert link.is_symlink() and target.is_dir()
 
 
 @pytest.mark.parametrize(
