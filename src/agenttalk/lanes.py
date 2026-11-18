@@ -77,6 +77,7 @@ HOLD_STALE_EPOCH = "stale_epoch"
 HOLD_STALE_REGISTRY = "stale_registry"
 HOLD_DIFF_UNAVAILABLE = "diff_unavailable"
 HOLD_DIFF_PARSE_ERROR = "diff_parse_error"
+HOLD_AMBIGUOUS_MERGE_BASE = "ambiguous_merge_base"
 HOLD_CASEFOLD_COLLISION = "casefold_collision"
 HOLD_OUT_OF_BOUNDS = "out_of_bounds_path"
 HOLD_UNOWNED = "unowned_path"
@@ -812,6 +813,10 @@ def compute_verdict(lane: dict, *, changed: dict, classifications: dict,
         return _verdict(holds)
     if err == "parse_error":
         hold(HOLD_DIFF_PARSE_ERROR, "could not parse the diff output")
+        return _verdict(holds)
+    if err == "ambiguous_base":
+        hold(HOLD_AMBIGUOUS_MERGE_BASE, "the lane and its target have several merge bases, so what a delivery "
+             "would write cannot be worked out; merge the current target into the lane and check again")
         return _verdict(holds)
 
     touched = [p for p in changed.get("paths", []) if p.get("touched")]
