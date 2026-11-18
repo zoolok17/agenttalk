@@ -1,5 +1,7 @@
 # The agenttalk charter
 
+**In plain words:** this page says what agenttalk is trying to become: a software engineering organization whose workforce is AI agents, one that delivers software people can trust, with evidence, and spends only the effort each change needs. It is for anyone who uses, contributes to or decides about agenttalk. It describes a direction, not finished work: several of the guarantees it names are not in place yet, and it says which.
+
 **Status:** agreed as the project's strategic direction on 18 November 2026, after an internal review: the lead's response and three independent challenges by agents of another vendor.
 
 This is a statement of intent. It does not authorize any roadmap, code, infrastructure or team change by itself; each of those still needs its own decision. It was reviewed inside the project, not audited from outside.
@@ -112,7 +114,7 @@ We aim to trace code back to its requirements, decisions, conversations and chec
 
 **Confidentiality.** Client material stays separate from general knowledge. Privacy scrubbing alone does not make client-derived material safe or permissible to reuse. Promotion across clients needs explicit rules, authorization, provenance, and protection against both disclosure and knowledge poisoning. No agent can turn an unverified conclusion into organization-wide policy because another agent agreed with it.
 
-**Honest status.** The knowledge architecture stays, but its benefit is not established. Retrieval quality has measured poorly, and in one internal pilot stored notes improved no decision. Knowledge is judged by whether it improves future outcomes, not by how much of it we store. Its benefit needs its own controlled evaluation before we claim it.
+**Honest status.** The knowledge architecture stays, but its benefit is not established. Automatic retrieval of relevant lessons has measured poorly ([#293, corrected report](https://github.com/zoolok17/agenttalk/issues/293#issuecomment-6926156373)). In one internal pilot, adding shared lessons to the automatically selected context produced no useful correction across 19 past decisions ([result](https://github.com/zoolok17/agenttalk/issues/293#issuecomment-6038377263)). Knowledge is judged by whether it improves future outcomes, not by how much of it we store. Its benefit needs its own controlled evaluation before we claim it.
 
 ## 6. Independent, verifiable quality assurance
 
@@ -127,7 +129,7 @@ We rely on established third-party tools rather than inventing every check ourse
 - independent audits, chosen by project and risk.
 
 agenttalk already has a starting point for this:
-- an assurance scan that runs Bandit, Semgrep, Gitleaks and dependency scanners;
+- an assurance scan that can run Bandit, Semgrep, Gitleaks and dependency scanners;
 - a development gate that binds its evidence to the source revision, manifest, plan and tool versions.
 
 **What is missing is the independent authority behind the results.** It would establish that the evidence applies to the code actually delivered, that the required checks really ran, and that no agent could influence the evidence or its acceptance.
