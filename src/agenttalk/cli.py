@@ -4999,6 +4999,13 @@ def _verify_lane_worktree(
     if not isinstance(wt, str) or not wt:
         raise lane_mod.LaneError("lane has no registered worktree")
     embedded_id = lane_mod.validate_lane_id(str(lane.get("lane_id")))
+    if embedded_id != lane_id:
+        # The branch below is picked by the id inside the row, so a damaged row that holds another lane's id would
+        # have this check confirm THAT lane's clean checkout, and a cleanup would then remove it. Refuse before the
+        # Git checks and any removal: the row must name itself.
+        raise lane_mod.LaneError(
+            f"lane row {pc.line(lane_id)} holds the lane id {pc.line(embedded_id)}; the two must match before its "
+            f"checkout is checked or removed: repair lane_id in that row of lanes.json")
     branch = lane_mod.lane_branch(embedded_id)
     toplevel = _git_read_one(wt, ["rev-parse", "--show-toplevel"], "worktree toplevel")
     toplevel_c = lane_mod.canonical_host_path(toplevel)

@@ -1798,6 +1798,29 @@ def test_the_candidate_and_the_verifier_name_the_selected_key(keyed):
         assert _hint(BAD) in str(caught.value) and f"--id {OTHER}" not in str(caught.value)
 
 
+def test_the_verifier_refuses_a_row_whose_own_lane_id_is_another_lanes_before_any_folder_use(
+    keyed, monkeypatch, tmp_path
+):
+    """The lane branch is picked by the id inside the row. A damaged row "bad" that holds the id "other" and names a
+    real, clean checkout would otherwise be confirmed as lane/other's checkout, and abandon's cleanup would remove
+    it. The row must name itself before any folder is read."""
+    folder = tmp_path / "someone-elses-checkout"
+    folder.mkdir()
+    store = keyed(embedded=OTHER, worktree_path=str(folder), worktree_toplevel_canonical=str(folder))
+    row = lanes.load_lanes(store)["lanes"][BAD]
+
+    def git(*args, **kwargs):
+        pytest.fail("a row that holds another lane's id must be refused before Git or any folder is used")
+
+    monkeypatch.setattr(cli, "_git_read_one", git)
+    monkeypatch.setattr(cli, "_git", git)
+    with pytest.raises(lanes.LaneError) as caught:
+        cli._verify_lane_worktree(store, row, lane_id=BAD)
+    assert f"lane row {BAD} holds the lane id {OTHER}" in str(caught.value)
+    assert "repair lane_id in that row of lanes.json" in str(caught.value)
+    assert folder.is_dir()
+
+
 @pytest.mark.parametrize("canonical", RELATIVE_CANONICALS[:2])
 def test_the_candidate_refuses_a_relative_canonical_before_any_git_or_folder_use(keyed, monkeypatch, canonical):
     store = keyed(worktree_toplevel_canonical=canonical)
@@ -2675,7 +2698,8 @@ def test_checkout_identity_and_cleanliness_stay_in_force_on_the_committed_snapsh
     primary = dict(row, worktree_path=str(store.root))  # the primary checkout is not a lane worktree
     with pytest.raises(lanes.LaneError, match="primary checkout"):
         cli._verify_lane_worktree(store, primary, lane_id=lane_id, check_paths=False)
-    with pytest.raises(lanes.LaneError, match="does not match"):  # another lane's branch
+    # another lane's id inside the row: refused before any folder is read (#834), not only by the branch check
+    with pytest.raises(lanes.LaneError, match="holds the lane id some-other-lane; the two must match"):
         cli._verify_lane_worktree(store, dict(row, lane_id="some-other-lane"), lane_id=lane_id, check_paths=False)
     (worktree / "src/core/a.py").write_text("tracked change\n", encoding="utf-8")
     assert _git_rc(worktree, "status", "--porcelain").stdout.strip()
@@ -3335,7 +3359,8 @@ def test_the_identity_checks_run_through_the_canonical_and_a_failure_there_is_a_
         cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
     assert _git_rc(worktree, "checkout", "--", "src/core/a.py").returncode == 0  # clean again
     row["lane_id"] = "some-other-lane"
-    with pytest.raises(lanes.LaneError, match="does not match"):  # another lane's branch
+    # another lane's id inside the row: refused before any folder is read (#834), not only by the branch check
+    with pytest.raises(lanes.LaneError, match="holds the lane id some-other-lane; the two must match"):
         cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
 
 
@@ -3360,7 +3385,8 @@ def test_the_identity_checks_still_run_on_the_committed_snapshot_path_for_an_abs
         cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
     assert _git_rc(worktree, "checkout", "--", "src/core/a.py").returncode == 0  # clean again
     row["lane_id"] = "some-other-lane"
-    with pytest.raises(lanes.LaneError, match="does not match"):  # another lane's branch
+    # another lane's id inside the row: refused before any folder is read (#834), not only by the branch check
+    with pytest.raises(lanes.LaneError, match="holds the lane id some-other-lane; the two must match"):
         cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
 
 
