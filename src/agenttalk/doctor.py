@@ -36,6 +36,7 @@ from agenttalk.store import (
     Store,
     find_root,
     find_stores_upward,
+    store_fence_allows,
 )
 
 
@@ -2056,6 +2057,24 @@ def _check_init(store: Store) -> Check:
                 "`agenttalk init` refuses to start a team folder here while that one exists, on purpose, so that "
                 "two teams at different depths do not talk past each other"
             )
+            if not store_fence_allows(above[0]):
+                # Opening a store the fence cannot vouch for (outside it, or holding an unreadable or linked
+                # entry) is refused and reported, so doctor does not look inside: it names the folder instead.
+                return Check(
+                    name="store.initialized",
+                    status="error",
+                    details=(
+                        f"not set up yet: .agenttalk/config.json not found at {pc.line(str(store.root))}; "
+                        f"a .agenttalk folder exists above it, at {pc.line(str(above[0]))}, which the store "
+                        "fence (AGENTTALK_STORE_FENCE) does not let doctor open safely (it lies outside the fence, "
+                        "or holds something the fence cannot vouch for), so doctor did not look inside it"
+                    ),
+                    fix=(
+                        "check that folder from a shell whose store fence includes it: if it is a team folder, "
+                        "use it as the root; if it is left over, look at what it holds before you move it away. "
+                        f"{refusal}"
+                    ),
+                )
             unreadable = False
             if Store(above[0]).initialized():
                 try:

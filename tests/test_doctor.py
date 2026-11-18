@@ -677,6 +677,40 @@ def test_doctor_below_a_team_folder_whose_config_cannot_be_read_says_to_check_th
         assert "init --here" not in text and "--force" not in text and "re-init" not in text.lower()
 
 
+def test_doctor_below_a_store_outside_the_store_fence_reports_it_without_opening_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With AGENTTALK_STORE_FENCE set, opening a store outside it is refused and reported. The team folder above
+    lies outside a fence around the project, so doctor names it without opening it, and still prints its report
+    (human and --json). A refusal here would also fail this test through the suite's fence report."""
+    from agenttalk.store import STORE_FENCE_ENV
+
+    Store(tmp_path).init(["claude-dev", "codex-rev"])  # the team folder above, outside the fence set below
+    fenced = tmp_path / "fenced"
+    child = fenced / "sub"
+    child.mkdir(parents=True)
+    for name in ("AGENTTALK_ROOT", "AGENTTALK_SELF", "AGENTTALK_PEER"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(STORE_FENCE_ENV, str(fenced))
+
+    check = doctor._check_init(Store(child))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert f"a .agenttalk folder exists above it, at {tmp_path}, which the store fence" in check.details
+    assert "does not let doctor open safely" in check.details
+    assert "so doctor did not look inside it" in check.details
+    assert "check that folder from a shell whose store fence includes it" in check.fix
+    assert "init --here" not in check.fix and "--force" not in check.fix
+
+    capsys.readouterr()
+    assert cli.main(["--root", str(child), "doctor"]) == 2
+    human = capsys.readouterr().out
+    assert "store.initialized" in human and "does not let doctor open safely" in human
+    assert cli.main(["--root", str(child), "doctor", "--json"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    init = [c for c in report["checks"] if c["name"] == "store.initialized"]
+    assert len(init) == 1 and "does not let doctor open safely" in init[0]["details"]
+
+
 def test_doctor_partly_set_up_folder_names_the_missing_config_file(tmp_path: Path) -> None:
     """Store.initialized() is true only when .agenttalk/config.json exists, so a folder that has a
     .agenttalk/ but no config.json is still "not set up", and the text must say which file is missing

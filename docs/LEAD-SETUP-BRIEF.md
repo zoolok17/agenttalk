@@ -168,6 +168,8 @@ it, so memory follows how many seats are working at the same moment, not how man
 
 ### 2a. Put agenttalk in its own environment
 
+On Debian or Ubuntu, install the venv package first: `sudo apt install python3-venv` (on Python 3.14 this brings `python3.14-venv`).
+
 Choose a folder for the environment that is **outside** the project's code and
 outside the team folder you will make in step 2c. Then install the released version.
 agenttalk is installed from its GitHub release tag, not from the Python package index.
