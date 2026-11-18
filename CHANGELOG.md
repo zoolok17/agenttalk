@@ -291,7 +291,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needs no host by default. It stays an error when a setup file is there, and when a Codex wrapper in the
   team has left a continuous marker, even an old one (it names those agents). It also stays an error, saying
   it could not check, when a file, a marker or the team list cannot be read or looked at, when a marker holds
-  a value the wrapper never writes, or when a marker (or the config or selection) sits under a folder link
+  a value the wrapper never writes or JSON nested too deeply to read, or when a marker (or the config or selection) sits under a folder link
   that cannot be followed: nothing is called absent unless it was not found where it could be looked for. A
   folder with no store at all gets the same `N/A`, and the separate store check still reports it. Its advice
   is unchanged when a host is selected. The plain `agenttalk doctor` output prints the next step only for a

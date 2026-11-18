@@ -783,7 +783,7 @@ def _wrapper_loop_evidence(store: Store) -> tuple[list[str], list[str], bool]:
     cannot tell "missing" from "damaged", and a "not found" under a link that cannot be followed says nothing."""
     try:
         agents = store.load_config().get("agents") or []
-    except (OSError, ValueError):  # a damaged config.json is a ValueError (json.JSONDecodeError is one)
+    except (OSError, ValueError, RecursionError):  # a damaged config.json may be too deeply nested
         return [], [], True
     loops: list[str] = []
     unknown: list[str] = []
@@ -799,7 +799,7 @@ def _wrapper_loop_evidence(store: Store) -> tuple[list[str], list[str], bool]:
             with open(path, "rb") as handle:
                 raw = handle.read(_MARKER_MAX_BYTES + 1)
             marker = json.loads(raw.decode("utf-8")) if 0 < len(raw) <= _MARKER_MAX_BYTES else None
-        except (OSError, ValueError):  # UnicodeDecodeError and json.JSONDecodeError are ValueErrors
+        except (OSError, ValueError, RecursionError):  # UnicodeDecodeError and json.JSONDecodeError are ValueErrors
             marker = None
         cli_name = marker.get("cli") if isinstance(marker, dict) else None
         mode = marker.get("mode") if isinstance(marker, dict) else None

@@ -2889,14 +2889,14 @@ def test_a_codex_marker_of_a_continuous_loop_needs_the_host_the_lead_loop_includ
     "content",
     ["", "{", "[]", '"codex"', "7", "null", "{}", '{"cli": "codex"}', '{"mode": "wrapper-loop"}',
      '{"cli": 7, "mode": "wrapper-loop"}', '{"cli": "codex", "mode": ["wrapper-loop"]}',
-     '{"cli": "", "mode": "wrapper-loop"}', "\ufeff{}",
+     '{"cli": "", "mode": "wrapper-loop"}', "\ufeff{}", "[" * 2000 + "]" * 2000,
      # text, but never a value the wrapper writes (health.safe_token cannot produce a space; the established values
      # are the two wrappable CLIs and the four modes the launcher sets)
      '{"cli": "codex", "mode": "bad mode"}', '{"cli": "codex", "mode": "wrapper-loops"}',
      '{"cli": "codex", "mode": "Wrapper-Loop"}', '{"cli": "gemini", "mode": "wrapper-loop"}',
      '{"cli": "Codex", "mode": "wrapper-loop"}', '{"cli": "codex ", "mode": "wrapper-loop"}'],
     ids=["empty", "truncated", "list", "string", "number", "null", "no-fields", "no-mode", "no-cli",
-         "cli-not-text", "mode-not-text", "cli-empty", "bom", "mode-with-a-space", "mode-unknown",
+         "cli-not-text", "mode-not-text", "cli-empty", "bom", "deeply-nested", "mode-with-a-space", "mode-unknown",
          "mode-wrong-case", "cli-unknown", "cli-wrong-case", "cli-padded"],
 )
 def test_a_marker_that_cannot_be_read_as_a_marker_is_unknown_not_absent(tmp_path, monkeypatch, content):
@@ -2920,6 +2920,24 @@ def test_a_marker_that_cannot_be_opened_is_unknown(tmp_path, monkeypatch):
     assert check.status == "error" and check.details.startswith("Cannot check wrapper health records")
 
 
+def test_a_marker_that_exceeds_the_json_decoder_recursion_limit_is_unknown(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    content = "[" * 2000 + "]" * 2000
+    _marker(store, "alpha", content)
+    original_loads = json.loads
+
+    def loads_with_recursion_error(value, *args, **kwargs):
+        if value == content:
+            raise RecursionError("nested marker")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", loads_with_recursion_error)
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and check.details.startswith(_HEALTH_UNKNOWN_PREFIX)
+
+
 def test_an_unknown_marker_never_hides_a_codex_loop_marker_next_to_it(tmp_path, monkeypatch):
     _windows_with_nothing_found(monkeypatch)
     store = Store(tmp_path)
@@ -2930,7 +2948,8 @@ def test_an_unknown_marker_never_hides_a_codex_loop_marker_next_to_it(tmp_path, 
     assert check.status == "error" and "beta" in check.details
 
 
-@pytest.mark.parametrize("config", ["", "{", "[]", '{"agents": "alpha"}', '{"agents": ["bad name"]}'])
+@pytest.mark.parametrize("config", ["", "{", "[]", '{"agents": "alpha"}', '{"agents": ["bad name"]}',
+                                    "[" * 2000 + "]" * 2000])
 def test_a_roster_that_cannot_be_read_is_unknown_not_na(tmp_path, monkeypatch, config):
     _windows_with_nothing_found(monkeypatch)
     store = Store(tmp_path)
@@ -2938,6 +2957,24 @@ def test_a_roster_that_cannot_be_read_is_unknown_not_na(tmp_path, monkeypatch, c
     store.config_path.write_text(config, encoding="utf-8")
     check = doctor._check_powershell_host(store)
     assert check.status == "error" and check.details.startswith("Cannot check wrapper health records")
+
+
+def test_a_roster_that_exceeds_the_json_decoder_recursion_limit_is_unknown(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    content = "[" * 2000 + "]" * 2000
+    store.config_path.write_text(content, encoding="utf-8")
+    original_loads = json.loads
+
+    def loads_with_recursion_error(value, *args, **kwargs):
+        if value == content:
+            raise RecursionError("nested roster")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", loads_with_recursion_error)
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and check.details.startswith(_HEALTH_UNKNOWN_PREFIX)
 
 
 def test_a_started_store_without_a_roster_is_unknown_not_na(tmp_path, monkeypatch):
@@ -3114,7 +3151,14 @@ def test_the_non_windows_answer_is_unchanged(tmp_path, monkeypatch):
 
 
 def test_the_doctor_command_reports_na_and_still_errors_on_a_root_with_no_store(tmp_path, monkeypatch, capsys):
-    _windows_with_nothing_found(monkeypatch)
+    host_check = doctor._check_powershell_host
+
+    def check_as_windows(store):
+        with monkeypatch.context() as host_patch:
+            _windows_with_nothing_found(host_patch)
+            return host_check(store)
+
+    monkeypatch.setattr(doctor, "_check_powershell_host", check_as_windows)
     monkeypatch.setattr(iskl, "default_claude_dir", lambda: tmp_path / "no-claude")
     monkeypatch.setattr(iskl, "default_codex_dir", lambda: tmp_path / "no-codex")
     Store(tmp_path / "team").init(["alpha"])
