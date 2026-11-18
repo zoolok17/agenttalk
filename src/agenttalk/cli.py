@@ -4993,35 +4993,45 @@ def _lane_checkout_folder(saved: str) -> str:
     return str(path.absolute())
 
 
-def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> str | None:
-    """The key of another lane whose saved checkout fields name one of `folders` (the same folder under another
-    spelling, a link or a junction included), or None. A checkout that two rows name is not proven to be either's."""
+def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> tuple[str, bool] | None:
+    """`(key, names)` for another lane whose saved checkout fields leave it possible that it owns one of `folders`, or
+    None when every other row is ruled out. `names` is True when a field names the folder (the same folder under
+    another spelling, a link or a junction included), and False when the row's `worktree_path` is not a full path (so
+    which folder it names depends on where it was written) and the row saves no full canonical path to settle it: that
+    row is never skipped, because it could be the owner. A blank, empty or non-text field names no folder."""
     rows = lane_mod.load_lanes(store).get("lanes") or {}
     for key, row in rows.items():
         if key == lane_id or not isinstance(row, dict):
             continue
+        anchored = False  # the row saves a full canonical path, which settles what its path field means
+        placed = True  # False while its `worktree_path` is a spelling that needs a folder to be read against
         for field in ("worktree_path", "worktree_toplevel_canonical"):
             saved = row.get(field)
             if not isinstance(saved, str) or lane_mod.checkout_path_problem({field: saved}) is not None:
                 continue
             saved = saved.replace("{ROOT}", str(store.root))
-            try:
-                # A relative spelling can mean the folder the command runs in or the store's folder, and which one
-                # was meant cannot be recovered: it names the checkout if it names it either way.
-                named = [_lane_checkout_folder(saved)]
-            except lane_mod.LaneError:
-                continue  # a spelling with no single meaning names no folder here
-            if not lane_mod.path_is_absolute(saved):
-                named.append(str(Path(store.root).absolute() / saved))
+            if lane_mod.path_is_absolute(saved):
+                named = [saved]
+                anchored = anchored or field == "worktree_toplevel_canonical"
+            else:
+                # Which folder it means cannot be recovered, so it names the checkout if any reading does: the
+                # folder the command runs in (a drive-relative `C:x` is read against that drive's current folder),
+                # or the store's folder.
+                named = [os.path.abspath(saved)]
+                if not (Path(saved).drive or Path(saved).root):
+                    named.append(str(Path(store.root).absolute() / saved))
+                placed = placed and field != "worktree_path"
             for folder in folders:
                 for candidate in named:
                     if _same_folder(candidate, folder):
-                        return key
+                        return key, True
                     try:
                         if os.path.samefile(candidate, folder):
-                            return key
+                            return key, True
                     except (OSError, ValueError):
                         pass  # one of them is not there: only the spelling comparison above could say
+        if not placed and not anchored:
+            return key, False
     return None
 
 
@@ -5111,10 +5121,16 @@ def _verify_lane_worktree(
         detached_at_lane_tip = True
     # Whatever the branch says, a folder that another lane's row names is that lane's, never this one's.
     owner = _lane_checkout_owned_by_another(store, lane_id, wt, toplevel)
+    if owner is not None and owner[1]:
+        raise lane_mod.LaneError(
+            f"this checkout is also the saved checkout of lane {pc.line(owner[0])}, so it is not proven to be lane "
+            f"{pc.line(lane_id)}'s alone: repair the saved checkout paths in lanes.json before anything is removed")
     if owner is not None:
         raise lane_mod.LaneError(
-            f"this checkout is also the saved checkout of lane {pc.line(owner)}, so it is not proven to be lane "
-            f"{pc.line(lane_id)}'s alone: repair the saved checkout paths in lanes.json before anything is removed")
+            f"the saved worktree path of lane {pc.line(owner[0])} is not a full path and that lane saves no full "
+            f"canonical path, so it is not known that this checkout is not that lane's: set worktree_path in lane "
+            f"{pc.line(owner[0])}'s record in lanes.json to its checkout's real absolute folder (or to empty text if "
+            "it has none) before anything is removed")
     rc, status = _git(wt, ["status", "--porcelain", "--untracked-files=no"])
     if rc != 0:
         raise lane_mod.LaneError(f"could not verify worktree tracked status (git rc={rc})")
@@ -6017,6 +6033,22 @@ def _lane_remove_prepared(store, pending: dict) -> None:
                 "agenttalk lane deliver: the prepared copy named in the saved delivery record is not this delivery's "
                 "own prepared file, so it was left in place; check that record in lanes.json.\n")
         return
+    # The right name is not enough: if a folder on the way to it is a link or a junction, the path resolves into some
+    # other folder and the file there is not the delivery's (its canonical path matches because both spellings resolve
+    # through the link). The delivery's managed folders must be real folders, or nothing is removed.
+    deliveries = lane_mod.deliveries_dir(store)
+    for folder in (deliveries, own.parent):
+        try:
+            linked = lane_mod._is_link(os.fspath(folder))
+        except FileNotFoundError:
+            return  # nothing is there to remove
+        except OSError:
+            linked = True  # it cannot be looked at, so it is not shown to be a real folder
+        if linked:
+            sys.stderr.write(
+                "agenttalk lane deliver: the delivery's prepared-copy folder is a link (or cannot be checked), so "
+                "the prepared copy was left in place; check the folders under the store's lane-deliveries folder.\n")
+            return
     try:
         own.unlink(missing_ok=True)
     except OSError:

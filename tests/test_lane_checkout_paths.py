@@ -4385,3 +4385,165 @@ def test_abandon_does_not_remove_a_detached_checkout_while_the_lane_branch_is_ch
     cli.main(["--root", str(root), "lane", "abandon", "--id", "first"])
 
     _assert_untouched(first, other)
+
+
+def _link_directory(link: Path, target: Path) -> None:
+    """Make `link` a folder link to `target`: a junction on Windows, a symbolic link elsewhere."""
+    import subprocess
+
+    if os.name == "nt":
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+        if made.returncode != 0:
+            pytest.skip("this machine does not allow a junction here")
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def _unplaced_owner_case(tmp_path, monkeypatch, command, spelling):
+    """Another lane's checkout, claimed by the selected lane's row, whose OWN row cannot be placed: its saved path is
+    not a full path and it has no saved canonical path. Returns (run, victim): `run()` does the command, `victim` is
+    the other lane's checkout, which must still be there afterwards."""
+    from test_lanes import _assign_worktree, _git_rc, _repo
+
+    if command == "deliver":
+        store, selected, mine, head, _artifact = _published_with_cleanup_postponed(tmp_path, monkeypatch)
+        tip = head
+        other = _assign_second_lane(store.root, lanes.load_lanes(store)["lanes"][selected]["base_sha"])
+        assert _git_rc(mine, "checkout", "--detach", head).returncode == 0  # the lane branch is checked out nowhere
+        assert _git_rc(other, "checkout", "--detach", tip).returncode == 0
+        _point_lane_at(store, selected, other)
+        victim = other
+        argv = ["lane", "deliver", "--id", selected, "--from", "dev"]
+    else:
+        root, base = _repo(tmp_path)
+        store, selected = Store(root), "first"
+        mine = Path(_assign_worktree(root, base, selected)["worktree_path"])
+        other = _assign_second_lane(root, base)
+        if command == "abandon":
+            assert _git_rc(mine, "checkout", "--detach", base).returncode == 0
+            assert _git_rc(other, "checkout", "--detach", base).returncode == 0
+            _point_lane_at(store, selected, other)
+            victim = other
+            argv = ["lane", "abandon", "--id", selected]
+        else:  # gc finds the retired lane's folder by name; the other lane's checkout has been moved into it
+            assert _git_rc(root, "worktree", "remove", str(mine)).returncode == 0
+            assert _git_rc(other, "checkout", "--detach", base).returncode == 0
+            assert _git_rc(root, "worktree", "move", str(other), str(mine)).returncode == 0
+            _update_row(store, selected, status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_ABANDONED)
+            victim = mine
+            argv = ["lane", "gc", "--delete", "--target", "HEAD", "--json"]
+    if spelling == "relative":
+        unplaced = "not-the-folder-it-looks-like"
+    else:  # a drive-relative name, read against that drive's current folder: here the other checkout's parent
+        unplaced = victim.drive + victim.name
+        monkeypatch.chdir(victim.parent)
+    _update_row(store, "other", worktree_path=unplaced, worktree_toplevel_canonical=None)
+    return (lambda: cli.main(["--root", str(store.root), *argv])), victim
+
+
+@pytest.mark.parametrize("command", ["abandon", "deliver", "gc"])
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "relative",
+        pytest.param("drive-relative", marks=pytest.mark.skipif(os.name != "nt", reason="drive letters are Windows")),
+    ],
+)
+def test_a_removal_is_blocked_by_another_lanes_record_whose_path_cannot_be_placed(
+    tmp_path, monkeypatch, capsys, command, spelling
+):
+    """An other-lane record that cannot be read as one folder (not a full path, no saved full canonical path) could be
+    naming the very checkout about to be removed. It was skipped, so abandon, delivery cleanup and gc removed that
+    other lane's checkout. It now blocks the removal unless the record's own canonical path rules it out."""
+    if command != "abandon" and spelling == "drive-relative":
+        pytest.skip("the drive-relative reading is the abandon reproduction")
+    run, victim = _unplaced_owner_case(tmp_path, monkeypatch, command, spelling)
+    capsys.readouterr()
+
+    run()
+
+    _assert_untouched(victim)
+    assert (victim / "src" / "other" / "b.py").exists()
+
+
+def test_another_lanes_relative_path_with_a_full_canonical_path_does_not_block_a_removal(tmp_path, capsys):
+    """The control: the other record's relative spelling is ruled out by its own saved full canonical path, which names
+    the other lane's real checkout, so the first lane's own checkout is still removed."""
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    _update_row(Store(root), "other", worktree_path=os.path.relpath(other, root))
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root), "lane", "abandon", "--id", "first"]) == 0
+
+    assert not first.exists()
+    _assert_untouched(other)
+
+
+@pytest.mark.parametrize("kind", ["junction", "symlink"])
+def test_the_prepared_copy_is_not_deleted_through_a_linked_prepared_folder(tmp_path, monkeypatch, capsys, kind):
+    """The expected file name and a matching canonical path do not make the managed `.prepared` folder trustworthy: if
+    it is a link or junction, the path resolves into some other folder, and the file there is not the delivery's.
+    Windows has the junction case (codex-rev's reproduction); the symbolic-link case is for systems that make them
+    without special rights."""
+    if kind == "junction" and os.name != "nt":
+        pytest.skip("a junction is a Windows folder link")
+    if kind == "symlink" and os.name == "nt":
+        pytest.skip("a symbolic link needs special rights on Windows; the junction case covers it there")
+    store, lane_id, _checkout, _head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    pending = lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]
+    own = lanes.prepared_delivery_artifact_path(store, pending["lane_id"], pending["transaction_id"])
+    own.parent.rename(own.parent.with_name(".prepared-original"))
+    independent = tmp_path.parent / f"{tmp_path.name}-independent"
+    independent.mkdir()
+    victim = independent / own.name
+    victim.write_text("not part of any delivery\n", encoding="utf-8")
+    _link_directory(own.parent, independent)
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["publish_pending"]["prepared_artifact"] = str(victim)
+    lanes.save_lanes(store, data)
+    signed = artifact.read_bytes()
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+
+    assert victim.read_text(encoding="utf-8") == "not part of any delivery\n"
+    assert artifact.read_bytes() == signed
+    assert "left in place" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["abandon", "deliver", "gc"])
+@pytest.mark.parametrize("dirt", ["tracked", "untracked"])
+def test_no_removal_takes_a_detached_checkout_that_no_record_shares_while_it_holds_unsaved_work(
+    tmp_path, monkeypatch, capsys, command, dirt
+):
+    """The one case accepted on the commit match alone (a detached checkout at the branch tip that no other record
+    names and whose branch is checked out nowhere) can only ever lose a clean checkout: a changed tracked file or an
+    untracked file stops every removal path, and nothing forces it."""
+    from test_lanes import _assign_worktree, _git_rc, _repo
+
+    if command == "deliver":
+        store, selected, checkout, head, _artifact = _published_with_cleanup_postponed(tmp_path, monkeypatch)
+        assert _git_rc(checkout, "checkout", "--detach", head).returncode == 0
+        argv = ["lane", "deliver", "--id", selected, "--from", "dev"]
+    else:
+        root, base = _repo(tmp_path)
+        store, selected = Store(root), "first"
+        checkout = Path(_assign_worktree(root, base, selected)["worktree_path"])
+        assert _git_rc(checkout, "checkout", "--detach", base).returncode == 0
+        if command == "abandon":
+            argv = ["lane", "abandon", "--id", selected]
+        else:
+            _update_row(store, selected, status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_ABANDONED)
+            argv = ["lane", "gc", "--delete", "--target", "HEAD", "--json"]
+    work = checkout / ("src/core/a.py" if dirt == "tracked" else "notes-not-saved.txt")
+    work.write_text("work that was never committed\n", encoding="utf-8")
+    capsys.readouterr()
+
+    cli.main(["--root", str(store.root), *argv])
+
+    _assert_untouched(checkout)
+    assert work.read_text(encoding="utf-8") == "work that was never committed\n"
