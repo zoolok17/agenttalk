@@ -718,6 +718,14 @@ _SETUP_FILES_UNKNOWN = (
 _HEALTH_RECORDS_UNKNOWN = "Cannot check wrapper health records; PowerShell host readiness is unknown."
 _HEALTH_RECORDS_FIX = "Check the team configuration and wrapper health records, then run agenttalk doctor again."
 _MARKER_MAX_BYTES = 64 * 1024
+# What a wrapper health marker can really say (see cli.py, where the launcher sets the mode, and wrapper/run.py): the
+# two wrappable CLIs, and one of four modes. Anything else is not something the wrapper wrote, so it is unknown.
+_MARKER_CLIS = frozenset({"claude", "codex"})
+_MARKER_MODES = frozenset({"wrapper", "wrapper-one-shot", "wrapper-loop", "lead-loop"})
+# A Codex marker in one of these modes is a continuous loop: its turn watchdog is on by default for Codex and runs
+# through the same wrapper drive (a managed lead loop included), and on Windows that watchdog needs a selected host.
+# A one-shot or plain wrapper, and a Claude loop of either kind, need none by default.
+_CODEX_LOOP_MODES = frozenset({"wrapper-loop", "lead-loop"})
 
 # What a look at one file system entry established. "absent" ONLY when the entry is not found (FileNotFoundError): any
 # other failure (access denied, a part of the path that is not a folder, an I/O error) leaves the question open.
@@ -767,10 +775,11 @@ def _setup_entry_state(store_dir: Path, relative: str) -> str:
 def _wrapper_loop_evidence(store: Store) -> tuple[list[str], list[str], bool]:
     """What the roster's wrapper health markers say, as (agents with a continuous Codex wrapper marker, agents whose
     marker could not be read, whether the roster itself could not be read). A marker is advisory, so none is not proof
-    that no wrapper runs; a marker that is there and cannot be read as one is unknown, never absent. A marker with
-    cli `codex` and mode `wrapper-loop` counts whatever its age or state. Other well-formed markers (a Claude loop, a
-    Codex one-shot) need no host by default. `store.read_health_raw` cannot tell "missing" from "damaged", so the
-    marker is looked at here."""
+    that no wrapper runs; a marker that is there and cannot be read as one, or holds a value the wrapper never writes,
+    is unknown, never absent. A marker with cli `codex` and mode `wrapper-loop` or `lead-loop` counts whatever its age
+    or state. Other well-formed markers (a Claude loop, a Codex one-shot) need no host by default. A marker is "absent"
+    only when it is not found AND the folders above it are reliably there (or reliably missing): `store.read_health_raw`
+    cannot tell "missing" from "damaged", and a "not found" under a link that cannot be followed says nothing."""
     try:
         agents = store.load_config().get("agents") or []
     except (OSError, ValueError):  # a damaged config.json is a ValueError (json.JSONDecodeError is one)
@@ -779,7 +788,7 @@ def _wrapper_loop_evidence(store: Store) -> tuple[list[str], list[str], bool]:
     unknown: list[str] = []
     for agent in agents:
         path = store.health_path(agent)
-        state = _entry_state(path)
+        state = _setup_entry_state(store.dir, str(path.relative_to(store.dir)))
         if state == _ABSENT:
             continue
         if state == _UNKNOWN:
@@ -793,9 +802,10 @@ def _wrapper_loop_evidence(store: Store) -> tuple[list[str], list[str], bool]:
             marker = None
         cli_name = marker.get("cli") if isinstance(marker, dict) else None
         mode = marker.get("mode") if isinstance(marker, dict) else None
-        if not (isinstance(cli_name, str) and cli_name and isinstance(mode, str) and mode):
+        if not (isinstance(cli_name, str) and isinstance(mode, str)
+                and cli_name in _MARKER_CLIS and mode in _MARKER_MODES):
             unknown.append(agent)
-        elif cli_name == "codex" and mode == "wrapper-loop":
+        elif cli_name == "codex" and mode in _CODEX_LOOP_MODES:
             loops.append(agent)
     return sorted(loops), sorted(unknown), False
 
@@ -820,7 +830,7 @@ def _check_powershell_host(store: Store) -> Check:
         )
     codex_loops: list[str] = []
     try:
-        config_state = _entry_state(store.config_path)
+        config_state = _setup_entry_state(store.dir, store.config_path.name)
         if config_state == _UNKNOWN:
             return _host_unknown_check(*_SETUP_FILES_UNKNOWN)
         if config_state == _PRESENT:
@@ -905,7 +915,7 @@ def _powershell_host_without_selection(store: Store, *, initialized: bool) -> Ch
     explain in the missing-host error. Only a selection that is reliably absent can lead to N/A; a selection that is
     there (valid or not) goes to the existing reader, and so does an absent one next to a footprint. The scheduled
     task is never asked about here: it is external state that local files cannot rule out, so it stays unknown."""
-    selection = _entry_state(supervisor_lifecycle.selection_path(store))
+    selection = _setup_entry_state(store.dir, supervisor_lifecycle.selection_path(store).name)
     if selection == _UNKNOWN:
         return _host_unknown_check(*_SETUP_FILES_UNKNOWN)
     if selection == _PRESENT:
@@ -922,7 +932,7 @@ def _powershell_host_without_selection(store: Store, *, initialized: bool) -> Ch
     else:
         # No config.json, so no roster to read the markers of. A store folder with state in it but no config is half
         # made: what its markers say cannot be found out. No store folder at all is the plain "nothing set up" case.
-        state = _entry_state(store.state_dir)
+        state = _setup_entry_state(store.dir, store.state_dir.name)
         loops, unknown, roster_unknown = [], [], state != _ABSENT
     if loops:
         return loops
@@ -931,6 +941,8 @@ def _powershell_host_without_selection(store: Store, *, initialized: bool) -> Ch
         if unknown:
             affected = " Affected: " + ", ".join(pc.line(name) for name in unknown) + "."
         return _host_unknown_check(f"{_HEALTH_RECORDS_UNKNOWN}{affected}", _HEALTH_RECORDS_FIX)
+    # The plain doctor output prints a fix only for a check that is not ok, so on this N/A line the optional next step
+    # (and the found-file advice) is in the `--json` output only; the details line carries the explanation itself.
     return Check(
         name="powershell_host",
         status="ok",

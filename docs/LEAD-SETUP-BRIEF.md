@@ -284,11 +284,14 @@ Run `agenttalk --root "<team>" doctor` now, and again after step 3b. Read the li
 marked `FAIL` or `warn`. A first run can end with `overall: ERROR` (exit code 2); that is
 expected until the points below are dealt with:
 
-- `powershell_host` (Windows): with no supervisor files and no continuous Codex wrapper marker in this
-  team, it says `N/A` and does not fail. If it still shows `FAIL`, the text says why: a supervisor was set
-  up here, a continuous Codex wrapper has run here, or doctor could not check the files. This brief leaves
-  the supervisor out, so a `FAIL` that names only the supervisor can wait. A `FAIL` that names a Codex
-  wrapper needs `agenttalk supervise --select-pwsh`, because the wrapper's hang watchdog uses the host.
+- `powershell_host` (Windows): it says `N/A` and does not fail only when all of this holds: no host is
+  selected, there are no supervisor files, there is no continuous Codex wrapper marker (a Codex lead loop
+  counts), and doctor could read all of those files and markers. A host that is already selected goes
+  through the normal check and can pass or fail. If it shows `FAIL`, the text says why: a supervisor was
+  set up here, a continuous Codex wrapper has run here, or doctor could not check the files or the
+  markers (an unreadable file or marker is an error, not `N/A`). This brief leaves the supervisor out, so
+  a `FAIL` that names only the supervisor can wait. A `FAIL` that names a Codex wrapper needs
+  `agenttalk supervise --select-pwsh`, because the wrapper's hang watchdog uses the host.
 - `FAIL codex_skills` (`7/7 missing`): Codex's skill files are not installed. If Codex is
   not used on this computer, it is harmless. Installing the skills (step 2b) clears it.
 - `warn escalation_target` and `warn task_kind_availability`: they appear because no seat
@@ -1238,9 +1241,11 @@ works from a fresh shell; and your human knows how to start, stop and restart.
 - **Two windows must never act as the same seat.** One consumer per name. Do not
   `wait` or `drain` as a seat's name in another window.
 - **Skills load when an assistant starts.** Restart a window after `install-skills`.
-- **`doctor` can show `FAIL powershell_host` on Windows.** With no supervisor files and no continuous
-  Codex wrapper marker it says `N/A` instead. The host is used by the supervisor and by the hang watchdog
-  of a continuous Codex wrapper: run `agenttalk supervise --select-pwsh` before you use either.
+- **`doctor` can show `FAIL powershell_host` on Windows.** It says `N/A` instead only when no host is
+  selected, there are no supervisor files, there is no continuous Codex wrapper marker (a Codex lead loop
+  counts), and doctor could read all of them; a file or marker it cannot read is an error. The host is
+  used by the supervisor and by the hang watchdog of a continuous Codex wrapper: run
+  `agenttalk supervise --select-pwsh` before you use either.
 - **Fixed after 0.101.1:** the Linux and macOS start problem with a linked environment (step 2a)
   is fixed in 0.102.0, so with that release or a newer one the `--copies` workaround is not needed.
 

@@ -2706,6 +2706,7 @@ _UNKNOWN_FILES = (
     "Cannot check the local supervisor or host-selection files; PowerShell host readiness is unknown.",
     "Check access to the store folder, then run agenttalk doctor again.",
 )
+_HEALTH_UNKNOWN_PREFIX = "Cannot check wrapper health records; PowerShell host readiness is unknown."
 _SETUP_FILES = ["supervisor.json", "supervisor.ps1", "supervisor-task.ps1", "deadman.ps1", "bin/agenttalk.cmd"]
 
 
@@ -2823,9 +2824,10 @@ def test_a_codex_wrapper_loop_marker_keeps_the_error_and_names_every_agent(tmp_p
 
 @pytest.mark.parametrize(
     "marker",
-    [{"cli": "claude", "mode": "wrapper-loop"}, {"cli": "codex", "mode": "wrapper-one-shot"},
-     {"cli": "codex", "mode": "lead-loop"}],
-    ids=["claude-loop", "codex-one-shot", "codex-lead-loop"],
+    [{"cli": "claude", "mode": "wrapper-loop"}, {"cli": "claude", "mode": "lead-loop"},
+     {"cli": "codex", "mode": "wrapper-one-shot"}, {"cli": "claude", "mode": "wrapper-one-shot"},
+     {"cli": "codex", "mode": "wrapper"}, {"cli": "claude", "mode": "wrapper"}],
+    ids=["claude-loop", "claude-lead-loop", "codex-one-shot", "claude-one-shot", "codex-plain", "claude-plain"],
 )
 def test_markers_that_do_not_need_the_host_by_default_still_give_na(tmp_path, monkeypatch, marker):
     _windows_with_nothing_found(monkeypatch)
@@ -2835,13 +2837,33 @@ def test_markers_that_do_not_need_the_host_by_default_still_give_na(tmp_path, mo
     assert doctor._check_powershell_host(store).details == _NA_DETAILS
 
 
+@pytest.mark.parametrize("mode", ["wrapper-loop", "lead-loop"])
+def test_a_codex_marker_of_a_continuous_loop_needs_the_host_the_lead_loop_included(tmp_path, monkeypatch, mode):
+    """A managed Codex lead loop is a continuous --loop too: its turn watchdog is on by default for Codex and runs
+    through the same wrapper drive, so without a selected host the Windows watchdog fails open."""
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    _marker(store, "beta", {"cli": "codex", "mode": mode})
+    check = doctor._check_powershell_host(store)
+    assert (check.status, check.data) == ("error", {"status": "error", "task_status": "unknown"})
+    assert "A continuous Codex wrapper ran here for: beta. Its hang watchdog needs a selected host" in check.details
+    assert "alpha" not in check.details
+
+
 @pytest.mark.parametrize(
     "content",
     ["", "{", "[]", '"codex"', "7", "null", "{}", '{"cli": "codex"}', '{"mode": "wrapper-loop"}',
      '{"cli": 7, "mode": "wrapper-loop"}', '{"cli": "codex", "mode": ["wrapper-loop"]}',
-     '{"cli": "", "mode": "wrapper-loop"}', "﻿{}"],
+     '{"cli": "", "mode": "wrapper-loop"}', "\ufeff{}",
+     # text, but never a value the wrapper writes (health.safe_token cannot produce a space; the established values
+     # are the two wrappable CLIs and the four modes the launcher sets)
+     '{"cli": "codex", "mode": "bad mode"}', '{"cli": "codex", "mode": "wrapper-loops"}',
+     '{"cli": "codex", "mode": "Wrapper-Loop"}', '{"cli": "gemini", "mode": "wrapper-loop"}',
+     '{"cli": "Codex", "mode": "wrapper-loop"}', '{"cli": "codex ", "mode": "wrapper-loop"}'],
     ids=["empty", "truncated", "list", "string", "number", "null", "no-fields", "no-mode", "no-cli",
-         "cli-not-text", "mode-not-text", "cli-empty", "bom"],
+         "cli-not-text", "mode-not-text", "cli-empty", "bom", "mode-with-a-space", "mode-unknown",
+         "mode-wrong-case", "cli-unknown", "cli-wrong-case", "cli-padded"],
 )
 def test_a_marker_that_cannot_be_read_as_a_marker_is_unknown_not_absent(tmp_path, monkeypatch, content):
     _windows_with_nothing_found(monkeypatch)
@@ -2947,6 +2969,81 @@ def test_a_parent_that_is_not_a_plain_folder_makes_a_missing_child_unknown(tmp_p
             return real_lstat(path, *args, **kwargs)
 
         monkeypatch.setattr(doctor.os, "lstat", lstat)
+    check = doctor._check_powershell_host(store)
+    assert (check.details, check.fix) == _UNKNOWN_FILES
+
+
+def _a_dangling_link_at(monkeypatch, folder: Path) -> None:
+    """`folder` is a link whose target cannot be followed: it is there, and everything under it is "not found"."""
+    import stat as _stat
+    import types
+
+    real_lstat = os.lstat
+    link = os.path.normcase(str(folder))
+
+    def lstat(path, *args, **kwargs):
+        shown = os.path.normcase(str(path))
+        if shown == link:
+            return types.SimpleNamespace(st_mode=_stat.S_IFLNK, st_file_attributes=0)
+        if shown.startswith(link + os.sep):
+            raise FileNotFoundError(2, "the link's target is not there")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(doctor.os, "lstat", lstat)
+
+
+def test_a_marker_under_a_dangling_state_folder_is_unknown_not_absent(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    _a_dangling_link_at(monkeypatch, store.state_dir)
+    check = doctor._check_powershell_host(store)
+    assert (check.status, check.data) == ("error", {"status": "error", "task_status": "unknown"})
+    assert check.details == _HEALTH_UNKNOWN_PREFIX + " Affected: alpha, beta."
+    assert check.fix == "Check the team configuration and wrapper health records, then run agenttalk doctor again."
+
+
+def test_a_state_folder_that_is_a_junction_makes_a_missing_marker_unknown(tmp_path, monkeypatch):
+    """A Windows junction reports as a folder, with the reparse attribute: a marker "not found" under it is not a
+    reliable absence (the junction may be pointing at nothing)."""
+    import stat as _stat
+    import types
+
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    real_lstat = os.lstat
+    state = os.path.normcase(str(store.state_dir))
+
+    def lstat(path, *args, **kwargs):
+        shown = os.path.normcase(str(path))
+        if shown == state:
+            return types.SimpleNamespace(st_mode=_stat.S_IFDIR, st_file_attributes=0x400)
+        if shown.startswith(state + os.sep):
+            raise FileNotFoundError(2, "not found")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(doctor.os, "lstat", lstat)
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and check.details.startswith(_HEALTH_UNKNOWN_PREFIX)
+
+
+def test_a_state_folder_that_cannot_be_looked_at_makes_the_markers_unknown(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    _lstat_fails_for(monkeypatch, store.state_dir, PermissionError(13, "Access is denied"))
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and check.details.startswith(_HEALTH_UNKNOWN_PREFIX)
+
+
+def test_the_files_under_a_dangling_store_folder_are_unknown_not_absent(tmp_path, monkeypatch):
+    """The store folder itself is a link that cannot be followed: no file under it is reliably absent, so the config,
+    the selection and the setup files are all unknown (never "not set up, so N/A")."""
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    _a_dangling_link_at(monkeypatch, store.dir)
     check = doctor._check_powershell_host(store)
     assert (check.details, check.fix) == _UNKNOWN_FILES
 

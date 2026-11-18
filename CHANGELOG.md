@@ -284,11 +284,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code 0), explains that the supervisor and the hang watchdog of a continuous Codex wrapper both need a
   selected host, and says the scheduled-task state was not checked (its data says `unknown`, not
   `not_configured`: a task can outlive its files). It is a snapshot of local files, not proof that the
-  features are unneeded. It stays an error when a setup file is there, and when a Codex wrapper in the
+  features are unneeded. A continuous Codex wrapper here means a Codex marker for a loop or for a managed
+  lead loop (both keep the hang watchdog on by default); a Codex one-shot, or a Claude loop of either kind,
+  needs no host by default. It stays an error when a setup file is there, and when a Codex wrapper in the
   team has left a continuous marker, even an old one (it names those agents). It also stays an error, saying
-  it could not check, when a file, a marker or the team list cannot be read or looked at: nothing is
-  called absent unless it was not found. A folder with no store at all gets the same `N/A`, and the
-  separate store check still reports it. Its advice is unchanged when a host is selected.
+  it could not check, when a file, a marker or the team list cannot be read or looked at, when a marker holds
+  a value the wrapper never writes, or when a marker (or the config or selection) sits under a folder link
+  that cannot be followed: nothing is called absent unless it was not found where it could be looked for. A
+  folder with no store at all gets the same `N/A`, and the separate store check still reports it. Its advice
+  is unchanged when a host is selected. The plain `agenttalk doctor` output prints the next step only for a
+  check that is not ok, so on the `N/A` line the optional next step (and the advice for a PowerShell 7 file
+  that was found) is in the `--json` output only; the line itself carries the explanation.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note
   for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report
   it to the agenttalk maintainers and that the maintenance advice is for them.
