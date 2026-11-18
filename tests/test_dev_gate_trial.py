@@ -204,7 +204,7 @@ def test_trial_workflow_does_not_change_the_required_gate_or_deadlines(manifest)
     original, extra = workflow.split("  windows-mode-trial:")
     assert "needs: [scope, docs-checks, dev-gate-leg]" in original
     assert "windows-mode-trial" not in original
-    assert "mode: [source, wheel]" in extra and "timeout-minutes: 330" in extra
+    assert "mode: [source, wheel]" in extra and "timeout-minutes: 360" in extra
     assert "${{ github.run_id }}-${{ github.run_attempt }}" in extra
     assert manifest["checks"]["pytest"]["windows_timeout_seconds"] == 9000
     assert "retain 9000 seconds" in manifest["checks"]["pytest"]["windows_timeout_reason"]

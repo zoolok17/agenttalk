@@ -123,7 +123,7 @@ def test_windows_ci_job_ceiling_matches_the_windows_capacity_stopgap() -> None:
     rediscovery under load. Linux/macOS keep the tight cap."""
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
     # #378: grouping shortens each pytest run but retains the whole-job ceiling.
-    assert "timeout_minutes: 330  # #378 layout 3a; retained after two hosted runs" in workflow
+    assert "timeout_minutes: 360  # #378: the hosted maximum; raised from 330 on 2026-11-18" in workflow
     assert workflow.count("timeout_minutes: 90") == 2
     for stale in ("timeout_minutes: 270", "timeout_minutes: 180", "timeout_minutes: 120"):
         assert stale not in workflow
