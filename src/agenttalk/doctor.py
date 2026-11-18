@@ -1866,6 +1866,23 @@ def _check_deadman_config_source(store: Store) -> Check | None:
 
 def _check_init(store: Store) -> Check:
     if not store.initialized():
+        # `agenttalk init` refuses to start a team folder inside another one (two teams at different depths talk
+        # past each other), so the init advice below would be refused there: name the folder above instead.
+        above = find_stores_upward(store.root.parent)
+        if above:
+            return Check(
+                name="store.initialized",
+                status="error",
+                details=(
+                    f"not set up yet: .agenttalk/config.json not found at {pc.line(str(store.root))}; "
+                    f"a team folder already exists above it, at {pc.line(str(above[0]))}"
+                ),
+                fix=(
+                    "this folder is inside that team folder: run agenttalk from that folder, or point "
+                    "AGENTTALK_ROOT at it, to use that team. `agenttalk init` refuses to start a second team "
+                    "folder here on purpose, so that two teams do not talk past each other"
+                ),
+            )
         return Check(
             name="store.initialized",
             status="error",

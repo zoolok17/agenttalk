@@ -606,6 +606,26 @@ def test_doctor_not_set_up_check_says_not_set_up_yet(tmp_path: Path) -> None:
         assert not set("<>|&;") & set(command), command
 
 
+def test_doctor_inside_an_existing_team_folder_names_it_instead_of_advising_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """init refuses to start a team folder inside another one, so doctor must not advise it there."""
+    Store(tmp_path).init(["claude-dev", "codex-rev"])
+    child = tmp_path / "sub"
+    child.mkdir()
+    check = doctor._check_init(Store(child))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert f"a team folder already exists above it, at {tmp_path}" in check.details
+    assert "run agenttalk from that folder, or point AGENTTALK_ROOT at it" in check.fix
+    assert "init --here" not in check.fix and "--force" not in check.fix
+    # the premise: the init the plain advice would print is refused in that folder
+    for name in ("AGENTTALK_ROOT", "AGENTTALK_SELF", "AGENTTALK_PEER"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(child)
+    assert cli.main(["init", "--here", "--agents", "claude-dev,codex-rev"]) == 2
+    assert not (child / ".agenttalk").exists()
+
+
 def test_doctor_partly_set_up_folder_names_the_missing_config_file(tmp_path: Path) -> None:
     """Store.initialized() is true only when .agenttalk/config.json exists, so a folder that has a
     .agenttalk/ but no config.json is still "not set up", and the text must say which file is missing
