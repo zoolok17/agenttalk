@@ -1097,6 +1097,17 @@ def test_release_refuses_damaged_retained_checkout_links(estate, retained):
     assert git(repo, "rev-parse", "finished") == head
 
 
+def _surviving_checkout_advice(damaged_field):
+    """The advice for a lane whose OTHER saved checkout path names the real folder, which still exists: the
+    acknowledgement ("the worktree is gone") would be refused, so it is not offered; repair the field, then retire."""
+    other = "worktree_toplevel_canonical" if damaged_field == "worktree_path" else "worktree_path"
+    return (
+        f"the lane's other saved checkout path ({other}) names a folder that still exists, so retiring it as missing "
+        f"is refused: inspect that folder, set {damaged_field} in lanes.json lane 'reassigned' to its real absolute "
+        "folder, then run `lane abandon --id reassigned`"
+    )
+
+
 @pytest.mark.parametrize("field,damaged", [
     *(('occupancy_worktrees', value) for value in (None, "bad", {}, [None], [7], [""])),
     *((field, value) for field in ("worktree_path", "worktree_toplevel_canonical")
@@ -1130,8 +1141,7 @@ def test_assign_refuses_damaged_checkout_links(tmp_path, capsys, field, damaged)
         "could not read retained occupancy worktrees"
         if field == "occupancy_worktrees"
         else f"lanes.json lane reassigned: could not read current checkout path {field}; "
-        "to retire this lane without using its checkout, run "
-        "`lane abandon --id reassigned --acknowledge-missing-worktree`"
+        + _surviving_checkout_advice(field)
     )
     assert code == 2 and output == f"agenttalk lane assign: {reason}\n", output
     assert state.read_bytes() == before
@@ -1318,10 +1328,15 @@ def test_assign_names_whitespace_checkout_path(tmp_path, capsys, field, whitespa
         if field == "worktree_path"
         else ""
     )
-    assert capsys.readouterr().err == (
-        f"agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path {field}; "
+    # a whitespace canonical path leaves the real worktree_path naming the folder that exists: no acknowledgement
+    retire = (
         f"to retire this lane without using its checkout, {first_step}run "
-        "`lane abandon --id reassigned --acknowledge-missing-worktree`\n"
+        "`lane abandon --id reassigned --acknowledge-missing-worktree`"
+        if field == "worktree_path"
+        else _surviving_checkout_advice(field)
+    )
+    assert capsys.readouterr().err == (
+        f"agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path {field}; {retire}\n"
     )
     assert state.read_bytes() == before
     assert (checkout / "src/core/a.py").read_bytes() == content

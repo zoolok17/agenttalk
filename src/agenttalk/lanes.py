@@ -228,10 +228,39 @@ def acknowledged_damage_remains(lane: dict) -> bool:
         for field in ("worktree_path", "worktree_toplevel_canonical"))
 
 
-def checkout_path_recovery(*, lane_id: str, lane: dict | None = None, owner: dict | None = None) -> str:
+def surviving_checkout_field(lane: dict | None, *, root=None) -> str | None:
+    """The saved checkout field (`worktree_path` or `worktree_toplevel_canonical`) that is sound AND names an entry that
+    exists on disk, or None. A damaged field does not mean no checkout survives: the other field can still name the
+    folder, and `lane abandon --acknowledge-missing-worktree` refuses while it does. A relative `worktree_path` has no
+    single meaning here (it is repaired first), and an entry that cannot be looked at counts as surviving, so the advice
+    never promises an acknowledgement the command would refuse. `root` expands the `{ROOT}` placeholder."""
+    if not isinstance(lane, dict):
+        return None
+    for field in ("worktree_path", "worktree_toplevel_canonical"):
+        value = lane.get(field)
+        if not isinstance(value, str) or checkout_path_problem({field: value}) is not None:
+            continue
+        if "{ROOT}" in value:
+            if root is None:
+                continue
+            value = value.replace("{ROOT}", str(root))
+        if not path_is_absolute(value):
+            continue
+        try:
+            os.lstat(value)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return field
+        return field
+    return None
+
+
+def checkout_path_recovery(*, lane_id: str, lane: dict | None = None, owner: dict | None = None, root=None) -> str:
     """The step to take for a damaged checkout field of `lane`. `owner` is the live row that holds `lane` when `lane`
     is a saved copy inside it (the snapshot of a pending delivery): the delivery state is the live row's, so that is
-    what decides whether the delivery must be recovered first. Without `owner`, `lane` is the live row."""
+    what decides whether the delivery must be recovered first. Without `owner`, `lane` is the live row. `root` is the
+    store folder: it expands `{ROOT}` when the advice must know whether another saved path names an existing folder."""
     try:
         lane_id = validate_lane_id(lane_id)
     except LaneError:
@@ -257,24 +286,26 @@ def checkout_path_recovery(*, lane_id: str, lane: dict | None = None, owner: dic
                   'anywhere, set worktree_path to empty text ("") instead), then ')
     live = owner if owner is not None else lane
     if live is not None and delivery_recovery_required(live):
-        if owner is not None and owner is not lane:
-            # `lane` is only a SAVED COPY inside the live row (the snapshot of the pending delivery); the live row's own
-            # checkout fields are sound (they are judged first). Recover is still the first step, because `lane
-            # abandon` refuses an unfinished delivery, but what is left after it depends on what recover did, and the
-            # old second step is wrong on one branch: with a committed final it names `lane deliver`, and the delivery
-            # then clears the damaged copy; with none it restores the lane to ACTIVE with its sound checkout, and a
-            # folder that still exists is retired by a plain `lane abandon`, which the acknowledgement option
-            # refuses; an overlapping lane holds recover. So the advice ends by sending the reader back to the same
-            # command, which prints the advice for the state that is then left, or none.
-            return (f"this lane's delivery is not finished: run `lane recover --id {lane_id} --reason <why>` first "
-                    "(it restores the lane to ACTIVE, names `lane deliver` when a committed final exists, or says "
-                    "which other lane overlaps it and must be resolved first), then repeat this command: it names "
-                    "what is left, if anything")
-        # `lane abandon` refuses a lane whose delivery is unfinished, so the first step is to recover it. This row's
-        # own checkout field is the damaged one, so retiring it is the step that follows.
+        # `lane abandon` refuses a lane whose delivery is unfinished, so recover is the first step, whether `lane` is
+        # the live row itself (its own checkout field is the damaged one) or only a SAVED COPY inside it (the snapshot
+        # of the pending delivery; the live row's own fields are sound and were judged first). What is left afterwards
+        # depends on what recover did, and on whether a checkout path still names a folder that exists, so no second
+        # step is promised here: with a committed final recover names `lane deliver` and the delivery then clears a
+        # damaged copy; with none it restores the lane to ACTIVE with its saved paths; an overlapping lane holds it. The
+        # advice ends by sending the reader back to the same command, which prints what is true for the state left.
         return (f"this lane's delivery is not finished: run `lane recover --id {lane_id} --reason <why>` first "
-                "(it restores the lane to ACTIVE, or names `lane deliver` when a committed final exists), then "
-                f"{repair}retire it without using its checkout with {retire}")
+                "(it restores the lane to ACTIVE, names `lane deliver` when a committed final exists, or says "
+                "which other lane overlaps it and must be resolved first), then repeat this command: it names "
+                "what is left, if anything")
+    survivor = None if repair else surviving_checkout_field(lane, root=root)
+    if survivor is not None:
+        # The acknowledgement says "the worktree is gone", and it is refused while a saved path still names a folder
+        # that exists; a plain `lane abandon` is refused too while a field is damaged. So the damaged field is repaired
+        # first (by hand: no command writes it), then a plain `lane abandon` retires the lane and removes the folder.
+        field = checkout_path_problem(lane)[0]
+        return (f"the lane's other saved checkout path ({survivor}) names a folder that still exists, so retiring "
+                f"it as missing is refused: inspect that folder, set {field} in lanes.json lane {lane_id!r} to its "
+                f"real absolute folder, then run `lane abandon --id {lane_id}`")
     return f"to retire this lane without using its checkout, {repair}run {retire}"
 
 
@@ -294,7 +325,7 @@ def checkout_issue_advice(lane: dict, *, lane_id: str, root) -> tuple[str, str, 
         return (*canonical, _CANONICAL_ADVICE)
     problem = checkout_path_problem(lane)
     if problem is not None:
-        return (*problem, checkout_path_recovery(lane_id=lane_id, lane=lane))
+        return (*problem, checkout_path_recovery(lane_id=lane_id, lane=lane, root=root))
     return None
 
 

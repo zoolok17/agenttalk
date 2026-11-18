@@ -212,6 +212,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of "use a new lane id". A saved worktree path that holds an unpaired surrogate gets
   the same hand-edit advice as a canonical one (no command can save the lane while it is
   there), never the acknowledgement step.
+  When a lane's own saved checkout path is damaged but its other saved path still names a folder that
+  exists, the advice no longer offers the missing-worktree acknowledgement (it is refused while the folder
+  exists, and so is a plain `lane abandon` while a field is damaged): it says to set the damaged field to
+  the folder's real absolute path in `lanes.json`, then run `lane abandon`. For a lane whose delivery is
+  unfinished it says to run `lane recover` first and then repeat the command, which names what is left.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,

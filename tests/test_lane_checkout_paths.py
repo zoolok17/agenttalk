@@ -75,8 +75,6 @@ def test_the_cleanup_warning_after_a_successful_committed_delivery_names_a_next_
     is complete. The printed command is run as printed; `lane recover` is the control that cannot run here."""
     import shlex
 
-    from test_lanes import _git_rc
-
     store, lane_id, worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
     data = lanes.load_lanes(store)
     data["lanes"][lane_id][field] = damage
@@ -87,13 +85,20 @@ def test_the_cleanup_warning_after_a_successful_committed_delivery_names_a_next_
     assert "worktree cleanup is pending" in err and field in err
     assert "lane recover" not in err
     printed = re.findall(r"`(lane abandon --id [^`]+)`", err)
-    assert printed == [f"lane abandon --id {lane_id} --acknowledge-missing-worktree"]
     assert lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"] is False
     assert cli.main(["--root", str(store.root), "lane", "recover", "--id", lane_id, "--reason", "probe"]) == 2
     assert "no incomplete delivered transaction to recover" in capsys.readouterr().err  # the old advice cannot run
-    removed = _git_rc(store.root, "worktree", "remove", "--", str(worktree))  # the person removes the known checkout
-    assert removed.returncode == 0, removed.stderr
+    # The damage is in one of the two saved fields and the other still names the checkout, which is still there: the
+    # acknowledgement is refused, so it is not printed. The person repairs the field, then the printed plain
+    # `lane abandon` runs and removes the checkout.
+    assert "names a folder that still exists" in err and worktree.exists()
+    assert printed == [f"lane abandon --id {lane_id}"] and "--acknowledge-missing-worktree" not in err
+    assert f"set {field} in lanes.json lane {lane_id!r} to its real absolute folder" in err
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id][field] = str(worktree) if field == "worktree_path" else lanes.canonical_host_path(worktree)
+    lanes.save_lanes(store, data)
     assert cli.main(["--root", str(store.root), *shlex.split(printed[0])]) == 0  # the printed step runs
+    assert not worktree.exists()
     assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ABANDONED
 
 
@@ -1018,19 +1023,20 @@ def _a_pending_delivery_with_a_blank_snapshot(tmp_path, monkeypatch, final=True)
     return store, lane_id, worktree
 
 
-def _release_check_refusal(store) -> str:
-    """What the release check says about this store (it reads every lane row, so it refuses any release)."""
+def _release_check_refusal(store, target=None) -> str:
+    """What the release check says about this store (it reads every lane row, so a damaged row refuses any release).
+    `target` is the checkout the release is for (by default one no lane names)."""
     from agenttalk import janitor, worktree_release
 
     with pytest.raises(worktree_release.Refused) as refused:
-        worktree_release._activity(janitor.JanitorConfig.load(store.root), store.root / "unrelated-checkout")
+        worktree_release._activity(janitor.JanitorConfig.load(store.root), target or store.root / "unrelated-checkout")
     return str(refused.value)
 
 
-def _release_check_is_clean(store) -> None:
+def _release_check_is_clean(store, target=None) -> None:
     from agenttalk import janitor, worktree_release
 
-    worktree_release._activity(janitor.JanitorConfig.load(store.root), store.root / "unrelated-checkout")
+    worktree_release._activity(janitor.JanitorConfig.load(store.root), target or store.root / "unrelated-checkout")
 
 
 @pytest.mark.parametrize("final", [True, False], ids=["committed-final", "no-final"])
@@ -1088,8 +1094,11 @@ def test_release_advice_for_a_pending_delivery_without_a_final_runs_step_by_step
     row = lanes.load_lanes(store)["lanes"][lane_id]
     assert row["status"] == lanes.STATUS_ACTIVE and "publish_pending" not in row and worktree.exists()
     assert row["worktree_toplevel_canonical"] == row_before["worktree_toplevel_canonical"]  # the repaired path is kept
-    # 2. "repeat this command": the saved copy with the blank path is gone, so nothing is left to refuse
+    # 2. "repeat this command": the saved copy with the blank path is gone, so it refuses nothing for an unrelated
+    # checkout. It is NOT clean for every target: the active lane's own checkout is in use, and the advice only says
+    # the repeat "names what is left, if anything".
     _release_check_is_clean(store)
+    assert _release_check_refusal(store, worktree)  # still refused, for the lane's own checkout
     for argv in _printed_abandon_steps(advice):  # none is printed; a printed step would have to be accepted here
         assert _step(store, capsys, *argv)[0] == 0, argv
     # Why the advice promises no second step: the acknowledgement is refused while the checkout is on disk, and a
@@ -1127,6 +1136,94 @@ def test_release_advice_when_another_lane_overlaps_the_recovery(tmp_path, monkey
     _release_check_is_clean(store)
 
 
+def _a_pending_live_row_with_one_damaged_checkout_field(tmp_path, monkeypatch, damaged):
+    """The live row ITSELF is damaged in one checkout field (an older version saved it so), its delivery stopped before
+    a final was committed, and the other field still names the real checkout folder that exists on disk."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, worktree = _unfinished_delivery_without_a_final(tmp_path, monkeypatch, "")
+    data = lanes.load_lanes(store)
+    row = data["lanes"][lane_id]
+    if damaged == "worktree_path":  # the other way round: the canonical field is the one that survives
+        row["worktree_path"] = ""
+        row["worktree_toplevel_canonical"] = lanes.canonical_host_path(worktree)
+    lanes.save_lanes(store, data)
+    row = lanes.load_lanes(store)["lanes"][lane_id]
+    assert row["status"] == lanes.STATUS_DELIVERED and lanes.delivery_recovery_required(row)
+    assert row[damaged] == "" and worktree.is_dir()
+    assert lanes.checkout_issue(row, root=store.root) is not None
+    return store, lane_id, worktree
+
+
+@pytest.mark.parametrize("damaged", ["worktree_toplevel_canonical", "worktree_path"])
+def test_release_advice_for_a_pending_live_row_with_a_surviving_checkout_runs_step_by_step(
+    tmp_path, monkeypatch, capsys, damaged
+):
+    """The row's own checkout field is damaged and the other field names a folder that exists. Every step the advice
+    prints is taken, in order, and each is accepted; the acknowledgement it must not promise is refused."""
+    store, lane_id, worktree = _a_pending_live_row_with_one_damaged_checkout_field(tmp_path, monkeypatch, damaged)
+    # 1. the first advice: recover first, then repeat; no abandon of any kind is promised
+    advice = _release_check_refusal(store)
+    assert f"run `lane recover --id {lane_id} --reason <why>` first" in advice
+    assert "then repeat this command: it names what is left, if anything" in advice
+    assert "lane abandon" not in advice and "acknowledge" not in advice
+    code, out = _step(store, capsys, "recover", "--id", lane_id, "--reason", "follow the release advice")
+    assert code == 0 and f"recovered lane {lane_id} to ACTIVE" in out.out
+    row = lanes.load_lanes(store)["lanes"][lane_id]
+    assert row["status"] == lanes.STATUS_ACTIVE and "publish_pending" not in row and worktree.is_dir()
+    assert row[damaged] == ""  # recover does not write the damaged field
+    # 2. "repeat this command": what is left depends on the row, and the checkout is still there
+    advice = _release_check_refusal(store)
+    other = "worktree_toplevel_canonical" if damaged == "worktree_path" else "worktree_path"
+    assert f"other saved checkout path ({other}) names a folder that still exists" in advice
+    assert f"set {damaged} in lanes.json lane {lane_id!r} to its real absolute folder" in advice
+    assert "--acknowledge-missing-worktree" not in advice  # the step it would promise is refused (below)
+    assert _printed_abandon_steps(advice) == [["abandon", "--id", lane_id]]
+    # why: the acknowledgement is refused while the folder exists, and a plain abandon while a field is damaged
+    code, out = _step(store, capsys, "abandon", "--id", lane_id, "--acknowledge-missing-worktree")
+    assert code == 2 and "still exists" in out.err and worktree.is_dir()
+    code, out = _step(store, capsys, "abandon", "--id", lane_id)
+    assert code == 2 and "repair the damaged field" in out.err and worktree.is_dir()
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
+    # 3. the person repairs the field by hand (no command writes it), then takes each printed step: accepted
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id][damaged] = (
+        str(worktree) if damaged == "worktree_path" else lanes.canonical_host_path(worktree)
+    )
+    lanes.save_lanes(store, data)
+    for argv in _printed_abandon_steps(advice):
+        code, out = _step(store, capsys, *argv)
+        assert code == 0 and f"abandoned lane {lane_id}" in out.out, (argv, out.err)
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ABANDONED and not worktree.exists()
+    _release_check_is_clean(store)
+
+
+def test_the_retirement_advice_acknowledges_only_when_no_saved_path_names_an_existing_folder(tmp_path):
+    folder = tmp_path / "there"
+    folder.mkdir()
+    gone = tmp_path / "gone"
+    blank_canonical = {"status": lanes.STATUS_ACTIVE, "worktree_path": str(folder), "worktree_toplevel_canonical": ""}
+    # a path survives: no acknowledgement is promised; repair the damaged field, then a plain abandon
+    survives = lanes.checkout_path_recovery(lane_id="a", lane=blank_canonical)
+    assert "--acknowledge-missing-worktree" not in survives
+    assert "set worktree_toplevel_canonical in lanes.json lane 'a' to its real absolute folder" in survives
+    assert survives.endswith("then run `lane abandon --id a`")
+    # no saved path names a folder that exists (the other one is gone, or both are damaged): the acknowledgement
+    for row in (
+        {**blank_canonical, "worktree_path": str(gone)},
+        {**blank_canonical, "worktree_path": ""},
+        {**blank_canonical, "worktree_path": 7},
+    ):
+        assert lanes.checkout_path_recovery(lane_id="a", lane=row) == (
+            "to retire this lane without using its checkout, run `lane abandon --id a --acknowledge-missing-worktree`"
+        )
+    # the canonical field is judged the same way, with the {ROOT} placeholder expanded
+    rooted = {"worktree_path": "", "worktree_toplevel_canonical": "{ROOT}/there"}
+    assert lanes.surviving_checkout_field(rooted, root=tmp_path) == "worktree_toplevel_canonical"
+    assert lanes.surviving_checkout_field(rooted, root=tmp_path / "elsewhere") is None
+    assert lanes.surviving_checkout_field(rooted) is None  # no root, no way to know: not claimed to survive
+    assert lanes.surviving_checkout_field("not a row") is None
+
+
 def test_the_recovery_step_follows_the_live_row_when_given_one_and_the_row_itself_otherwise():
     pending = {"status": lanes.STATUS_DELIVERED, "publish_pending": {"lane_snapshot": {}}}
     active = {"status": lanes.STATUS_ACTIVE, "worktree_path": "", "worktree_toplevel_canonical": ""}
@@ -1140,10 +1237,12 @@ def test_the_recovery_step_follows_the_live_row_when_given_one_and_the_row_itsel
     # no owner: the row is judged by itself, exactly as before this change (every other caller)
     assert lanes.checkout_path_recovery(lane_id="a", lane=active) == plain
     assert "this lane's delivery is not finished" in lanes.checkout_path_recovery(lane_id="a", lane=pending)
-    # the owner is the row itself (its OWN checkout field is the damaged one): the earlier advice, retiring last
+    # the owner is the row itself (its OWN checkout field is the damaged one): the same advice, recover first and then
+    # repeat the command. No second step is promised: a damaged field does not mean no checkout survives, and the
+    # acknowledgement is refused while one does.
     own = lanes.checkout_path_recovery(lane_id="a", lane=pending, owner=pending)
-    assert own == lanes.checkout_path_recovery(lane_id="a", lane=pending)
-    assert "lane abandon --id a --acknowledge-missing-worktree" in own and "then repeat this command" not in own
+    assert own == lanes.checkout_path_recovery(lane_id="a", lane=pending) == held
+    assert "then repeat this command" in own and "lane abandon" not in own and "acknowledge" not in own
 
 
 def test_the_live_row_is_carried_through_a_list_inside_the_row_too(tmp_path):
@@ -3068,8 +3167,10 @@ def test_the_checkout_advice_depends_on_the_lane_state() -> None:
     assert "lane abandon --id x --acknowledge-missing-worktree" in plain and "lane recover" not in plain
     unfinished = {"status": lanes.STATUS_DELIVERED, "publish_pending": {"transaction_id": "t"}}
     advice = lanes.checkout_path_recovery(lane_id="x", lane=unfinished)
-    assert "lane recover --id x --reason" in advice and "lane abandon --id x --acknowledge-missing-worktree" in advice
-    assert advice.index("lane recover") < advice.index("lane abandon")  # recover first, then retire
+    # recover first; no second step is promised (what is left depends on what recover did), the reader repeats the
+    # command: the retirement is then judged for the state that is left (see the matrix test below)
+    assert "lane recover --id x --reason" in advice and "then repeat this command" in advice
+    assert "lane abandon" not in advice and "acknowledge" not in advice
     finished = {"status": lanes.STATUS_DELIVERED, "publish_pending": False}
     assert "lane recover" not in lanes.checkout_path_recovery(lane_id="x", lane=finished)
     assert "lane recover" not in lanes.checkout_path_recovery(lane_id="x")  # no row, no state to read
@@ -3087,7 +3188,8 @@ def test_a_delivered_lane_with_an_unfinished_delivery_and_a_blank_checkout_is_to
     capsys.readouterr()
     assert cli.main(["--root", str(store.root), "lane", "workspace", "--id", lane_id]) == 2
     err = capsys.readouterr().err
-    assert f"lane recover --id {lane_id} --reason" in err and err.index("lane recover") < err.index("lane abandon")
+    assert f"lane recover --id {lane_id} --reason" in err and "then repeat this command" in err
+    assert "lane abandon" not in err  # the acknowledgement refuses in this state: it is not offered
     assert cli.main(["--root", str(store.root), "lane", "recover", "--id", lane_id, "--reason", "advice"]) == 0
 
 
@@ -3128,17 +3230,21 @@ def test_the_checkout_advice_is_actionable_for_every_state_and_path(state, path)
     if state == "retired":
         assert advice == "this lane was already retired; use a new lane id"
         return
+    if state == "delivered-unfinished":
+        # recover first, then repeat the command: it names what is left for the row recover leaves (the retirement, and
+        # the replace-first step for a relative path, are printed by that repeat; the next case of this test)
+        assert "lane recover --id x --reason" in advice and "then repeat this command" in advice
+        assert retire not in advice and "replace worktree_path" not in advice
+        return
     assert retire in advice
     steps = {
         "recover": advice.find("lane recover --id x --reason"),
         "replace": advice.find("replace worktree_path in lanes.json lane 'x' with the checkout's real absolute folder"),
         "retire": advice.find(retire),
     }
-    assert (steps["recover"] >= 0) == (state == "delivered-unfinished")
+    assert steps["recover"] < 0
     assert (steps["replace"] >= 0) == (path == "relative")  # only a relative path needs repairing before retiring
     assert steps["retire"] == max(steps.values())  # retiring is always the last step
-    if steps["recover"] >= 0 and steps["replace"] >= 0:
-        assert steps["recover"] < steps["replace"]  # recover first, then repair, then retire
 
 
 def test_the_relative_worktree_refusal_says_replace_never_remove() -> None:
