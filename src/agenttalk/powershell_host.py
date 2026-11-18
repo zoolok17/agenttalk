@@ -697,12 +697,25 @@ def program_files_candidates(
     return tuple(out)
 
 
-def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+# What the diagnostic search trims from the edges of a PATH entry or a Program Files value before it removes surrounding
+# double quotes: space and tab, an explicit set, not str.strip()'s whole Unicode whitespace class (which also holds
+# U+001C..U+001F, U+0085, U+00A0 and more). The lookups doctor prints for an escaped path run in PowerShell, whose
+# Trim() takes the set it is given; giving it this same set (.Trim(' ', [char]9)) makes the two read an entry alike.
+# Narrower than before on purpose: a value padded with one of the other characters is no longer found, and a folder
+# whose real name ends in one is now found as it is (str.strip() cut that character off and looked in the folder
+# with the shorter name, which might be missing or hold a different pwsh.exe).
+_ENV_PADDING = " " + chr(9)
+
+
+def path_candidate_sources(environ: Mapping[str, str] | None = None) -> tuple[tuple[str, str], ...]:
+    """The PowerShell 7 files found on the PATH or under the Program Files variables, each with where it was found:
+    ``(path, "PATH")`` or ``(path, "<the variable's name>")``. In the order `supervise --select-pwsh` suggests them.
+    A file-existence test only: nothing is run. A file under a Program Files variable need not be on the PATH."""
     env = os.environ if environ is None else environ
-    out: list[str] = []
+    out: list[tuple[str, str]] = []
     seen: set[str] = set()
 
-    def add(candidate: str) -> None:
+    def add(candidate: str, source: str) -> None:
         try:
             _validate_local_exe_shape(candidate, subject="PATH candidate")
         except PowerShellHostError:
@@ -716,23 +729,49 @@ def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tup
         except OSError:
             exists = False
         if exists:
-            out.append(pc.cmd(
-                "agenttalk supervise --select-pwsh --pwsh {p}", p=str(candidate),
-                shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
-                lookup="the whole path is listed by: Get-Command pwsh -All, or in the Program Files folders",
-                source="is listed by: Get-Command pwsh -All, or is in the Program Files folders",
-            ))
+            out.append((str(candidate), source))
 
     for entry in (env.get("PATH") or "").split(os.pathsep):
-        entry = entry.strip().strip('"')
+        entry = entry.strip(_ENV_PADDING).strip('"')
         if not entry or not os.path.isabs(entry) or entry.startswith("\\\\"):
             continue
-        add(os.path.join(entry, "pwsh.exe"))
+        add(os.path.join(entry, "pwsh.exe"), "PATH")
     for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
-        root = (env.get(name) or "").strip().strip('"')
+        root = (env.get(name) or "").strip(_ENV_PADDING).strip('"')
         if not root or not os.path.isabs(root) or root.startswith("\\\\"):
             continue
-        add(os.path.join(root, "PowerShell", "7", "pwsh.exe"))
+        add(os.path.join(root, "PowerShell", "7", "pwsh.exe"), name)
+    return tuple(out)
+
+
+def path_candidates(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The same files as `path_candidate_sources`, as plain paths."""
+    return tuple(path for path, _source in path_candidate_sources(environ))
+
+
+SELECT_PWSH_COMMAND = "agenttalk supervise --select-pwsh --pwsh {p}"
+
+
+def select_pwsh_commands(path: str) -> tuple[str, str | None]:
+    """The `--select-pwsh --pwsh <path>` command for a found file, and the note (None when it is a ready command).
+
+    A real absolute path is never a plain token, so in practice this is the placeholder form with its note: the
+    text is not a command to paste (see printed_commands)."""
+    (command,), note = pc.cmds(
+        [SELECT_PWSH_COMMAND],
+        p=path,
+        shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+        lookup="the whole path is listed by: Get-Command pwsh -All, or in the Program Files folders",
+        source="is listed by: Get-Command pwsh -All, or is in the Program Files folders",
+    )
+    return command, note
+
+
+def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    out: list[str] = []
+    for candidate in path_candidates(environ):
+        command, note = select_pwsh_commands(candidate)
+        out.append(command if note is None else f"{command}  ({note})")
     return tuple(out)
 
 

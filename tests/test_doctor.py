@@ -7,6 +7,8 @@ import inspect
 import json
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -78,7 +80,7 @@ def test_doctor_leaves_empty_folders_unset_up(
             assert checks["multi_store"]["data"]["stores"] == []
         else:
             assert f"root: {folder.resolve()}" in output
-            assert f"no .agenttalk/ found at {folder.resolve()}" in output
+            assert f".agenttalk/config.json not found at {folder.resolve()}" in output
         assert not (folder / ".agenttalk").exists()
         assert sorted(parent.rglob("*")) == [child]
 
@@ -103,6 +105,9 @@ def test_doctor_powershell_check_keeps_result_and_locks_only_set_up_project(
 
     monkeypatch.setattr(store, "_powershell_selection_lock", tracked_lock)
     monkeypatch.setattr(doctor.sys, "platform", "win32")
+    # This test is about locking, not about where PowerShell is installed: no host found.
+    monkeypatch.setattr(doctor.psh, "program_files_candidates", lambda *a, **k: ())
+    monkeypatch.setattr(doctor.psh, "path_candidate_sources", lambda *a, **k: ())
     check = doctor._check_powershell_host(store)
     assert check == doctor.Check(
         name="powershell_host",
@@ -117,6 +122,681 @@ def test_doctor_powershell_check_keeps_result_and_locks_only_set_up_project(
     assert len(lock_entries) == int(initialized)
     if not initialized:
         assert list(tmp_path.iterdir()) == []
+
+
+def _windows_without_selection(monkeypatch: pytest.MonkeyPatch, program_files, on_path=()):
+    """Windows branch forced (the check returns early on other platforms); the two candidate
+    searches `supervise --select-pwsh` uses are replaced by what the test wants them to find.
+    ``on_path=None`` keeps the REAL PATH search (the test sets PATH itself); a path in ``on_path`` is found on the
+    PATH, a ``(path, variable name)`` pair under that Program Files variable."""
+    monkeypatch.setattr(doctor.sys, "platform", "win32")
+    monkeypatch.setattr(doctor.psh, "program_files_candidates", lambda *a, **k: tuple(program_files))
+    if on_path is not None:
+        found = tuple(item if isinstance(item, tuple) else (item, "PATH") for item in on_path)
+        monkeypatch.setattr(doctor.psh, "path_candidate_sources", lambda *a, **k: found)
+
+
+@pytest.mark.parametrize("content", [b"", b"not a real program"], ids=["zero-byte", "not-a-program"])
+def test_doctor_powershell_check_says_found_not_verified_when_pwsh_is_present_but_not_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> None:
+    pwsh = tmp_path / "pf" / "PowerShell" / "7" / "pwsh.exe"
+    pwsh.parent.mkdir(parents=True)
+    pwsh.write_bytes(content)  # only its existence is tested; nothing is run, so it cannot be vouched for
+    _windows_without_selection(monkeypatch, [str(pwsh)])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert (check.name, check.status, check.data) == (
+        "powershell_host", "error", {"status": "error", "task_status": "unknown"},
+    )
+    assert f"found at {pwsh}" in check.fix
+    assert "`agenttalk supervise --select-pwsh` to check and select it" in check.fix
+    # finding a file is not proof of a working install, and doctor never runs it to find out
+    assert "installed" not in check.fix
+    assert "install PowerShell" not in check.fix and "aka.ms" not in check.fix
+    # the message no longer tells the reader to install what is there
+    assert "no PowerShell host is selected" in check.details
+    assert "aka.ms" not in check.details
+    assert check.details.endswith("; task status UNKNOWN")
+
+
+_SPELLINGS = {"plain": "{}", "quoted": '"{}"', "quoted-and-padded": ' "{}" '}  # how an environment value may be written
+
+
+def _pwsh_only_on_a_temp_path(monkeypatch: pytest.MonkeyPatch, folder: Path, spelling: str = "plain") -> Path:
+    """A real pwsh.exe file in ``folder``, which is the whole PATH (written as ``spelling``), and no Program Files
+    variable."""
+    folder.mkdir(parents=True)
+    pwsh = folder / "pwsh.exe"
+    pwsh.write_bytes(b"")
+    monkeypatch.setenv("PATH", _SPELLINGS[spelling].format(folder))
+    for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
+        monkeypatch.delenv(name, raising=False)
+    return pwsh
+
+
+@pytest.mark.parametrize("folder_name", ["tools", "tools dir"], ids=["no-space", "with-space"])
+def test_doctor_powershell_check_names_the_found_path_for_a_path_only_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder_name: str
+) -> None:
+    # The REAL search runs on a real temp PATH. A real absolute path is never a plain token, so what it prints is
+    # not a ready command: doctor shows the path for reading and the command with a placeholder, and never asks
+    # the reader to paste the raw path.
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, tmp_path / folder_name)
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert check.status == "error"
+    assert f"found at {pwsh};" in check.fix
+    assert "`agenttalk supervise --select-pwsh --pwsh <path>`" in check.fix
+    assert "not ready to paste" in check.fix
+    assert "Type the path yourself" in check.fix
+    assert "<p>" not in check.fix
+    assert "installed" not in check.fix
+    assert "aka.ms" not in check.fix
+    # an ordinary path is shown as it is, so there is nothing to explain
+    assert "unusual character" not in check.fix
+
+
+# Paths with shell metacharacters. A command line that holds one of them unquoted runs another command in cmd.exe
+# (& | ^), or is expanded (% $ ` and $(...) in PowerShell), and no quoting is right in every shell. So doctor must
+# never put the raw path in a command: it appears exactly once, in the "found at" echo, and never after --pwsh.
+_ODD_PATHS = {
+    "ampersands": "C:\\tools\\host&ver&tail\\pwsh.exe",
+    "pipe": "C:\\tools\\a|b\\pwsh.exe",
+    "caret": "C:\\tools\\a^b\\pwsh.exe",
+    "percent": "C:\\tools\\%PATH%\\pwsh.exe",
+    "semicolon": "C:\\tools\\a;b\\pwsh.exe",
+    "parentheses": "C:\\tools\\a(b)c\\pwsh.exe",
+    "dollar-subexpression": "C:\\tools\\$(calc)\\pwsh.exe",
+    "backtick": "C:\\tools\\a`b\\pwsh.exe",
+    "space-and-ampersand": "C:\\tools dir\\a & b\\pwsh.exe",
+}
+
+
+@pytest.mark.parametrize("path", list(_ODD_PATHS.values()), ids=list(_ODD_PATHS))
+def test_doctor_powershell_check_never_puts_a_found_path_in_a_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    _windows_without_selection(monkeypatch, [], on_path=[path])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert f"found at {path};" in check.fix
+    assert check.fix.count(path) == 1  # only the echo: it is in no command and nowhere else
+    assert "--pwsh <path>`" in check.fix and "--pwsh " + path not in check.fix
+    assert '--pwsh "' not in check.fix and "--pwsh '" not in check.fix
+    assert "not ready to paste" in check.fix and "Type the path yourself" in check.fix
+
+
+def test_doctor_powershell_check_never_puts_a_real_path_with_ampersands_in_a_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the codex-rev case: a real folder and the real search
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, tmp_path / "host&ver&tail")
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert f"found at {pwsh};" in check.fix
+    assert check.fix.count(str(pwsh)) == 1 and "--pwsh " + str(pwsh) not in check.fix
+
+
+def test_doctor_powershell_check_says_when_the_shown_path_is_not_the_exact_file_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # U+202E (right-to-left override) is shown as a code, not as the character: the display is safe on one line,
+    # but it is not the real name, and the text says so and says where the real path is listed. The REAL search
+    # runs on a real folder whose name holds the character.
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, tmp_path / "a\u202eb")
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "\u202e" not in check.fix
+    assert f"found at {str(pwsh).replace(chr(0x202E), chr(92) + 'u202e')};" in check.fix
+    assert "writes an unusual character as a \\uXXXX code, so it is not the exact file name" in check.fix
+    assert f"the real path is printed in full, one per line, by `{doctor.PATH_LOOKUP}`" in check.fix
+    assert "environment variable" not in check.fix
+    assert "Get-ChildItem" not in check.fix
+
+
+def _pwsh_only_under_a_program_files_variable(
+    monkeypatch: pytest.MonkeyPatch, root: Path, variable: str, spelling: str = "plain"
+) -> Path:
+    """A real PowerShell\\7\\pwsh.exe under ``root``, named only by the environment variable ``variable`` (its value
+    written as ``spelling``). The PATH is a folder with no pwsh.exe in it, so the file is NOT on the PATH and the PATH
+    lookup does not list it."""
+    pwsh = root / "PowerShell" / "7" / "pwsh.exe"
+    pwsh.parent.mkdir(parents=True)
+    pwsh.write_bytes(b"")
+    empty = root.parent / "empty-path-folder"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(variable, _SPELLINGS[spelling].format(root))
+    return pwsh
+
+
+@pytest.mark.parametrize("variable", ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"])
+def test_doctor_powershell_check_says_where_an_escaped_program_files_hit_came_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    # A file under a Program Files variable is not on the PATH, so "Get-Command pwsh -All" would not list it. For this
+    # source the text names the variable and the fixed place inside its folder, without the raw character.
+    pwsh = _pwsh_only_under_a_program_files_variable(monkeypatch, tmp_path / "pf\u202e", variable)
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "\u202e" not in check.fix
+    assert f"found at {str(pwsh).replace(chr(0x202E), chr(92) + 'u202e')};" in check.fix
+    assert f"it was found under the folder named by the environment variable {variable}, as " in check.fix
+    lookup = doctor.env_root_lookup(variable)
+    assert f"as PowerShell\\7\\pwsh.exe inside that folder; this prints the full path: `{lookup}`" in check.fix
+    assert "Get-Command" not in check.fix  # the PATH advice would be untrue for this file
+    assert "Get-ChildItem" not in check.fix  # and an environment listing shows every variable, credentials included
+
+
+def test_doctor_powershell_check_has_no_lookup_sentence_for_an_ordinary_program_files_hit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _pwsh_only_under_a_program_files_variable(monkeypatch, tmp_path / "pf", "ProgramFiles")
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "unusual character" not in check.fix and "environment variable" not in check.fix
+    assert "it is checked and selected by" in check.fix
+
+
+_REAL_PWSH = next(
+    (c for c in (shutil.which("pwsh"), "C:\\Program Files\\PowerShell\\7\\pwsh.exe") if c and os.path.isfile(c)), None
+)
+_needs_real_pwsh = pytest.mark.skipif(os.name != "nt" or _REAL_PWSH is None, reason="runs the printed lookup in pwsh")
+_SYNTHETIC_SECRET = "synthetic-not-real-123"
+
+
+def _the_printed_lookup(fix: str, marker: tuple[str, ...]) -> str:
+    """The one backticked PowerShell expression in the hint that starts with one of ``marker``."""
+    found = [text for text in re.findall(r"`([^`]+)`", fix) if text.startswith(marker)]
+    assert len(found) == 1, (marker, found)
+    return found[0]
+
+
+_LANGUAGE_MODES = ["FullLanguage", "ConstrainedLanguage"]  # the printed lookups must behave the same in both
+_HOST_MODE: list[str] = []  # the language mode a fresh pwsh starts in on this machine, read once
+
+
+def _host_language_mode(env: dict[str, str]) -> str:
+    """The mode a new pwsh starts in here. A machine (or a sandbox) can enforce Constrained Language mode; there a
+    session cannot set its own mode at all, not even to the mode it already has, so the helper must not try."""
+    if not _HOST_MODE:
+        done = subprocess.run(
+            [_REAL_PWSH, "-NoProfile", "-NonInteractive", "-Command", "$ExecutionContext.SessionState.LanguageMode"],
+            env=env,
+            capture_output=True,
+            timeout=120,
+        )
+        assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
+        _HOST_MODE.append(done.stdout.decode("ascii").strip())
+    return _HOST_MODE[0]
+
+
+def _render_in_a_minimal_environment(expression: str, extra: dict[str, str], mode: str = "FullLanguage") -> list[str]:
+    """Run ``expression`` in a real pwsh in the given language mode and return the lines it prints, as text.
+
+    The environment is built from scratch (never the seat's own, which holds credentials): SystemRoot, PATHEXT, what the
+    test needs, and a synthetic secret in an unrelated variable, so a lookup that prints more than it should shows it.
+    Nothing here is refused by Constrained Language mode: from Full Language mode the mode is switched with one
+    assignment on the session state; a host that already enforces Constrained Language mode is used as it is (it
+    refuses any such assignment), and there the Full Language case is skipped. The output is read back as hex code
+    units of each printed line, so no console encoding has to be set (an assignment to [Console]::OutputEncoding is
+    refused there). stderr must be empty: a method call refused in Constrained Language mode prints its error and
+    leaves the output empty."""
+    env = {
+        "SystemRoot": os.environ["SystemRoot"],
+        "PATHEXT": ".COM;.EXE",
+        "ATK_TEST_UNRELATED_SECRET": _SYNTHETIC_SECRET,
+        **extra,
+    }
+    hex_of_each_line = "ForEach-Object { ($_.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ' }"
+    host = _host_language_mode(env)
+    if host == "ConstrainedLanguage" and mode == "FullLanguage":
+        pytest.skip("this machine enforces Constrained Language mode, so Full Language mode cannot be tested here")
+    # switch only when the host starts in Full Language mode; an enforced Constrained Language host is already there
+    switch = f"$ExecutionContext.SessionState.LanguageMode = '{mode}'; " if mode != host else ""
+    script = f"{switch}$ExecutionContext.SessionState.LanguageMode; {expression} | {hex_of_each_line}"
+    done = subprocess.run(
+        [_REAL_PWSH, "-NoProfile", "-NonInteractive", "-Command", script], env=env, capture_output=True, timeout=120
+    )
+    assert done.stderr.decode("utf-8", "replace").strip() == "", done.stderr.decode("utf-8", "replace")
+    assert done.returncode == 0
+    first, *rest = done.stdout.decode("ascii").splitlines()
+    assert first == mode, (first, mode)  # it really ran in the mode asked for
+    return ["".join(chr(int(unit, 16)) for unit in line.split()) for line in rest]
+
+
+def _without_the_host(lines: list[str]) -> list[str]:
+    """pwsh puts its own folder first on the PATH it runs with, so the lookup also lists the pwsh that runs it."""
+    return [line for line in lines if line.lower() != str(Path(_REAL_PWSH)).lower()]
+
+
+def _a_long_folder(tmp_path: Path) -> Path:
+    # over 150 characters in all (the temp root makes up the rest), yet short enough for Windows' 260-character limit
+    # even under a long CI temp root; U+202E is in the last folder name
+    return tmp_path / ("d" * 40) / ("e" * 30 + "\u202e" + "f" * 20)
+
+
+@_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
+@pytest.mark.parametrize("spelling", list(_SPELLINGS))
+def test_the_printed_path_lookup_prints_the_exact_long_path_and_no_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str, mode: str
+) -> None:
+    # The same PATH the search reads is given to the printed lookup, so a quoted or padded entry (which the search
+    # accepts) must be found by the lookup too, in Full and in Constrained Language mode.
+    folder = _a_long_folder(tmp_path)
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, folder, spelling)
+    assert len(str(pwsh)) > 150
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    expression = _the_printed_lookup(check.fix, ("$env:PATH", "(Get-Command", "Get-Command"))
+    lines = _render_in_a_minimal_environment(expression, {"PATH": _SPELLINGS[spelling].format(folder)}, mode)
+    assert _SYNTHETIC_SECRET not in "\n".join(lines)  # first: a listing of the environment shows it
+    assert _without_the_host(lines) == [str(pwsh)]  # the whole path, on a line of its own, and nothing else
+    assert not any("\u2026" in line or "..." in line for line in lines)  # no ellipsis
+
+
+@_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
+def test_the_printed_path_lookup_reads_the_path_the_way_the_search_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    # Several entries at once: quoted, padded, empty, relative, a network share and one with no pwsh.exe; only the
+    # real file is printed.
+    folder = _a_long_folder(tmp_path)
+    pwsh = _pwsh_only_on_a_temp_path(monkeypatch, folder)
+    other = tmp_path / "no-pwsh-here"
+    other.mkdir()
+    entries = [f' "{other}" ', "", "relative\\folder", "\\\\server\\share", f'"{folder}"', f"{folder}"]
+    path_value = ";".join(entries)
+    monkeypatch.setenv("PATH", path_value)
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    lines = _render_in_a_minimal_environment(_the_printed_lookup(check.fix, ("$env:PATH",)), {"PATH": path_value}, mode)
+    # the folder is on the PATH twice, spelled two ways; nothing else is printed
+    assert _without_the_host(lines) == [str(pwsh), str(pwsh)]
+    assert _SYNTHETIC_SECRET not in "\n".join(lines)
+
+
+# How a PATH entry or a Program Files value may be padded, and whether the search accepts it. The search trims an
+# explicit set (space and tab) and the printed lookups trim the same set, so the two must always agree; U+001C and the
+# no-break space are whitespace to Python's str.strip() but not to PowerShell's Trim(), so neither side takes them.
+_PADDINGS = {
+    "plain": ("{}", True),
+    "quoted": ('"{}"', True),
+    "quoted-and-padded": (' "{}" ', True),
+    "tab-padded": ("\t{}\t", True),
+    "unit-separator-padded": ("\x1c{}\x1c", False),
+    "no-break-space-padded": ("\u00a0{}\u00a0", False),
+}
+
+
+@_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
+@pytest.mark.parametrize("padding", list(_PADDINGS))
+def test_the_path_search_and_its_printed_lookup_trim_the_same_characters(
+    tmp_path: Path, padding: str, mode: str
+) -> None:
+    template, accepted = _PADDINGS[padding]
+    folder = _a_long_folder(tmp_path)
+    folder.mkdir(parents=True)
+    pwsh = folder / "pwsh.exe"
+    pwsh.write_bytes(b"")
+    value = template.format(folder)
+    found = list(doctor.psh.path_candidates({"PATH": value}))
+    assert (found == [str(pwsh)]) if accepted else (found == []), (padding, found)  # the search's own verdict
+    lines = _render_in_a_minimal_environment(doctor.PATH_LOOKUP, {"PATH": value}, mode)
+    assert _SYNTHETIC_SECRET not in "\n".join(lines)
+    assert _without_the_host(lines) == found  # the lookup prints exactly what the search found: no more, no less
+
+
+@_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
+@pytest.mark.parametrize("padding", list(_PADDINGS))
+@pytest.mark.parametrize("variable", ["ProgramFiles", "ProgramFiles(x86)"])
+def test_the_program_files_search_and_its_printed_lookup_trim_the_same_characters(
+    tmp_path: Path, variable: str, padding: str, mode: str
+) -> None:
+    template, accepted = _PADDINGS[padding]
+    root = _a_long_folder(tmp_path)
+    pwsh = root / "PowerShell" / "7" / "pwsh.exe"
+    pwsh.parent.mkdir(parents=True)
+    pwsh.write_bytes(b"")
+    value = template.format(root)
+    found = doctor.psh.path_candidate_sources({variable: value})
+    assert (found == ((str(pwsh), variable),)) if accepted else (found == ()), (padding, found)
+    if accepted:  # a hint (and so a lookup) exists only for what the search found
+        lines = _render_in_a_minimal_environment(doctor.env_root_lookup(variable), {variable: value}, mode)
+        assert _SYNTHETIC_SECRET not in "\n".join(lines)
+        assert lines == [str(pwsh)]
+
+
+@_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
+@pytest.mark.parametrize("spelling", list(_SPELLINGS))
+@pytest.mark.parametrize("variable", ["ProgramFiles", "ProgramFiles(x86)"])
+def test_the_printed_program_files_lookup_prints_the_exact_long_path_and_no_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable: str, spelling: str, mode: str
+) -> None:
+    root = _a_long_folder(tmp_path)
+    pwsh = _pwsh_only_under_a_program_files_variable(monkeypatch, root, variable, spelling)
+    assert len(str(pwsh)) > 150
+    _windows_without_selection(monkeypatch, [], on_path=None)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    expression = _the_printed_lookup(check.fix, ("Join-Path", "Get-ChildItem"))
+    empty = root.parent / "empty-path-folder"
+    extra = {"PATH": str(empty), variable: _SPELLINGS[spelling].format(root)}  # the value as the search read it
+    lines = _render_in_a_minimal_environment(expression, extra, mode)
+    assert _SYNTHETIC_SECRET not in "\n".join(lines)  # first: a listing of the environment shows it
+    assert lines == [str(pwsh)]
+    assert not any("\u2026" in line or "..." in line for line in lines)
+
+
+def test_the_hint_never_recommends_a_listing_that_shows_more_than_the_one_thing_it_names() -> None:
+    # `Get-ChildItem Env:` prints every environment variable, credentials included; a table cuts long values.
+    for expression in (doctor.PATH_LOOKUP, *(doctor.env_root_lookup(v) for v in _PROGRAM_FILES_VARIABLES)):
+        assert "Get-ChildItem" not in expression and "-Format" not in expression and "Get-Command" not in expression
+        # Constrained Language mode refuses a call to a static .NET method (it exits 0 and prints nothing)
+        assert "[IO." not in expression and "[System." not in expression and "::" not in expression
+    assert doctor.PATH_LOOKUP.startswith("$env:PATH -split ';'")  # reads the PATH and nothing else
+    assert "${env:" not in doctor.PATH_LOOKUP
+    for variable in _PROGRAM_FILES_VARIABLES:
+        expression = doctor.env_root_lookup(variable)
+        assert expression == f"Join-Path (${{env:{variable}}}.Trim(' ', [char]9).Trim('\"')) 'PowerShell\\7\\pwsh.exe'"
+        assert expression.count("${env:") == 1 and "$env:PATH" not in expression  # only that one variable is read
+
+
+_PROGRAM_FILES_VARIABLES = ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)")
+
+
+def test_doctor_powershell_check_runs_the_path_command_only_when_it_really_is_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A plain token is the one case where the command is ready; no real path is one, so the search is replaced here.
+    _windows_without_selection(monkeypatch, [], on_path=["pwsh.exe"])
+    check = doctor._check_powershell_host(Store(tmp_path))
+    assert "found at pwsh.exe;" in check.fix
+    assert "run `agenttalk supervise --select-pwsh --pwsh pwsh.exe` to check and select it" in check.fix
+    assert "not ready to paste" not in check.fix
+
+
+def test_doctor_powershell_check_echoes_a_found_path_safely(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The path came from the machine: it goes through the echo rule, so it cannot start a line of its own.
+    odd = "C:\\pf\\Power\nShell\\7\\pwsh.exe"
+    _windows_without_selection(monkeypatch, [odd])
+    monkeypatch.setattr(doctor.os.path, "isfile", lambda path: path == odd)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "\n" not in check.fix
+    assert "found at C:\\pf\\Power\\u000aShell\\7\\pwsh.exe;" in check.fix
+
+
+def test_doctor_powershell_check_echoes_a_path_only_hit_safely(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    odd = "C:\\tools\\pw\nsh\\pwsh.exe"
+    _windows_without_selection(monkeypatch, [], on_path=[odd])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "\n" not in check.fix
+    assert "found at C:\\tools\\pw\\u000ash\\pwsh.exe;" in check.fix
+
+
+@pytest.mark.parametrize("where", ["program-files", "path-plain-token", "path-real-path"])
+def test_doctor_powershell_check_names_everything_that_uses_the_selected_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    # The Windows turn watchdog of a continuous Codex wrapper reads the selected host too, so "only the supervisor
+    # needs this" would be untrue in all three texts.
+    if where == "program-files":
+        pwsh = tmp_path / "pf" / "PowerShell" / "7" / "pwsh.exe"
+        pwsh.parent.mkdir(parents=True)
+        pwsh.write_bytes(b"")
+        _windows_without_selection(monkeypatch, [str(pwsh)])
+    else:
+        found = "pwsh.exe" if where == "path-plain-token" else "C:\\t\\pwsh.exe"
+        _windows_without_selection(monkeypatch, [], on_path=[found])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert "the supervisor and the hang watchdog of a continuous Codex wrapper use the selected host" in check.fix
+    assert "only the supervisor" not in check.fix.lower()
+
+
+def test_doctor_powershell_check_keeps_install_advice_when_no_pwsh_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "pf" / "PowerShell" / "7" / "pwsh.exe"  # never created
+    _windows_without_selection(monkeypatch, [str(missing)])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert check.status == "error"
+    assert check.fix == doctor.psh.INSTALL_REMEDIATION
+    assert doctor.psh.INSTALL_REMEDIATION in check.details
+
+
+def test_doctor_powershell_check_never_runs_the_pwsh_it_finds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pwsh = tmp_path / "pwsh.exe"
+    pwsh.write_bytes(b"")
+    _windows_without_selection(monkeypatch, [str(pwsh)])
+
+    def boom(*args, **kwargs):
+        raise AssertionError("doctor must only test that the file exists")
+
+    monkeypatch.setattr(doctor.psh, "probe_candidate", boom)
+    monkeypatch.setattr(doctor.psh, "resolve_candidate", boom)
+    monkeypatch.setattr(doctor.psh.subprocess, "run", boom)
+    monkeypatch.setattr(doctor.psh.subprocess, "Popen", boom)
+    assert doctor._check_powershell_host(Store(tmp_path / "project")).status == "error"
+
+
+def test_doctor_powershell_install_advice_constant_is_unchanged() -> None:
+    # supervisor_lifecycle and `supervise --select-pwsh` share this text; doctor must not edit it.
+    assert doctor.psh.INSTALL_REMEDIATION == (
+        "install PowerShell Core 7+ (pwsh) from https://aka.ms/powershell, then run "
+        "`agenttalk supervise --select-pwsh`"
+    )
+
+
+def test_doctor_not_set_up_check_says_not_set_up_yet(tmp_path: Path) -> None:
+    check = doctor._check_init(Store(tmp_path))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert check.details == f"not set up yet: .agenttalk/config.json not found at {tmp_path}"
+    assert "`agenttalk init --here --agents claude-dev,codex-rev`" in check.fix
+    assert "with your own agent names in place of claude-dev,codex-rev" in check.fix
+    assert "claude,codex" not in check.fix
+    # a backticked command is one a reader may paste: it must hold no placeholder, no shell syntax, no space in a value
+    for command in re.findall(r"`([^`]+)`", check.fix):
+        assert not set("<>|&;") & set(command), command
+
+
+def test_doctor_inside_an_existing_team_folder_names_it_instead_of_advising_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """init refuses to start a team folder inside another one, so doctor must not advise it there."""
+    Store(tmp_path).init(["claude-dev", "codex-rev"])
+    child = tmp_path / "sub"
+    child.mkdir()
+    check = doctor._check_init(Store(child))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert f"a team folder already exists above it, at {tmp_path}" in check.details
+    assert "give agenttalk that folder as its root: the --root option, or the AGENTTALK_ROOT setting" in check.fix
+    # find_root: --root wins over AGENTTALK_ROOT, which wins over the folder the command runs from
+    assert "--root wins over AGENTTALK_ROOT, and both win over the folder you run from" in check.fix
+    assert "init --here" not in check.fix and "--force" not in check.fix
+    # the premise: the init the plain advice would print is refused in that folder
+    for name in ("AGENTTALK_ROOT", "AGENTTALK_SELF", "AGENTTALK_PEER"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(child)
+    assert cli.main(["init", "--here", "--agents", "claude-dev,codex-rev"]) == 2
+    assert not (child / ".agenttalk").exists()
+
+
+def test_doctor_below_a_folder_that_is_not_set_up_either_does_not_call_it_a_team(tmp_path: Path) -> None:
+    """The init guard sees any .agenttalk folder above, set up or not; doctor must not call a bare one a team."""
+    (tmp_path / ".agenttalk").mkdir()
+    child = tmp_path / "sub"
+    child.mkdir()
+    assert not Store(tmp_path).initialized()
+    check = doctor._check_init(Store(child))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert f"a .agenttalk folder exists above it, at {tmp_path}, but it is not set up either" in check.details
+    assert "team folder already exists" not in check.details
+    assert "to use that team" not in check.fix
+    assert "look at what it holds before you move it away" in check.fix
+    assert "init --here" not in check.fix and "--force" not in check.fix
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    ["{not json", '{"agents": ["worker", "worker"]}'],
+    ids=["malformed", "duplicate-roster"],
+)
+def test_doctor_below_a_team_folder_whose_config_cannot_be_read_says_to_check_that_team(
+    tmp_path: Path, config_text: str
+) -> None:
+    """A config.json above that exists but cannot be loaded is not a team anyone can use yet. Its own error is not
+    repeated: some errors carry init advice meant for that folder, which would read as advice for this one."""
+    (tmp_path / ".agenttalk").mkdir()
+    (tmp_path / ".agenttalk" / "config.json").write_text(config_text, encoding="utf-8")
+    child = tmp_path / "sub"
+    child.mkdir()
+    assert Store(tmp_path).initialized()
+    check = doctor._check_init(Store(child))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert check.details.endswith(f"a team folder exists above it, at {tmp_path}, but its config.json cannot be "
+                                  "read or is not valid")
+    assert "that team cannot be used until its config.json is readable and valid: run `agenttalk doctor`" in check.fix
+    assert "to use that team, give agenttalk" not in check.fix
+    for text in (check.details, check.fix):
+        assert "init --here" not in text and "--force" not in text and "re-init" not in text.lower()
+
+
+def test_doctor_below_a_store_outside_the_store_fence_reports_it_without_opening_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With AGENTTALK_STORE_FENCE set, opening a store outside it is refused and reported. The team folder above
+    lies outside a fence around the project, so doctor names it without opening it, and still prints its report
+    (human and --json). A refusal here would also fail this test through the suite's fence report."""
+    from agenttalk.store import STORE_FENCE_ENV
+
+    Store(tmp_path).init(["claude-dev", "codex-rev"])  # the team folder above, outside the fence set below
+    fenced = tmp_path / "fenced"
+    child = fenced / "sub"
+    child.mkdir(parents=True)
+    for name in ("AGENTTALK_ROOT", "AGENTTALK_SELF", "AGENTTALK_PEER"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(STORE_FENCE_ENV, str(fenced))
+
+    check = doctor._check_init(Store(child))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert f"a .agenttalk folder exists above it, at {tmp_path}, which the store fence" in check.details
+    assert "does not let doctor open safely" in check.details
+    assert "so doctor did not look inside it" in check.details
+    assert "check that folder from a shell whose store fence includes it" in check.fix
+    assert "init --here" not in check.fix and "--force" not in check.fix
+
+    capsys.readouterr()
+    assert cli.main(["--root", str(child), "doctor"]) == 2
+    human = capsys.readouterr().out
+    assert "store.initialized" in human and "does not let doctor open safely" in human
+    assert cli.main(["--root", str(child), "doctor", "--json"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    init = [c for c in report["checks"] if c["name"] == "store.initialized"]
+    assert len(init) == 1 and "does not let doctor open safely" in init[0]["details"]
+
+
+def test_doctor_partly_set_up_folder_names_the_missing_config_file(tmp_path: Path) -> None:
+    """Store.initialized() is true only when .agenttalk/config.json exists, so a folder that has a
+    .agenttalk/ but no config.json is still "not set up", and the text must say which file is missing
+    rather than claim the whole folder is absent."""
+    (tmp_path / ".agenttalk").mkdir()
+    check = doctor._check_init(Store(tmp_path))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert check.details == f"not set up yet: .agenttalk/config.json not found at {tmp_path}"
+    assert ".agenttalk/ found" not in check.details
+    assert "`agenttalk init --here --agents claude-dev,codex-rev`" in check.fix
+    assert [p.name for p in (tmp_path / ".agenttalk").iterdir()] == []  # a diagnostic adds nothing
+
+
+def test_doctor_not_set_up_run_keeps_result_exit_code_and_json_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["doctor", "--json"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    check = report["checks"][0]
+    assert report["overall"] == "error"
+    assert set(check) == {"name", "status", "details", "fix", "data"}  # the same keys as before
+    assert check["data"] is None
+    assert (check["name"], check["status"]) == ("store.initialized", "error")
+    assert check["details"].startswith("not set up yet: .agenttalk/config.json not found at ")
+    assert cli.main(["doctor"]) == 2
+    text = capsys.readouterr().out
+    assert "not set up yet" in text
+    assert "overall: ERROR" in text
+    # no extra line promises the ERROR goes away after `init`: on Windows powershell_host
+    # still fails until `supervise --select-pwsh`
+    assert "will clear" not in text and "then run doctor again" not in text
+    assert not (tmp_path / ".agenttalk").exists()
+
+
+def _stub_skill_findings(monkeypatch: pytest.MonkeyPatch, findings) -> None:
+    from agenttalk import skill_currency as skc
+
+    monkeypatch.setattr(skc, "check_bundled_skills", lambda *a, **k: list(findings))
+
+
+def _lag(n: int):
+    from agenttalk import skill_currency as skc
+
+    return [
+        skc.Finding(f"skills/s{i}.md", 0, "reviewed-against",
+                    "reviewed-against 0.92 lags package 0.104 (re-review against current CLI)",
+                    level="warn")
+        for i in range(n)
+    ]
+
+
+def test_skill_currency_advisory_only_is_a_note_for_the_maintainers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    findings = _lag(41)
+    _stub_skill_findings(monkeypatch, findings)
+    check = doctor._check_skill_currency()
+    assert check.status == "warn"
+    assert check.details.startswith("41 bundled skills were last reviewed against an older agenttalk")
+    assert check.fix == "nothing to do: this is a note for the maintainers of the bundled skills"
+    assert "re-stamp" not in check.details + check.fix
+    # every finding stays in the JSON data
+    assert len(check.data["findings"]) == 41
+    assert check.data["findings"][0] == {
+        "file": "skills/s0.md", "line": 0, "token": "reviewed-against",
+        "reason": findings[0].reason, "level": "warn",
+    }
+
+
+def test_skill_currency_with_blocking_findings_also_names_the_maintainers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agenttalk import skill_currency as skc
+
+    blocking = skc.Finding("skills/a.md", 3, "agenttalk nope", "unknown CLI command", level="error")
+    _stub_skill_findings(monkeypatch, [blocking, *_lag(2)])
+    check = doctor._check_skill_currency()
+    assert check.status == "warn"
+    assert check.details.startswith("1 blocking + 2 advisory skill-currency issue(s): ")
+    assert "skills/a.md:3 unknown CLI command" in check.details
+    # the maintainer advice is kept, but it now says who it is for and what the reader should do
+    assert "maintainers" in check.fix
+    assert "report it" in check.fix
+    assert "fix blocking drift" in check.fix
+    assert "re-stamp reviewed-against" in check.fix
+    assert len(check.data["findings"]) == 3
+
+
+def test_skill_currency_with_no_findings_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_skill_findings(monkeypatch, [])
+    check = doctor._check_skill_currency()
+    assert check.status == "ok" and check.fix == ""
+    assert check.details == "bundled skills pass currency lint (frontmatter + stamps + CLI tokens)"
 
 
 def test_doctor_on_initialized_project_includes_all_check_categories(

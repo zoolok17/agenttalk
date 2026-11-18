@@ -241,6 +241,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The user manuals install agenttalk the same way as the README (#716).** The two manuals still told readers to install agenttalk into whatever Python was active and then run plain `agenttalk`, so a reader could end up running an older copy. They now send readers to the README's do-it-yourself install steps (up to its project setup, which the manual replaces), which give agenttalk its own environment and put it first on PATH, and say not to activate another Python environment in a terminal where agenttalk runs (and how to check which copy runs). The Codex-sandbox example in the user manual uses that environment's Python, and a test keeps the old bare install line from coming back.
 
+- **The first `agenttalk doctor` run reads less like a failure (Part of #716).** Three lines
+  changed their words; no result, exit code, check name or JSON field changed.
+  In a folder that is not set up, `store.initialized` now says "not set up yet" and names the missing
+  `.agenttalk/config.json` (a folder with a `.agenttalk/` but no `config.json` counts as not set up
+  too). Its fix gives a command that runs as printed, `agenttalk init --here --agents claude-dev,codex-rev`,
+  and says to put your own agent names in place of those two, separated by commas with no spaces
+  (before, it showed the names `claude,codex` without saying they were only an example). When a
+  `.agenttalk` folder exists above, `agenttalk init` refuses on purpose, so doctor names that folder
+  instead. If it is a set-up team folder, doctor says how to use it (the `--root` option or the
+  `AGENTTALK_ROOT` setting, and which one wins); if its `config.json` cannot be read or is not valid,
+  doctor says so and to run `agenttalk doctor` there; if it is not set up either, doctor says to check it.
+  On Windows, when a PowerShell 7 file is found where `agenttalk supervise --select-pwsh` looks,
+  `powershell_host` no longer says to install it: it says where it found it and gives the one missing
+  step, `agenttalk supervise --select-pwsh`, which checks the file and selects it (the supervisor and
+  the hang watchdog of a continuous Codex wrapper use the selected host). A file found only on the
+  PATH needs the same command with `--pwsh` and its path. A real path is not a plain token, and no
+  quoting is right in every shell (an unquoted `&` or `|` in a folder name would start a second
+  command), so doctor shows that command with a `<path>` placeholder, says plainly that it is not
+  ready to paste, and tells the reader to type the path themselves. The found path is shown for
+  reading only; if it holds an unusual character, that is shown as a `\uXXXX` code, and doctor says
+  the display is not the exact file name and how to get the real one for the place it was found. For a
+  file on the PATH it gives a one-line expression that splits the PATH, trims each entry of spaces and tabs
+  and then of surrounding double quotes (as the search does, so a quoted entry is found too), keeps an
+  entry only if it starts with a drive letter, a colon and a slash (the search's own rule), and prints
+  every `pwsh.exe` that exists, one full path per line. A file under a Program Files environment
+  variable is not on the PATH, so doctor names that variable and gives one expression for it, such as
+  `Join-Path (${env:ProgramFiles}.Trim(' ', [char]9).Trim('"')) 'PowerShell\7\pwsh.exe'`, which also reads
+  a quoted value. Both print the full path as plain text on its own line (a table would cut a long path
+  with an ellipsis), and each reads only the one variable it names: doctor never recommends
+  `Get-ChildItem Env:`, which prints every environment variable, credentials included. Both use only
+  commands, operators and string methods, so they work the same when PowerShell runs in Constrained
+  Language mode, which refuses calls to .NET methods (an earlier form of the PATH expression printed
+  nothing there, without an error). The search and the expressions now trim the same two characters,
+  space and tab: before, the search also trimmed some invisible separator characters that PowerShell
+  does not, so a path padded with one was found by the search but not by the expression. So a value
+  padded with such a character is no longer found, and a folder whose real name ends in one (for
+  example a no-break space) is now found as it is. Before, the search cut that character off and looked
+  in the folder with the shorter name instead, which might not exist or might hold a different
+  `pwsh.exe`; the suggestions of `agenttalk supervise --select-pwsh` use the same search, so they now
+  name the right file too.
+  Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
+  has just been set up can still end with `overall: ERROR` on Windows until that step is done.
+  `skill_currency` now says that bundled skills last reviewed against an older version are a note
+  for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report
+  it to the agenttalk maintainers and that the maintenance advice is for them.
+
 ## [0.105.0] - 2026-11-13
 
 This release makes agenttalk safer and clearer when something goes wrong, and shows more of what is really happening. For a Claude agent run by the wrapper, the status views now show how large its current conversation is (other agents still show the size as unknown), and an old size can no longer look current after a failed save. Commands that tell you to "run this" now print only values that are safe to paste, and new request ids are checked when they are made. A backup now skips the temporary files other commands write while they work and, when files vanish while it reads them, tries again within a short limit; if the store keeps changing, it stops, publishes nothing and asks you to run it again. A reset and the retry of a failed message now take turns, and a failed message can be put back in the queue only once. Release lanes are better protected: a lane that an agent is working in is no longer cleaned up underneath it, a lane whose checkout has gone can be retired on purpose, a held lane can be re-stamped, and the cleanup commands say what they refuse and why. The web console says "nothing checked" instead of a green GO when no gate applies, and the status overview no longer suggests that anyone can safely drain another agent's messages. Notes and gate files report their problems more clearly, and code is now written with a short security note first.

@@ -35,6 +35,7 @@ from agenttalk.store import (
     Store,
     find_root,
     find_stores_upward,
+    store_fence_allows,
 )
 
 
@@ -610,6 +611,98 @@ def _check_ovh_qwen_gateway(store: Store) -> Check | None:
     )
 
 
+_HOST_USERS = "the supervisor and the hang watchdog of a continuous Codex wrapper use the selected host"
+# How to get the exact path of a found file whose display is escaped. Both print plain strings, one per line, so a
+# long value is never cut with an ellipsis (a table such as `Get-Command pwsh -All` or `Get-ChildItem Env:` is), and
+# each shows only the one thing it is about: never a listing of the environment, which holds credentials.
+# The expression that prints, one full path per line, every pwsh.exe on the PATH that passes the search's entry rules.
+# It reads each entry exactly as the search does: PATH split on the separator; each entry trimmed of the same
+# explicit set (space and tab) and then of surrounding double quotes (a quoted entry is legal on Windows); an entry
+# kept only if it starts with an ASCII drive letter, a colon and a slash (the search's own rule, so empty, relative
+# and network-share entries drop out); a file printed only if it exists, with Test-Path on the literal text so no
+# wildcard in a folder name is expanded. It uses only cmdlets, operators and string methods, so it behaves the same
+# in Constrained Language mode (which refuses calls to static .NET methods such as [IO.Path]::IsPathFullyQualified:
+# the expression would run, print nothing and exit 0). Plain strings, so nothing is cut with an ellipsis. It reads
+# only the PATH variable.
+# Its list can be longer than the search's: the search also drops WindowsApps aliases and files on drives that are
+# not fixed, and pwsh lists its own folder first; the reader finds the line that matches the path shown above.
+PATH_LOOKUP = (
+    "$env:PATH -split ';' | ForEach-Object { $e = $_.Trim(' ', [char]9).Trim('\"'); "
+    "if ($e -cmatch '^[A-Za-z]:[\\\\/]') "
+    "{ $p = Join-Path $e 'pwsh.exe'; if (Test-Path -LiteralPath $p -PathType Leaf) { $p } } }"
+)
+
+
+def env_root_lookup(variable: str) -> str:
+    """The PowerShell expression that prints the full path of PowerShell\\7\\pwsh.exe under ONE Program Files
+    variable. ``variable`` is one of the four fixed names, never a stored value; the braces let a name with
+    parentheses, such as ProgramFiles(x86), be read as a variable. The value is trimmed of the same explicit set as the
+    search (space and tab) and then of surrounding double quotes, so a quoted root is read as the folder it names. Only
+    cmdlets and string methods, so it behaves the same in Constrained Language mode."""
+    return f"Join-Path (${{env:{variable}}}.Trim(' ', [char]9).Trim('\"')) 'PowerShell\\7\\pwsh.exe'"
+
+
+def _found_pwsh_fix() -> str:
+    """The fix text when a PowerShell 7 file is found but none is selected, else "".
+
+    Looks in the places `agenttalk supervise --select-pwsh` looks (its standard Program Files
+    search, then the PATH hints it prints). A file-existence test only: nothing is executed, so
+    the file is reported as found, never as a working install; `--select-pwsh` is what checks it.
+
+    The rule for a found path (the safety point): it came from the machine, so it is never put in a
+    command the reader is told to paste. No quoting is right in every shell (cmd.exe expands `%` even
+    inside double quotes, PowerShell runs `$(...)` inside them, and an unquoted `&` starts a second
+    command), and the printed-commands rule is the same: a value that is not a plain token is not
+    printed in a command. A real absolute path is never a plain token, so the PATH-only text shows the
+    command with a `<path>` placeholder, says in words that it is not ready to paste and why, and tells
+    the reader to type the path themselves. The path is only echoed for reading, through `pc.line`
+    (never able to start a line of its own); when that display differs from the real path (an unusual
+    character is written as a \\uXXXX code) the text says so and says how to get the real value FOR THE SOURCE THE
+    FILE CAME FROM: a PATH entry is printed in full by PATH_LOOKUP; a file under a Program Files variable is not on
+    the PATH, so that one gets `env_root_lookup(variable)`, which prints only that variable's folder joined with the
+    fixed place. The rule for both (security): the lookup prints plain strings, one per line, so a long value is not
+    cut with an ellipsis (a table is), and it shows ONLY the one thing named: never `Get-ChildItem Env:`, which
+    prints every environment variable, credentials included, into text people copy and share.
+    Only a plain token is shown as a command to run."""
+    try:
+        for candidate in psh.program_files_candidates():
+            if os.path.isfile(candidate):
+                return (
+                    f"PowerShell 7 found at {pc.line(candidate)}; run `agenttalk supervise --select-pwsh` "
+                    f"to check and select it ({_HOST_USERS})"
+                )
+        path, source = next(iter(psh.path_candidate_sources()), ("", ""))
+    except (OSError, ValueError):
+        return ""
+    if not path:
+        return ""
+    command, note = psh.select_pwsh_commands(path)
+    if note is None:
+        return f"PowerShell 7 found at {pc.line(path)}; run `{command}` to check and select it ({_HOST_USERS})"
+    text = (
+        f"PowerShell 7 found at {pc.line(path)}; it is checked and selected by "
+        "`agenttalk supervise --select-pwsh --pwsh <path>`, where <path> is that file's full path. "
+        "That line is not ready to paste: a path is not a plain token, and a character in it such as "
+        "& | ^ % $ ; ( ) or a backtick would be read by your shell as part of a command, so agenttalk "
+        "does not print the path for you to paste. Type the path yourself, in the quotes your shell needs "
+        f"({_HOST_USERS})"
+    )
+    if pc.line(path) != path:
+        text += (
+            ". The path shown above writes an unusual character as a \\uXXXX code, so it is not the exact file name; "
+        )
+        if source == "PATH":
+            text += f"the real path is printed in full, one per line, by `{PATH_LOOKUP}`"
+        else:
+            # not on the PATH, so the PATH lookup does not list it: name the one variable that found it, and print only
+            # that variable's folder joined with the fixed place; never a listing of the environment
+            text += (
+                f"it was found under the folder named by the environment variable {source}, as "
+                f"PowerShell\\7\\pwsh.exe inside that folder; this prints the full path: `{env_root_lookup(source)}`"
+            )
+    return text
+
+
 def _check_powershell_host(store: Store) -> Check:
     if not sys.platform.startswith("win"):
         return Check(
@@ -625,11 +718,18 @@ def _check_powershell_host(store: Store) -> Check:
             # A diagnostic must not create a store just to lock an absent selection.
             record = supervisor_lifecycle.read_selected_host_locked(store)
     except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as exc:
+        message = str(exc)
+        fix = psh.INSTALL_REMEDIATION
+        found_fix = _found_pwsh_fix()
+        if found_fix:
+            # A PowerShell 7 file is already there; "install it" would send the reader the wrong way.
+            fix = found_fix
+            message = message.removesuffix(f"; {psh.INSTALL_REMEDIATION}")
         return Check(
             name="powershell_host",
             status="error",
-            details=f"PowerShell Core host unavailable: {exc}; task status UNKNOWN",
-            fix=psh.INSTALL_REMEDIATION,
+            details=f"PowerShell Core host unavailable: {message}; task status UNKNOWN",
+            fix=fix,
             data={"status": "error", "task_status": "unknown"},
         )
     warning = record.get("_warning")
@@ -1767,11 +1867,81 @@ def _check_deadman_config_source(store: Store) -> Check | None:
 
 def _check_init(store: Store) -> Check:
     if not store.initialized():
+        # `agenttalk init` refuses to start a team folder inside another one (two teams at different depths talk
+        # past each other), so the init advice below would be refused there: name the folder above instead.
+        above = find_stores_upward(store.root.parent)
+        if above:
+            refusal = (
+                "`agenttalk init` refuses to start a team folder here while that one exists, on purpose, so that "
+                "two teams at different depths do not talk past each other"
+            )
+            if not store_fence_allows(above[0]):
+                # Opening a store the fence cannot vouch for (outside it, or holding an unreadable or linked
+                # entry) is refused and reported, so doctor does not look inside: it names the folder instead.
+                return Check(
+                    name="store.initialized",
+                    status="error",
+                    details=(
+                        f"not set up yet: .agenttalk/config.json not found at {pc.line(str(store.root))}; "
+                        f"a .agenttalk folder exists above it, at {pc.line(str(above[0]))}, which the store "
+                        "fence (AGENTTALK_STORE_FENCE) does not let doctor open safely (it lies outside the fence, "
+                        "or holds something the fence cannot vouch for), so doctor did not look inside it"
+                    ),
+                    fix=(
+                        "check that folder from a shell whose store fence includes it: if it is a team folder, "
+                        "use it as the root; if it is left over, look at what it holds before you move it away. "
+                        f"{refusal}"
+                    ),
+                )
+            unreadable = False
+            if Store(above[0]).initialized():
+                try:
+                    Store(above[0]).load_config()
+                except (ValueError, OSError):  # the same errors _check_init reports for a store's own config
+                    # the reason is not repeated here: some reasons carry their own init advice, which is meant for
+                    # that folder, not this one; doctor run there shows it in the right place
+                    unreadable = True
+            if unreadable:
+                found = (
+                    f"a team folder exists above it, at {pc.line(str(above[0]))}, but its config.json cannot be "
+                    "read or is not valid"
+                )
+                fix = (
+                    "that team cannot be used until its config.json is readable and valid: run `agenttalk doctor` "
+                    "with that folder as its root (the --root option, or the AGENTTALK_ROOT setting; --root wins "
+                    f"over AGENTTALK_ROOT) to see what is wrong there. {refusal}"
+                )
+            elif Store(above[0]).initialized():
+                found = f"a team folder already exists above it, at {pc.line(str(above[0]))}"
+                fix = (
+                    "to use that team, give agenttalk that folder as its root: the --root option, or the "
+                    "AGENTTALK_ROOT setting (--root wins over AGENTTALK_ROOT, and both win over the folder you run "
+                    f"from, so running agenttalk from that folder uses it only when neither is set). {refusal}"
+                )
+            else:
+                # only a .agenttalk folder, no config.json: not a team anyone can use, yet init still sees it
+                found = (
+                    f"a .agenttalk folder exists above it, at {pc.line(str(above[0]))}, but it is not set up "
+                    "either (it has no config.json)"
+                )
+                fix = (
+                    "check that folder: if it was meant to be the team folder, set it up there; if it is left "
+                    f"over, look at what it holds before you move it away. {refusal}"
+                )
+            return Check(
+                name="store.initialized",
+                status="error",
+                details=f"not set up yet: .agenttalk/config.json not found at {pc.line(str(store.root))}; {found}",
+                fix=fix,
+            )
         return Check(
             name="store.initialized",
             status="error",
-            details=f"no .agenttalk/ found at {store.root}",
-            fix="run `agenttalk init --here --agents claude,codex` from the project root",
+            details=f"not set up yet: .agenttalk/config.json not found at {store.root}",
+            fix=(
+                "from the project root, run `agenttalk init --here --agents claude-dev,codex-rev` with your own "
+                "agent names in place of claude-dev,codex-rev: one name per assistant, separated by commas, no spaces"
+            ),
         )
     try:
         cfg = store.load_config()
@@ -1897,14 +2067,27 @@ def _check_skill_currency() -> Check:
     lead = errors or warnings
     sample = "; ".join(f"{f.file}:{f.line} {f.reason}" for f in lead[:5])
     more = "" if len(lead) <= 5 else f" (+{len(lead) - 5} more)"
+    data = {"findings": [{"file": f.file, "line": f.line, "token": f.token,
+                          "reason": f.reason, "level": f.level} for f in findings]}
+    if not errors:
+        # Only version-lag notes: they are for the people who maintain the bundled skills.
+        return Check(
+            name="skill_currency", status="warn",
+            details=f"{len(warnings)} bundled skills were last reviewed against an older agenttalk "
+                    f"version ({sample}{more})",
+            # still a text fix, so the JSON `fix` keeps its type
+            fix="nothing to do: this is a note for the maintainers of the bundled skills",
+            data=data,
+        )
     return Check(
         name="skill_currency", status="warn",
         details=f"{len(errors)} blocking + {len(warnings)} advisory skill-currency "
                 f"issue(s): {sample}{more}",
-        fix="fix blocking drift (stamps/CLI tokens/parity); re-stamp reviewed-against on "
-            "review (see docs/skill-devkit-evolution-design.md)",
-        data={"findings": [{"file": f.file, "line": f.line, "token": f.token,
-                            "reason": f.reason, "level": f.level} for f in findings]},
+        fix="report it to the agenttalk maintainers: the problem is in the bundled skills of the "
+            "agenttalk package, not in your project. For the maintainers: fix blocking drift "
+            "(stamps/CLI tokens/parity); re-stamp reviewed-against on review "
+            "(see docs/skill-devkit-evolution-design.md)",
+        data=data,
     )
 
 
