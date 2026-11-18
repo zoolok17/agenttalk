@@ -4998,17 +4998,30 @@ def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> tuple
     None when every other row is ruled out. `names` is True when a field names the folder (the same folder under
     another spelling, a link or a junction included), and False when the row's `worktree_path` is not a full path (so
     which folder it names depends on where it was written) and the row saves no full canonical path to settle it: that
-    row is never skipped, because it could be the owner. A blank, empty or non-text field names no folder."""
+    row is never skipped, because it could be the owner. A blank, empty or non-text field names no folder.
+    The lane's retained claims (`occupancy_worktrees`, the checkouts of its earlier generations, which a forced
+    reassignment moves out of the two fields) name folders too, and a claim that cannot be read as a full path
+    cannot be ruled out either: the full canonical path of the current checkout says nothing about an earlier one."""
     rows = lane_mod.load_lanes(store).get("lanes") or {}
     for key, row in rows.items():
         if key == lane_id or not isinstance(row, dict):
             continue
         anchored = False  # the row saves a full canonical path, which settles what its path field means
         placed = True  # False while its `worktree_path` is a spelling that needs a folder to be read against
+        claim_unplaced = False  # a retained claim that is not a full path (nothing settles it)
+        claims: list[tuple[str, str]] = []
         for field in ("worktree_path", "worktree_toplevel_canonical"):
             saved = row.get(field)
-            if not isinstance(saved, str) or lane_mod.checkout_path_problem({field: saved}) is not None:
-                continue
+            if isinstance(saved, str) and lane_mod.checkout_path_problem({field: saved}) is None:
+                claims.append((field, saved))
+        retained = row.get("occupancy_worktrees")
+        if retained is not None and not isinstance(retained, list):
+            return key, False  # the claims cannot be read at all
+        for claim in retained or []:
+            if not isinstance(claim, str) or not claim.strip() or "\x00" in claim:
+                return key, False  # a claim that cannot be read cannot be ruled out
+            claims.append(("occupancy_worktrees", claim))
+        for field, saved in claims:
             saved = saved.replace("{ROOT}", str(store.root))
             if lane_mod.path_is_absolute(saved):
                 named = [saved]
@@ -5020,7 +5033,10 @@ def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> tuple
                 named = [os.path.abspath(saved)]
                 if not (Path(saved).drive or Path(saved).root):
                     named.append(str(Path(store.root).absolute() / saved))
-                placed = placed and field != "worktree_path"
+                if field == "worktree_path":
+                    placed = False
+                elif field == "occupancy_worktrees":
+                    claim_unplaced = True
             for folder in folders:
                 for candidate in named:
                     if _same_folder(candidate, folder):
@@ -5030,13 +5046,46 @@ def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> tuple
                             return key, True
                     except (OSError, ValueError):
                         pass  # one of them is not there: only the spelling comparison above could say
-        if not placed and not anchored:
+        if claim_unplaced or (not placed and not anchored):
             return key, False
     return None
 
 
+def _lane_checkout_outside_store(store, *folders: str) -> str | None:
+    """None when every one of `folders` lies inside this store's folder, where `lane assign` always makes a lane's
+    checkout (a worktrees root outside the store folder is refused), and under no other store of its own; otherwise
+    the first folder that does not. This is the store's own evidence that a checkout is its own. A row can name a
+    checkout that belongs to ANOTHER store sharing the repository (a copied store folder, a restored lanes.json),
+    and every check on such a row passes, because every field in it is genuine: only where the folder is tells.
+    Paths are compared as they resolve (a link or junction into another store's folder counts as that folder)."""
+    try:
+        root = os.path.normcase(os.path.realpath(store.root))
+        for folder in folders:
+            real = os.path.normcase(os.path.realpath(folder))
+            if not real.startswith(root.rstrip(os.sep) + os.sep):
+                return folder
+            parent = os.path.dirname(real)
+            while parent.startswith(root.rstrip(os.sep) + os.sep):  # a store of its own between the two is not ours
+                if os.path.isdir(os.path.join(parent, store_mod.DIRNAME)):
+                    return folder
+                parent = os.path.dirname(parent)
+    except (OSError, ValueError):
+        return folders[0] if folders else None
+    return None
+
+
+def _lane_checkout_not_ours_text(store, folder: str) -> str:
+    return (
+        f"this checkout, {pc.line(folder)}, is not inside this store's folder {pc.line(str(store.root))}, so this "
+        "store cannot show that it made it (a lane checkout is always made inside its own store's folder; this one "
+        "may belong to another store that shares the repository), and it was left alone. If it really is this lane's: "
+        "inspect it, save any ignored files, remove it yourself with `git worktree remove` (naming that folder), then "
+        "retire the lane with `lane abandon --acknowledge-missing-worktree`")
+
+
 def _verify_lane_worktree(
     store, lane: dict, *, lane_id: str, expected_base: str | None = None, check_paths: bool = True,
+    store_owned: bool = False,
 ) -> dict:
     """`lane_id` is the registry key: it names the row in every refusal. The id written inside the row is a separate
     fact (it picks the lane branch below, as before) and must never stand in for the key.
@@ -5075,6 +5124,10 @@ def _verify_lane_worktree(
     if toplevel_c != expected_c:
         raise lane_mod.LaneError(
             f"registered worktree path {expected_c!r} does not match git toplevel {toplevel_c!r}")
+    if store_owned:  # for a removal or a delivery: only a checkout this store can show it made (see the helper)
+        elsewhere_folder = _lane_checkout_outside_store(store, wt, toplevel)
+        if elsewhere_folder is not None:
+            raise lane_mod.LaneError(_lane_checkout_not_ours_text(store, elsewhere_folder))
     stored_c = lane.get("worktree_toplevel_canonical")
     ambiguous = not check_paths and (
         not isinstance(stored_c, str) or not stored_c.strip()
@@ -5127,10 +5180,10 @@ def _verify_lane_worktree(
             f"{pc.line(lane_id)}'s alone: repair the saved checkout paths in lanes.json before anything is removed")
     if owner is not None:
         raise lane_mod.LaneError(
-            f"the saved worktree path of lane {pc.line(owner[0])} is not a full path and that lane saves no full "
-            f"canonical path, so it is not known that this checkout is not that lane's: set worktree_path in lane "
-            f"{pc.line(owner[0])}'s record in lanes.json to its checkout's real absolute folder (or to empty text if "
-            "it has none) before anything is removed")
+            f"a saved checkout of lane {pc.line(owner[0])} (its worktree path, or an earlier checkout it still "
+            "claims) is not a full path and cannot be placed, so it is not known that this checkout is not that "
+            f"lane's: put the real absolute folder in that lane's record in lanes.json (or remove the entry if it "
+            "has none) before anything is removed")
     rc, status = _git(wt, ["status", "--porcelain", "--untracked-files=no"])
     if rc != 0:
         raise lane_mod.LaneError(f"could not verify worktree tracked status (git rc={rc})")
@@ -5660,7 +5713,7 @@ def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
     if in_use is not None:
         return False, in_use
     try:
-        _verify_lane_worktree(store, probe, lane_id=lane_id)
+        _verify_lane_worktree(store, probe, lane_id=lane_id, store_owned=True)
     except lane_mod.LaneError as e:
         return False, f"worktree is not clean/verifiable: {e}"
     return True, "worktree is clean and idle"
@@ -5886,7 +5939,11 @@ def _lane_candidate(
         lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
     provenance = None
     if lane.get("worktree_path") and (delivery or not requested_head):
-        provenance = _verify_lane_worktree(store, lane, lane_id=lane_id, check_paths=check_paths)
+        # A delivery is judged only for a checkout this store can show it made, so a row that names another store's
+        # checkout is refused here, before anything is written; the retry of an already committed delivery
+        # (`check_paths=False`) is not judged again, and its cleanup is.
+        provenance = _verify_lane_worktree(
+            store, lane, lane_id=lane_id, check_paths=check_paths, store_owned=delivery and check_paths)
         head = provenance["head"]
         if requested_head:
             requested = _lane_resolve(store, requested_head)
@@ -6627,7 +6684,7 @@ def _lane_deliver_cleanup(store, lane_id: str, pending: dict, cleanup_lane: dict
             f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {in_use}.\n")
         return artifact, True, delivered_head
     try:
-        provenance = _verify_lane_worktree(store, cleanup_lane, lane_id=lane_id)
+        provenance = _verify_lane_worktree(store, cleanup_lane, lane_id=lane_id, store_owned=True)
         if provenance.get("head") != pending.get("head_sha"):
             raise lane_mod.LaneError("worktree HEAD changed before teardown")
         with store._config_lock():  # every lane writer takes this lock: none gets in between the look and the removal
@@ -7524,7 +7581,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     in_use = _lane_worktree_launch_use(store, lane)
                     if in_use is None:
                         try:
-                            _verify_lane_worktree(store, lane, lane_id=lane_id)
+                            _verify_lane_worktree(store, lane, lane_id=lane_id, store_owned=True)
                             rc, _out, err = _git_write(  # the folder the check above read: one absolute target
                                 store.root,
                                 ["worktree", "remove", "--", _lane_checkout_folder(lane["worktree_path"])])
@@ -7613,7 +7670,16 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             name = rec.get("branch")
             if isinstance(name, str) and name.startswith("refs/heads/lane/"):
                 regs_by_branch.setdefault(name.removeprefix("refs/heads/"), []).append(rec)
-        wt_by_branch = {branch: recs[-1] for branch, recs in regs_by_branch.items()}
+        # gc may take a checkout from Git's repository-wide list only when it lies inside THIS store's folder. Git lists
+        # every store's checkouts, and lane branches belong to the whole repository, so a `lane/x` checked out by
+        # another store is not this store's to remove (nor is its branch to delete): it stays in `regs_by_branch`, so it
+        # keeps the branch, but it is never a target.
+        wt_by_branch = {
+            branch: ours[-1] for branch, recs in regs_by_branch.items()
+            if (ours := [r for r in recs
+                         if isinstance(r.get("worktree"), str)
+                         and _lane_checkout_outside_store(store, r["worktree"]) is None])
+        }
         managed_wt_by_branch = _managed_worktree_paths(store)
         rc, refs_out = _git(store.root, ["for-each-ref", "--format=%(refname:short)", "refs/heads/lane/"])
         branches = [b.strip() for b in refs_out.splitlines() if rc == 0 and b.strip()]
@@ -7657,6 +7723,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 reason = branch_allowed_reason if reason.startswith("branch tip is") else reason
             wt_safe, wt_reason = _lane_worktree_remove_safe(
                 store, lane_id, lane if isinstance(lane, dict) else None, wt_path, safe)
+            if not wt_path and others:  # Git lists it, but not inside this store's folder: say that, remove nothing
+                wt_reason = (
+                    "no checkout of this branch lies inside this store's folder; it is checked out at "
+                    f"{', '.join(pc.line(path) for path in others)}, which this store did not make, so it is left "
+                    "alone (and so is the branch)")
             if in_use is not None:  # a session is on the lane (or that could not be established): nothing of it goes
                 wt_safe, wt_reason = False, lane_occupancy.refusal(lane_id, in_use)
                 safe, reason = False, wt_reason

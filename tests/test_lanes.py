@@ -4068,7 +4068,9 @@ def test_an_older_record_without_any_new_field_can_be_acknowledged_and_keeps_wor
 def test_gc_never_removes_a_worktree_that_turns_up_for_an_acknowledged_lane(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """The person was wrong: the lane's branch is checked out in a worktree that was only moved. gc must not treat the
-    acknowledgement as leave to remove it, even for an older record that has no canonical path to compare."""
+    acknowledgement as leave to remove it, even for an older record that has no canonical path to compare. The moved
+    checkout now lies outside this store's folder, which gc reports as the reason (it only removes what this store
+    made)."""
     (tmp_path / "store").mkdir()
     root, base = _repo(tmp_path / "store")
     lane = _assign_worktree(root, base, "wrong")
@@ -4086,7 +4088,7 @@ def test_gc_never_removes_a_worktree_that_turns_up_for_an_acknowledged_lane(
     assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
 
     item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "wrong")
-    assert item["worktree_remove_safe"] is False and "acknowledged" in item["worktree_reason"]
+    assert item["worktree_remove_safe"] is False and "did not make" in item["worktree_reason"]
     assert item["branch_delete_safe"] is False
     assert live.exists() and _branch_exists(root, "lane/wrong")
 

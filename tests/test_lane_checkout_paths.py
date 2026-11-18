@@ -4547,3 +4547,101 @@ def test_no_removal_takes_a_detached_checkout_that_no_record_shares_while_it_hol
 
     _assert_untouched(checkout)
     assert work.read_text(encoding="utf-8") == "work that was never committed\n"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 22 (zteam's read of ebe81643): a forced reassignment moves a lane's checkout into its retained claims
+# (`occupancy_worktrees`); a removal for another lane must see that claim too.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _reassign_without_a_checkout(root: Path, base: str, lane_id: str = "other") -> None:
+    """The ordinary forced reassignment of review: the lane keeps no current checkout, and the checkout it had moves
+    into `occupancy_worktrees`."""
+    from test_lanes import _branch
+
+    assert cli.main([
+        "--root", str(root), "lane", "assign", "--id", lane_id, "--from", "lead", "--assignee", "dev2",
+        "--domain", "core", "--base", base, "--target", _branch(root), "--path", "src/other", "--force",
+        "--advisory", "--no-worktree", "--worktree-waiver-reason", "review fixture retained generation",
+    ]) == 0
+
+
+def _retained_claim_case(tmp_path, monkeypatch, command):
+    """Another lane's checkout that only its retained claims still name. Returns (run, victim)."""
+    from test_lanes import _assign_worktree, _git_rc, _repo
+
+    if command == "deliver":
+        store, selected, mine, head, _artifact = _published_with_cleanup_postponed(tmp_path, monkeypatch)
+        other = _assign_second_lane(store.root, lanes.load_lanes(store)["lanes"][selected]["base_sha"])
+        assert _git_rc(mine, "checkout", "--detach", head).returncode == 0
+        assert _git_rc(other, "checkout", "--detach", head).returncode == 0
+        victim = other
+        base = lanes.load_lanes(store)["lanes"][selected]["base_sha"]
+        argv = ["lane", "deliver", "--id", selected, "--from", "dev"]
+    else:
+        root, base = _repo(tmp_path)
+        store, selected = Store(root), "first"
+        mine = Path(_assign_worktree(root, base, selected)["worktree_path"])
+        other = _assign_second_lane(root, base)
+        if command == "abandon":
+            assert _git_rc(mine, "checkout", "--detach", base).returncode == 0
+            assert _git_rc(other, "checkout", "--detach", base).returncode == 0
+            victim = other
+            argv = ["lane", "abandon", "--id", selected]
+        else:
+            assert _git_rc(root, "worktree", "remove", str(mine)).returncode == 0
+            assert _git_rc(other, "checkout", "--detach", base).returncode == 0
+            assert _git_rc(root, "worktree", "move", str(other), str(mine)).returncode == 0
+            _point_lane_at(store, "other", mine)
+            _update_row(store, selected, status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_ABANDONED)
+            victim = mine
+            argv = ["lane", "gc", "--delete", "--target", "HEAD", "--json"]
+    _reassign_without_a_checkout(store.root, base)
+    assert lanes.load_lanes(store)["lanes"]["other"].get("worktree_path") in (None, "")
+    assert any(str(victim.name) in claim for claim in lanes.load_lanes(store)["lanes"]["other"]["occupancy_worktrees"])
+    if command != "gc":
+        _point_lane_at(store, selected, victim)
+    return (lambda: cli.main(["--root", str(store.root), *argv])), victim
+
+
+@pytest.mark.parametrize("command", ["abandon", "deliver", "gc"])
+def test_a_removal_never_takes_a_checkout_that_another_lane_still_claims_as_retained(
+    tmp_path, monkeypatch, capsys, command
+):
+    run, victim = _retained_claim_case(tmp_path, monkeypatch, command)
+    capsys.readouterr()
+
+    run()
+
+    _assert_untouched(victim)
+    assert (victim / "src" / "other" / "b.py").exists()
+
+
+def test_a_lanes_own_retained_claim_does_not_stop_its_own_checkout_from_being_removed(tmp_path, capsys):
+    """The control: the lane's own earlier-checkout claim is its own, so it blocks nothing."""
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    _update_row(Store(root), "first", occupancy_worktrees=[str(tmp_path / "an-earlier-checkout")])
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root), "lane", "abandon", "--id", "first"]) == 0
+
+    assert not first.exists()
+
+
+def test_gc_removes_the_checkout_of_a_retired_lane_whose_row_names_no_folder(tmp_path, capsys):
+    """The control for the lane's own managed folder: gc finds it through Git's list, inside this store's folder."""
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    _update_row(Store(root), "first", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_ABANDONED,
+                worktree_path=None, worktree_toplevel_canonical=None)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root), "lane", "gc", "--delete", "--target", "HEAD", "--json"]) == 0
+
+    assert not first.exists()
