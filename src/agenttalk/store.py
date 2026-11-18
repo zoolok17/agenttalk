@@ -232,6 +232,24 @@ def check_store_fence(root: Path) -> None:
         _refuse(root, escape[0], allowed, why=escape[1])
 
 
+def store_fence_allows(root: Path) -> bool:
+    """True when ``AGENTTALK_STORE_FENCE`` is not set, or when the store at `root` would pass
+    check_store_fence. It never refuses and never writes a refusal report: it is for a
+    diagnostic that only wants to know whether it may look at a store."""
+    allowed = _fence()
+    if allowed is None:
+        return True
+    root = Path(root).resolve()
+    escape = _first_escape(root, allowed)
+    # the same settle loop as check_store_fence: a lock being taken shows a file's second name for a moment
+    for _ in range(_LINK_SETTLE_TRIES):
+        if escape is None or escape[1] != "linked":
+            break
+        time.sleep(_LINK_SETTLE_SECONDS)
+        escape = _first_escape(root, allowed)
+    return escape is None
+
+
 def check_folder_fence(folder: Path) -> None:
     """Refuse a folder that a command would create in or remove from, when
     ``AGENTTALK_STORE_FENCE`` is set and the folder lies outside the fence."""
