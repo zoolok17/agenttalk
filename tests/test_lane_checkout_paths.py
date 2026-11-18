@@ -4645,3 +4645,49 @@ def test_gc_removes_the_checkout_of_a_retired_lane_whose_row_names_no_folder(tmp
     assert cli.main(["--root", str(root), "lane", "gc", "--delete", "--target", "HEAD", "--json"]) == 0
 
     assert not first.exists()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 23 (codex-rev's read of 806dcba9): a store made inside a lane checkout is store data, which Git ignores, so no
+# clean check sees it, and removing the checkout deletes it. It may sit at the checkout's root or deeper.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", ["abandon", "deliver", "gc"])
+@pytest.mark.parametrize("where", ["root", "deeper", "none"])
+def test_a_removal_never_deletes_a_store_made_inside_the_checkout(tmp_path, monkeypatch, capsys, command, where):
+    from test_lanes import _assign_worktree, _repo
+
+    if command == "deliver":
+        store, selected, checkout, _head, _artifact = _published_with_cleanup_postponed(tmp_path, monkeypatch)
+        argv = ["lane", "deliver", "--id", selected, "--from", "dev"]
+    else:
+        root, base = _repo(tmp_path)
+        store, selected = Store(root), "first"
+        checkout = Path(_assign_worktree(root, base, selected)["worktree_path"])
+        if command == "abandon":
+            argv = ["lane", "abandon", "--id", selected]
+        else:
+            _update_row(store, selected, status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_ABANDONED)
+            argv = ["lane", "gc", "--delete", "--target", "HEAD", "--json"]
+    kept = None
+    if where != "none":
+        inner = checkout if where == "root" else checkout / "sub" / "deeper"
+        inner.mkdir(parents=True, exist_ok=True)
+        Store(inner).init(["lead"])
+        kept = inner / ".agenttalk" / "independent-data.txt"
+        kept.write_text("independent store data\n", encoding="utf-8")
+    capsys.readouterr()
+
+    cli.main(["--root", str(store.root), *argv])
+
+    shown = capsys.readouterr()
+    if where == "none":
+        assert not checkout.exists()  # the control: an ordinary own checkout is still removed
+    else:
+        assert kept.read_text(encoding="utf-8") == "independent store data\n"
+        _assert_untouched(checkout)
+        said = shown.err + shown.out
+        if command == "deliver":  # the delivery cleanup keeps its reason in the row (`lane status` shows it)
+            said = lanes.load_lanes(store)["lanes"][selected].get("worktree_cleanup_error", "")
+        assert "holds a store of its own" in said

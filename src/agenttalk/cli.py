@@ -5074,6 +5074,38 @@ def _lane_checkout_outside_store(store, *folders: str) -> str | None:
     return None
 
 
+def _lane_checkout_holds_a_store(folder: str) -> str | None:
+    """The first `.agenttalk` folder found at the checkout's root or anywhere below it, or None. A store made inside a
+    lane checkout (agenttalk was initialised there, by hand or by a command run from it) is store data, which Git
+    ignores, so the clean checks never see it, and removing the checkout deletes it. Links and junctions are not
+    followed (a folder the checkout only points at is not removed with it), and `.git` is not entered. A folder that
+    cannot be read raises OSError: it is not known to be free of a store."""
+    pending = [folder]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                if entry.name == ".git":
+                    continue
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                if entry.name == store_mod.DIRNAME:
+                    return entry.path
+                pending.append(entry.path)
+    return None
+
+
+def _lane_checkout_holds_a_store_text(found: str) -> str:
+    return (
+        f"this checkout holds a store of its own, {pc.line(found)}, which Git ignores and which would be deleted with "
+        "the checkout, so it was left alone. If the checkout is no longer needed: inspect that store, save what you "
+        "need, remove the store folder yourself, remove the checkout with `git worktree remove` (naming that "
+        "folder), then retire the lane with `lane abandon --acknowledge-missing-worktree`")
+
+
 def _lane_checkout_not_ours_text(store, folder: str) -> str:
     return (
         f"this checkout, {pc.line(folder)}, is not inside this store's folder {pc.line(str(store.root))}, so this "
@@ -5085,7 +5117,7 @@ def _lane_checkout_not_ours_text(store, folder: str) -> str:
 
 def _verify_lane_worktree(
     store, lane: dict, *, lane_id: str, expected_base: str | None = None, check_paths: bool = True,
-    store_owned: bool = False,
+    store_owned: bool = False, for_removal: bool = False,
 ) -> dict:
     """`lane_id` is the registry key: it names the row in every refusal. The id written inside the row is a separate
     fact (it picks the lane branch below, as before) and must never stand in for the key.
@@ -5128,6 +5160,15 @@ def _verify_lane_worktree(
         elsewhere_folder = _lane_checkout_outside_store(store, wt, toplevel)
         if elsewhere_folder is not None:
             raise lane_mod.LaneError(_lane_checkout_not_ours_text(store, elsewhere_folder))
+    if for_removal:  # a store inside the checkout (at its root or deeper) is deleted with it, unseen by Git
+        try:
+            held_store = _lane_checkout_holds_a_store(toplevel)
+        except OSError as exc:
+            raise lane_mod.LaneError(
+                f"the inside of this checkout could not be read ({pc.line(str(exc))}), so it is not known that it "
+                "holds no store of its own; it was left alone") from exc
+        if held_store is not None:
+            raise lane_mod.LaneError(_lane_checkout_holds_a_store_text(held_store))
     stored_c = lane.get("worktree_toplevel_canonical")
     ambiguous = not check_paths and (
         not isinstance(stored_c, str) or not stored_c.strip()
@@ -5713,7 +5754,7 @@ def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
     if in_use is not None:
         return False, in_use
     try:
-        _verify_lane_worktree(store, probe, lane_id=lane_id, store_owned=True)
+        _verify_lane_worktree(store, probe, lane_id=lane_id, store_owned=True, for_removal=True)
     except lane_mod.LaneError as e:
         return False, f"worktree is not clean/verifiable: {e}"
     return True, "worktree is clean and idle"
@@ -6684,7 +6725,7 @@ def _lane_deliver_cleanup(store, lane_id: str, pending: dict, cleanup_lane: dict
             f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {in_use}.\n")
         return artifact, True, delivered_head
     try:
-        provenance = _verify_lane_worktree(store, cleanup_lane, lane_id=lane_id, store_owned=True)
+        provenance = _verify_lane_worktree(store, cleanup_lane, lane_id=lane_id, store_owned=True, for_removal=True)
         if provenance.get("head") != pending.get("head_sha"):
             raise lane_mod.LaneError("worktree HEAD changed before teardown")
         with store._config_lock():  # every lane writer takes this lock: none gets in between the look and the removal
@@ -7581,7 +7622,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     in_use = _lane_worktree_launch_use(store, lane)
                     if in_use is None:
                         try:
-                            _verify_lane_worktree(store, lane, lane_id=lane_id, store_owned=True)
+                            _verify_lane_worktree(store, lane, lane_id=lane_id, store_owned=True, for_removal=True)
                             rc, _out, err = _git_write(  # the folder the check above read: one absolute target
                                 store.root,
                                 ["worktree", "remove", "--", _lane_checkout_folder(lane["worktree_path"])])
