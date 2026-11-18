@@ -2798,6 +2798,36 @@ def test_an_initialized_store_without_a_selection_or_a_footprint_is_na_under_the
     assert check.data["task_status"] == "unknown"  # not "not_configured": nothing was asked of Windows
 
 
+@pytest.mark.parametrize("selection", ["none", "unreadable-selection"])
+def test_the_host_check_takes_the_selection_lock_and_no_other_ordered_lock(tmp_path, monkeypatch, selection):
+    """The lock-order review of #716 item 3b, as a test: under the host selection lock (rank 50) the check reads the
+    config, the markers, the setup files and the selection, and acquires no other lock of the store's order, so it is
+    a leaf there and cannot invert anything."""
+    from agenttalk import lock_order
+    from agenttalk import powershell_host as psh
+
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    _marker(store, "alpha", {"cli": "codex", "mode": "wrapper-loop"})
+    if selection == "unreadable-selection":
+        (store.dir / psh.SELECTION_FILENAME).write_bytes(b"{not json")
+    taken: list[tuple[int, str]] = []
+    real_hold = lock_order.hold
+
+    @contextlib.contextmanager
+    def recording(root, path):
+        taken.append((lock_order.rank(root, path), path.name))
+        with real_hold(root, path):
+            yield
+
+    monkeypatch.setattr(lock_order, "hold", recording)
+
+    doctor._check_powershell_host(store)
+
+    assert taken == [(50, "powershell-host.lock")]
+
+
 def test_the_selection_and_the_footprint_are_looked_at_while_the_lock_is_held(tmp_path, monkeypatch):
     """A setup file that appears the moment the lock is taken is seen: the observation is made under the lock, not
     before it. (Setup-file writers are not serialized by this lock: it is a point-in-time diagnostic.)"""
