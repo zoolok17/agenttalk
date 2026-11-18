@@ -175,6 +175,11 @@ def test_quick_start_uses_the_environment_python(shell, create, capture, invoke,
     assert any(path_setup == line.strip() for block in blocks[1:] for line in block.splitlines())
     assert f"`{show_path}`" in started
     assert "`& $env:AGENTTALK_PY -m agenttalk doctor`" in started
+    # the doctor line before the recipe serves both platforms
+    assert '`"$AGENTTALK_PY" -m agenttalk doctor`' in started
+    # that line comes before the recipe, so it says where AGENTTALK_PY is set
+    early = started.split("`& $env:AGENTTALK_PY -m agenttalk doctor`", 1)[0]
+    assert "After the steps below, which set `AGENTTALK_PY`" in " ".join(early.split())
 
 
 def test_quick_setup_links_to_the_first_install_without_another_pip_recipe():

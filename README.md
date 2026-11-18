@@ -164,8 +164,8 @@ assistant that talks to you.
 
 New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/v0.105.0/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
 agenttalk: it sets up a first team without the supervisor and tells you what only a person can decide.
-Once agenttalk is installed, the brief and the other guides for leads are on your machine too: `& $env:AGENTTALK_PY -m agenttalk doctor`
-prints the installed `module path`, and the brief is `docs/LEAD-SETUP-BRIEF.md` under it.
+Once agenttalk is installed, the brief and the other guides for leads are on your machine too. After the steps below, which set `AGENTTALK_PY`,
+`& $env:AGENTTALK_PY -m agenttalk doctor` in PowerShell, or `"$AGENTTALK_PY" -m agenttalk doctor` on Linux and macOS, prints the installed `module path`, and the brief is `docs/LEAD-SETUP-BRIEF.md` under it.
 To do it yourself, follow the steps below.
 
 Give agenttalk its own Python environment, a folder that keeps its packages separate from your other software.
