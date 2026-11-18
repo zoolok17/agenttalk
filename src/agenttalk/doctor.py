@@ -1874,7 +1874,23 @@ def _check_init(store: Store) -> Check:
                 "`agenttalk init` refuses to start a team folder here while that one exists, on purpose, so that "
                 "two teams at different depths do not talk past each other"
             )
+            unreadable = None
             if Store(above[0]).initialized():
+                try:
+                    Store(above[0]).load_config()
+                except (ValueError, OSError) as e:  # the same errors _check_init reports for a store's own config
+                    unreadable = pc.line(str(e))
+            if unreadable is not None:
+                found = (
+                    f"a team folder exists above it, at {pc.line(str(above[0]))}, but its config.json cannot be "
+                    f"read: {unreadable}"
+                )
+                fix = (
+                    "that team cannot be used until its config.json is repaired: run `agenttalk doctor` with that "
+                    "folder as its root (the --root option, or the AGENTTALK_ROOT setting; --root wins over "
+                    f"AGENTTALK_ROOT) to see what is wrong there. {refusal}"
+                )
+            elif Store(above[0]).initialized():
                 found = f"a team folder already exists above it, at {pc.line(str(above[0]))}"
                 fix = (
                     "to use that team, give agenttalk that folder as its root: the --root option, or the "

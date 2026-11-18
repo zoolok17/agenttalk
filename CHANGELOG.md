@@ -246,7 +246,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (before, it showed the names `claude,codex` without saying they were only an example). When a
   `.agenttalk` folder exists above, `agenttalk init` refuses on purpose, so doctor names that folder
   instead. If it is a set-up team folder, doctor says how to use it (the `--root` option or the
-  `AGENTTALK_ROOT` setting, and which one wins); if it is not set up either, doctor says to check it.
+  `AGENTTALK_ROOT` setting, and which one wins); if its `config.json` cannot be read, doctor says so
+  and to run `agenttalk doctor` there; if it is not set up either, doctor says to check it.
   On Windows, when a PowerShell 7 file is found where `agenttalk supervise --select-pwsh` looks,
   `powershell_host` no longer says to install it: it says where it found it and gives the one missing
   step, `agenttalk supervise --select-pwsh`, which checks the file and selects it (the supervisor and

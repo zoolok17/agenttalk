@@ -643,6 +643,21 @@ def test_doctor_below_a_folder_that_is_not_set_up_either_does_not_call_it_a_team
     assert "init --here" not in check.fix and "--force" not in check.fix
 
 
+def test_doctor_below_a_team_folder_whose_config_cannot_be_read_says_to_check_that_team(tmp_path: Path) -> None:
+    """A config.json above that exists but cannot be read is not a team anyone can use yet."""
+    (tmp_path / ".agenttalk").mkdir()
+    (tmp_path / ".agenttalk" / "config.json").write_text("{not json", encoding="utf-8")
+    child = tmp_path / "sub"
+    child.mkdir()
+    assert Store(tmp_path).initialized()
+    check = doctor._check_init(Store(child))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert f"a team folder exists above it, at {tmp_path}, but its config.json cannot be read: " in check.details
+    assert "that team cannot be used until its config.json is repaired: run `agenttalk doctor`" in check.fix
+    assert "to use that team, give agenttalk" not in check.fix
+    assert "init --here" not in check.fix and "--force" not in check.fix
+
+
 def test_doctor_partly_set_up_folder_names_the_missing_config_file(tmp_path: Path) -> None:
     """Store.initialized() is true only when .agenttalk/config.json exists, so a folder that has a
     .agenttalk/ but no config.json is still "not set up", and the text must say which file is missing
