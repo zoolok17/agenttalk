@@ -598,8 +598,12 @@ def test_doctor_not_set_up_check_says_not_set_up_yet(tmp_path: Path) -> None:
     check = doctor._check_init(Store(tmp_path))
     assert (check.name, check.status) == ("store.initialized", "error")
     assert check.details == f"not set up yet: .agenttalk/config.json not found at {tmp_path}"
-    assert "`agenttalk init --here --agents <your agent names>`" in check.fix
+    assert "`agenttalk init --here --agents claude-dev,codex-rev`" in check.fix
+    assert "with your own agent names in place of claude-dev,codex-rev" in check.fix
     assert "claude,codex" not in check.fix
+    # a backticked command is one a reader may paste: it must hold no placeholder, no shell syntax, no space in a value
+    for command in re.findall(r"`([^`]+)`", check.fix):
+        assert not set("<>|&;") & set(command), command
 
 
 def test_doctor_partly_set_up_folder_names_the_missing_config_file(tmp_path: Path) -> None:
@@ -611,7 +615,7 @@ def test_doctor_partly_set_up_folder_names_the_missing_config_file(tmp_path: Pat
     assert (check.name, check.status) == ("store.initialized", "error")
     assert check.details == f"not set up yet: .agenttalk/config.json not found at {tmp_path}"
     assert ".agenttalk/ found" not in check.details
-    assert "`agenttalk init --here --agents <your agent names>`" in check.fix
+    assert "`agenttalk init --here --agents claude-dev,codex-rev`" in check.fix
     assert [p.name for p in (tmp_path / ".agenttalk").iterdir()] == []  # a diagnostic adds nothing
 
 

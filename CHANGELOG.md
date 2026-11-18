@@ -241,8 +241,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed their words; no result, exit code, check name or JSON field changed.
   In a folder that is not set up, `store.initialized` now says "not set up yet" and names the missing
   `.agenttalk/config.json` (a folder with a `.agenttalk/` but no `config.json` counts as not set up
-  too). Its fix reads `agenttalk init --here --agents <your agent names>` instead of the example
-  names `claude,codex`.
+  too). Its fix gives a command that runs as printed, `agenttalk init --here --agents claude-dev,codex-rev`,
+  and says to put your own agent names in place of those two, separated by commas with no spaces
+  (before, it showed the names `claude,codex` without saying they were only an example).
   On Windows, when a PowerShell 7 file is found where `agenttalk supervise --select-pwsh` looks,
   `powershell_host` no longer says to install it: it says where it found it and gives the one missing
   step, `agenttalk supervise --select-pwsh`, which checks the file and selects it (the supervisor and

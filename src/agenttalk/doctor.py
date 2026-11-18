@@ -1870,7 +1870,10 @@ def _check_init(store: Store) -> Check:
             name="store.initialized",
             status="error",
             details=f"not set up yet: .agenttalk/config.json not found at {store.root}",
-            fix="run `agenttalk init --here --agents <your agent names>` from the project root",
+            fix=(
+                "from the project root, run `agenttalk init --here --agents claude-dev,codex-rev` with your own "
+                "agent names in place of claude-dev,codex-rev: one name per assistant, separated by commas, no spaces"
+            ),
         )
     try:
         cfg = store.load_config()
