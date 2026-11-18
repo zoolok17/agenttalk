@@ -215,8 +215,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   When a lane's own saved checkout path is damaged but its other saved path still names a folder that
   exists, the advice no longer offers the missing-worktree acknowledgement (it is refused while the folder
   exists, and so is a plain `lane abandon` while a field is damaged): it says to set the damaged field to
-  the folder's real absolute path in `lanes.json`, then run `lane abandon`. For a lane whose delivery is
-  unfinished it says to run `lane recover` first and then repeat the command, which names what is left.
+  the folder's real absolute path in `lanes.json`, then run `lane abandon`. The advice says only what was
+  found: a real folder is called a folder; a file or a link (a link is never offered as the value to set) is
+  called that, with the two ways out (name the real checkout folder in both fields, then `lane abandon`, or
+  move that entry away by hand and repeat the command); an entry that could not be examined is said to be
+  unexamined, with the reason, and is not claimed to exist. In none of these is the missing-worktree
+  acknowledgement offered. For a lane whose delivery is unfinished it says to run `lane recover` first and
+  then repeat the command, which names what is left.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,

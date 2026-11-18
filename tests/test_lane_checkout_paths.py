@@ -4,7 +4,9 @@ import json
 import ntpath
 import os
 import re
+import stat
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -1222,6 +1224,188 @@ def test_the_retirement_advice_acknowledges_only_when_no_saved_path_names_an_exi
     assert lanes.surviving_checkout_field(rooted, root=tmp_path / "elsewhere") is None
     assert lanes.surviving_checkout_field(rooted) is None  # no root, no way to know: not claimed to survive
     assert lanes.surviving_checkout_field("not a row") is None
+
+
+def _the_advice(store, lane_id):
+    """The advice the checkout checks print for this lane's damaged field (what every refusing command quotes)."""
+    row = lanes.load_lanes(store)["lanes"][lane_id]
+    return lanes.checkout_issue_advice(row, lane_id=lane_id, root=store.root)[2]
+
+
+def _not_a_folder_advice(lane_id, what):
+    """The advice for a surviving path (the row's worktree_path) that exists but is not a folder."""
+    return (
+        f"the lane's other saved checkout path (worktree_path) names {what}, not a folder, so retiring it as missing "
+        f"is refused: inspect it, then repair the lane record in lanes.json lane {lane_id!r}: set both worktree_path "
+        "and worktree_toplevel_canonical to the checkout's real absolute folder and run "
+        f"`lane abandon --id {lane_id}`; if the lane has no checkout folder, move that entry out of the way by hand "
+        "and repeat this command, which then names the retirement as missing"
+    )
+
+
+def _unexamined_advice(lane_id, why):
+    return (
+        f"the lane's other saved checkout path (worktree_path) could not be examined ({why}), so it is not known "
+        "whether anything is there, and retiring it as missing is refused: check that the entry can be read "
+        f"(permissions, disk) and repair the lane record in lanes.json lane {lane_id!r} if it is wrong, then repeat "
+        "this command: it names the step that then runs"
+    )
+
+
+def _the_missing_worktree_retirement(lane_id):
+    return (
+        f"to retire this lane without using its checkout, run `lane abandon --id {lane_id} "
+        "--acknowledge-missing-worktree`"
+    )
+
+
+def test_a_file_at_the_surviving_path_is_called_a_file_and_no_acknowledgement_is_offered(damaged_lane, capsys):
+    store = damaged_lane("worktree_toplevel_canonical", "")
+    stray = store.root / "checkout"  # the lane's worktree_path names this
+    stray.write_text("not a folder")
+    advice = _the_advice(store, "damaged")
+    assert advice == _not_a_folder_advice("damaged", "a file")
+    assert "acknowledge" not in advice and "names a folder" not in advice and "that folder" not in advice
+    # what the commands really do with it: both refuse and change nothing
+    code, out = _step(store, capsys, "abandon", "--id", "damaged", "--acknowledge-missing-worktree")
+    assert code == 2 and "still exists" in out.err
+    code, out = _step(store, capsys, "abandon", "--id", "damaged")
+    assert code == 2 and "repair the damaged field" in out.err
+    assert stray.read_text() == "not a folder"
+    assert lanes.load_lanes(store)["lanes"]["damaged"]["status"] == lanes.STATUS_ACTIVE
+    # "move that entry out of the way by hand and repeat this command": it then names the retirement, which runs
+    stray.unlink()
+    advice = _the_advice(store, "damaged")
+    assert advice == _the_missing_worktree_retirement("damaged")
+    for argv in _printed_abandon_steps(advice):
+        code, out = _step(store, capsys, *argv)
+        assert code == 0 and "abandoned lane damaged" in out.out, (argv, out.err)
+
+
+def test_a_file_at_one_path_and_a_real_checkout_elsewhere_end_in_the_plain_abandon(tmp_path, monkeypatch, capsys):
+    """The other way out of the file case: the lane's real checkout folder exists, the record names a file."""
+    store, lane_id, worktree = _unfinished_delivery_without_a_final(tmp_path, monkeypatch, "")
+    code, out = _step(store, capsys, "recover", "--id", lane_id, "--reason", "follow the release advice")
+    assert code == 0 and f"recovered lane {lane_id} to ACTIVE" in out.out
+    stray = tmp_path / "stray.txt"
+    stray.write_text("not a folder")
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id].update(worktree_path=str(stray), worktree_toplevel_canonical="")
+    lanes.save_lanes(store, data)
+    advice = _the_advice(store, lane_id)
+    assert advice == _not_a_folder_advice(lane_id, "a file")
+    assert _printed_abandon_steps(advice) == [["abandon", "--id", lane_id]]  # no acknowledgement is printed
+    assert _step(store, capsys, "abandon", "--id", lane_id, "--acknowledge-missing-worktree")[0] == 2
+    assert _step(store, capsys, "abandon", "--id", lane_id)[0] == 2
+    assert worktree.is_dir() and stray.exists()
+    # the person sets both fields to the real folder (no command writes them), then the printed step runs
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id].update(
+        worktree_path=str(worktree), worktree_toplevel_canonical=lanes.canonical_host_path(worktree)
+    )
+    lanes.save_lanes(store, data)
+    for argv in _printed_abandon_steps(advice):
+        code, out = _step(store, capsys, *argv)
+        assert code == 0 and f"abandoned lane {lane_id}" in out.out, (argv, out.err)
+    assert not worktree.exists()
+
+
+def test_a_link_at_the_surviving_path_is_a_link_even_when_it_leads_to_a_folder(damaged_lane, capsys):
+    """A link is never offered as the value to set: the record must name the real folder (see the helper)."""
+    store = damaged_lane("worktree_toplevel_canonical", "")
+    target = store.root / "the-real-folder"
+    target.mkdir()
+    link = store.root / "checkout"
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this machine does not allow creating a symbolic link")
+    advice = _the_advice(store, "damaged")
+    assert advice == _not_a_folder_advice("damaged", "a link (the record must name the real folder, not a link to it)")
+    assert "names a folder" not in advice and "acknowledge" not in advice
+    code, out = _step(store, capsys, "abandon", "--id", "damaged", "--acknowledge-missing-worktree")
+    assert code == 2 and "still exists" in out.err and target.is_dir()
+    link.unlink()  # the entry (not what it led to) is moved out of the way by hand, as the advice says
+    assert target.is_dir()
+    assert _the_advice(store, "damaged") == _the_missing_worktree_retirement("damaged")
+
+
+@pytest.mark.parametrize(
+    ("mode", "what"),
+    [
+        (stat.S_IFSOCK, "an entry that is neither a file nor a folder"),
+        (stat.S_IFLNK, "a link (the record must name the real folder, not a link to it)"),  # no privilege needed
+    ],
+    ids=["socket", "link"],
+)
+def test_an_entry_that_is_not_a_file_or_a_folder_is_not_called_a_folder(monkeypatch, tmp_path, mode, what):
+    real_lstat = os.lstat
+    odd = str(tmp_path / "odd")
+
+    def lstat(path, *args, **kwargs):
+        if str(path) == odd:
+            return types.SimpleNamespace(st_mode=mode)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(lanes.os, "lstat", lstat)
+    row = {"status": lanes.STATUS_ACTIVE, "worktree_path": odd, "worktree_toplevel_canonical": ""}
+    assert lanes.checkout_path_recovery(lane_id="a", lane=row) == _not_a_folder_advice("a", what)
+
+
+def test_an_entry_that_cannot_be_examined_is_not_claimed_to_exist(damaged_lane, monkeypatch, capsys):
+    import errno
+
+    store = damaged_lane("worktree_toplevel_canonical", "")
+    target = str(store.root / "checkout")
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if str(path) == target:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_lstat(path, *args, **kwargs)
+
+    with monkeypatch.context() as broken:
+        broken.setattr(lanes.os, "lstat", lstat)
+        advice = _the_advice(store, "damaged")
+        assert advice == _unexamined_advice("damaged", "Permission denied")
+        assert "exists" not in advice and "folder that" not in advice and "acknowledge" not in advice
+        # the commands agree: nothing is established, so the acknowledgement is refused and nothing changes
+        code, out = _step(store, capsys, "abandon", "--id", "damaged", "--acknowledge-missing-worktree")
+        assert code == 2 and "could not be established" in out.err
+        assert _step(store, capsys, "abandon", "--id", "damaged")[0] == 2
+        assert lanes.load_lanes(store)["lanes"]["damaged"]["status"] == lanes.STATUS_ACTIVE
+    # "repeat this command" once the entry can be looked at: nothing is there, so the retirement is named and runs
+    advice = _the_advice(store, "damaged")
+    assert advice == _the_missing_worktree_retirement("damaged")
+    for argv in _printed_abandon_steps(advice):
+        code, out = _step(store, capsys, *argv)
+        assert code == 0 and "abandoned lane damaged" in out.out, (argv, out.err)
+
+
+def test_a_verified_folder_is_reported_before_a_file_and_a_file_before_an_entry_that_cannot_be_examined(
+    tmp_path, monkeypatch
+):
+    import errno
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    file = tmp_path / "file"
+    file.write_text("x")
+    row = {"worktree_path": str(file), "worktree_toplevel_canonical": str(folder)}
+    assert lanes.surviving_checkout_entry(row) == ("worktree_toplevel_canonical", "folder", "")
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if str(path) == str(tmp_path / "broken"):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(lanes.os, "lstat", lstat)
+    both = {"worktree_path": str(tmp_path / "broken"), "worktree_toplevel_canonical": str(file)}
+    assert lanes.surviving_checkout_entry(both) == ("worktree_toplevel_canonical", "file", "")
+    broken_only = {"worktree_path": str(tmp_path / "broken"), "worktree_toplevel_canonical": ""}
+    assert lanes.surviving_checkout_entry(broken_only) == ("worktree_path", "unexamined", "Input/output error")
+    assert lanes.surviving_checkout_entry({"worktree_path": str(tmp_path / "gone")}) is None  # only absence is None
 
 
 def test_the_recovery_step_follows_the_live_row_when_given_one_and_the_row_itself_otherwise():

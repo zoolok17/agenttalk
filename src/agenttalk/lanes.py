@@ -228,14 +228,22 @@ def acknowledged_damage_remains(lane: dict) -> bool:
         for field in ("worktree_path", "worktree_toplevel_canonical"))
 
 
-def surviving_checkout_field(lane: dict | None, *, root=None) -> str | None:
-    """The saved checkout field (`worktree_path` or `worktree_toplevel_canonical`) that is sound AND names an entry that
-    exists on disk, or None. A damaged field does not mean no checkout survives: the other field can still name the
-    folder, and `lane abandon --acknowledge-missing-worktree` refuses while it does. A relative `worktree_path` has no
-    single meaning here (it is repaired first), and an entry that cannot be looked at counts as surviving, so the advice
-    never promises an acknowledgement the command would refuse. `root` expands the `{ROOT}` placeholder."""
+def surviving_checkout_entry(lane: dict | None, *, root=None) -> tuple[str, str, str] | None:
+    """What a SOUND saved checkout field still names on disk, as `(field, kind, detail)`, or None when no sound,
+    absolute field names an entry. `kind` is "folder" (a real directory; a Windows junction counts, it reports as one),
+    "link" (a symbolic link: never followed, see below), "file" (a regular file), "other" (anything else), or
+    "unexamined" (the entry could not be looked at; `detail` is the reason). Only FileNotFoundError means "nothing is
+    there", the same as `lane abandon --acknowledge-missing-worktree`, which refuses on anything else; so no case here
+    ever lets the advice offer an acknowledgement the command would refuse.
+
+    A link counts as a link even when it leads to a folder: the record must name the checkout's real folder (Git's
+    checkout check compares real paths), so a link is never offered as the value to set, and following it would be a
+    second look that can fail on its own. A relative `worktree_path` has no single meaning here (it is repaired first).
+    `root` expands the `{ROOT}` placeholder. When both fields name something, a folder is reported before another
+    entry, and another entry before one that could not be examined."""
     if not isinstance(lane, dict):
         return None
+    found: list[tuple[str, str, str]] = []
     for field in ("worktree_path", "worktree_toplevel_canonical"):
         value = lane.get(field)
         if not isinstance(value, str) or checkout_path_problem({field: value}) is not None:
@@ -247,13 +255,52 @@ def surviving_checkout_field(lane: dict | None, *, root=None) -> str | None:
         if not path_is_absolute(value):
             continue
         try:
-            os.lstat(value)
+            mode = os.lstat(value).st_mode
         except FileNotFoundError:
             continue
-        except (OSError, ValueError):
-            return field
-        return field
+        except (OSError, ValueError) as exc:
+            found.append((field, "unexamined", getattr(exc, "strerror", None) or type(exc).__name__))
+            continue
+        kind = ("folder" if stat.S_ISDIR(mode) else "link" if stat.S_ISLNK(mode)
+                else "file" if stat.S_ISREG(mode) else "other")
+        found.append((field, kind, ""))
+    for wanted in (("folder",), ("link", "file", "other"), ("unexamined",)):
+        for entry in found:
+            if entry[1] in wanted:
+                return entry
     return None
+
+
+def surviving_checkout_field(lane: dict | None, *, root=None) -> str | None:
+    """The field `surviving_checkout_entry` reports, or None."""
+    entry = surviving_checkout_entry(lane, root=root)
+    return entry[0] if entry is not None else None
+
+
+def _surviving_entry_advice(entry: tuple[str, str, str], *, damaged: str, lane_id: str) -> str:
+    """What to say when the damaged field's neighbour still names something on disk (see `surviving_checkout_entry`).
+    Each case names only what was established, and the step that then runs. The acknowledgement says "the worktree is
+    gone": it is refused while the entry is there (and when it cannot be examined), and a plain `lane abandon` is
+    refused while a field is damaged. So the record is repaired by hand first (no command writes it)."""
+    field, kind, detail = entry
+    row = f"lanes.json lane {lane_id!r}"
+    if kind == "folder":
+        return (f"the lane's other saved checkout path ({field}) names a folder that still exists, so retiring it as "
+                f"missing is refused: inspect that folder, set {damaged} in {row} to its real absolute folder, then "
+                f"run `lane abandon --id {lane_id}`")
+    if kind == "unexamined":
+        return (f"the lane's other saved checkout path ({field}) could not be examined ({detail}), so it is not known "
+                "whether anything is there, and retiring it as missing is refused: check that the entry can be read "
+                f"(permissions, disk) and repair the lane record in {row} if it is wrong, then repeat this command: "
+                "it names the step that then runs")
+    what = {"file": "a file", "link": "a link (the record must name the real folder, not a link to it)"}.get(
+        kind, "an entry that is neither a file nor a folder")
+    return (f"the lane's other saved checkout path ({field}) names {what}, not a folder, so retiring it as missing is "
+            f"refused: inspect it, then repair the lane record in {row}: set both worktree_path and "
+            "worktree_toplevel_canonical to the checkout's real absolute folder and run "
+            f"`lane abandon --id {lane_id}`; if the lane has no checkout folder, move that entry out of the way by "
+            "hand and repeat this command, "
+            "which then names the retirement as missing")
 
 
 def checkout_path_recovery(*, lane_id: str, lane: dict | None = None, owner: dict | None = None, root=None) -> str:
@@ -297,15 +344,9 @@ def checkout_path_recovery(*, lane_id: str, lane: dict | None = None, owner: dic
                 "(it restores the lane to ACTIVE, names `lane deliver` when a committed final exists, or says "
                 "which other lane overlaps it and must be resolved first), then repeat this command: it names "
                 "what is left, if anything")
-    survivor = None if repair else surviving_checkout_field(lane, root=root)
+    survivor = None if repair else surviving_checkout_entry(lane, root=root)
     if survivor is not None:
-        # The acknowledgement says "the worktree is gone", and it is refused while a saved path still names a folder
-        # that exists; a plain `lane abandon` is refused too while a field is damaged. So the damaged field is repaired
-        # first (by hand: no command writes it), then a plain `lane abandon` retires the lane and removes the folder.
-        field = checkout_path_problem(lane)[0]
-        return (f"the lane's other saved checkout path ({survivor}) names a folder that still exists, so retiring "
-                f"it as missing is refused: inspect that folder, set {field} in lanes.json lane {lane_id!r} to its "
-                f"real absolute folder, then run `lane abandon --id {lane_id}`")
+        return _surviving_entry_advice(survivor, damaged=checkout_path_problem(lane)[0], lane_id=lane_id)
     return f"to retire this lane without using its checkout, {repair}run {retire}"
 
 
