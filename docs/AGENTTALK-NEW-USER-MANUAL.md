@@ -131,18 +131,22 @@ Keep these rules in mind before learning commands.
 
 ## 3. Install and initialize
 
-Install agenttalk with the steps in the README's [Get started](../README.md#get-started). They give agenttalk
-its own Python environment, name that environment's Python in `AGENTTALK_PY`, install the skills, and put its
-command folder first on PATH, so a plain `agenttalk` runs that copy. In any terminal where you or an assistant
+Install agenttalk with the README's do-it-yourself steps in [Get started](../README.md#get-started): start at
+"Give agenttalk its own Python environment" and stop before the line "Then, in your project's top folder:".
+Do not follow the README's project setup after that line: this manual sets up the project below, and a second
+`init` without `--force` keeps the team list of the first. (The setup brief the README opens with is a
+different route, with its own version.) The steps you follow give agenttalk its own Python environment, name
+that environment's Python in `AGENTTALK_PY`, install the skills, and put its command folder first on PATH, so a
+plain `agenttalk` runs that copy. In any terminal where you or an assistant
 run agenttalk, do not activate another Python environment: it would put its own folder first on PATH, and an
 older agenttalk installed there could run instead. To check which copy a terminal runs, type
 `(Get-Command agenttalk).Source` in PowerShell or `command -v agenttalk` in sh: the path it shows must be
 inside the `agenttalk-env` folder (or the folder name you chose). The README also says how to call a
 project's own Python by its full path, without activating it.
 
-The README's steps install a released version, not a branch, so every agent in a project runs the same version.
-They also install the skills: the instructions each agent CLI reads to use agenttalk. To see which version you
-have, run `agenttalk --version`.
+Those steps install the one released version the README names, not a branch, so every agent that follows them
+runs the same version. They also install the skills: the instructions each agent CLI reads to use agenttalk.
+To see which version you have, run `agenttalk --version`.
 
 When you upgrade an existing install, a plain `agenttalk install-skills`
 leaves alone every skill file that differs from the new version, so updated

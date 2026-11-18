@@ -72,6 +72,39 @@ def test_a_manual_sends_the_reader_to_the_readme_install_steps(path: Path, headi
     assert "pip install" not in section
 
 
+# the lines of the README's Get started that mark where the do-it-yourself install starts and stops
+README_INSTALL_START = "Give agenttalk its own Python environment"
+README_PROJECT_SETUP = "Then, in your project's top folder:"
+
+
+@pytest.mark.parametrize("path, heading", INSTALL_SECTIONS)
+def test_a_manual_points_to_the_readme_install_steps_only_and_stops_before_its_project_setup(
+    path: Path, heading: str
+) -> None:
+    """The README goes on, after the install, to set up a project with its own team names; a reader who goes on there
+    and then follows the manual's own init finds the first team list kept (a second init without --force keeps it)."""
+    started = README.read_text(encoding="utf-8").split("## Get started\n", 1)[1].split("\n## ", 1)[0]
+    assert README_INSTALL_START in started and started.count(README_PROJECT_SETUP) == 1  # the stop point is real
+    assert started.index(README_INSTALL_START) < started.index(README_PROJECT_SETUP)
+    section = " ".join(_install_section(path, heading).split())
+    assert "the README's do-it-yourself steps in [Get started](../README.md#get-started)" in section
+    assert f'start at "{README_INSTALL_START}" and stop before the line "{README_PROJECT_SETUP}"' in section
+    assert "Do not follow the README's project setup after that line" in section
+    assert "a second `init` without `--force` keeps the team list of the first" in section
+    # the setup brief is a different route with its own version: if it is named, it is named as that, never linked
+    assert "LEAD-SETUP-BRIEF" not in section
+    assert "different route, with its own version" in section
+    # the pointer never again sends the reader through the whole section
+    assert "with the steps in the README's [Get started]" not in section
+
+
+def test_the_new_user_manual_claims_one_version_only_for_the_steps_that_install_it() -> None:
+    section = " ".join(_install_section(MANUAL, "## 3. Install and initialize").split())
+    assert "The README's steps install a released version" not in section
+    assert ("Those steps install the one released version the README names, not a branch, so every agent that "
+            "follows them runs the same version") in section
+
+
 @pytest.mark.parametrize("path, heading", INSTALL_SECTIONS)
 def test_no_fenced_line_in_an_install_section_starts_with_a_bare_python_m(path: Path, heading: str) -> None:
     section = _install_section(path, heading)
