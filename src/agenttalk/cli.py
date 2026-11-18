@@ -5051,6 +5051,21 @@ def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> tuple
     return None
 
 
+def _is_store_folder_name(name: str) -> bool:
+    """True for the store folder's name in any case. On a case-insensitive disk (Windows, the macOS default)
+    `.AGENTTALK` is the very folder `Store` opens as `.agenttalk`, so a name compared as written would miss a real
+    store; the comparison ignores case on every system, because refusing a differently spelled folder on a
+    case-sensitive disk costs only the manual exit, which is the safe side."""
+    return name.casefold() == store_mod.DIRNAME.casefold()
+
+
+def _lane_dir_has_store_folder(directory: str) -> bool:
+    """Whether `directory` holds a store folder, however it is spelled (a link to a folder counts). An unreadable
+    `directory` raises OSError."""
+    with os.scandir(directory) as entries:
+        return any(_is_store_folder_name(entry.name) and entry.is_dir() for entry in entries)
+
+
 def _lane_checkout_outside_store(store, *folders: str) -> str | None:
     """None when every one of `folders` lies inside this store's folder, where `lane assign` always makes a lane's
     checkout (a worktrees root outside the store folder is refused), and under no other store of its own; otherwise
@@ -5066,7 +5081,7 @@ def _lane_checkout_outside_store(store, *folders: str) -> str | None:
                 return folder
             parent = os.path.dirname(real)
             while parent.startswith(root.rstrip(os.sep) + os.sep):  # a store of its own between the two is not ours
-                if os.path.isdir(os.path.join(parent, store_mod.DIRNAME)):
+                if _lane_dir_has_store_folder(parent):
                     return folder
                 parent = os.path.dirname(parent)
     except (OSError, ValueError):
@@ -5092,7 +5107,7 @@ def _lane_checkout_holds_a_store(folder: str) -> str | None:
                     continue
                 if not stat.S_ISDIR(info.st_mode):
                     continue
-                if entry.name == store_mod.DIRNAME:
+                if _is_store_folder_name(entry.name):
                     return entry.path
                 pending.append(entry.path)
     return None

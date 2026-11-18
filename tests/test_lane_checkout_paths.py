@@ -4654,8 +4654,19 @@ def test_gc_removes_the_checkout_of_a_retired_lane_whose_row_names_no_folder(tmp
 
 
 @pytest.mark.parametrize("command", ["abandon", "deliver", "gc"])
-@pytest.mark.parametrize("where", ["root", "deeper", "none"])
-def test_a_removal_never_deletes_a_store_made_inside_the_checkout(tmp_path, monkeypatch, capsys, command, where):
+@pytest.mark.parametrize(
+    ("where", "spelling"),
+    [
+        ("root", ".agenttalk"), ("deeper", ".agenttalk"), ("none", ".agenttalk"),
+        # Round 24: on a case-insensitive disk (Windows, the macOS default) these are the very store `Store(...)`
+        # opens as `.agenttalk`; the name is compared without regard to case on every system (refusing one on a
+        # case-sensitive disk costs only the manual exit).
+        ("root", ".AGENTTALK"), ("deeper", ".AGENTTALK"), ("root", ".AgentTalk"), ("deeper", ".AgentTalk"),
+    ],
+)
+def test_a_removal_never_deletes_a_store_made_inside_the_checkout(
+    tmp_path, monkeypatch, capsys, command, where, spelling
+):
     from test_lanes import _assign_worktree, _repo
 
     if command == "deliver":
@@ -4674,6 +4685,8 @@ def test_a_removal_never_deletes_a_store_made_inside_the_checkout(tmp_path, monk
     if where != "none":
         inner = checkout if where == "root" else checkout / "sub" / "deeper"
         inner.mkdir(parents=True, exist_ok=True)
+        if spelling != ".agenttalk":
+            (inner / spelling).mkdir()  # the store folder spelled in another case, made before the store is
         Store(inner).init(["lead"])
         kept = inner / ".agenttalk" / "independent-data.txt"
         kept.write_text("independent store data\n", encoding="utf-8")
@@ -4691,3 +4704,20 @@ def test_a_removal_never_deletes_a_store_made_inside_the_checkout(tmp_path, monk
         if command == "deliver":  # the delivery cleanup keeps its reason in the row (`lane status` shows it)
             said = lanes.load_lanes(store)["lanes"][selected].get("worktree_cleanup_error", "")
         assert "holds a store of its own" in said
+
+
+@pytest.mark.parametrize("spelling", [".agenttalk", ".AGENTTALK", ".AgentTalk"])
+def test_the_store_folder_name_is_recognised_in_any_case_by_both_walks(tmp_path, spelling):
+    """The walk down into a checkout and the walk up between a checkout and its store use one name test."""
+    inside = tmp_path / "checkout"
+    (inside / "sub" / spelling).mkdir(parents=True)
+    assert cli._lane_checkout_holds_a_store(str(inside)) == str(inside / "sub" / spelling)
+    (tmp_path / "folder-with-a-file").mkdir()
+    (tmp_path / "folder-with-a-file" / spelling).write_text("a file is not a store folder", encoding="utf-8")
+    assert not cli._lane_dir_has_store_folder(str(tmp_path / "folder-with-a-file"))
+    # a store of its own between this store's folder and a checkout, whatever its spelling
+    (tmp_path / "mid" / spelling).mkdir(parents=True)
+    (tmp_path / "mid" / "made-checkout").mkdir()
+    assert cli._lane_dir_has_store_folder(str(tmp_path / "mid"))
+    assert cli._lane_checkout_outside_store(Store(tmp_path), str(tmp_path / "mid" / "made-checkout")) is not None
+    assert cli._lane_checkout_outside_store(Store(tmp_path), str(tmp_path / "checkout")) is None  # the control
