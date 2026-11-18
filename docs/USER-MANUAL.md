@@ -56,20 +56,23 @@ decisions are what make a GO credible.
 
 ## 2. Install and initialize
 
-Install once per machine. Pin the version in repeatable setups.
+Install once per machine.
 
-```powershell
-python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.105.0
-agenttalk --version
-agenttalk --help
-agenttalk install-skills
-```
+Install agenttalk with the steps in the README's [Get started](../README.md#get-started). They give agenttalk
+its own Python environment, name that environment's Python in `AGENTTALK_PY`, install the skills, and put its
+command folder first on PATH, so a plain `agenttalk` runs that copy. In any terminal where you or an assistant
+run agenttalk, do not activate another Python environment: it would put its own folder first on PATH, and an
+older agenttalk installed there could run instead. To check which copy a terminal runs, type
+`(Get-Command agenttalk).Source` in PowerShell or `command -v agenttalk` in sh: the path it shows must be
+inside the `agenttalk-env` folder (or the folder name you chose). The README also says how to call a
+project's own Python by its full path, without activating it.
 
 If you run commands from inside a Codex sandbox and bare `agenttalk` is denied,
-use the module form:
+use the module form with that environment's Python (on Linux or macOS write `"$AGENTTALK_PY"` instead of
+`& $env:AGENTTALK_PY`):
 
 ```powershell
-python -m agenttalk --help
+& $env:AGENTTALK_PY -m agenttalk --help
 ```
 
 Initialize once per project from the repository root:

@@ -133,7 +133,7 @@ The lead. A pull request that changes a rule this list summarises (sections 4.2 
   & .\.venv\Scripts\python.exe -m pytest tests/test_pytest_shell_recipe.py -p no:cacheprovider --basetemp $testScratch
   ```
 
-  `tests/test_docs_plain_voice.py` reads only `README.md` and `docs/AGENTTALK-NEW-USER-MANUAL.md`, so it says nothing about other pages. For a different document, search `tests/` for its file name to find a test that reads it; if there is none, CI's documentation checks are the check.
+  `tests/test_docs_plain_voice.py` reads only `README.md` and the two manuals, `docs/AGENTTALK-NEW-USER-MANUAL.md` and `docs/USER-MANUAL.md`, so it says nothing about other pages. For a different document, search `tests/` for its file name to find a test that reads it; if there is none, CI's documentation checks are the check.
 - The full gate is `agenttalk dev-gate`. It needs CPython 3.10 and 3.14, `gitleaks` on your PATH and the packages in `dev-gate-requirements.txt`, so most contributors will let CI run it. [docs/DEV-GATE.md](https://github.com/zoolok17/agenttalk/blob/master/docs/DEV-GATE.md) lists the prerequisites if you want it locally.
 - For a change to code or tests, put the security lines under "How you checked it" in your pull request description, one line for each rule your change brings into play, and run the tests those lines name ([the short route](https://github.com/zoolok17/agenttalk/blob/master/docs/SECURE-CODING.md#if-you-are-sending-one-pull-request) has two complete examples). You need no other tool.
 - Keep a pull request to one subject. Add a line to the `Unreleased` section of `CHANGELOG.md` for a change that a user will notice, and only add lines: do not edit older entries.
