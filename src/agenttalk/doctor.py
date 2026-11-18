@@ -1874,21 +1874,23 @@ def _check_init(store: Store) -> Check:
                 "`agenttalk init` refuses to start a team folder here while that one exists, on purpose, so that "
                 "two teams at different depths do not talk past each other"
             )
-            unreadable = None
+            unreadable = False
             if Store(above[0]).initialized():
                 try:
                     Store(above[0]).load_config()
-                except (ValueError, OSError) as e:  # the same errors _check_init reports for a store's own config
-                    unreadable = pc.line(str(e))
-            if unreadable is not None:
+                except (ValueError, OSError):  # the same errors _check_init reports for a store's own config
+                    # the reason is not repeated here: some reasons carry their own init advice, which is meant for
+                    # that folder, not this one; doctor run there shows it in the right place
+                    unreadable = True
+            if unreadable:
                 found = (
                     f"a team folder exists above it, at {pc.line(str(above[0]))}, but its config.json cannot be "
-                    f"read: {unreadable}"
+                    "read or is not valid"
                 )
                 fix = (
-                    "that team cannot be used until its config.json is repaired: run `agenttalk doctor` with that "
-                    "folder as its root (the --root option, or the AGENTTALK_ROOT setting; --root wins over "
-                    f"AGENTTALK_ROOT) to see what is wrong there. {refusal}"
+                    "that team cannot be used until its config.json is readable and valid: run `agenttalk doctor` "
+                    "with that folder as its root (the --root option, or the AGENTTALK_ROOT setting; --root wins "
+                    f"over AGENTTALK_ROOT) to see what is wrong there. {refusal}"
                 )
             elif Store(above[0]).initialized():
                 found = f"a team folder already exists above it, at {pc.line(str(above[0]))}"
