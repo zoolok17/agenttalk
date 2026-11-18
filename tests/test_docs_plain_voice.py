@@ -7,6 +7,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 README = REPO / "README.md"
 MANUAL = REPO / "docs" / "AGENTTALK-NEW-USER-MANUAL.md"
@@ -130,3 +132,68 @@ def test_readme_describes_the_install_flags_exactly() -> None:
     assert ("`--claude-only` and `--codex-only` choose which side gets the bus commands; the devkit "
             "still goes to both sides unless you add `--no-devkit`") in readme
     assert "to install just one side" not in readme
+
+
+@pytest.mark.parametrize(
+    "shell, create, capture, invoke, path_setup, show_path",
+    [
+        (
+            "powershell",
+            "python -m venv agenttalk-env",
+            r"$env:AGENTTALK_PY = (Resolve-Path .\agenttalk-env\Scripts\python.exe).Path",
+            "& $env:AGENTTALK_PY",
+            "$env:PATH = (Split-Path $env:AGENTTALK_PY) + ';' + $env:PATH",
+            "$env:AGENTTALK_PY",
+        ),
+        (
+            "sh",
+            "python3 -m venv agenttalk-env",
+            'export AGENTTALK_PY="$(pwd)/agenttalk-env/bin/python"',
+            '"$AGENTTALK_PY"',
+            'export PATH="$(dirname "$AGENTTALK_PY"):$PATH"',
+            'echo "$AGENTTALK_PY"',
+        ),
+    ],
+    ids=["powershell", "sh"],
+)
+def test_quick_start_uses_the_environment_python(shell, create, capture, invoke, path_setup, show_path):
+    """The first install block uses one Python; assistant terminals put its commands first on PATH."""
+    started = README.read_text(encoding="utf-8").split("## Get started\n", 1)[1].split("\n## ", 1)[0]
+    blocks = [
+        body for language, body in re.findall(r"```(powershell|sh)\n(.*?)```", started, re.S) if language == shell
+    ]
+    assert blocks, f"Get started needs the {shell} environment recipe"
+    commands = [line.strip() for line in blocks[0].splitlines() if line.strip()]
+    assert len(commands) == 4
+    assert commands[:2] == [create, capture]
+    assert commands[2].startswith(invoke + " -m pip install ")
+    pins = PIN.findall(commands[2])
+    assert pins and set(pins) == set(PIN.findall(MANUAL.read_text(encoding="utf-8")))
+    assert commands[3] == invoke + " -m agenttalk install-skills"
+    assert "& $env:AGENTTALK_PY -m agenttalk init --here --agents claude-dev,codex-rev" in started
+    assert "& $env:AGENTTALK_PY -m agenttalk codex-config --enable" in started
+    assert any(path_setup == line.strip() for block in blocks[1:] for line in block.splitlines())
+    assert f"`{show_path}`" in started
+    assert "`& $env:AGENTTALK_PY -m agenttalk doctor`" in started
+    # the doctor line before the recipe serves both platforms
+    assert '`"$AGENTTALK_PY" -m agenttalk doctor`' in started
+    # that line comes before the recipe, so it says where AGENTTALK_PY is set
+    early = started.split("`& $env:AGENTTALK_PY -m agenttalk doctor`", 1)[0]
+    assert "After the steps below, which set `AGENTTALK_PY`" in " ".join(early.split())
+
+
+def test_quick_setup_links_to_the_first_install_without_another_pip_recipe():
+    quick = README.read_text(encoding="utf-8").split("\n## 2. Quick setup\n", 1)[1].split("\n## ", 1)[0]
+    assert "[Get started](#get-started)" in quick
+    assert "pip install" not in quick
+
+
+def test_get_started_never_says_to_activate_a_project_environment_after_the_path_step():
+    """Activating another venv would put its folder first on PATH and could run an older agenttalk."""
+    started = " ".join(README.read_text(encoding="utf-8").split("## Get started\n", 1)[1].split("\n## ", 1)[0].split())
+    assert "activate it after" not in started
+    assert "do not activate it in any terminal where you or an assistant run agenttalk" in started
+    assert "Call the project's Python by its full path instead" in started
+    # a full path with spaces must still be one command in PowerShell
+    assert r'`& "<project-env>\Scripts\python.exe"`' in started
+    assert "`(Get-Command agenttalk).Source`" in started and "`command -v agenttalk`" in started
