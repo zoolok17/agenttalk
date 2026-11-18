@@ -237,6 +237,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delivery's `changed_paths` can now name where a target rename moved the lane's edit. Existing
   JSON gains one new `code` value and no new fields.
 
+- **The README first install keeps agenttalk in its own Python environment (#716).** Before, setup could install into another Python, and assistants could find an older agenttalk on PATH. Now both platform recipes keep using the environment's Python after changing folders and put its commands first on PATH in every assistant terminal. Quick setup links to the same recipe, and the README and lead setup brief name the Debian/Ubuntu venv package.
+
 - **The first `agenttalk doctor` run reads less like a failure (Part of #716).** Three lines
   changed their words; no result, exit code, check name or JSON field changed.
   In a folder that is not set up, `store.initialized` now says "not set up yet" and names the missing
