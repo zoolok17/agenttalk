@@ -616,7 +616,9 @@ def test_doctor_inside_an_existing_team_folder_names_it_instead_of_advising_init
     check = doctor._check_init(Store(child))
     assert (check.name, check.status) == ("store.initialized", "error")
     assert f"a team folder already exists above it, at {tmp_path}" in check.details
-    assert "run agenttalk from that folder, or point AGENTTALK_ROOT at it" in check.fix
+    assert "give agenttalk that folder as its root: the --root option, or the AGENTTALK_ROOT setting" in check.fix
+    # find_root: --root wins over AGENTTALK_ROOT, which wins over the folder the command runs from
+    assert "--root wins over AGENTTALK_ROOT, and both win over the folder you run from" in check.fix
     assert "init --here" not in check.fix and "--force" not in check.fix
     # the premise: the init the plain advice would print is refused in that folder
     for name in ("AGENTTALK_ROOT", "AGENTTALK_SELF", "AGENTTALK_PEER"):
@@ -624,6 +626,21 @@ def test_doctor_inside_an_existing_team_folder_names_it_instead_of_advising_init
     monkeypatch.chdir(child)
     assert cli.main(["init", "--here", "--agents", "claude-dev,codex-rev"]) == 2
     assert not (child / ".agenttalk").exists()
+
+
+def test_doctor_below_a_folder_that_is_not_set_up_either_does_not_call_it_a_team(tmp_path: Path) -> None:
+    """The init guard sees any .agenttalk folder above, set up or not; doctor must not call a bare one a team."""
+    (tmp_path / ".agenttalk").mkdir()
+    child = tmp_path / "sub"
+    child.mkdir()
+    assert not Store(tmp_path).initialized()
+    check = doctor._check_init(Store(child))
+    assert (check.name, check.status) == ("store.initialized", "error")
+    assert f"a .agenttalk folder exists above it, at {tmp_path}, but it is not set up either" in check.details
+    assert "team folder already exists" not in check.details
+    assert "to use that team" not in check.fix
+    assert "look at what it holds before you move it away" in check.fix
+    assert "init --here" not in check.fix and "--force" not in check.fix
 
 
 def test_doctor_partly_set_up_folder_names_the_missing_config_file(tmp_path: Path) -> None:

@@ -1870,18 +1870,32 @@ def _check_init(store: Store) -> Check:
         # past each other), so the init advice below would be refused there: name the folder above instead.
         above = find_stores_upward(store.root.parent)
         if above:
+            refusal = (
+                "`agenttalk init` refuses to start a team folder here while that one exists, on purpose, so that "
+                "two teams at different depths do not talk past each other"
+            )
+            if Store(above[0]).initialized():
+                found = f"a team folder already exists above it, at {pc.line(str(above[0]))}"
+                fix = (
+                    "to use that team, give agenttalk that folder as its root: the --root option, or the "
+                    "AGENTTALK_ROOT setting (--root wins over AGENTTALK_ROOT, and both win over the folder you run "
+                    f"from, so running agenttalk from that folder uses it only when neither is set). {refusal}"
+                )
+            else:
+                # only a .agenttalk folder, no config.json: not a team anyone can use, yet init still sees it
+                found = (
+                    f"a .agenttalk folder exists above it, at {pc.line(str(above[0]))}, but it is not set up "
+                    "either (it has no config.json)"
+                )
+                fix = (
+                    "check that folder: if it was meant to be the team folder, set it up there; if it is left "
+                    f"over, look at what it holds before you move it away. {refusal}"
+                )
             return Check(
                 name="store.initialized",
                 status="error",
-                details=(
-                    f"not set up yet: .agenttalk/config.json not found at {pc.line(str(store.root))}; "
-                    f"a team folder already exists above it, at {pc.line(str(above[0]))}"
-                ),
-                fix=(
-                    "this folder is inside that team folder: run agenttalk from that folder, or point "
-                    "AGENTTALK_ROOT at it, to use that team. `agenttalk init` refuses to start a second team "
-                    "folder here on purpose, so that two teams do not talk past each other"
-                ),
+                details=f"not set up yet: .agenttalk/config.json not found at {pc.line(str(store.root))}; {found}",
+                fix=fix,
             )
         return Check(
             name="store.initialized",
