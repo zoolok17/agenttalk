@@ -697,6 +697,14 @@ def program_files_candidates(
     return tuple(out)
 
 
+# What the diagnostic search trims from the edges of a PATH entry or a Program Files value before it removes surrounding
+# double quotes: space and tab, an explicit set, not str.strip()'s whole Unicode whitespace class (which also holds
+# U+001C..U+001F, U+0085, U+00A0 and more). The lookups doctor prints for an escaped path run in PowerShell, whose
+# Trim() takes the set it is given; giving it this same set (.Trim(' ', [char]9)) makes the two read an entry alike.
+# Narrower than before on purpose: nothing is accepted now that was not accepted, and no real PATH pads with the rest.
+_ENV_PADDING = " " + chr(9)
+
+
 def path_candidate_sources(environ: Mapping[str, str] | None = None) -> tuple[tuple[str, str], ...]:
     """The PowerShell 7 files found on the PATH or under the Program Files variables, each with where it was found:
     ``(path, "PATH")`` or ``(path, "<the variable's name>")``. In the order `supervise --select-pwsh` suggests them.
@@ -722,12 +730,12 @@ def path_candidate_sources(environ: Mapping[str, str] | None = None) -> tuple[tu
             out.append((str(candidate), source))
 
     for entry in (env.get("PATH") or "").split(os.pathsep):
-        entry = entry.strip().strip('"')
+        entry = entry.strip(_ENV_PADDING).strip('"')
         if not entry or not os.path.isabs(entry) or entry.startswith("\\\\"):
             continue
         add(os.path.join(entry, "pwsh.exe"), "PATH")
     for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
-        root = (env.get(name) or "").strip().strip('"')
+        root = (env.get(name) or "").strip(_ENV_PADDING).strip('"')
         if not root or not os.path.isabs(root) or root.startswith("\\\\"):
             continue
         add(os.path.join(root, "PowerShell", "7", "pwsh.exe"), name)

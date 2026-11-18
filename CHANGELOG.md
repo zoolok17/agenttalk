@@ -233,14 +233,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ready to paste, and tells the reader to type the path themselves. The found path is shown for
   reading only; if it holds an unusual character, that is shown as a `\uXXXX` code, and doctor says
   the display is not the exact file name and how to get the real one for the place it was found. For a
-  file on the PATH it gives a one-line expression that splits the PATH, trims each entry of spaces and
-  surrounding double quotes (as the search does, so a quoted entry is found too) and prints every
-  `pwsh.exe` that exists, one full path per line. A file under a Program Files environment variable is
-  not on the PATH, so doctor names that variable and gives one expression for it, such as
-  `Join-Path (${env:ProgramFiles}.Trim().Trim('"')) 'PowerShell\7\pwsh.exe'`, which also reads a quoted
-  value. Both print the full path as plain text on its own line (a table would cut a long path with an
-  ellipsis), and each reads only the one variable it names: doctor never recommends
-  `Get-ChildItem Env:`, which prints every environment variable, credentials included.
+  file on the PATH it gives a one-line expression that splits the PATH, trims each entry of spaces and tabs
+  and then of surrounding double quotes (as the search does, so a quoted entry is found too), keeps an
+  entry only if it starts with a drive letter, a colon and a slash (the search's own rule), and prints
+  every `pwsh.exe` that exists, one full path per line. A file under a Program Files environment
+  variable is not on the PATH, so doctor names that variable and gives one expression for it, such as
+  `Join-Path (${env:ProgramFiles}.Trim(' ', [char]9).Trim('"')) 'PowerShell\7\pwsh.exe'`, which also reads
+  a quoted value. Both print the full path as plain text on its own line (a table would cut a long path
+  with an ellipsis), and each reads only the one variable it names: doctor never recommends
+  `Get-ChildItem Env:`, which prints every environment variable, credentials included. Both use only
+  commands, operators and string methods, so they work the same when PowerShell runs in Constrained
+  Language mode, which refuses calls to .NET methods (an earlier form of the PATH expression printed
+  nothing there, without an error). The search and the expressions now trim the same two characters,
+  space and tab: before, the search also trimmed some invisible separator characters that PowerShell
+  does not, so a path padded with one was found by the search but not by the expression. The search
+  accepts nothing new; it is a little stricter about such padding.
   Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
   has just been set up can still end with `overall: ERROR` on Windows until that step is done.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note

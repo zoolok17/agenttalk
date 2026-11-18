@@ -614,14 +614,17 @@ _HOST_USERS = "the supervisor and the hang watchdog of a continuous Codex wrappe
 # How to get the exact path of a found file whose display is escaped. Both print plain strings, one per line, so a
 # long value is never cut with an ellipsis (a table such as `Get-Command pwsh -All` or `Get-ChildItem Env:` is), and
 # each shows only the one thing it is about: never a listing of the environment, which holds credentials.
-# The expression that prints, one full path per line, every pwsh.exe the search finds on the PATH. It takes exactly what
-# the search takes: PATH split on the separator, each entry trimmed of whitespace and then of surrounding double quotes
-# (a quoted entry is legal on Windows), empty and non-absolute entries and network shares skipped. It prints a file
-# only if it exists, with Test-Path on the literal text so no wildcard in a folder name is expanded. Plain strings, so
-# nothing is cut with an ellipsis. It reads only the PATH variable.
+# The expression that prints, one full path per line, every pwsh.exe the search finds on the PATH. It takes exactly
+# what the search takes: PATH split on the separator; each entry trimmed of the same explicit set (space and tab) and
+# then of surrounding double quotes (a quoted entry is legal on Windows); an entry kept only if it starts with an
+# ASCII drive letter, a colon and a slash (the search's own rule, so empty, relative and network-share entries drop
+# out); a file printed only if it exists, with Test-Path on the literal text so no wildcard in a folder name is
+# expanded. It uses only cmdlets, operators and string methods, so it behaves the same in Constrained Language mode
+# (which refuses calls to static .NET methods such as [IO.Path]::IsPathFullyQualified: the expression would run, print
+# nothing and exit 0). Plain strings, so nothing is cut with an ellipsis. It reads only the PATH variable.
 PATH_LOOKUP = (
-    "$env:PATH -split ';' | ForEach-Object { $e = $_.Trim().Trim('\"'); "
-    "if ($e -and [IO.Path]::IsPathFullyQualified($e) -and -not $e.StartsWith('\\\\')) "
+    "$env:PATH -split ';' | ForEach-Object { $e = $_.Trim(' ', [char]9).Trim('\"'); "
+    "if ($e -cmatch '^[A-Za-z]:[\\\\/]') "
     "{ $p = Join-Path $e 'pwsh.exe'; if (Test-Path -LiteralPath $p -PathType Leaf) { $p } } }"
 )
 
@@ -629,9 +632,10 @@ PATH_LOOKUP = (
 def env_root_lookup(variable: str) -> str:
     """The PowerShell expression that prints the full path of PowerShell\\7\\pwsh.exe under ONE Program Files
     variable. ``variable`` is one of the four fixed names, never a stored value; the braces let a name with
-    parentheses, such as ProgramFiles(x86), be read as a variable. The value is trimmed of whitespace and then of
-    surrounding double quotes, as the search does, so a quoted root is read as the folder it names."""
-    return f"Join-Path (${{env:{variable}}}.Trim().Trim('\"')) 'PowerShell\\7\\pwsh.exe'"
+    parentheses, such as ProgramFiles(x86), be read as a variable. The value is trimmed of the same explicit set as the
+    search (space and tab) and then of surrounding double quotes, so a quoted root is read as the folder it names. Only
+    cmdlets and string methods, so it behaves the same in Constrained Language mode."""
+    return f"Join-Path (${{env:{variable}}}.Trim(' ', [char]9).Trim('\"')) 'PowerShell\\7\\pwsh.exe'"
 
 
 def _found_pwsh_fix() -> str:

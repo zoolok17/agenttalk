@@ -419,6 +419,39 @@ def test_environment_program_files_root_is_diagnostic_only(tmp_path: Path) -> No
     )
 
 
+@pytest.mark.parametrize(
+    ("padding", "accepted"),
+    [
+        ("{}", True),
+        ('"{}"', True),
+        (' "{}" ', True),
+        ("\t{}\t", True),
+        # whitespace to Python's str.strip() but not to the lookups doctor prints (PowerShell's Trim of an explicit
+        # set): the search must not take them either, or the two would disagree about the same value
+        ("\x1c{}\x1c", False),
+        ("\x1f{}\x1f", False),
+        ("\u0085{}\u0085", False),
+        (" {} ", False),
+    ],
+)
+def test_the_search_trims_only_space_and_tab_around_a_path_entry_and_a_program_files_root(
+    tmp_path: Path, padding: str, accepted: bool
+) -> None:
+    on_path = tmp_path / "on-path"
+    on_path.mkdir()
+    (on_path / "pwsh.exe").write_bytes(b"")
+    root = tmp_path / "root"
+    under_root = root / "PowerShell" / "7" / "pwsh.exe"
+    under_root.parent.mkdir(parents=True)
+    under_root.write_bytes(b"")
+
+    from_path = psh.path_candidate_sources({"PATH": padding.format(on_path)})
+    from_root = psh.path_candidate_sources({"ProgramFiles": padding.format(root)})
+
+    assert from_path == (((str(on_path / "pwsh.exe"), "PATH"),) if accepted else ())
+    assert from_root == (((str(under_root), "ProgramFiles"),) if accepted else ())
+
+
 def test_path_diagnostics_do_not_recommend_windowsapps_alias(tmp_path: Path) -> None:
     windowsapps = tmp_path / "Microsoft" / "WindowsApps"
     windowsapps.mkdir(parents=True)

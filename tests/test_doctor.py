@@ -313,22 +313,35 @@ def _the_printed_lookup(fix: str, marker: tuple[str, ...]) -> str:
     return found[0]
 
 
-def _render_in_a_minimal_environment(expression: str, extra: dict[str, str]) -> list[str]:
-    """Run ``expression`` in a real pwsh and return its output lines. The environment is built from scratch (never the
-    seat's own, which holds credentials): SystemRoot, what the test needs, and a synthetic secret in an unrelated
-    variable, so a lookup that prints more than it should shows it."""
+_LANGUAGE_MODES = ["FullLanguage", "ConstrainedLanguage"]  # the printed lookups must behave the same in both
+
+
+def _render_in_a_minimal_environment(expression: str, extra: dict[str, str], mode: str = "FullLanguage") -> list[str]:
+    """Run ``expression`` in a real pwsh in the given language mode and return the lines it prints, as text.
+
+    The environment is built from scratch (never the seat's own, which holds credentials): SystemRoot, PATHEXT, what the
+    test needs, and a synthetic secret in an unrelated variable, so a lookup that prints more than it should shows it.
+    Nothing here is refused by Constrained Language mode: the mode is switched with one assignment on the session state
+    (which that mode allows), and the output is read back as hex code units of each printed line, so no console
+    encoding has to be set (an assignment to [Console]::OutputEncoding is refused there). stderr must be empty: a
+    method call refused in Constrained Language mode prints its error and leaves the output empty."""
     env = {
         "SystemRoot": os.environ["SystemRoot"],
-        "PATHEXT": ".COM;.EXE",  # an ordinary Windows value; the lookups do not depend on it
+        "PATHEXT": ".COM;.EXE",
         "ATK_TEST_UNRELATED_SECRET": _SYNTHETIC_SECRET,
         **extra,
     }
-    script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " + expression  # so U+202E is not turned into ?
+    hex_of_each_line = "ForEach-Object { ($_.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ' }"
+    switch = f"$ExecutionContext.SessionState.LanguageMode = '{mode}'; " if mode != "FullLanguage" else ""
+    script = f"{switch}$ExecutionContext.SessionState.LanguageMode; {expression} | {hex_of_each_line}"
     done = subprocess.run(
         [_REAL_PWSH, "-NoProfile", "-NonInteractive", "-Command", script], env=env, capture_output=True, timeout=120
     )
-    assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
-    return done.stdout.decode("utf-8").splitlines()
+    assert done.stderr.decode("utf-8", "replace").strip() == "", done.stderr.decode("utf-8", "replace")
+    assert done.returncode == 0
+    first, *rest = done.stdout.decode("ascii").splitlines()
+    assert first == mode, (first, mode)  # it really ran in the mode asked for
+    return ["".join(chr(int(unit, 16)) for unit in line.split()) for line in rest]
 
 
 def _without_the_host(lines: list[str]) -> list[str]:
@@ -343,49 +356,106 @@ def _a_long_folder(tmp_path: Path) -> Path:
 
 
 @_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
 @pytest.mark.parametrize("spelling", list(_SPELLINGS))
 def test_the_printed_path_lookup_prints_the_exact_long_path_and_no_secret(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str, mode: str
 ) -> None:
     # The same PATH the search reads is given to the printed lookup, so a quoted or padded entry (which the search
-    # accepts) must be found by the lookup too.
+    # accepts) must be found by the lookup too, in Full and in Constrained Language mode.
     folder = _a_long_folder(tmp_path)
     pwsh = _pwsh_only_on_a_temp_path(monkeypatch, folder, spelling)
     assert len(str(pwsh)) > 150
     _windows_without_selection(monkeypatch, [], on_path=None)
     check = doctor._check_powershell_host(Store(tmp_path / "project"))
     expression = _the_printed_lookup(check.fix, ("$env:PATH", "(Get-Command", "Get-Command"))
-    lines = _render_in_a_minimal_environment(expression, {"PATH": _SPELLINGS[spelling].format(folder)})
+    lines = _render_in_a_minimal_environment(expression, {"PATH": _SPELLINGS[spelling].format(folder)}, mode)
     assert _SYNTHETIC_SECRET not in "\n".join(lines)  # first: a listing of the environment shows it
     assert _without_the_host(lines) == [str(pwsh)]  # the whole path, on a line of its own, and nothing else
-    assert not any("…" in line or "..." in line for line in lines)  # no ellipsis
+    assert not any("\u2026" in line or "..." in line for line in lines)  # no ellipsis
 
 
 @_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
 def test_the_printed_path_lookup_reads_the_path_the_way_the_search_does(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    # Several entries at once: quoted, padded, empty, relative, and one with no pwsh.exe; only the real file is printed.
+    # Several entries at once: quoted, padded, empty, relative, a network share and one with no pwsh.exe; only the
+    # real file is printed.
     folder = _a_long_folder(tmp_path)
     pwsh = _pwsh_only_on_a_temp_path(monkeypatch, folder)
     other = tmp_path / "no-pwsh-here"
     other.mkdir()
-    entries = [f' "{other}" ', "", "relative\\folder", f'"{folder}"', f"{folder}"]
+    entries = [f' "{other}" ', "", "relative\\folder", "\\\\server\\share", f'"{folder}"', f"{folder}"]
     path_value = ";".join(entries)
     monkeypatch.setenv("PATH", path_value)
     _windows_without_selection(monkeypatch, [], on_path=None)
     check = doctor._check_powershell_host(Store(tmp_path / "project"))
-    lines = _render_in_a_minimal_environment(_the_printed_lookup(check.fix, ("$env:PATH",)), {"PATH": path_value})
+    lines = _render_in_a_minimal_environment(_the_printed_lookup(check.fix, ("$env:PATH",)), {"PATH": path_value}, mode)
     # the folder is on the PATH twice, spelled two ways; nothing else is printed
     assert _without_the_host(lines) == [str(pwsh), str(pwsh)]
     assert _SYNTHETIC_SECRET not in "\n".join(lines)
 
 
+# How a PATH entry or a Program Files value may be padded, and whether the search accepts it. The search trims an
+# explicit set (space and tab) and the printed lookups trim the same set, so the two must always agree; U+001C and the
+# no-break space are whitespace to Python's str.strip() but not to PowerShell's Trim(), so neither side takes them.
+_PADDINGS = {
+    "plain": ("{}", True),
+    "quoted": ('"{}"', True),
+    "quoted-and-padded": (' "{}" ', True),
+    "tab-padded": ("\t{}\t", True),
+    "unit-separator-padded": ("\x1c{}\x1c", False),
+    "no-break-space-padded": ("\u00a0{}\u00a0", False),
+}
+
+
 @_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
+@pytest.mark.parametrize("padding", list(_PADDINGS))
+def test_the_path_search_and_its_printed_lookup_trim_the_same_characters(
+    tmp_path: Path, padding: str, mode: str
+) -> None:
+    template, accepted = _PADDINGS[padding]
+    folder = _a_long_folder(tmp_path)
+    folder.mkdir(parents=True)
+    pwsh = folder / "pwsh.exe"
+    pwsh.write_bytes(b"")
+    value = template.format(folder)
+    found = list(doctor.psh.path_candidates({"PATH": value}))
+    assert (found == [str(pwsh)]) if accepted else (found == []), (padding, found)  # the search's own verdict
+    lines = _render_in_a_minimal_environment(doctor.PATH_LOOKUP, {"PATH": value}, mode)
+    assert _SYNTHETIC_SECRET not in "\n".join(lines)
+    assert _without_the_host(lines) == found  # the lookup prints exactly what the search found: no more, no less
+
+
+@_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
+@pytest.mark.parametrize("padding", list(_PADDINGS))
+@pytest.mark.parametrize("variable", ["ProgramFiles", "ProgramFiles(x86)"])
+def test_the_program_files_search_and_its_printed_lookup_trim_the_same_characters(
+    tmp_path: Path, variable: str, padding: str, mode: str
+) -> None:
+    template, accepted = _PADDINGS[padding]
+    root = _a_long_folder(tmp_path)
+    pwsh = root / "PowerShell" / "7" / "pwsh.exe"
+    pwsh.parent.mkdir(parents=True)
+    pwsh.write_bytes(b"")
+    value = template.format(root)
+    found = doctor.psh.path_candidate_sources({variable: value})
+    assert (found == ((str(pwsh), variable),)) if accepted else (found == ()), (padding, found)
+    if accepted:  # a hint (and so a lookup) exists only for what the search found
+        lines = _render_in_a_minimal_environment(doctor.env_root_lookup(variable), {variable: value}, mode)
+        assert _SYNTHETIC_SECRET not in "\n".join(lines)
+        assert lines == [str(pwsh)]
+
+
+@_needs_real_pwsh
+@pytest.mark.parametrize("mode", _LANGUAGE_MODES)
 @pytest.mark.parametrize("spelling", list(_SPELLINGS))
 @pytest.mark.parametrize("variable", ["ProgramFiles", "ProgramFiles(x86)"])
 def test_the_printed_program_files_lookup_prints_the_exact_long_path_and_no_secret(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable: str, spelling: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable: str, spelling: str, mode: str
 ) -> None:
     root = _a_long_folder(tmp_path)
     pwsh = _pwsh_only_under_a_program_files_variable(monkeypatch, root, variable, spelling)
@@ -395,21 +465,23 @@ def test_the_printed_program_files_lookup_prints_the_exact_long_path_and_no_secr
     expression = _the_printed_lookup(check.fix, ("Join-Path", "Get-ChildItem"))
     empty = root.parent / "empty-path-folder"
     extra = {"PATH": str(empty), variable: _SPELLINGS[spelling].format(root)}  # the value as the search read it
-    lines = _render_in_a_minimal_environment(expression, extra)
+    lines = _render_in_a_minimal_environment(expression, extra, mode)
     assert _SYNTHETIC_SECRET not in "\n".join(lines)  # first: a listing of the environment shows it
     assert lines == [str(pwsh)]
-    assert not any("…" in line or "..." in line for line in lines)
+    assert not any("\u2026" in line or "..." in line for line in lines)
 
 
 def test_the_hint_never_recommends_a_listing_that_shows_more_than_the_one_thing_it_names() -> None:
     # `Get-ChildItem Env:` prints every environment variable, credentials included; a table cuts long values.
     for expression in (doctor.PATH_LOOKUP, *(doctor.env_root_lookup(v) for v in _PROGRAM_FILES_VARIABLES)):
         assert "Get-ChildItem" not in expression and "-Format" not in expression and "Get-Command" not in expression
+        # Constrained Language mode refuses a call to a static .NET method (it exits 0 and prints nothing)
+        assert "[IO." not in expression and "[System." not in expression and "::" not in expression
     assert doctor.PATH_LOOKUP.startswith("$env:PATH -split ';'")  # reads the PATH and nothing else
     assert "${env:" not in doctor.PATH_LOOKUP
     for variable in _PROGRAM_FILES_VARIABLES:
         expression = doctor.env_root_lookup(variable)
-        assert expression == f"Join-Path (${{env:{variable}}}.Trim().Trim('\"')) 'PowerShell\\7\\pwsh.exe'"
+        assert expression == f"Join-Path (${{env:{variable}}}.Trim(' ', [char]9).Trim('\"')) 'PowerShell\\7\\pwsh.exe'"
         assert expression.count("${env:") == 1 and "$env:PATH" not in expression  # only that one variable is read
 
 
