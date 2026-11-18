@@ -4364,3 +4364,22 @@ def test_the_prepared_copy_of_a_delivery_is_removed_only_at_its_own_path(tmp_pat
     cli._lane_remove_prepared(store, {**pending, "prepared_artifact": str(own)})
     assert not own.exists() and stray.exists()
     capsys.readouterr()
+
+
+def test_abandon_does_not_remove_a_detached_checkout_while_the_lane_branch_is_checked_out_elsewhere(tmp_path, capsys):
+    """The branch alone settles it where no other record does: the first lane's branch is attached in its own
+    checkout, so a detached checkout at the same commit is not the first lane's, whatever the first row says."""
+    from test_lanes import _assign_worktree, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    store = Store(root)
+    assert _git_rc(other, "checkout", "--detach", base).returncode == 0
+    _point_lane_at(store, "first", other)
+    _point_lane_at(store, "other", tmp_path / "nowhere")  # no other record names the detached checkout now
+    capsys.readouterr()
+
+    cli.main(["--root", str(root), "lane", "abandon", "--id", "first"])
+
+    _assert_untouched(first, other)
