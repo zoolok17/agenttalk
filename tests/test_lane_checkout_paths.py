@@ -4181,8 +4181,9 @@ def _assert_untouched(*folders: Path) -> None:
 
 
 def test_abandon_with_a_relative_path_removes_the_checkout_it_verified_or_nothing(tmp_path, monkeypatch, capsys):
-    """A relative worktree_path was verified against the caller's folder and removed against the store folder: the
-    command verified one checkout and removed another lane's. One absolute target is resolved and used for both."""
+    """A relative worktree_path was verified from the caller's folder and removed from the store folder: the command
+    verified one checkout (the first lane's) and removed another (the other lane's). One absolute target is resolved
+    once and handed to the removal, so what is removed is exactly what was verified."""
     from test_lanes import _assign_worktree, _repo
 
     root, base = _repo(tmp_path)
@@ -4196,15 +4197,15 @@ def test_abandon_with_a_relative_path_removes_the_checkout_it_verified_or_nothin
 
     cli.main(["--root", str(root), "lane", "abandon", "--id", "first"])
 
-    _assert_untouched(first, moved)
+    _assert_untouched(moved)  # the other lane's checkout is never touched
     assert (moved / "src" / "other" / "b.py").exists()
-    assert "first" in lanes.load_lanes(store)["lanes"]
+    assert not first.exists()  # the checkout that was verified is the one that was removed
 
 
 def test_delivery_cleanup_with_a_relative_path_removes_the_checkout_it_verified_or_nothing(
     tmp_path, monkeypatch, capsys
 ):
-    """The same split in the cleanup that ends a delivery: verified against one folder, removed from another."""
+    """The same split in the cleanup that ends a delivery: verified in one folder, removed from another."""
     store, lane_id, first, _head, artifact = _published_with_cleanup_postponed(tmp_path, monkeypatch)
     base = lanes.load_lanes(store)["lanes"][lane_id]["base_sha"]
     _assign_second_lane(store.root, base)
@@ -4216,7 +4217,8 @@ def test_delivery_cleanup_with_a_relative_path_removes_the_checkout_it_verified_
 
     cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"])
 
-    _assert_untouched(first, moved)
+    _assert_untouched(moved)
+    assert not first.exists()  # the delivered lane's own checkout is the one that went
     assert artifact.read_bytes() == signed
 
 

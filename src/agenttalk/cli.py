@@ -4977,11 +4977,12 @@ def _cleanup_failed_provision(
     return "; ".join(notes) if notes else None
 
 
-def _lane_checkout_folder(store, saved: str) -> str:
-    """The one absolute folder a saved `worktree_path` names. A relative name is read from the store's folder (where
-    `lane assign` writes a relative worktrees root from), never from the folder a command happens to run in, so the
-    check that a checkout is the lane's and the removal that follows look at the same folder. A name that depends on a
-    drive's current folder (`C:x`, `\\x`) has no single meaning and is refused."""
+def _lane_checkout_folder(saved: str) -> str:
+    """The one absolute folder a saved `worktree_path` names. A relative name is read from the folder the command runs
+    in, as the checks have always read it, and the result is what every later step is given: the check that a checkout
+    is the lane's and the removal that follows look at the same folder, because the removal is handed this full path
+    and never the original spelling (which Git's adapter would read from the store's folder instead). A name that
+    depends on a drive's current folder (`C:x`, `\\x`) has no single meaning and is refused."""
     if lane_mod.path_is_absolute(saved):
         return saved
     path = Path(saved)
@@ -4989,7 +4990,7 @@ def _lane_checkout_folder(store, saved: str) -> str:
         raise lane_mod.LaneError(
             f"the stored worktree path {saved!r} depends on a drive's current folder, so it names no single folder; "
             "replace worktree_path in that lane's record in lanes.json with the checkout's real absolute folder")
-    return str(Path(store.root).absolute() / path)
+    return str(path.absolute())
 
 
 def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> str | None:
@@ -5003,18 +5004,24 @@ def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> str |
             saved = row.get(field)
             if not isinstance(saved, str) or lane_mod.checkout_path_problem({field: saved}) is not None:
                 continue
+            saved = saved.replace("{ROOT}", str(store.root))
             try:
-                named = _lane_checkout_folder(store, saved.replace("{ROOT}", str(store.root)))
+                # A relative spelling can mean the folder the command runs in or the store's folder, and which one
+                # was meant cannot be recovered: it names the checkout if it names it either way.
+                named = [_lane_checkout_folder(saved)]
             except lane_mod.LaneError:
                 continue  # a spelling with no single meaning names no folder here
+            if not lane_mod.path_is_absolute(saved):
+                named.append(str(Path(store.root).absolute() / saved))
             for folder in folders:
-                if _same_folder(named, folder):
-                    return key
-                try:
-                    if os.path.samefile(named, folder):
+                for candidate in named:
+                    if _same_folder(candidate, folder):
                         return key
-                except (OSError, ValueError):
-                    pass  # one of them is not there: only the spelling comparison above could say
+                    try:
+                        if os.path.samefile(candidate, folder):
+                            return key
+                    except (OSError, ValueError):
+                        pass  # one of them is not there: only the spelling comparison above could say
     return None
 
 
@@ -5047,10 +5054,10 @@ def _verify_lane_worktree(
         raise lane_mod.LaneError(
             f"lane row {pc.line(lane_id)} holds the lane id {pc.line(embedded_id)}; the two must match before its "
             f"checkout is checked or removed: repair lane_id in that row of lanes.json")
-    # One absolute folder, read the same way here and by the removal that follows (`_lane_checkout_folder`): a relative
-    # name was read from the folder the command ran in below, but from the store's folder by the removal, so one
-    # checkout could be verified and another removed.
-    wt = _lane_checkout_folder(store, wt)
+    # One absolute folder, the same one the removal that follows is given (`_lane_checkout_folder`): a relative name was
+    # read from the folder the command ran in below, but from the store's folder by the removal, so one checkout could
+    # be verified and another removed.
+    wt = _lane_checkout_folder(wt)
     branch = lane_mod.lane_branch(embedded_id)
     toplevel = _git_read_one(wt, ["rev-parse", "--show-toplevel"], "worktree toplevel")
     toplevel_c = lane_mod.canonical_host_path(toplevel)
@@ -6564,7 +6571,7 @@ def _lane_deliver_cleanup(store, lane_id: str, pending: dict, cleanup_lane: dict
     try:
         # One absolute folder for the look, the verification and the removal below: the original spelling is never
         # read again against another folder.
-        wt_raw = _lane_checkout_folder(store, wt_raw)
+        wt_raw = _lane_checkout_folder(wt_raw)
     except lane_mod.LaneError as exc:
         sys.stderr.write(
             f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {exc}.\n"
@@ -7488,7 +7495,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                             _verify_lane_worktree(store, lane, lane_id=lane_id)
                             rc, _out, err = _git_write(  # the folder the check above read: one absolute target
                                 store.root,
-                                ["worktree", "remove", "--", _lane_checkout_folder(store, lane["worktree_path"])])
+                                ["worktree", "remove", "--", _lane_checkout_folder(lane["worktree_path"])])
                             lane["worktree_state"] = (
                                 lane_mod.STATUS_ABANDONED if rc == 0
                                 else lane_mod.STATUS_CLEANUP_FAILED)

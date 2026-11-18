@@ -233,7 +233,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Three damaged-record cases could lose work or delete an unrelated file; each now stops and changes nothing.
   A saved checkout name that is not a full path was read from the folder the command ran in when the checkout
   was checked, but from the store folder when it was removed, so one checkout could be checked and another lane's
-  removed; both steps now use the store folder. A checkout that is not on its lane branch (it sits at the same commit)
+  removed; the removal is now given the same full path the check read. A checkout that is not on its lane branch (it sits at the same commit)
   is accepted as that lane's only when no other lane's record names it and the lane branch is not checked out
   elsewhere; `lane abandon`, `lane deliver` and `lane gc --delete` all apply this. And a delivery retry deleted
   whatever file a damaged delivery record named as its prepared copy; it now deletes only the delivery's own
