@@ -701,7 +701,8 @@ def program_files_candidates(
 # double quotes: space and tab, an explicit set, not str.strip()'s whole Unicode whitespace class (which also holds
 # U+001C..U+001F, U+0085, U+00A0 and more). The lookups doctor prints for an escaped path run in PowerShell, whose
 # Trim() takes the set it is given; giving it this same set (.Trim(' ', [char]9)) makes the two read an entry alike.
-# Narrower than before on purpose: nothing is accepted now that was not accepted, and no real PATH pads with the rest.
+# Narrower than before on purpose: a value padded with one of the other characters is no longer found, and a folder
+# whose real name ends in one is now found as it is (str.strip() cut that character off and missed the folder).
 _ENV_PADDING = " " + chr(9)
 
 

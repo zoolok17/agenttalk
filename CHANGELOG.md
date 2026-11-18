@@ -246,8 +246,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Language mode, which refuses calls to .NET methods (an earlier form of the PATH expression printed
   nothing there, without an error). The search and the expressions now trim the same two characters,
   space and tab: before, the search also trimmed some invisible separator characters that PowerShell
-  does not, so a path padded with one was found by the search but not by the expression. The search
-  accepts nothing new; it is a little stricter about such padding.
+  does not, so a path padded with one was found by the search but not by the expression. So a value
+  padded with such a character is no longer found, and a folder whose real name ends in one (for
+  example a no-break space) is now found as it is, where before the search cut that character off and
+  looked in a folder that does not exist.
   Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
   has just been set up can still end with `overall: ERROR` on Windows until that step is done.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note

@@ -452,6 +452,28 @@ def test_the_search_trims_only_space_and_tab_around_a_path_entry_and_a_program_f
     assert from_root == (((str(under_root), "ProgramFiles"),) if accepted else ())
 
 
+@pytest.mark.parametrize("last_character", [" ", ""])
+def test_the_search_keeps_a_real_folder_name_that_ends_in_a_character_it_does_not_trim(
+    tmp_path: Path, last_character: str
+) -> None:
+    # Only space and tab are trimmed, so a folder whose real name ends in another blank-looking character is found
+    # as it is. (str.strip() used to cut that character off and look in a folder that does not exist.)
+    folder = tmp_path / ("tools" + last_character)
+    try:
+        folder.mkdir()
+    except OSError:
+        pytest.skip("this file system refuses that character at the end of a folder name")
+    (folder / "pwsh.exe").write_bytes(b"")
+    root = tmp_path / ("root" + last_character)
+    (root / "PowerShell" / "7").mkdir(parents=True)
+    (root / "PowerShell" / "7" / "pwsh.exe").write_bytes(b"")
+
+    assert psh.path_candidate_sources({"PATH": str(folder)}) == ((str(folder / "pwsh.exe"), "PATH"),)
+    assert psh.path_candidate_sources({"ProgramFiles": str(root)}) == (
+        (str(root / "PowerShell" / "7" / "pwsh.exe"), "ProgramFiles"),
+    )
+
+
 def test_path_diagnostics_do_not_recommend_windowsapps_alias(tmp_path: Path) -> None:
     windowsapps = tmp_path / "Microsoft" / "WindowsApps"
     windowsapps.mkdir(parents=True)
