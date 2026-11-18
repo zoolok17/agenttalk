@@ -239,7 +239,15 @@ def store_fence_allows(root: Path) -> bool:
     allowed = _fence()
     if allowed is None:
         return True
-    return _first_escape(Path(root).resolve(), allowed) is None
+    root = Path(root).resolve()
+    escape = _first_escape(root, allowed)
+    # the same settle loop as check_store_fence: a lock being taken shows a file's second name for a moment
+    for _ in range(_LINK_SETTLE_TRIES):
+        if escape is None or escape[1] != "linked":
+            break
+        time.sleep(_LINK_SETTLE_SECONDS)
+        escape = _first_escape(root, allowed)
+    return escape is None
 
 
 def check_folder_fence(folder: Path) -> None:

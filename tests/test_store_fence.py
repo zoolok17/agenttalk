@@ -2010,3 +2010,22 @@ def test_janitor_checks_the_worktrees_folder_first(
             f"{inside.resolve() / '.worktrees'} -> {linked.resolve()}"]
     finally:
         _unlink_dir(inside / ".worktrees")
+
+
+@pytest.mark.parametrize("answers, allowed", [
+    ([("lock", "linked"), None], True),  # a lock's second name, gone on the next look
+    ([("lock", "linked")] * 10, False),  # a second name that stays
+    ([("out", "outside")], False),  # never retried
+])
+def test_store_fence_allows_settles_a_passing_second_name_like_the_fence_check(
+    tmp_path, monkeypatch, answers, allowed
+):
+    """store_fence_allows only reads, and it gives the same answer check_store_fence would: a lock being taken
+    shows a file's second name for a moment, so a 'linked' answer is looked at again before it counts."""
+    from agenttalk import store as store_mod
+
+    monkeypatch.setenv(store_mod.STORE_FENCE_ENV, str(tmp_path))
+    seen = list(answers)
+    monkeypatch.setattr(store_mod, "_first_escape", lambda root, fence: seen.pop(0) if len(seen) > 1 else seen[0])
+    monkeypatch.setattr(store_mod.time, "sleep", lambda seconds: None)
+    assert store_mod.store_fence_allows(tmp_path / "team") is allowed
