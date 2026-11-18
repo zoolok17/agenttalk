@@ -217,6 +217,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its limit. When a check refuses a lead's regular sweep, the wrapper now says why on its
   error output and in its health, and the notice after repeated failures names the reason.
 
+- **`lane check` and `lane deliver` judge what a delivery really writes (#671).** Before, a lane that
+  merged its own target branch was held with `out_of_bounds_path` for files the target had changed,
+  and a lane that undid a target change, or whose edit a target rename carried outside the lane,
+  could be waved through. Now the lane is compared with its one merge base with the target, and the
+  paths Git's own merge result would write on the current target are judged too. What you will
+  notice: a lane that only merged its target is no longer held for the target's files, unless its
+  latest commit is already part of the target (then there is nothing newer to compare, so it is
+  still compared with the commit it started from and can still be held for files outside its
+  paths that came in through its own history); a lane whose
+  edit the target moved outside the lane is held, naming the real destination, and the remedy is to
+  merge the target and move the edit, widen the lane, or ask for the move to be reversed; a lane
+  that undoes a target change is held on that file. When the lane and its target have several merge
+  bases, the new hold `ambiguous_merge_base` says to merge the current target into the lane and
+  check again. A delivery interrupted under the old rule can still resume if its saved checks match
+  the new result. If the new checks differ, it is refused at its final re-check ("terminal evaluation
+  differs from the prepared GO snapshot"); if the lane is now held, it is refused with "terminal
+  verdict is HOLD". Retry the delivery, after clearing any hold `lane check` names. A saved
+  delivery's `changed_paths` can now name where a target rename moved the lane's edit. Existing
+  JSON gains one new `code` value and no new fields.
+
 - **The first `agenttalk doctor` run reads less like a failure (Part of #716).** Three lines
   changed their words; no result, exit code, check name or JSON field changed.
   In a folder that is not set up, `store.initialized` now says "not set up yet" and names the missing
