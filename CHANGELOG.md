@@ -10,15 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **The project charter.** `docs/CHARTER.md` states what agenttalk is for and where it is meant to go:
-  an engineering organization whose workforce is AI agents, procedures chosen by risk, two trust boundaries
-  (isolation from the host, and checks that the working agents cannot change), knowledge kept outside the
-  models, and the decisions taken on 18 November 2026. It is a statement of direction only: it changes no
-  behaviour, and the gaps it names (for example, that checks agents cannot alter are not enforced yet) are
-  still open.
-
 ### Changed
 
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
