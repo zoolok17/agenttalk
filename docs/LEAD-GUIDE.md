@@ -73,7 +73,11 @@ cause. Run doctor first:
 ```
 agenttalk doctor
 ```
-If you see `[FAIL] powershell_host ... no PowerShell host is selected`, fix it:
+If doctor shows `N/A` for `powershell_host`, nothing found here says a host is needed: no host is
+selected, no supervisor setup files exist and no continuous Codex wrapper has left its marker. Select a
+host before you use the supervisor or a continuous Codex wrapper on Windows (its hang watchdog uses the
+host too); the scheduled-task state is not checked then. If you see
+`[FAIL] powershell_host ... no PowerShell host is selected`, fix it:
 ```
 agenttalk supervise --select-pwsh
 ```

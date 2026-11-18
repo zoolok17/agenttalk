@@ -108,6 +108,9 @@ def test_doctor_powershell_check_keeps_result_and_locks_only_set_up_project(
     # This test is about locking, not about where PowerShell is installed: no host found.
     monkeypatch.setattr(doctor.psh, "program_files_candidates", lambda *a, **k: ())
     monkeypatch.setattr(doctor.psh, "path_candidate_sources", lambda *a, **k: ())
+    # a supervisor was set up (so the missing host is an error, as it always was)
+    store.dir.mkdir(parents=True, exist_ok=True)
+    (store.dir / "supervisor.json").write_text("{}", encoding="utf-8")
     check = doctor._check_powershell_host(store)
     assert check == doctor.Check(
         name="powershell_host",
@@ -120,8 +123,14 @@ def test_doctor_powershell_check_keeps_result_and_locks_only_set_up_project(
         data={"status": "error", "task_status": "unknown"},
     )
     assert len(lock_entries) == int(initialized)
-    if not initialized:
-        assert list(tmp_path.iterdir()) == []
+
+
+def _a_supervisor_was_set_up(store: Store) -> Store:
+    """A supervisor setup file is there. A missing host is only an error when something needs one: with no setup file
+    and no continuous Codex wrapper marker the check says N/A (see the item 3b tests at the end of this file)."""
+    store.dir.mkdir(parents=True, exist_ok=True)
+    (store.dir / "supervisor.json").write_text("{}", encoding="utf-8")
+    return store
 
 
 def _windows_without_selection(monkeypatch: pytest.MonkeyPatch, program_files, on_path=()):
@@ -144,7 +153,7 @@ def test_doctor_powershell_check_says_found_not_verified_when_pwsh_is_present_bu
     pwsh.parent.mkdir(parents=True)
     pwsh.write_bytes(content)  # only its existence is tested; nothing is run, so it cannot be vouched for
     _windows_without_selection(monkeypatch, [str(pwsh)])
-    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    check = doctor._check_powershell_host(_a_supervisor_was_set_up(Store(tmp_path / "project")))
     assert (check.name, check.status, check.data) == (
         "powershell_host", "error", {"status": "error", "task_status": "unknown"},
     )
@@ -183,7 +192,7 @@ def test_doctor_powershell_check_names_the_found_path_for_a_path_only_install(
     # the reader to paste the raw path.
     pwsh = _pwsh_only_on_a_temp_path(monkeypatch, tmp_path / folder_name)
     _windows_without_selection(monkeypatch, [], on_path=None)
-    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    check = doctor._check_powershell_host(_a_supervisor_was_set_up(Store(tmp_path / "project")))
     assert check.status == "error"
     assert f"found at {pwsh};" in check.fix
     assert "`agenttalk supervise --select-pwsh --pwsh <path>`" in check.fix
@@ -563,7 +572,7 @@ def test_doctor_powershell_check_keeps_install_advice_when_no_pwsh_exists(
 ) -> None:
     missing = tmp_path / "pf" / "PowerShell" / "7" / "pwsh.exe"  # never created
     _windows_without_selection(monkeypatch, [str(missing)])
-    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    check = doctor._check_powershell_host(_a_supervisor_was_set_up(Store(tmp_path / "project")))
     assert check.status == "error"
     assert check.fix == doctor.psh.INSTALL_REMEDIATION
     assert doctor.psh.INSTALL_REMEDIATION in check.details
@@ -583,7 +592,7 @@ def test_doctor_powershell_check_never_runs_the_pwsh_it_finds(
     monkeypatch.setattr(doctor.psh, "resolve_candidate", boom)
     monkeypatch.setattr(doctor.psh.subprocess, "run", boom)
     monkeypatch.setattr(doctor.psh.subprocess, "Popen", boom)
-    assert doctor._check_powershell_host(Store(tmp_path / "project")).status == "error"
+    assert doctor._check_powershell_host(_a_supervisor_was_set_up(Store(tmp_path / "project"))).status == "error"
 
 
 def test_doctor_powershell_install_advice_constant_is_unchanged() -> None:
@@ -2682,3 +2691,315 @@ def test_check_scratch_hygiene_warns_and_names_access_errors(tmp_path: Path, mon
     assert result is not None
     assert result.status == "warn"
     assert "could not be listed" in result.details
+
+
+# ---------------------------------------------------------------- #716 item 3b: no supervisor footprint, no host error
+
+_NA_DETAILS = (
+    "N/A: no PowerShell host is selected, and no supervisor setup files or continuous Codex wrapper markers were "
+    "found here. The supervisor and the hang watchdog for a continuous Codex wrapper on Windows need a selected host. "
+    "Scheduled-task state was not checked."
+)
+_NA_FIX = "If you use either feature, install PowerShell 7 if needed, then run `agenttalk supervise --select-pwsh`."
+_NA_DATA = {"status": "n/a", "task_status": "unknown"}
+_UNKNOWN_FILES = (
+    "Cannot check the local supervisor or host-selection files; PowerShell host readiness is unknown.",
+    "Check access to the store folder, then run agenttalk doctor again.",
+)
+_SETUP_FILES = ["supervisor.json", "supervisor.ps1", "supervisor-task.ps1", "deadman.ps1", "bin/agenttalk.cmd"]
+
+
+def _windows_with_nothing_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Windows branch, no PowerShell 7 file anywhere, and no way for the check to run a host or a task query."""
+    _windows_without_selection(monkeypatch, [])
+
+    def never(*args, **kwargs):
+        raise AssertionError("the check must not inspect a task or probe a host here")
+
+    monkeypatch.setattr(doctor, "_inspect_selected_task", never)
+    monkeypatch.setattr(doctor.supervisor_lifecycle, "select_powershell_host", never)
+
+
+def _marker(store: Store, agent: str, content) -> None:
+    path = store.health_path(agent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content if isinstance(content, str) else json.dumps(content), encoding="utf-8")
+
+
+def _the_selection_lock_is_counted(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    entries: list[bool] = []
+    real_lock = Store._powershell_selection_lock
+
+    @contextlib.contextmanager
+    def tracked(self, *args, **kwargs):
+        with real_lock(self, *args, **kwargs):
+            entries.append(True)
+            yield
+
+    monkeypatch.setattr(Store, "_powershell_selection_lock", tracked)
+    return entries
+
+
+def test_no_store_at_all_is_na_with_an_unknown_task_and_creates_nothing(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    entries = _the_selection_lock_is_counted(monkeypatch)
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert check == doctor.Check(
+        name="powershell_host", status="ok", details=_NA_DETAILS, fix=_NA_FIX, data=_NA_DATA
+    )
+    assert entries == [] and list(tmp_path.iterdir()) == []  # no store, no lock
+
+
+def test_an_initialized_store_without_a_selection_or_a_footprint_is_na_under_the_selection_lock(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    entries = _the_selection_lock_is_counted(monkeypatch)
+    check = doctor._check_powershell_host(store)
+    assert check == doctor.Check(
+        name="powershell_host", status="ok", details=_NA_DETAILS, fix=_NA_FIX, data=_NA_DATA
+    )
+    assert entries == [True]
+    assert check.data["task_status"] == "unknown"  # not "not_configured": nothing was asked of Windows
+
+
+def test_the_selection_and_the_footprint_are_looked_at_while_the_lock_is_held(tmp_path, monkeypatch):
+    """A setup file that appears the moment the lock is taken is seen: the observation is made under the lock, not
+    before it. (Setup-file writers are not serialized by this lock: it is a point-in-time diagnostic.)"""
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    real_lock = Store._powershell_selection_lock
+
+    @contextlib.contextmanager
+    def lock_then_change(self, *args, **kwargs):
+        with real_lock(self, *args, **kwargs):
+            (self.dir / "supervisor.json").write_text("{}", encoding="utf-8")
+            yield
+
+    monkeypatch.setattr(Store, "_powershell_selection_lock", lock_then_change)
+    assert doctor._check_powershell_host(store).status == "error"
+
+
+@pytest.mark.parametrize("relative", _SETUP_FILES)
+@pytest.mark.parametrize("initialized", [True, False], ids=["initialized", "not-initialized"])
+@pytest.mark.parametrize("content", ["", "{", "{}"], ids=["empty", "malformed", "object"])
+def test_any_supervisor_setup_file_keeps_the_missing_host_error(tmp_path, monkeypatch, relative, initialized, content):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    if initialized:
+        store.init(["alpha"])
+    target = store.dir / Path(relative)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    check = doctor._check_powershell_host(store)
+    assert (check.status, check.data) == ("error", {"status": "error", "task_status": "unknown"})
+    assert "no PowerShell host is selected" in check.details and check.details.endswith("; task status UNKNOWN")
+    assert check.fix == doctor.psh.INSTALL_REMEDIATION
+
+
+def test_a_setup_file_that_is_a_folder_or_a_dangling_link_is_still_a_footprint(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    (store.dir / "supervisor.ps1").mkdir()  # something is there, whatever it is
+    assert doctor._check_powershell_host(store).status == "error"
+
+
+def test_a_codex_wrapper_loop_marker_keeps_the_error_and_names_every_agent(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha", "beta", "gamma"])
+    _marker(store, "gamma", {"cli": "codex", "mode": "wrapper-loop", "updated_at": "2001-01-01T00:00:00Z"})  # stale
+    _marker(store, "alpha", {"cli": "codex", "mode": "wrapper-loop", "state": "stopped"})
+    _marker(store, "beta", {"cli": "claude", "mode": "wrapper-loop"})  # a control: not a Codex loop
+    check = doctor._check_powershell_host(store)
+    assert (check.status, check.data) == ("error", {"status": "error", "task_status": "unknown"})
+    sentence = "A continuous Codex wrapper ran here for: alpha, gamma. Its hang watchdog needs a selected host"
+    assert sentence in check.details
+    assert "beta" not in check.details and "no PowerShell host is selected" in check.details
+    assert check.fix == doctor.psh.INSTALL_REMEDIATION and check.details.endswith("; task status UNKNOWN")
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [{"cli": "claude", "mode": "wrapper-loop"}, {"cli": "codex", "mode": "wrapper-one-shot"},
+     {"cli": "codex", "mode": "lead-loop"}],
+    ids=["claude-loop", "codex-one-shot", "codex-lead-loop"],
+)
+def test_markers_that_do_not_need_the_host_by_default_still_give_na(tmp_path, monkeypatch, marker):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    _marker(store, "alpha", marker)
+    assert doctor._check_powershell_host(store).details == _NA_DETAILS
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["", "{", "[]", '"codex"', "7", "null", "{}", '{"cli": "codex"}', '{"mode": "wrapper-loop"}',
+     '{"cli": 7, "mode": "wrapper-loop"}', '{"cli": "codex", "mode": ["wrapper-loop"]}',
+     '{"cli": "", "mode": "wrapper-loop"}', "﻿{}"],
+    ids=["empty", "truncated", "list", "string", "number", "null", "no-fields", "no-mode", "no-cli",
+         "cli-not-text", "mode-not-text", "cli-empty", "bom"],
+)
+def test_a_marker_that_cannot_be_read_as_a_marker_is_unknown_not_absent(tmp_path, monkeypatch, content):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    _marker(store, "alpha", content)
+    check = doctor._check_powershell_host(store)
+    assert (check.status, check.data) == ("error", {"status": "error", "task_status": "unknown"})
+    assert check.details.startswith("Cannot check wrapper health records; PowerShell host readiness is unknown.")
+    assert "alpha" in check.details
+    assert check.fix == "Check the team configuration and wrapper health records, then run agenttalk doctor again."
+
+
+def test_a_marker_that_cannot_be_opened_is_unknown(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    store.health_path("alpha").mkdir(parents=True)  # present, and not readable as a file
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and check.details.startswith("Cannot check wrapper health records")
+
+
+def test_an_unknown_marker_never_hides_a_codex_loop_marker_next_to_it(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    _marker(store, "alpha", "{")
+    _marker(store, "beta", {"cli": "codex", "mode": "wrapper-loop"})
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and "beta" in check.details
+
+
+@pytest.mark.parametrize("config", ["", "{", "[]", '{"agents": "alpha"}', '{"agents": ["bad name"]}'])
+def test_a_roster_that_cannot_be_read_is_unknown_not_na(tmp_path, monkeypatch, config):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    store.config_path.write_text(config, encoding="utf-8")
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and check.details.startswith("Cannot check wrapper health records")
+
+
+def test_a_started_store_without_a_roster_is_unknown_not_na(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.state_dir.mkdir(parents=True)  # state is there, the config that names the roster is not
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and check.details.startswith("Cannot check wrapper health records")
+
+
+def test_a_present_but_malformed_selection_is_never_na(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    (store.dir / "powershell-host.json").write_text("{", encoding="utf-8")
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and "malformed" in check.details
+
+
+def _lstat_fails_for(monkeypatch, target: Path, error: BaseException):
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if os.path.normcase(str(path)) == os.path.normcase(str(target)):
+            raise error
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(doctor.os, "lstat", lstat)
+
+
+@pytest.mark.parametrize("relative", ["powershell-host.json", *_SETUP_FILES, "config.json"])
+@pytest.mark.parametrize("error", [PermissionError(13, "Access is denied"), OSError(5, "Input/output error")])
+def test_a_file_that_cannot_be_looked_at_is_unknown_never_absent(tmp_path, monkeypatch, relative, error):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    _lstat_fails_for(monkeypatch, store.dir / Path(relative), error)
+    check = doctor._check_powershell_host(store)
+    assert (check.status, check.data) == ("error", {"status": "error", "task_status": "unknown"})
+    assert (check.details, check.fix) == _UNKNOWN_FILES
+
+
+@pytest.mark.parametrize("kind", ["file", "dangling-link"])
+def test_a_parent_that_is_not_a_plain_folder_makes_a_missing_child_unknown(tmp_path, monkeypatch, kind):
+    """`bin` is a file, or a link whose target cannot be followed: the child under it is not reliably absent."""
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    if kind == "file":
+        (store.dir / "bin").write_text("x", encoding="utf-8")
+    else:
+        import stat as _stat
+        import types
+
+        real_lstat = os.lstat
+        parent = os.path.normcase(str(store.dir / "bin"))
+
+        def lstat(path, *args, **kwargs):
+            if os.path.normcase(str(path)) == parent:
+                return types.SimpleNamespace(st_mode=_stat.S_IFLNK, st_file_attributes=0)
+            if os.path.normcase(str(path)).startswith(parent + os.sep):
+                raise FileNotFoundError(2, "the link's target is not there")
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(doctor.os, "lstat", lstat)
+    check = doctor._check_powershell_host(store)
+    assert (check.details, check.fix) == _UNKNOWN_FILES
+
+
+def test_a_missing_parent_is_a_reliable_absence(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    assert not (store.dir / "bin").exists()
+    assert doctor._check_powershell_host(store).details == _NA_DETAILS
+
+
+def test_na_keeps_the_found_file_advice_when_a_powershell_is_found_and_does_not_run_it(tmp_path, monkeypatch):
+    found = tmp_path / "pf dir" / "PowerShell" / "7" / "pwsh.exe"
+    found.parent.mkdir(parents=True)
+    found.write_bytes(b"")
+    _windows_without_selection(monkeypatch, [str(found)])
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert (check.status, check.details, check.data) == ("ok", _NA_DETAILS, _NA_DATA)
+    assert f"found at {found}" in check.fix
+    assert "`agenttalk supervise --select-pwsh` to check and select it" in check.fix
+    assert "the supervisor and the hang watchdog of a continuous Codex wrapper use the selected host" in check.fix
+
+
+def test_the_non_windows_answer_is_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor.sys, "platform", "linux")
+    check = doctor._check_powershell_host(Store(tmp_path / "project"))
+    assert check == doctor.Check(
+        name="powershell_host",
+        status="ok",
+        details="N/A: generated PowerShell supervisor and Scheduled Tasks are Windows-only",
+        data={"status": "n/a", "task_status": "n/a"},
+    )
+
+
+def test_the_doctor_command_reports_na_and_still_errors_on_a_root_with_no_store(tmp_path, monkeypatch, capsys):
+    _windows_with_nothing_found(monkeypatch)
+    monkeypatch.setattr(iskl, "default_claude_dir", lambda: tmp_path / "no-claude")
+    monkeypatch.setattr(iskl, "default_codex_dir", lambda: tmp_path / "no-codex")
+    Store(tmp_path / "team").init(["alpha"])
+    capsys.readouterr()
+    code = cli.main(["--root", str(tmp_path / "team"), "doctor", "--json"])
+    report = json.loads(capsys.readouterr().out)
+    host = next(item for item in report["checks"] if item["name"] == "powershell_host")
+    assert host == {"name": "powershell_host", "status": "ok", "details": _NA_DETAILS, "fix": _NA_FIX,
+                    "data": _NA_DATA}
+    assert code in (0, 2) and set(report) >= {"project_root", "overall", "checks"}  # other checks are the machine's
+    # a root with no store at all: the separate store check still errors, and nothing is created
+    empty = tmp_path / "empty-root"
+    empty.mkdir()
+    capsys.readouterr()
+    assert cli.main(["--root", str(empty), "doctor", "--json"]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["overall"] == "error"
+    assert next(i for i in report["checks"] if i["name"] == "powershell_host")["details"] == _NA_DETAILS
+    assert list(empty.iterdir()) == []

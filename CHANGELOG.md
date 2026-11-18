@@ -277,8 +277,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the folder with the shorter name instead, which might not exist or might hold a different
   `pwsh.exe`; the suggestions of `agenttalk supervise --select-pwsh` use the same search, so they now
   name the right file too.
-  Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
-  has just been set up can still end with `overall: ERROR` on Windows until that step is done.
+  Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before.
+  On Windows, `powershell_host` is no longer a permanent error for a team that does not use a supervisor.
+  When no host is selected, none of the supervisor setup files exists and no continuous Codex wrapper has
+  left its marker in the team folder, it says `N/A` (not an error, so a set-up team can now end with exit
+  code 0), explains that the supervisor and the hang watchdog of a continuous Codex wrapper both need a
+  selected host, and says the scheduled-task state was not checked (its data says `unknown`, not
+  `not_configured`: a task can outlive its files). It is a snapshot of local files, not proof that the
+  features are unneeded. It stays an error when a setup file is there, and when a Codex wrapper in the
+  team has left a continuous marker, even an old one (it names those agents). It also stays an error, saying
+  it could not check, when a file, a marker or the team list cannot be read or looked at: nothing is
+  called absent unless it was not found. A folder with no store at all gets the same `N/A`, and the
+  separate store check still reports it. Its advice is unchanged when a host is selected.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note
   for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report
   it to the agenttalk maintainers and that the maintenance advice is for them.

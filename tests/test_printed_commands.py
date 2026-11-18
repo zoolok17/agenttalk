@@ -422,7 +422,8 @@ def _doctor_host_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str)
     record = host_cases._record(store)
     record["path"] = path
     record["_warning"] = "the selected host is older than the one installed"
-    monkeypatch.setattr(doctor.supervisor_lifecycle, "read_selected_host", lambda s: record)
+    (store.dir / doctor.psh.SELECTION_FILENAME).write_text("{}", encoding="utf-8")  # a selection is on file
+    monkeypatch.setattr(doctor.supervisor_lifecycle, "read_selected_host_locked", lambda s: record)
     monkeypatch.setattr(doctor, "_inspect_selected_task", lambda *a: {"status": "ok"})
     # the check is Windows-only and answers "N/A" with no fix anywhere else: select its Windows branch, so these
     # tests run the real sink on every platform (the same way tests/test_powershell_doctor.py mocks Windows state)
