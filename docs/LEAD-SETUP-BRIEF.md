@@ -286,8 +286,11 @@ Run `agenttalk --root "<team>" doctor` now, and again after step 3b. Read the li
 marked `FAIL` or `warn`. A first run can end with `overall: ERROR` (exit code 2); that is
 expected until the points below are dealt with:
 
-- `powershell_host` (Windows): it says `N/A` and does not fail only when all of this holds: no host is
-  selected, there are no supervisor files, there is no continuous Codex wrapper marker (a Codex lead loop
+- `powershell_host` (Windows): in 0.101.1 it shows `FAIL` whenever no host is selected, even for a
+  team that uses neither a supervisor nor a continuous Codex wrapper; this brief leaves the supervisor
+  out, so that `FAIL` can wait unless you run a continuous Codex wrapper (then see the last sentence of
+  this point). Since 0.101.1: in the first release after v0.105.0 (not in v0.105.0 itself), it says
+  `N/A` and does not fail only when all of this holds: no host is selected, there are no supervisor files, there is no continuous Codex wrapper marker (a Codex lead loop
   counts), and doctor could read all of those files and markers. A host that is already selected goes
   through the normal check and can pass or fail. If it shows `FAIL`, the text says why: a supervisor was
   set up here, a continuous Codex wrapper has run here, or doctor could not check the files or the
@@ -1243,8 +1246,9 @@ works from a fresh shell; and your human knows how to start, stop and restart.
 - **Two windows must never act as the same seat.** One consumer per name. Do not
   `wait` or `drain` as a seat's name in another window.
 - **Skills load when an assistant starts.** Restart a window after `install-skills`.
-- **`doctor` can show `FAIL powershell_host` on Windows.** It says `N/A` instead only when no host is
-  selected, there are no supervisor files, there is no continuous Codex wrapper marker (a Codex lead loop
+- **`doctor` can show `FAIL powershell_host` on Windows.** In 0.101.1 (and v0.105.0) it always does
+  while no host is selected. Since 0.101.1: from the first release after v0.105.0, it says `N/A` instead
+  only when no host is selected, there are no supervisor files, there is no continuous Codex wrapper marker (a Codex lead loop
   counts), and doctor could read all of them; a file or marker it cannot read is an error. The host is
   used by the supervisor and by the hang watchdog of a continuous Codex wrapper: run
   `agenttalk supervise --select-pwsh` before you use either.
