@@ -289,7 +289,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   features are unneeded. A continuous Codex wrapper here means a Codex marker for a loop or for a managed
   lead loop (both keep the hang watchdog on by default); a Codex one-shot, or a Claude loop of either kind,
   needs no host by default. It stays an error when a setup file is there, and when a Codex wrapper in the
-  team has left a continuous marker, even an old one (it names those agents). It also stays an error, saying
+  team has left a continuous marker, even an old one (it names those agents), and the same holds for a seat
+  that is no longer on the roster (retired, renamed or removed; its marker stays and its wrapper may still run,
+  #847): doctor names it with "(not on the roster)" and says which marker file to remove once no wrapper runs
+  for it. It also stays an error, saying
   it could not check, when a file, a marker or the team list cannot be read or looked at, when a marker holds
   a value the wrapper never writes or JSON nested too deeply to read, or when a marker (or the config or selection) sits under a folder link
   that cannot be followed: nothing is called absent unless it was not found where it could be looked for. A

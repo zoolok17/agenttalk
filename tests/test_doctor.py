@@ -3208,3 +3208,140 @@ def test_the_doctor_command_reports_na_and_still_errors_on_a_root_with_no_store(
     assert report["overall"] == "error"
     assert next(i for i in report["checks"] if i["name"] == "powershell_host")["details"] == _NA_DETAILS
     assert list(empty.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# #847: retiring, renaming or force-removing a seat only edits the configuration. Its wrapper may still run, and its
+# marker stays, so the roster alone cannot say that no host is needed.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _store_with_a_departed_seat(tmp_path, how: str) -> tuple[Store, str]:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta", "gamma"])
+    _marker(store, "beta", {"cli": "codex", "mode": "wrapper-loop", "state": "idle_waiting"})
+    if how == "retire":
+        store.retire_agent("beta", reason="test")
+    elif how == "rename":
+        store.rename_agent("beta", "beta2", reason="test")
+    else:
+        store.remove_agent("beta")
+    assert "beta" not in store.load_config()["agents"]
+    assert store.health_path("beta").exists()  # the marker is still there: nothing removes it
+    return store, "beta"
+
+
+@pytest.mark.parametrize("how", ["retire", "rename", "force-remove"])
+def test_a_departed_seats_continuous_codex_marker_keeps_the_host_error(tmp_path, monkeypatch, how):
+    _windows_with_nothing_found(monkeypatch)
+    store, seat = _store_with_a_departed_seat(tmp_path, how)
+    check = doctor._check_powershell_host(store)
+    assert (check.status, check.data) == ("error", {"status": "error", "task_status": "unknown"})
+    sentence = "A continuous Codex wrapper ran here for: beta (not on the roster). Its hang watchdog needs a selected"
+    assert sentence + " host" in check.details
+    assert "keeps its marker file after it is retired, renamed or removed, and its wrapper may still be running" \
+        in check.details
+    assert check.details.endswith("; task status UNKNOWN") and "no PowerShell host is selected" in check.details
+    # How to clear it, and only what is true: a marker is advisory, a running wrapper writes it again.
+    assert "If no wrapper runs for that seat any more, remove its marker file, state/<seat>.health.json" in check.fix
+    assert "a wrapper that is still running writes it again" in check.fix
+    assert check.fix.startswith(doctor.psh.INSTALL_REMEDIATION)
+
+
+def test_removing_the_departed_seats_marker_clears_the_error(tmp_path, monkeypatch):
+    """The advice is true: with the marker gone and no wrapper for it, the check is N/A again."""
+    _windows_with_nothing_found(monkeypatch)
+    store, seat = _store_with_a_departed_seat(tmp_path, "retire")
+    assert doctor._check_powershell_host(store).status == "error"
+    store.health_path(seat).unlink()
+    assert doctor._check_powershell_host(store).details == _NA_DETAILS
+
+
+def test_a_departed_seat_and_a_roster_seat_are_both_named_and_only_the_departed_one_is_marked(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store, _seat = _store_with_a_departed_seat(tmp_path, "retire")
+    _marker(store, "alpha", {"cli": "codex", "mode": "lead-loop"})
+    check = doctor._check_powershell_host(store)
+    assert "ran here for: alpha, beta (not on the roster). Its hang watchdog" in check.details
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [{"cli": "claude", "mode": "wrapper-loop"}, {"cli": "claude", "mode": "lead-loop"},
+     {"cli": "codex", "mode": "wrapper-one-shot"}, {"cli": "codex", "mode": "wrapper"}],
+    ids=["claude-loop", "claude-lead-loop", "codex-one-shot", "codex-plain"],
+)
+def test_a_departed_seats_marker_that_needs_no_host_still_gives_na(tmp_path, monkeypatch, marker):
+    _windows_with_nothing_found(monkeypatch)
+    store, seat = _store_with_a_departed_seat(tmp_path, "retire")
+    _marker(store, seat, marker)
+    assert doctor._check_powershell_host(store).details == _NA_DETAILS
+
+
+@pytest.mark.parametrize("content", ["{", "[]", "", '{"cli": "gemini", "mode": "wrapper-loop"}', "\ufeff{}"],
+                         ids=["truncated", "list", "empty", "cli-unknown", "bom"])
+def test_a_departed_seats_marker_that_cannot_be_read_is_could_not_check_and_names_the_seat(
+    tmp_path, monkeypatch, content
+):
+    _windows_with_nothing_found(monkeypatch)
+    store, seat = _store_with_a_departed_seat(tmp_path, "retire")
+    _marker(store, seat, content)
+    check = doctor._check_powershell_host(store)
+    assert (check.status, check.data) == ("error", {"status": "error", "task_status": "unknown"})
+    assert check.details.startswith(_HEALTH_UNKNOWN_PREFIX)
+    assert "Affected: beta (not on the roster)." in check.details
+    assert check.fix == "Check the team configuration and wrapper health records, then run agenttalk doctor again."
+
+
+def test_a_departed_seats_marker_that_is_a_folder_or_a_link_is_not_followed_and_is_unknown(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store, seat = _store_with_a_departed_seat(tmp_path, "retire")
+    store.health_path(seat).unlink()
+    store.health_path(seat).mkdir()  # not a plain file
+    check = doctor._check_powershell_host(store)
+    assert check.details.startswith(_HEALTH_UNKNOWN_PREFIX) and "beta (not on the roster)" in check.details
+    store.health_path(seat).rmdir()
+    target = tmp_path / "elsewhere.json"
+    target.write_text(json.dumps({"cli": "claude", "mode": "wrapper-loop"}), encoding="utf-8")  # a harmless target
+    try:
+        os.symlink(target, store.health_path(seat))
+    except (OSError, NotImplementedError):
+        pytest.skip("this account cannot make a symbolic link")
+    check = doctor._check_powershell_host(store)
+    assert check.details.startswith(_HEALTH_UNKNOWN_PREFIX)  # the link is not opened, whatever it points at
+
+
+def test_files_in_the_state_folder_that_are_not_a_marker_name_are_ignored(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    loop = json.dumps({"cli": "codex", "mode": "wrapper-loop"})
+    for name in ("ghost.health.json.tmp", ".ghost.health.json", "ghost.health", "ghost.json", "notes.txt",
+                 "has space.health.json", "-leading.health.json", ".health.json", "ghost.heartbeat"):
+        (store.state_dir / name).write_text(loop, encoding="utf-8")  # a loop's content, but not a marker's name
+    (store.state_dir / "alpha.health.json").write_text(
+        json.dumps({"cli": "claude", "mode": "wrapper"}), encoding="utf-8")  # a roster marker, read as before
+    assert doctor._check_powershell_host(store).details == _NA_DETAILS
+
+
+def test_a_marker_that_differs_from_a_roster_name_only_in_case_is_the_roster_seats(tmp_path, monkeypatch):
+    """On a case-insensitive disk it is the same file the roster scan already read; it is not a departed seat."""
+    _windows_with_nothing_found(monkeypatch)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    (store.state_dir / "Alpha.health.json").write_text(
+        json.dumps({"cli": "claude", "mode": "wrapper"}), encoding="utf-8")
+    assert "(not on the roster)" not in doctor._check_powershell_host(store).details
+
+
+def test_more_departed_markers_than_the_limit_is_could_not_check(tmp_path, monkeypatch):
+    _windows_with_nothing_found(monkeypatch)
+    monkeypatch.setattr(doctor, "_OFF_ROSTER_MARKER_LIMIT", 3)
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    for number in range(4):
+        _marker(store, f"gone{number}", {"cli": "claude", "mode": "wrapper"})
+    check = doctor._check_powershell_host(store)
+    assert check.status == "error" and check.details.startswith(_HEALTH_UNKNOWN_PREFIX)
+    monkeypatch.setattr(doctor, "_OFF_ROSTER_MARKER_LIMIT", 4)
+    assert doctor._check_powershell_host(store).details == _NA_DETAILS  # at the limit is still read

@@ -37,6 +37,7 @@ from agenttalk.store import (
     find_root,
     find_stores_upward,
     store_fence_allows,
+    validate_agent_name,
 )
 
 
@@ -719,6 +720,11 @@ _SETUP_FILES_UNKNOWN = (
 _HEALTH_RECORDS_UNKNOWN = "Cannot check wrapper health records; PowerShell host readiness is unknown."
 _HEALTH_RECORDS_FIX = "Check the team configuration and wrapper health records, then run agenttalk doctor again."
 _MARKER_MAX_BYTES = 64 * 1024
+# Markers of seats that are not on the roster (retired, renamed or force-removed ones leave theirs behind): the file
+# name the wrapper writes, how many are read at most, and how their names are shown. See `_off_roster_marker_evidence`.
+_MARKER_SUFFIX = ".health.json"
+_OFF_ROSTER_MARKER_LIMIT = 256
+_OFF_ROSTER = " (not on the roster)"
 # What a wrapper health marker can really say (see cli.py, where the launcher sets the mode, and wrapper/run.py): the
 # two wrappable CLIs, and one of four modes. Anything else is not something the wrapper wrote, so it is unknown.
 _MARKER_CLIS = frozenset({"claude", "codex"})
@@ -795,20 +801,94 @@ def _wrapper_loop_evidence(store: Store) -> tuple[list[str], list[str], bool]:
         if state == _UNKNOWN:
             unknown.append(agent)
             continue
-        try:
-            with open(path, "rb") as handle:
-                raw = handle.read(_MARKER_MAX_BYTES + 1)
-            marker = json.loads(raw.decode("utf-8")) if 0 < len(raw) <= _MARKER_MAX_BYTES else None
-        except (OSError, ValueError, RecursionError):  # UnicodeDecodeError and json.JSONDecodeError are ValueErrors
-            marker = None
-        cli_name = marker.get("cli") if isinstance(marker, dict) else None
-        mode = marker.get("mode") if isinstance(marker, dict) else None
-        if not (isinstance(cli_name, str) and isinstance(mode, str)
-                and cli_name in _MARKER_CLIS and mode in _MARKER_MODES):
-            unknown.append(agent)
-        elif cli_name == "codex" and mode in _CODEX_LOOP_MODES:
+        kind = _read_marker_kind(path)
+        if kind == "loop":
             loops.append(agent)
-    return sorted(loops), sorted(unknown), False
+        elif kind == "unknown":
+            unknown.append(agent)
+    off_loops, off_unknown, listing_failed = _off_roster_marker_evidence(store, agents)
+    return sorted(loops) + off_loops, sorted(unknown) + off_unknown, listing_failed
+
+
+def _seat_label(name: str) -> str:
+    """A seat name as shown, the "(not on the roster)" note kept apart from the name that is cleaned for display."""
+    if name.endswith(_OFF_ROSTER):
+        return pc.line(name[: -len(_OFF_ROSTER)]) + _OFF_ROSTER
+    return pc.line(name)
+
+
+def _read_marker_kind(path: Path, *, plain_file_only: bool = False) -> str:
+    """"loop" (a continuous Codex wrapper), "other" (a well-formed marker that needs no host by default) or "unknown"
+    (it cannot be read as a marker the wrapper wrote). With `plain_file_only`, anything but a regular file (a link, a
+    folder, a device) is unknown and is never opened, so a link cannot be followed."""
+    if plain_file_only:
+        try:
+            info = os.lstat(path)
+        except (OSError, ValueError):
+            return "unknown"
+        if _is_link(info) or not stat.S_ISREG(info.st_mode):
+            return "unknown"
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(_MARKER_MAX_BYTES + 1)
+        marker = json.loads(raw.decode("utf-8")) if 0 < len(raw) <= _MARKER_MAX_BYTES else None
+    except (OSError, ValueError, RecursionError):  # UnicodeDecodeError and json.JSONDecodeError are ValueErrors
+        marker = None
+    cli_name = marker.get("cli") if isinstance(marker, dict) else None
+    mode = marker.get("mode") if isinstance(marker, dict) else None
+    if not (isinstance(cli_name, str) and isinstance(mode, str)
+            and cli_name in _MARKER_CLIS and mode in _MARKER_MODES):
+        return "unknown"
+    return "loop" if cli_name == "codex" and mode in _CODEX_LOOP_MODES else "other"
+
+
+def _off_roster_marker_evidence(store: Store, roster: list) -> tuple[list[str], list[str], bool]:
+    """The same evidence for seats that are NOT on the roster, as (loops, unknown, listing failed). Retiring, renaming
+    or force-removing a seat only edits the configuration: the seat's wrapper keeps running if it was, and its
+    `state/<seat>.health.json` stays, so the roster alone can say "no host needed" while a loop still needs one.
+    What counts as a marker of such a seat: a file in the store's state folder named exactly
+    `<safe agent name>.health.json` (the name the wrapper writes, as `validate_agent_name` judges it, so a temporary
+    file, a lock or any other name is ignored), whose seat is not on the roster (compared without regard to case), read
+    by the same rules as a roster marker and, on top of them, only as a regular file (a link or folder there is
+    "unknown", never followed). Names come back with " (not on the roster)" after them. More than
+    `_OFF_ROSTER_MARKER_LIMIT` of them, or a state folder that cannot be listed, is a failed listing: it is not known
+    that none of them is a loop."""
+    try:
+        info = os.lstat(store.state_dir)
+    except FileNotFoundError:
+        return [], [], False
+    except (OSError, ValueError):
+        return [], [], True
+    if _is_link(info) or not stat.S_ISDIR(info.st_mode):
+        return [], [], True
+    on_roster = {str(name).casefold() for name in roster}
+    seats: list[str] = []
+    try:
+        with os.scandir(store.state_dir) as entries:
+            for entry in entries:
+                if not entry.name.endswith(_MARKER_SUFFIX):
+                    continue
+                seat = entry.name[: -len(_MARKER_SUFFIX)]
+                try:
+                    validate_agent_name(seat)
+                except ValueError:
+                    continue  # not a name the wrapper could have written a marker for
+                if seat.casefold() in on_roster:
+                    continue
+                seats.append(seat)
+                if len(seats) > _OFF_ROSTER_MARKER_LIMIT:
+                    return [], [], True
+    except (OSError, ValueError):
+        return [], [], True
+    loops: list[str] = []
+    unknown: list[str] = []
+    for seat in sorted(seats):
+        kind = _read_marker_kind(store.health_path(seat), plain_file_only=True)
+        if kind == "loop":
+            loops.append(seat + _OFF_ROSTER)
+        elif kind == "unknown":
+            unknown.append(seat + _OFF_ROSTER)
+    return loops, unknown, False
 
 
 def _host_unknown_check(details: str, fix: str) -> Check:
@@ -860,8 +940,17 @@ def _check_powershell_host(store: Store) -> Check:
             message = message.removesuffix(f"; {psh.INSTALL_REMEDIATION}")
         loops = ""
         if codex_loops:
-            names = ", ".join(pc.line(name) for name in codex_loops)
+            names = ", ".join(_seat_label(name) for name in codex_loops)
             loops = f". A continuous Codex wrapper ran here for: {names}. Its hang watchdog needs a selected host"
+            if any(name.endswith(_OFF_ROSTER) for name in codex_loops):
+                # Retiring, renaming or removing a seat neither stops its wrapper nor removes its marker, and nothing
+                # else removes a marker: it stays after the wrapper has ended. A marker is advisory, and a wrapper that
+                # still runs writes its marker again, so removing it is safe once no wrapper runs for that seat.
+                loops += (". A seat that is not on the roster keeps its marker file after it is retired, renamed or "
+                          "removed, and its wrapper may still be running")
+                fix += (". If no wrapper runs for that seat any more, remove its marker file, "
+                        "state/<seat>.health.json in the store folder (a wrapper that is still running writes it "
+                        "again), then run agenttalk doctor again")
         return Check(
             name="powershell_host",
             status="error",
@@ -940,7 +1029,7 @@ def _powershell_host_without_selection(store: Store, *, initialized: bool) -> Ch
     if roster_unknown or unknown:
         affected = ""
         if unknown:
-            affected = " Affected: " + ", ".join(pc.line(name) for name in unknown) + "."
+            affected = " Affected: " + ", ".join(_seat_label(name) for name in unknown) + "."
         return _host_unknown_check(f"{_HEALTH_RECORDS_UNKNOWN}{affected}", _HEALTH_RECORDS_FIX)
     # The plain doctor output prints a fix only for a check that is not ok, so on this N/A line the optional next step
     # (and the found-file advice) is in the `--json` output only; the details line carries the explanation itself.
