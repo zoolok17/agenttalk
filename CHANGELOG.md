@@ -47,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Doctor now reports a host selection or config file nested too deeply instead of crashing.
+- Doctor now reports a PowerShell host selection or config file nested too deeply instead of crashing (#846).
 
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,

@@ -57,6 +57,16 @@ def test_config_reader_reports_nested_json(tmp_path, bad_json):
         store.load_config()
 
 
+def test_force_init_repairs_nested_config(tmp_path, monkeypatch, bad_json, capsys):
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    store.config_path.write_text(bad_json, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    capsys.readouterr()
+    assert cli.main(["init", "--here", "--agents", "alpha,beta", "--force"]) == 0
+    assert json.loads(store.config_path.read_text(encoding="utf-8"))["agents"] == ["alpha", "beta"]
+
+
 def test_doctor_reports_nested_config(tmp_path, bad_json):
     store = Store(tmp_path)
     store.init(["alpha"])
