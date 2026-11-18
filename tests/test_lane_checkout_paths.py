@@ -4121,3 +4121,246 @@ def test_a_worktree_path_the_registry_cannot_be_written_with_gets_repair_advice_
     lanes.save_lanes(store, data)
     capsys.readouterr()
     assert cli.main([*root, "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"]) == 0
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Removal safety (zteam's final read of PR #771): a checkout is removed only when that exact checkout is proven to be
+# the selected lane's own: its own absolute path, its own registry key, its own branch. Never another lane's folder.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _assign_second_lane(root: Path, base: str, lane_id: str = "other") -> Path:
+    """A second, non-overlapping lane (path src/other) through the public command; returns its checkout folder."""
+    from test_lanes import _branch
+
+    assert cli.main([
+        "--root", str(root), "lane", "assign", "--id", lane_id, "--from", "lead", "--assignee", "dev2",
+        "--domain", "core", "--base", base, "--target", _branch(root), "--path", "src/other",
+        "--worktrees-root", str(root / ".worktrees"),
+    ]) == 0
+    return Path(lanes.load_lanes(Store(root))["lanes"][lane_id]["worktree_path"])
+
+
+def _update_row(store: Store, lane_id: str, **fields) -> None:
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id].update(fields)
+    lanes.save_lanes(store, data)
+
+
+def _point_lane_at(store: Store, lane_id: str, folder: Path) -> None:
+    """Make the lane's two saved checkout fields name `folder`, both written absolute."""
+    canonical = lanes.canonical_host_path(folder)
+    _update_row(store, lane_id, worktree_path=str(folder), worktree_toplevel_canonical=canonical)
+
+
+def _move_other_to_the_name_of(store: Store, first_checkout: Path, other_id: str = "other") -> Path:
+    """The relative-path set-up of the review: the other lane's checkout is moved to <root>/<N>, N being the first
+    checkout's folder name, and the other lane's row follows it. Returns that new folder."""
+    from test_lanes import _git_rc
+
+    other_checkout = Path(lanes.load_lanes(store)["lanes"][other_id]["worktree_path"])
+    moved = store.root / first_checkout.name
+    assert _git_rc(store.root, "worktree", "move", str(other_checkout), str(moved)).returncode == 0
+    _point_lane_at(store, other_id, moved)
+    return moved
+
+
+def _published_with_cleanup_postponed(tmp_path, monkeypatch):
+    """A delivery that is published, whose checkout cleanup has not run: the retry that does it is the test."""
+    store, lane_id, checkout, head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    with monkeypatch.context() as postponed:
+        postponed.setattr(cli, "_lane_deliver_cleanup", lambda *args, **kwargs: (artifact, True, head))
+        cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"])
+    assert lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"] is False
+    return store, lane_id, checkout, head, artifact
+
+
+def _assert_untouched(*folders: Path) -> None:
+    gone = [f"{folder.parent.name}/{folder.name}" for folder in folders if not (folder / ".git").exists()]
+    assert not gone, f"these checkouts were removed: {gone}"
+
+
+def test_abandon_with_a_relative_path_removes_the_checkout_it_verified_or_nothing(tmp_path, monkeypatch, capsys):
+    """A relative worktree_path was verified against the caller's folder and removed against the store folder: the
+    command verified one checkout and removed another lane's. One absolute target is resolved and used for both."""
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    _assign_second_lane(root, base)
+    store = Store(root)
+    moved = _move_other_to_the_name_of(store, first)
+    _update_row(store, "first", worktree_path=first.name)  # relative; the saved canonical path still names `first`
+    monkeypatch.chdir(first.parent)  # from here the relative name reads as the first lane's own checkout
+    capsys.readouterr()
+
+    cli.main(["--root", str(root), "lane", "abandon", "--id", "first"])
+
+    _assert_untouched(first, moved)
+    assert (moved / "src" / "other" / "b.py").exists()
+    assert "first" in lanes.load_lanes(store)["lanes"]
+
+
+def test_delivery_cleanup_with_a_relative_path_removes_the_checkout_it_verified_or_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """The same split in the cleanup that ends a delivery: verified against one folder, removed from another."""
+    store, lane_id, first, _head, artifact = _published_with_cleanup_postponed(tmp_path, monkeypatch)
+    base = lanes.load_lanes(store)["lanes"][lane_id]["base_sha"]
+    _assign_second_lane(store.root, base)
+    moved = _move_other_to_the_name_of(store, first)
+    _update_row(store, lane_id, worktree_path=first.name)
+    monkeypatch.chdir(first.parent)
+    signed = artifact.read_bytes()
+    capsys.readouterr()
+
+    cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"])
+
+    _assert_untouched(first, moved)
+    assert artifact.read_bytes() == signed
+
+
+def test_abandon_does_not_remove_a_detached_checkout_that_another_lane_owns(tmp_path, capsys):
+    """Two checkouts at one commit are not one lane. A detached checkout at the lane branch's tip passed the check
+    for ANY row that named it; it is the first lane's only when nothing says it is somebody else's."""
+    from test_lanes import _assign_worktree, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    store = Store(root)
+    assert _git_rc(other, "checkout", "--detach", base).returncode == 0
+    _point_lane_at(store, "first", other)  # the first row now names the other lane's checkout
+    capsys.readouterr()
+
+    cli.main(["--root", str(root), "lane", "abandon", "--id", "first"])
+
+    _assert_untouched(first, other)
+    assert (other / "src" / "other" / "b.py").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a junction is a Windows folder link")
+def test_abandon_does_not_remove_a_checkout_reached_through_a_junction(tmp_path, capsys):
+    import subprocess
+
+    from test_lanes import _assign_worktree, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    store = Store(root)
+    assert _git_rc(other, "checkout", "--detach", base).returncode == 0
+    junction = tmp_path / "via-junction"
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(other)], capture_output=True, text=True)
+    if made.returncode != 0:
+        pytest.skip("this machine does not allow a junction here")
+    _update_row(store, "first", worktree_path=str(junction), worktree_toplevel_canonical=str(junction))
+    capsys.readouterr()
+
+    cli.main(["--root", str(root), "lane", "abandon", "--id", "first"])
+
+    _assert_untouched(first, other)
+
+
+def test_delivery_cleanup_does_not_remove_a_detached_checkout_that_another_lane_owns(tmp_path, monkeypatch, capsys):
+    from test_lanes import _git_rc
+
+    store, lane_id, first, head, artifact = _published_with_cleanup_postponed(tmp_path, monkeypatch)
+    base = lanes.load_lanes(store)["lanes"][lane_id]["base_sha"]
+    other = _assign_second_lane(store.root, base)
+    assert _git_rc(other, "checkout", "--detach", head).returncode == 0
+    _point_lane_at(store, lane_id, other)
+    signed = artifact.read_bytes()
+    capsys.readouterr()
+
+    cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"])
+
+    _assert_untouched(first, other)
+    assert artifact.read_bytes() == signed
+
+
+def test_gc_does_not_remove_an_active_lanes_checkout_found_in_a_retired_lanes_folder(tmp_path, capsys):
+    """gc finds a retired lane's folder by its name. A detached checkout of ANOTHER lane moved into that folder is
+    that other lane's: gc must neither call it safe to remove nor remove it."""
+    from test_lanes import _assign_worktree, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    store = Store(root)
+    assert _git_rc(root, "worktree", "remove", str(first)).returncode == 0
+    assert _git_rc(other, "checkout", "--detach", base).returncode == 0
+    assert _git_rc(root, "worktree", "move", str(other), str(first)).returncode == 0
+    _point_lane_at(store, "other", first)
+    _update_row(store, "first", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_ABANDONED)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root), "lane", "gc", "--delete", "--target", "HEAD", "--json"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    item = next(row for row in report["items"] if row["lane_id"] == "first")
+    assert item["worktree_remove_safe"] is False
+    assert item.get("worktree_removed") is not True
+    _assert_untouched(first)
+    assert (first / "src" / "other" / "b.py").exists()
+
+
+def test_a_checkout_that_only_its_own_lane_names_is_still_removed(tmp_path, capsys):
+    """The control for the ownership rules: a lane's own, attached checkout, named by no other lane, goes."""
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root), "lane", "abandon", "--id", "first"]) == 0
+
+    assert not first.exists()
+    _assert_untouched(other)
+
+
+def test_delivery_retry_does_not_delete_an_unrelated_file_named_by_a_damaged_pending_record(
+    tmp_path, monkeypatch, capsys
+):
+    """On a retry the committed final already exists, so publication returned early and the saved prepared-copy path
+    reached the unlink unchecked: a hand-damaged record deleted any file its path named."""
+    store, lane_id, _checkout, _head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    unrelated = tmp_path.parent / f"{tmp_path.name}-unrelated.txt"
+    unrelated.write_text("not part of any delivery\n", encoding="utf-8")
+    signed = artifact.read_bytes()
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["publish_pending"]["prepared_artifact"] = str(unrelated)
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+
+    assert unrelated.read_text(encoding="utf-8") == "not part of any delivery\n"
+    assert artifact.read_bytes() == signed
+    assert lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"] is False  # the delivery still finished
+
+
+def test_the_prepared_copy_of_a_delivery_is_removed_only_at_its_own_path(tmp_path, capsys):
+    """Every remover of a prepared copy asks `_lane_remove_prepared`: its own path goes, any other path stays."""
+    from test_lanes import _repo
+
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    transaction = "ab" * 16
+    own = lanes.prepared_delivery_artifact_path(store, "lane-a", transaction)
+    own.parent.mkdir(parents=True)
+    own.write_text("{}", encoding="utf-8")
+    stray = tmp_path / "stray.json"
+    stray.write_text("{}", encoding="utf-8")
+    pending = {"lane_id": "lane-a", "transaction_id": transaction}
+
+    other_lanes_copy = own.with_name("lane-b-" + transaction + ".prepared.json")
+    for raw in (str(stray), str(own.parent), "", None, 7, str(other_lanes_copy)):
+        cli._lane_remove_prepared(store, {**pending, "prepared_artifact": raw})
+        assert stray.exists() and own.exists() and own.parent.exists()
+    cli._lane_remove_prepared(store, {**pending, "transaction_id": "not-hex", "prepared_artifact": str(own)})
+    assert own.exists()
+    cli._lane_remove_prepared(store, {**pending, "prepared_artifact": str(own)})
+    assert not own.exists() and stray.exists()
+    capsys.readouterr()

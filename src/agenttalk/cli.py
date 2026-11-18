@@ -4977,6 +4977,47 @@ def _cleanup_failed_provision(
     return "; ".join(notes) if notes else None
 
 
+def _lane_checkout_folder(store, saved: str) -> str:
+    """The one absolute folder a saved `worktree_path` names. A relative name is read from the store's folder (where
+    `lane assign` writes a relative worktrees root from), never from the folder a command happens to run in, so the
+    check that a checkout is the lane's and the removal that follows look at the same folder. A name that depends on a
+    drive's current folder (`C:x`, `\\x`) has no single meaning and is refused."""
+    if lane_mod.path_is_absolute(saved):
+        return saved
+    path = Path(saved)
+    if path.drive or path.root:
+        raise lane_mod.LaneError(
+            f"the stored worktree path {saved!r} depends on a drive's current folder, so it names no single folder; "
+            "replace worktree_path in that lane's record in lanes.json with the checkout's real absolute folder")
+    return str(Path(store.root).absolute() / path)
+
+
+def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> str | None:
+    """The key of another lane whose saved checkout fields name one of `folders` (the same folder under another
+    spelling, a link or a junction included), or None. A checkout that two rows name is not proven to be either's."""
+    rows = lane_mod.load_lanes(store).get("lanes") or {}
+    for key, row in rows.items():
+        if key == lane_id or not isinstance(row, dict):
+            continue
+        for field in ("worktree_path", "worktree_toplevel_canonical"):
+            saved = row.get(field)
+            if not isinstance(saved, str) or lane_mod.checkout_path_problem({field: saved}) is not None:
+                continue
+            try:
+                named = _lane_checkout_folder(store, saved.replace("{ROOT}", str(store.root)))
+            except lane_mod.LaneError:
+                continue  # a spelling with no single meaning names no folder here
+            for folder in folders:
+                if _same_folder(named, folder):
+                    return key
+                try:
+                    if os.path.samefile(named, folder):
+                        return key
+                except (OSError, ValueError):
+                    pass  # one of them is not there: only the spelling comparison above could say
+    return None
+
+
 def _verify_lane_worktree(
     store, lane: dict, *, lane_id: str, expected_base: str | None = None, check_paths: bool = True,
 ) -> dict:
@@ -5006,6 +5047,10 @@ def _verify_lane_worktree(
         raise lane_mod.LaneError(
             f"lane row {pc.line(lane_id)} holds the lane id {pc.line(embedded_id)}; the two must match before its "
             f"checkout is checked or removed: repair lane_id in that row of lanes.json")
+    # One absolute folder, read the same way here and by the removal that follows (`_lane_checkout_folder`): a relative
+    # name was read from the folder the command ran in below, but from the store's folder by the removal, so one
+    # checkout could be verified and another removed.
+    wt = _lane_checkout_folder(store, wt)
     branch = lane_mod.lane_branch(embedded_id)
     toplevel = _git_read_one(wt, ["rev-parse", "--show-toplevel"], "worktree toplevel")
     toplevel_c = lane_mod.canonical_host_path(toplevel)
@@ -5042,7 +5087,27 @@ def _verify_lane_worktree(
             "lane branch tip")
         if head != branch_tip:
             raise lane_mod.LaneError("detached worktree HEAD is not at the lane branch tip")
+        # Sitting at the branch's commit says nothing about whose checkout it is: two lanes made from one base share
+        # that commit. So a detached checkout is this lane's only when the branch is not checked out anywhere else.
+        records = _worktree_records(store.root)
+        if records is None:
+            raise lane_mod.LaneError(
+                "this checkout is detached, and which worktrees are registered could not be established, so it is "
+                "not proven to be this lane's")
+        elsewhere = [str(record.get("worktree")) for record in records
+                     if record.get("branch") == lane_mod.lane_ref(embedded_id)
+                     and not _same_folder(str(record.get("worktree")), toplevel)]
+        if elsewhere:
+            raise lane_mod.LaneError(
+                f"this checkout is detached, and the lane branch {branch!r} is checked out in another worktree "
+                f"({', '.join(repr(path) for path in elsewhere)}), so this checkout is not proven to be this lane's")
         detached_at_lane_tip = True
+    # Whatever the branch says, a folder that another lane's row names is that lane's, never this one's.
+    owner = _lane_checkout_owned_by_another(store, lane_id, wt, toplevel)
+    if owner is not None:
+        raise lane_mod.LaneError(
+            f"this checkout is also the saved checkout of lane {pc.line(owner)}, so it is not proven to be lane "
+            f"{pc.line(lane_id)}'s alone: repair the saved checkout paths in lanes.json before anything is removed")
     rc, status = _git(wt, ["status", "--porcelain", "--untracked-files=no"])
     if rc != 0:
         raise lane_mod.LaneError(f"could not verify worktree tracked status (git rc={rc})")
@@ -5924,12 +5989,29 @@ def _lane_checkpoint_cleanup(store, lane_id: str, pending: dict, *,
         lane_mod.save_lanes(store, data)
 
 
-def _lane_remove_prepared(pending: dict) -> None:
+def _lane_remove_prepared(store, pending: dict) -> None:
+    """Remove the delivery's own prepared copy, and nothing else. The path in a saved record can be damaged, and the
+    check that publication makes of it is skipped when the final already exists (a retry), so the path is judged here,
+    at the one place that deletes: only the file this delivery's own identity names is removed. A record naming any
+    other path leaves that file alone and says so."""
     raw = pending.get("prepared_artifact")
     if not isinstance(raw, str):
         return
     try:
-        Path(raw).unlink(missing_ok=True)
+        own = lane_mod.prepared_delivery_artifact_path(
+            store, str(pending.get("lane_id")), str(pending.get("transaction_id")))
+        named = Path(raw) if Path(raw).is_absolute() else store.root / raw
+        mine = lane_mod.canonical_host_path(named) == lane_mod.canonical_host_path(own)
+    except (lane_mod.LaneError, OSError, ValueError):
+        mine = False
+    if not mine:
+        if raw:
+            sys.stderr.write(
+                "agenttalk lane deliver: the prepared copy named in the saved delivery record is not this delivery's "
+                "own prepared file, so it was left in place; check that record in lanes.json.\n")
+        return
+    try:
+        own.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -6146,7 +6228,7 @@ def _lane_abort_terminal_binding(
         _lane_quarantine_rejected_final(store, artifact)
     rollback, conflicts = _lane_rollback_pending_delivery(store, lane_id, pending)
     if rollback == "restored":
-        _lane_remove_prepared(pending)
+        _lane_remove_prepared(store, pending)
     elif rollback == "bound":
         raise lane_mod.LaneError(
             "lane terminal binding changed before the stale transaction could be rolled back"
@@ -6414,7 +6496,7 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
             raise _LaneTerminalBoundaryChanged(error, conflicts)
         artifact = Path(lane_mod.publish_delivery_artifact(store, pending))
         _lane_checkpoint_publication(store, lane_id, pending, artifact)
-        _lane_remove_prepared(pending)
+        _lane_remove_prepared(store, pending)
     else:
         artifact_raw = pending.get("committed_artifact")
         if not isinstance(artifact_raw, str):
@@ -6479,6 +6561,15 @@ def _lane_deliver_cleanup(store, lane_id: str, pending: dict, cleanup_lane: dict
     if not isinstance(wt_raw, str) or not wt_raw:
         _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
         return artifact, False, delivered_head
+    try:
+        # One absolute folder for the look, the verification and the removal below: the original spelling is never
+        # read again against another folder.
+        wt_raw = _lane_checkout_folder(store, wt_raw)
+    except lane_mod.LaneError as exc:
+        sys.stderr.write(
+            f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {exc}.\n"
+        )
+        return artifact, True, delivered_head
     wt = Path(wt_raw)
     try:
         wt_there = _lane_entry_present(wt)
@@ -7076,7 +7167,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             except (OSError, lane_mod.LaneError, TimeoutError):
                 pass
             if not persisted:
-                _lane_remove_prepared(pending)
+                _lane_remove_prepared(store, pending)
             sys.stderr.write(
                 f"agenttalk lane deliver: first delivery state save failed ({exc}); "
                 "no consumable artifact was published.\n"
@@ -7084,9 +7175,9 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             return 2
 
         if competing_delivery:
-            _lane_remove_prepared(pending)
+            _lane_remove_prepared(store, pending)
         elif cas_error:
-            _lane_remove_prepared(pending)
+            _lane_remove_prepared(store, pending)
             sys.stderr.write(
                 f"agenttalk lane deliver: CAS refused ({cas_error}); lane was not "
                 "committed.\n"
@@ -7395,8 +7486,9 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     if in_use is None:
                         try:
                             _verify_lane_worktree(store, lane, lane_id=lane_id)
-                            rc, _out, err = _git_write(
-                                store.root, ["worktree", "remove", "--", str(lane["worktree_path"])])
+                            rc, _out, err = _git_write(  # the folder the check above read: one absolute target
+                                store.root,
+                                ["worktree", "remove", "--", _lane_checkout_folder(store, lane["worktree_path"])])
                             lane["worktree_state"] = (
                                 lane_mod.STATUS_ABANDONED if rc == 0
                                 else lane_mod.STATUS_CLEANUP_FAILED)
