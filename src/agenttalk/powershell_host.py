@@ -702,7 +702,8 @@ def program_files_candidates(
 # U+001C..U+001F, U+0085, U+00A0 and more). The lookups doctor prints for an escaped path run in PowerShell, whose
 # Trim() takes the set it is given; giving it this same set (.Trim(' ', [char]9)) makes the two read an entry alike.
 # Narrower than before on purpose: a value padded with one of the other characters is no longer found, and a folder
-# whose real name ends in one is now found as it is (str.strip() cut that character off and missed the folder).
+# whose real name ends in one is now found as it is (str.strip() cut that character off and looked in the folder
+# with the shorter name, which might be missing or hold a different pwsh.exe).
 _ENV_PADDING = " " + chr(9)
 
 

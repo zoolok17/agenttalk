@@ -614,14 +614,17 @@ _HOST_USERS = "the supervisor and the hang watchdog of a continuous Codex wrappe
 # How to get the exact path of a found file whose display is escaped. Both print plain strings, one per line, so a
 # long value is never cut with an ellipsis (a table such as `Get-Command pwsh -All` or `Get-ChildItem Env:` is), and
 # each shows only the one thing it is about: never a listing of the environment, which holds credentials.
-# The expression that prints, one full path per line, every pwsh.exe the search finds on the PATH. It takes exactly
-# what the search takes: PATH split on the separator; each entry trimmed of the same explicit set (space and tab) and
-# then of surrounding double quotes (a quoted entry is legal on Windows); an entry kept only if it starts with an
-# ASCII drive letter, a colon and a slash (the search's own rule, so empty, relative and network-share entries drop
-# out); a file printed only if it exists, with Test-Path on the literal text so no wildcard in a folder name is
-# expanded. It uses only cmdlets, operators and string methods, so it behaves the same in Constrained Language mode
-# (which refuses calls to static .NET methods such as [IO.Path]::IsPathFullyQualified: the expression would run, print
-# nothing and exit 0). Plain strings, so nothing is cut with an ellipsis. It reads only the PATH variable.
+# The expression that prints, one full path per line, every pwsh.exe on the PATH that passes the search's entry rules.
+# It reads each entry exactly as the search does: PATH split on the separator; each entry trimmed of the same
+# explicit set (space and tab) and then of surrounding double quotes (a quoted entry is legal on Windows); an entry
+# kept only if it starts with an ASCII drive letter, a colon and a slash (the search's own rule, so empty, relative
+# and network-share entries drop out); a file printed only if it exists, with Test-Path on the literal text so no
+# wildcard in a folder name is expanded. It uses only cmdlets, operators and string methods, so it behaves the same
+# in Constrained Language mode (which refuses calls to static .NET methods such as [IO.Path]::IsPathFullyQualified:
+# the expression would run, print nothing and exit 0). Plain strings, so nothing is cut with an ellipsis. It reads
+# only the PATH variable.
+# Its list can be longer than the search's: the search also drops WindowsApps aliases and files on drives that are
+# not fixed, and pwsh lists its own folder first; the reader finds the line that matches the path shown above.
 PATH_LOOKUP = (
     "$env:PATH -split ';' | ForEach-Object { $e = $_.Trim(' ', [char]9).Trim('\"'); "
     "if ($e -cmatch '^[A-Za-z]:[\\\\/]') "
