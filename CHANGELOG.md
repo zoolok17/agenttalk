@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Close checks no longer report hidden submodule work as clean (#796).**
+  Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked.
+
 - **Closes now hold and show repair steps when their saved checkout cleanliness is damaged (#798).**
   If the saved record cannot say whether the checkout was clean, the close stays on HOLD and shows repair steps.
 

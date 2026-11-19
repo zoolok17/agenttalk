@@ -17,7 +17,7 @@ import stat
 import subprocess  # nosec B404 - fixed Git argv lists; shell is never used
 import uuid
 
-from agenttalk import acceptance_git, close
+from agenttalk import acceptance_git, close, git_index_safety
 from agenttalk.acceptance_schema import capabilities as schema
 
 MAX_BYTES = 1024 * 1024
@@ -323,13 +323,18 @@ def verify_project(repo, revision, *, live=True):
     project = acceptance_git.read_once(key, metadata) if _SHA.fullmatch(revision) else metadata()
     if live and (head if head is not None else git("rev-parse", "HEAD")) != project["revision"]:
         _fail("project HEAD must equal the verified SHA", "acceptance_project_unverified")
-    dirty = git("status", "--porcelain", "--untracked-files=all") if live else ""
+    dirty = git("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none") if live else ""
     if dirty:
         lines = dirty.splitlines()
         details = "\n".join(lines[:20])
         if len(lines) > 20:
             details += f"\n... {len(lines) - 20} more entries"
         _fail(f"acceptance project checkout is dirty:\n{details}", "acceptance_project_unverified")
+    if live:
+        if git_index_safety.check_hidden_index(repo, env=env).state != "safe":
+            _fail("acceptance project index is not verifiably clean", "acceptance_project_unverified")
+        if git_index_safety.check_close_submodules(repo, env=env).state != "safe":
+            _fail("acceptance project submodule is not verifiably clean", "acceptance_project_unverified")
     return project
 
 

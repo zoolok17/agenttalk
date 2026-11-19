@@ -3313,6 +3313,14 @@ def _worktree_clean_detail(root) -> tuple[bool | None, str | None]:
     return result.state == "safe", result.reason
 
 
+def _close_clean_detail(root) -> tuple[bool | None, str | None]:
+    clean, reason = _worktree_clean_detail(root)
+    if clean is not True:
+        return clean, reason
+    result = index_safety.check_close_submodules(root)
+    return result.state == "safe", result.reason
+
+
 def _print_unknown_cleanliness(action, *, hold_hint=False):
     message = (f"agenttalk close {action}: WARNING - Git could not report whether this checkout is clean; "
                "it is not recorded as clean.")
@@ -4202,7 +4210,7 @@ def cmd_close(args: argparse.Namespace) -> int:
         except (OSError, ValueError, TypeError, KeyError) as e:
             sys.stderr.write(f"agenttalk close open: invalid acceptance input: {e}\n")
             return 2
-        clean, index_reason = (True, None) if prepared else _worktree_clean_detail(store.root)
+        clean, index_reason = (True, None) if prepared else _close_clean_detail(store.root)
         if index_reason:
             _print_index_recovery(store.root, index_reason, action="open")
         unknown_cleanliness = clean is None
@@ -4588,7 +4596,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             except close_mod.CloseError as e:
                 sys.stderr.write(f"agenttalk close reopen: {e}\n")
                 return 2
-            wc, index_reason = _worktree_clean_detail(store.root)
+            wc, index_reason = _close_clean_detail(store.root)
             if index_reason:
                 _print_index_recovery(store.root, index_reason, action="reopen")
             if wc is None:

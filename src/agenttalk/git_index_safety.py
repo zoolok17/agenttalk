@@ -19,6 +19,7 @@ SUBMODULE = (
     "yourself before retrying"
 )
 SUBMODULE_UNKNOWN = "could not check whether this checkout contains a materialized submodule"
+SUBMODULE_NOT_CLEAN = "a submodule is not verifiably clean; inspect its files and Git index"
 STATUS_ARGS = [
     "-c",
     "core.fsmonitor=false",
@@ -37,10 +38,10 @@ class Inspection:
     reason: str | None = None
 
 
-def _checkout_root(root):
+def _checkout_root(root, *, env=None):
     command = ["git", "-C", str(root), "rev-parse", "--show-toplevel"]
     # Fixed read-only Git command, with no shell or user-selected operation.
-    result = subprocess.run(command, capture_output=True, timeout=15)  # noqa: S603  # nosec B603
+    result = subprocess.run(command, capture_output=True, timeout=15, env=env)  # noqa: S603  # nosec B603
     if result.returncode != 0 or not isinstance(result.stdout, bytes) or not result.stdout.endswith(b"\n"):
         raise ValueError("checkout root read failed")
     raw = result.stdout[:-1]
@@ -51,13 +52,14 @@ def _checkout_root(root):
     return checkout
 
 
-def _records(root, option):
+def _records(root, option, *, env=None):
     command = ["git", "-C", str(root), "ls-files", "--cached", option, "-z", "--full-name"]
     # Fixed read-only Git command, with no shell or user-selected operation.
     result = subprocess.run(  # noqa: S603  # nosec B603
         command,
         capture_output=True,
         timeout=15,
+        env=env,
     )
     if result.returncode != 0 or not isinstance(result.stdout, bytes):
         raise ValueError("index read failed")
@@ -114,11 +116,11 @@ def _entry(root, relative):
     raise ValueError("empty index path")
 
 
-def check_hidden_index(root) -> Inspection:
+def check_hidden_index(root, *, env=None) -> Inspection:
     try:
-        root = _checkout_root(root)
+        root = _checkout_root(root, env=env)
         hidden = False
-        for record in _records(root, "-v"):
+        for record in _records(root, "-v", env=env):
             if len(record) < 3 or record[1:2] != b" " or record[:1] not in [bytes([c]) for c in b"HSMRCK?hsmrck"]:
                 raise ValueError("invalid index tag")
             tag, path = record[:1], _path(record[2:])
@@ -156,6 +158,57 @@ def check_materialized_submodules(root) -> Inspection:
         return Inspection("hidden", SUBMODULE) if hidden else Inspection("safe")
     except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired):
         return Inspection("unverifiable", SUBMODULE_UNKNOWN)
+
+
+def check_close_submodules(root, *, env=None) -> Inspection:
+    """Check nested indexes and refuse content in uninitialized submodules."""
+    try:
+        pending = [_checkout_root(root, env=env)]
+        while pending:
+            checkout = pending.pop()
+            for record in _records(checkout, "--stage", env=env):
+                header, separator, raw = record.partition(b"\t")
+                if not separator or not re.fullmatch(
+                    rb"(?:100644|100755|120000|160000) [0-9a-f]{40}(?:[0-9a-f]{24})? [0-3]", header
+                ):
+                    raise ValueError("invalid staged index record")
+                relative = _path(raw)
+                if not header.startswith(b"160000 "):
+                    continue
+                info = _entry(checkout, relative)
+                if info is None:
+                    continue
+                if not _plain_directory(info):
+                    return Inspection("hidden", SUBMODULE_NOT_CLEAN)
+                folder = checkout / relative
+                try:
+                    metadata = os.lstat(folder / ".git")
+                except FileNotFoundError:
+                    with os.scandir(folder) as entries:
+                        if next(entries, None) is not None:
+                            return Inspection("hidden", SUBMODULE_NOT_CLEAN)
+                    continue
+                if stat.S_ISLNK(metadata.st_mode) or (
+                    getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                ):
+                    raise ValueError("uncertain submodule metadata")
+                if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)):
+                    raise ValueError("invalid submodule metadata")
+                if not os.path.samefile(_checkout_root(folder, env=env), folder):
+                    raise ValueError("submodule is not its own checkout")
+                if check_hidden_index(folder, env=env).state != "safe":
+                    return Inspection("hidden", SUBMODULE_NOT_CLEAN)
+                result = subprocess.run(  # noqa: S603  # nosec B603
+                    ["git", "-C", str(folder), *STATUS_ARGS], capture_output=True, timeout=15, env=env
+                )
+                if result.returncode != 0 or not isinstance(result.stdout, bytes):
+                    raise ValueError("submodule status failed")
+                if result.stdout:
+                    return Inspection("hidden", SUBMODULE_NOT_CLEAN)
+                pending.append(folder)
+        return Inspection("safe")
+    except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired):
+        return Inspection("unverifiable", SUBMODULE_NOT_CLEAN)
 
 
 def keep_reason(root) -> str | None:
