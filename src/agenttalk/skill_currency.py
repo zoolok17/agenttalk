@@ -80,7 +80,11 @@ _POINTS_BACK_RE = re.compile(
     rf"|{_NEGATION}[^;.:!?]*\bpinned\b",
     re.IGNORECASE,
 )
-_CLAUSE_END_RE = re.compile(r"[;.:!?]|\n\s*\n")
+# A clause ends at ; : ! ? a blank line, or a period before whitespace or the end of the text (so the period inside
+# `agenttalk.assurance` or `reply.md`, written without backticks, ends nothing).
+_CLAUSE_END_RE = re.compile(r"[;:!?]|\.(?!\S)|\n\s*\n")
+_INLINE_CODE_RE = re.compile(r"(?<!`)`(?!`)[^`\n]+`(?!`)")
+_CLAUSE_PUNCTUATION_RE = re.compile(r"[;.:!?]")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
@@ -413,13 +417,25 @@ def _forbids_the_pinned_command(after: str) -> bool:
     return False
 
 
+def _mask_inline_code_punctuation(text: str) -> str:
+    """``text`` with every clause-ending character inside a one-line inline code span replaced by a space, so the copy
+    is as long as the text and every word stays where it was: the dot in `` `agenttalk.assurance` `` or the colon in
+    `` `--meta status:done` `` does not end the clause the command is in. A span that is not closed on its line, and a
+    double-backtick span, are left as they are."""
+    return _INLINE_CODE_RE.sub(lambda span: _CLAUSE_PUNCTUATION_RE.sub(" ", span.group(0)), text)
+
+
 def _states_pinned_rule(text: str) -> bool:
     """True when the skill states the pinned-runtime rule itself: a condition on ``AGENTTALK_PY`` being set, then the
     pinned command (not forbidden, and a command split over two lines counts), with what to do otherwise close by. A
     mention, the name inside an HTML comment or inside a longer name, or the condition without its fallback does not
     count."""
     joined = _join_fenced_continuations(_HTML_COMMENT_RE.sub("", text))
-    return any(not _forbids_the_pinned_command(found.group("after")) for found in _RULE_RE.finditer(joined))
+    masked = _mask_inline_code_punctuation(joined)  # read only to cut clauses; the pattern reads `joined`
+    return any(
+        not _forbids_the_pinned_command(masked[found.start("after"):found.end("after")])
+        for found in _RULE_RE.finditer(joined)
+    )
 
 
 def _pinned_runtime_findings(rel: str, text: str, kind: str) -> list[Finding]:

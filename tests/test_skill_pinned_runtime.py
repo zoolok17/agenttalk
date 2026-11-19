@@ -559,3 +559,72 @@ def test_the_example_from_the_review_is_accepted_and_its_opposite_is_not(tmp_pat
     assert pinned_findings(tmp_path, "codex", valid) == []
     opposite = valid.replace("do not use the unpinned form", "do not use the pinned form")
     assert pinned_findings(tmp_path, "codex", opposite)
+
+
+# ----------------------------------------- punctuation inside the command's own words (#861, after #801)
+
+IN_THE_SPAN_FORBIDDEN = {
+    "dotted-module-must-not": "When AGENTTALK_PY is set, `{cmd}.assurance` must not be used; "
+    "otherwise run `python -m agenttalk send`.",
+    "dotted-module-do-not": "When AGENTTALK_PY is set, `{cmd}.assurance` do not use while it is set; "
+    "otherwise run `python -m agenttalk send`.",
+    "dotted-argument-must-not": "When AGENTTALK_PY is set, `{cmd} send --file reply.md` must not be used; "
+    "otherwise run `python -m agenttalk send`.",
+    "dotted-argument-do-not": "When AGENTTALK_PY is set, `{cmd} send --file reply.md` do not use while it is set; "
+    "otherwise run `python -m agenttalk send`.",
+    "colon-in-span-must-not": "When AGENTTALK_PY is set, `{cmd} send --meta status:done` must not be used; "
+    "otherwise run `python -m agenttalk send`.",
+    "sentence-in-span-must-not": "When AGENTTALK_PY is set, `{cmd} send --note 'Done. Next'` must not be used; "
+    "otherwise run `python -m agenttalk send`.",
+}
+IN_THE_SPAN_VALID = {
+    "dotted-module": "When AGENTTALK_PY is set, run `{cmd}.assurance scan`; otherwise use your manual.",
+    "dotted-argument": "When AGENTTALK_PY is set, run `{cmd} send --file reply.md`; do not use the unpinned form "
+    "while it is set; otherwise use your manual.",
+    "a-real-period-still-ends-the-clause": "When AGENTTALK_PY is set, run `{cmd} send`. Do not use the unpinned form; "
+    "otherwise use your manual.",
+}
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("name", sorted(IN_THE_SPAN_FORBIDDEN))
+def test_a_prohibition_after_punctuation_inside_the_command_span_is_seen(tmp_path, kind, shell, name) -> None:
+    """#861: a period or colon INSIDE the command's code span does not end the clause, so the "must not" that follows
+    is still about the command."""
+    rule = IN_THE_SPAN_FORBIDDEN[name].format(cmd=PINNED_FORMS[shell]) + "\n"
+    assert not sc._states_pinned_rule(rule), rule
+    assert pinned_findings(tmp_path, kind, rule + "Run `python -m agenttalk x`.\n")
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("name", sorted(IN_THE_SPAN_VALID))
+def test_a_valid_rule_with_punctuation_inside_the_command_span_still_states_the_rule(
+    tmp_path, kind, shell, name
+) -> None:
+    rule = IN_THE_SPAN_VALID[name].format(cmd=PINNED_FORMS[shell]) + "\n"
+    assert sc._states_pinned_rule(rule), rule
+    assert pinned_findings(tmp_path, kind, rule + "Run `python -m agenttalk x`.\n") == []
+
+
+UNQUOTED_FORBIDDEN = {
+    "dotted-module": "When AGENTTALK_PY is set, {cmd}.assurance must not be used; otherwise run python -m agenttalk x.",
+    "dotted-argument": "When AGENTTALK_PY is set, {cmd} send --file reply.md must not be used; "
+    "otherwise run python -m agenttalk x.",
+}
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("name", sorted(UNQUOTED_FORBIDDEN))
+def test_a_period_inside_a_word_of_a_command_written_without_backticks_does_not_end_the_clause(shell, name) -> None:
+    """The same split without a code span: a period ends a clause only before whitespace or the end of the text."""
+    rule = UNQUOTED_FORBIDDEN[name].format(cmd=PINNED_FORMS[shell]) + "\n"
+    assert not sc._states_pinned_rule(rule), rule
+
+
+def test_the_rule_pattern_still_reads_the_text_as_written_not_the_masked_copy() -> None:
+    """Only the cutting of the words after the command reads the masked copy: a period inside a code span between
+    "When" and the variable still keeps the condition from counting (the pattern allows no period there)."""
+    rule = 'When `a.b` says so, AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`; otherwise use your manual.\n'
+    assert not sc._states_pinned_rule(rule)
