@@ -1769,6 +1769,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     store = _get_store(args)
     payload = _gather_status(store)
     if args.json:
+        if not getattr(args, "show_account", False):
+            groups: dict[str, list[str]] = {}
+            for row in payload["agents"]:
+                account = row.get("capacity", {}).get("account")
+                if isinstance(account, str) and account:
+                    groups.setdefault(account, []).append(row["name"])
+            for row in payload["agents"]:
+                if "capacity" in row:
+                    account = row["capacity"].pop("account", None)
+                    if isinstance(account, str) and account:
+                        row["capacity"]["account_group"] = sorted(groups[account])
         print(json.dumps(payload, indent=2))
         return 0
     print(f"root:       {payload['root']}")
@@ -17511,6 +17522,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("status", help="Show roster, message count, per-agent cursor + unread.")
     ps.add_argument("--json", action="store_true",
                     help="Emit structured JSON instead of human-readable text.")
+    ps.add_argument("--show-account", action="store_true",
+                    help="Include the operating-system login name and folder fingerprint in JSON.")
     ps.set_defaults(func=cmd_status)
 
     pov = sub.add_parser(

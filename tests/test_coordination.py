@@ -1095,6 +1095,17 @@ def test_backcompat_json_shapes_without_new_features(tmp_path: Path, capsys) -> 
         assert set(a) == {"name", "role", "cursor", "unread", "heartbeat",
                           "last_seen_seconds", "stale", "health", "waiting",
                           "waiting_stale"}  # operator_facing ABSENT
+    from agenttalk import capacity
+    store = Store(root)
+    store.write_capacity("alpha", capacity.CapacitySnapshot.unknown("alpha", account="codex:test").to_dict())
+    status = _json_of(["status", "--json"], root, capsys)
+    agent_rows = {a["name"]: a for a in status["agents"]}
+    assert set(agent_rows["alpha"]["capacity"]) == {"state", "observed_at", "reason", "account_group"}
+    assert agent_rows["alpha"]["capacity"]["account_group"] == ["alpha"]
+    assert "capacity" not in agent_rows["beta"]
+    shown = _json_of(["status", "--json", "--show-account"], root, capsys)
+    shown_alpha = next(a for a in shown["agents"] if a["name"] == "alpha")
+    assert set(shown_alpha["capacity"]) == {"state", "observed_at", "reason", "account"}
     who = _json_of(["whoami", "--for", "alpha", "--json"], root, capsys)
     assert set(who) == {"root", "self", "self_in_roster", "peer", "role",
                         "groups", "roster", "unread", "owed", "warnings"}

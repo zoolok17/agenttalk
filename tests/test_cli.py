@@ -414,9 +414,17 @@ def test_status_json_schema(
         assert a["stale"] is None
         # cursor is None until something ack'd
         assert a["cursor"] is None
+        assert "capacity" not in a
     # beta got the message, so beta is unread=1
     beta = next(a for a in payload["agents"] if a["name"] == "beta")
     assert beta["unread"] == 1
+    from agenttalk import capacity as capmod
+    Store(store_root).write_capacity("alpha", capmod.CapacitySnapshot.unknown("alpha", account="codex:test").to_dict())
+    assert _run(["status", "--json"], store_root) == 0
+    rows = {a["name"]: a for a in _json.loads(capsys.readouterr().out)["agents"]}
+    assert set(rows["alpha"]["capacity"]) == {"state", "observed_at", "reason", "account_group"}
+    assert rows["alpha"]["capacity"]["account_group"] == ["alpha"]
+    assert "capacity" not in rows["beta"]
 
 
 def test_status_json_includes_heartbeat_when_set(
@@ -3991,7 +3999,7 @@ def test_616_capacity_account_display_privacy_and_grouping(tmp_path: Path, capsy
     from agenttalk import capacity as capmod
 
     monkeypatch.setattr(capmod.getpass, "getuser", lambda: "invented-login")
-    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta,gamma,legacy"])
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta,gamma,legacy,empty"])
     store = Store(tmp_path)
     first = capmod.account_key("codex", tmp_path / "invented-home-one")
     second = capmod.account_key("codex", tmp_path / "invented-home-two")
@@ -4020,8 +4028,32 @@ def test_616_capacity_account_display_privacy_and_grouping(tmp_path: Path, capsy
     assert store.read_capacity("alpha")["account"] == first
 
     assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
-    rows = {row["name"]: row for row in json.loads(capsys.readouterr().out)["agents"]}
-    assert rows["alpha"]["capacity"]["account"] == first
+    output = capsys.readouterr().out
+    assert "invented-login" not in output and "home-" not in output
+    rows = {row["name"]: row for row in json.loads(output)["agents"]}
+    assert rows["alpha"]["capacity"]["account_group"] == ["alpha", "beta"]
+    assert rows["beta"]["capacity"]["account_group"] == ["alpha", "beta"]
+    assert rows["gamma"]["capacity"]["account_group"] == ["gamma"]
+    assert "account_group" not in rows["legacy"]["capacity"]
+    assert all("account" not in row["capacity"] for row in rows.values() if "capacity" in row)
+    assert "capacity" not in rows["empty"]
+
+    assert cli.main(["--root", str(tmp_path), "status", "--json", "--show-account"]) == 0
+    shown = {row["name"]: row for row in json.loads(capsys.readouterr().out)["agents"]}
+    for agent, account in (("alpha", first), ("beta", first), ("gamma", second), ("legacy", None)):
+        expected = dict(rows[agent]["capacity"])
+        expected.pop("account_group", None)
+        expected["account"] = account
+        assert shown[agent]["capacity"] == expected
+    assert "capacity" not in shown["empty"]
+
+
+def test_867_status_show_account_help(capsys) -> None:
+    with pytest.raises(SystemExit) as result:
+        cli.main(["status", "--help"])
+    assert result.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "operating-system login" in text and "folder fingerprint" in text
 
 
 def test_616_capacity_show_account_help(capsys) -> None:

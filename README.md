@@ -1385,6 +1385,9 @@ in agenttalk waits for it or is held back by it.
   are never merged across seats: to judge the account, read the newest seat's row.
 - `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or
   `capacity=unknown(<reason>)` to each seat that has written a reading.
+  `status --json` shows `account_group` as the sorted seats sharing an account;
+  use `--show-account` to include the login and folder fingerprint instead.
+  The store itself records the login, so review it before sharing the store.
 - The web console and `agenttalk attention` show and warn only on figures that are still current.
 
 **Where the figures come from**
