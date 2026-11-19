@@ -57,6 +57,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A strict-mode Claude seat whose Python sits in a folder with brackets now gets the full-path form too.**
+  Since #828, a Claude seat in a stricter permission mode is told to run agenttalk through the full path
+  of its Python, but a path with `(` or `)`, such as one under `Program Files (x86)`, fell back to the old
+  form, which such a seat cannot run. A live Claude Code in `dontAsk` mode was tried with the rule for a
+  path holding `Program Files (x86)`: it allowed only that exact command, the same as for a path without
+  brackets. So the wrapper no longer refuses brackets. It still refuses a `*` (a rule reads it as "any
+  text"), characters that are unsafe inside double quotes, and a path that is not an existing full path
+  (#860).
 - **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
   Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
   variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run

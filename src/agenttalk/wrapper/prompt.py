@@ -83,10 +83,11 @@ def strict_reply_invocation(cli: str, argv: list[str], agenttalk_py: object) -> 
     # `"`, `$`, backtick and backslash change their meaning inside bash double quotes. The rest are special in
     # the allow rule `Bash(<this form> *)` (code.claude.com/docs/en/permissions, "Wildcard patterns" and
     # "Exec wrappers and find actions"): `*` matches any text there, quotes do not make it literal and there is
-    # no escape, so a star in the path would let the rule allow other programs; `(` and `)` enclose the rule,
-    # and the page does not say how one inside a Bash rule is read. `:` is special only as `:*` at the very end
-    # of a rule, never right after this path, and every Windows drive path holds one.
-    if any(c in '"$`\\*()' or unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in path):
+    # no escape, so a star in the path would let the rule allow other programs. `(` and `)` are allowed: a
+    # live Claude Code in dontAsk mode matched a rule for `Program Files (x86)` only to that exact path, as it
+    # did for a path without brackets (#860). `:` is special only as `:*` at the very end of a rule, never
+    # right after this path, and every Windows drive path holds one.
+    if any(c in '"$`\\*' or unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in path):
         return None
     return f'"{path}" -m agenttalk'
 
