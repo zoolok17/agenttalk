@@ -4581,7 +4581,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             wc, index_reason = _worktree_clean_detail(store.root)
             if index_reason:
                 _print_index_recovery(store.root, index_reason, action="reopen")
-            clean = True if wc is None else wc
+            clean = wc is True
         try:
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record

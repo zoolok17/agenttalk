@@ -70,6 +70,47 @@ def test_worktree_clean_without_git_is_unknown(tmp_path, monkeypatch):
     assert cli._worktree_clean(tmp_path) is None
 
 
+def test_close_reopen_does_not_record_clean_when_git_status_fails(repo, monkeypatch):
+    root, git = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    revision = git("rev-parse", "HEAD")
+    common = ["--root", str(root), "close"]
+    assert (
+        cli.main(
+            common
+            + [
+                "open",
+                "--id",
+                "check",
+                "--from",
+                "lead",
+                "--scope",
+                "release",
+                "--revision",
+                revision,
+                "--non-lane-isolation-not-asserted",
+            ]
+        )
+        == 0
+    )
+    assert close.load_close(store, "check")["revision_clean"] is True
+    original_git = cli._git
+    status_calls = []
+
+    def git_status_fails(path, args):
+        if args == cli.index_safety.STATUS_ARGS:
+            status_calls.append(True)
+            return 1, ""
+        return original_git(path, args)
+
+    monkeypatch.setattr(cli, "_git", git_status_fails)
+    assert cli.main(common + ["reopen", "--id", "check", "--from", "lead", "--revision", revision]) == 0
+    assert status_calls == [True]
+    assert close.load_close(store, "check")["revision_clean"] is False
+
+
 @pytest.mark.parametrize("action", ["open", "reopen"])
 @pytest.mark.parametrize("relative", ["untracked.txt", "new-folder/untracked.txt"])
 def test_close_records_untracked_files_as_dirty(repo, action, relative):
