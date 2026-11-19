@@ -678,3 +678,54 @@ def test_a_period_inside_a_word_still_does_not_end_the_clause(shell, words) -> N
     """Version numbers and dotted names written without backticks keep the "must not" in the command's own clause."""
     rule = f"When AGENTTALK_PY is set, run `{PINNED_FORMS[shell]}` {words}; otherwise use your manual.\n"
     assert not sc._states_pinned_rule(rule), rule
+
+
+# ----------------------------------- a drive-letter colon does not end a clause (#864)
+
+DRIVE_PATHS = {
+    "backslash": r"C:\temp\a.txt",
+    "slash": "C:/temp/a.txt",
+    "double-quoted-backslash": r'"C:\temp\a.txt"',
+    "single-quoted-slash": "'C:/temp/a.txt'",
+}
+FORBIDDING_AFTER_A_PATH = {
+    "must-not": "must not be used",
+    "do-not": "do not use while it is set",
+}
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("path", sorted(DRIVE_PATHS))
+@pytest.mark.parametrize("negation", sorted(FORBIDDING_AFTER_A_PATH))
+def test_a_drive_letter_colon_in_a_path_without_backticks_does_not_end_the_clause(shell, path, negation) -> None:
+    """#864: `... --file C:\\temp\\a.txt must not be used` is about the pinned command, so it is not the rule."""
+    rule = (
+        f"When AGENTTALK_PY is set, {PINNED_FORMS[shell]} send --file {DRIVE_PATHS[path]} "
+        f"{FORBIDDING_AFTER_A_PATH[negation]}; otherwise run python -m agenttalk send.\n"
+    )
+    assert not sc._states_pinned_rule(rule), rule
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("path", sorted(DRIVE_PATHS))
+def test_a_valid_rule_with_a_drive_path_still_states_the_rule(shell, path) -> None:
+    rule = (
+        f"When AGENTTALK_PY is set, run {PINNED_FORMS[shell]} send --file {DRIVE_PATHS[path]}; "
+        "do not use the unpinned form while it is set; otherwise use your manual.\n"
+    )
+    assert sc._states_pinned_rule(rule), rule
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("after", ["\n", " "], ids=["newline", "space"])
+def test_a_real_colon_before_whitespace_still_ends_the_clause(shell, after) -> None:
+    """The control: "run the command: do not use the unpinned form" is two clauses, the second about another command."""
+    rule = f"When AGENTTALK_PY is set, run `{PINNED_FORMS[shell]}`:{after}do not use the unpinned form; otherwise it"
+    assert sc._states_pinned_rule(rule), rule
+
+
+def test_a_colon_ends_a_clause_before_whitespace_or_the_end_of_the_text_and_a_drive_colon_does_not() -> None:
+    for text in ("x: y", "x:\ny", "x:"):
+        assert len(sc._CLAUSE_END_RE.split(text)) == 2, text
+    for text in ("C:\\temp\\a.txt", "C:/temp/a.txt", "d:\\x"):
+        assert len(sc._CLAUSE_END_RE.split(text)) == 1, text
