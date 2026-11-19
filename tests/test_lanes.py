@@ -3289,6 +3289,98 @@ def test_delivery_does_not_record_the_cleanup_as_done_when_the_worktree_cannot_b
     assert wt.exists() and fired
 
 
+def _checkout_cannot_be_resolved(monkeypatch: pytest.MonkeyPatch, *folders: Path) -> list[str]:
+    """`os.path.realpath(..., strict=True)` of exactly these folders fails with an access-denied error, on every system
+    (`_hidden_error` reaches it only where `realpath` is built on `os.lstat`, which is not Windows: there it asks the
+    system for the final path name instead). Without `strict` the answer is unchanged. Returns the calls it fired on."""
+    bad = {os.path.normcase(os.path.abspath(folder)) for folder in folders}
+    bad |= {os.path.normcase(os.path.realpath(folder)) for folder in folders}
+    real = os.path.realpath
+    fired: list[str] = []
+
+    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if strict and os.path.normcase(os.path.abspath(os.fspath(path))) in bad:
+            fired.append(os.fspath(path))
+            raise PermissionError(13, "injected: access denied")
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    return fired
+
+
+def test_delivery_is_published_when_the_checkout_cannot_be_examined_and_the_cleanup_keeps_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Round 29 (CI red on Linux): the same scenario as the test above, made to run on Windows too. A checkout that
+    cannot be examined is not proven to be outside this store, so the delivery (which removes nothing) is published;
+    the cleanup that follows is a removal, so it keeps the checkout and says why, and the lane stays cleanup pending."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "unexam")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nunexamined\n")
+    fired = _checkout_cannot_be_resolved(monkeypatch, wt)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "deliver", "--id", "unexam", "--from", "dev"], root) == 0
+
+    captured = capsys.readouterr()
+    saved = lanes.load_lanes(Store(root))["lanes"]["unexam"]
+    assert saved["status"] == lanes.STATUS_DELIVERED and saved.get("cleanup_pending") is True
+    assert Path(saved["delivery_artifact"]).is_file()
+    # The cleanup stops at the first removal-side look it cannot make (whether a launch uses the folder, then the
+    # check that it is this lane's own): either way the folder is kept and the reason is "could not be ...".
+    assert "cleanup pending" in captured.out and "could not be" in captured.err
+    assert "is not inside this store's folder" not in captured.err           # it is not claimed to be somewhere else
+    assert wt.exists() and fired
+
+
+def test_an_unexaminable_checkout_is_never_removed_by_abandon(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Round 29: the removal side stays strict. A checkout that cannot be examined is kept and nothing is changed (the
+    first look it cannot make is whether a launch uses it; the check that it is the lane's own is covered in
+    `test_the_worktree_check_tells_proven_outside_from_could_not_be_examined`)."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "unexrm")
+    wt = Path(lane["worktree_path"])
+    fired = _checkout_cannot_be_resolved(monkeypatch, wt)
+    capsys.readouterr()
+
+    before = lanes.load_lanes(Store(root))
+    assert _run_raw(["lane", "abandon", "--id", "unexrm"], root) == 3
+
+    err = capsys.readouterr().err
+    monkeypatch.undo()                                                  # look at the folder with the fault gone
+    assert wt.exists() and fired
+    assert "could not be established" in err and "was not removed" in err and "nothing was changed" in err
+    assert "is not inside this store's folder" not in err
+    assert lanes.load_lanes(Store(root)) == before
+
+
+def test_the_worktree_check_tells_proven_outside_from_could_not_be_examined(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 29: three answers, three results. Inside: nothing. Proven outside: refused for a delivery and a removal.
+    Could not be examined: refused for a removal only, in words that say so."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "place")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    outside = tmp_path.parent / (tmp_path.name + "-elsewhere")
+    outside.mkdir()
+
+    assert cli._lane_checkout_place(store, str(wt)) is None
+    kind, folder, _detail = cli._lane_checkout_place(store, str(outside))
+    assert (kind, folder) == ("outside", str(outside))
+    fired = _checkout_cannot_be_resolved(monkeypatch, wt)
+    kind, folder, detail = cli._lane_checkout_place(store, str(wt))
+    assert (kind, folder) == ("unknown", str(wt)) and "access denied" in detail and fired
+    assert cli._lane_checkout_outside_store(store, str(wt)) == str(wt)          # a removal-style caller: not proven
+
+    with pytest.raises(lanes.LaneError, match="could not be examined") as removal:
+        cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True, for_removal=True)
+    assert "is not inside this store's folder" not in str(removal.value)
+    provenance = cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True)      # a delivery
+    assert provenance["tracked_tree_clean"] is True
+
+
 def test_the_acknowledgement_does_not_accept_a_folder_it_cannot_look_at(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
     """Round 21 (4): `os.path.lexists(wt)` answered False for a hidden lstat error, so the acknowledgement was

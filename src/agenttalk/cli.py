@@ -5104,28 +5104,44 @@ def _strict_real(path, *, missing_tail_ok: bool = False) -> str:
         return os.path.normcase(os.path.join(_strict_real(parent, missing_tail_ok=True), name))
 
 
-def _lane_checkout_outside_store(store, *folders: str) -> str | None:
-    """None when every one of `folders` lies inside this store's folder, where `lane assign` always makes a lane's
-    checkout (a worktrees root outside the store folder is refused), and under no other store of its own; otherwise
-    the first folder that does not. This is the store's own evidence that a checkout is its own. A row can name a
-    checkout that belongs to ANOTHER store sharing the repository (a copied store folder, a restored lanes.json),
-    and every check on such a row passes, because every field in it is genuine: only where the folder is tells.
-    Paths are compared as they resolve (a link or junction into another store's folder counts as that folder), and
-    only when they resolve completely: a path that cannot be resolved (`_strict_real` raises) is not proven inside."""
+def _lane_checkout_place(store, *folders: str) -> tuple[str, str, str] | None:
+    """Where `folders` are, against this store's folder, as `(kind, folder, detail)`, or None when every one lies inside
+    this store's folder, where `lane assign` always makes a lane's checkout (a worktrees root outside the store folder
+    is refused), and under no other store of its own. This is the store's own evidence that a checkout is its own. A
+    row can name a checkout that belongs to ANOTHER store sharing the repository (a copied store folder, a restored
+    lanes.json), and every check on such a row passes, because every field in it is genuine: only where the folder is
+    tells. Paths are compared as they resolve (a link or junction into another store's folder counts as that folder),
+    and only when they resolve completely.
+
+    Two different answers are kept apart, because they call for different things:
+    - "outside": the folder resolved completely and it is not this store's (or another store lies between). Proven.
+    - "unknown": the folder (or the store's folder, or a folder between) could not be examined, so nothing is proven
+      either way (`detail` says what failed). A removal treats this as not inside; a delivery, which removes nothing,
+      does not refuse for it (see `_verify_lane_worktree`)."""
+    looking = None
     try:
         root = _strict_real(store.root)
         for folder in folders:
+            looking = folder
             real = _strict_real(folder, missing_tail_ok=True)
             if not real.startswith(root.rstrip(os.sep) + os.sep):
-                return folder
+                return "outside", folder, ""
             parent = os.path.dirname(real)
             while parent.startswith(root.rstrip(os.sep) + os.sep):  # a store of its own between the two is not ours
                 if _lane_dir_has_store_folder(parent):
-                    return folder
+                    return "outside", folder, ""
                 parent = os.path.dirname(parent)
-    except (OSError, ValueError):
-        return folders[0] if folders else None
+    except (OSError, ValueError) as exc:
+        return "unknown", looking if looking is not None else str(store.root), str(exc)
     return None
+
+
+def _lane_checkout_outside_store(store, *folders: str) -> str | None:
+    """None when every one of `folders` is proven inside this store's folder; otherwise the first folder that is not
+    proven so (outside it, or one that could not be examined: for a removal both mean "not ours", see
+    `_lane_checkout_place` for the difference)."""
+    place = _lane_checkout_place(store, *folders)
+    return None if place is None else place[1]
 
 
 def _lane_checkout_hazard(folder: str) -> tuple[str, str] | None:
@@ -5210,6 +5226,13 @@ def _lane_checkout_not_ours_text(store, folder: str) -> str:
         "retire the lane with `lane abandon --acknowledge-missing-worktree`")
 
 
+def _lane_checkout_unexamined_text(store, folder: str, detail: str) -> str:
+    return (
+        f"this checkout, {pc.line(folder)}, could not be examined ({pc.line(detail)}), so it is not known whether it "
+        f"lies inside this store's folder {pc.line(str(store.root))}, and it was left alone. Make the folder readable "
+        "and run the command again")
+
+
 def _verify_lane_worktree(
     store, lane: dict, *, lane_id: str, expected_base: str | None = None, check_paths: bool = True,
     store_owned: bool = False, for_removal: bool = False,
@@ -5252,9 +5275,13 @@ def _verify_lane_worktree(
         raise lane_mod.LaneError(
             f"registered worktree path {expected_c!r} does not match git toplevel {toplevel_c!r}")
     if store_owned:  # for a removal or a delivery: only a checkout this store can show it made (see the helper)
-        elsewhere_folder = _lane_checkout_outside_store(store, wt, toplevel)
-        if elsewhere_folder is not None:
-            raise lane_mod.LaneError(_lane_checkout_not_ours_text(store, elsewhere_folder))
+        place = _lane_checkout_place(store, wt, toplevel)
+        if place is not None and place[0] == "outside":
+            raise lane_mod.LaneError(_lane_checkout_not_ours_text(store, place[1]))
+        if place is not None and for_removal:  # nothing proves it is ours: an unexaminable checkout is never removed
+            raise lane_mod.LaneError(_lane_checkout_unexamined_text(store, place[1], place[2]))
+        # A delivery removes nothing, so a checkout that merely could not be examined here does not refuse it: it is
+        # published, and the cleanup that follows runs this same check as a removal and keeps the checkout (pending).
     if for_removal:  # a store inside the checkout, or a link the removal can follow out of it, is lost unseen by Git
         try:
             hazard = _lane_checkout_hazard(toplevel)
@@ -5309,12 +5336,17 @@ def _verify_lane_worktree(
                 f"({', '.join(repr(path) for path in elsewhere)}), so this checkout is not proven to be this lane's")
         detached_at_lane_tip = True
     # Whatever the branch says, a folder that another lane's row names is that lane's, never this one's.
+    owner = None
     try:
         owner = _lane_checkout_owned_by_another(store, lane_id, wt, toplevel)
     except (OSError, ValueError) as exc:
-        raise lane_mod.LaneError(
-            f"whether another lane owns this checkout could not be established ({pc.line(str(exc))}); it was left "
-            "alone") from exc
+        if for_removal:  # an unexaminable checkout is never removed
+            raise lane_mod.LaneError(
+                f"whether another lane owns this checkout could not be established ({pc.line(str(exc))}); it was "
+                "left alone") from exc
+        # Anything that removes nothing (a delivery and its terminal recheck, `lane check`, `lane assign`) is not
+        # refused for a checkout that could not be examined: the cleanup that follows runs this scan again as a
+        # removal. Same as the containment check above.
     if owner is not None and owner[1]:
         raise lane_mod.LaneError(
             f"this checkout is also the saved checkout of lane {pc.line(owner[0])}, so it is not proven to be lane "

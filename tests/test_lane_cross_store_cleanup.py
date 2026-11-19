@@ -271,6 +271,30 @@ def test_deliver_in_store_a_for_store_b_checkout_writes_nothing(two_stores, monk
     _b_checkout_is_intact(root_b, checkout)
 
 
+def test_the_refusal_for_store_b_checkout_says_it_is_outside_not_that_it_could_not_be_examined(
+        two_stores, monkeypatch, capsys):
+    """Round 29: a checkout PROVEN to be outside this store is still refused at the delivery boundary, before anything
+    is written, and for that reason (not the reason given for a checkout that could not be looked at)."""
+    from test_lanes import _commit
+
+    root_a, root_b, base, target = two_stores
+    b_row = _assign(root_b, base, target)
+    checkout = Path(b_row["worktree_path"])
+    _commit(checkout, "src/core/a.py", "base\nB's work in progress\n")
+    _row_in_a(root_a, root_b, b_row, "copied", monkeypatch)
+    store_a = Store(root_a)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root_a), "lane", "deliver", "--id", LANE, "--from", "dev"]) == 3
+
+    err = capsys.readouterr().err
+    assert "is not inside this store's folder" in err and "could not be examined" not in err
+    deliveries = store_a.dir / lanes.DELIVERIES_DIRNAME
+    assert not deliveries.exists() or not [p for p in deliveries.rglob("*") if p.is_file()]
+    assert lanes.load_lanes(store_a)["lanes"][LANE]["status"] == lanes.STATUS_ACTIVE
+    _b_checkout_is_intact(root_b, checkout)
+
+
 def test_store_a_still_removes_its_own_lanes_checkout_beside_store_b_lane(two_stores, monkeypatch, capsys):
     """The control: abandon and gc in A take A's own lane `y` (its checkout is inside A's folder), and B's `x` stays."""
     root_a, root_b, base, target = two_stores
