@@ -507,3 +507,55 @@ def test_a_backslash_or_backtick_outside_a_fence_joins_nothing() -> None:
     """Only a fenced command is continued (as the plain-command scan does it): prose that ends in a backtick is not."""
     prose = 'When AGENTTALK_PY is set, run `"$AGENTTALK_PY"`\n-m agenttalk; otherwise use your manual.\n'
     assert not sc._states_pinned_rule(prose)
+
+
+# A negation after the pinned command counts only when it is about THAT command (#801, codex-rev's read of the fix).
+
+VALID_AFTER = {
+    "about-the-unpinned-form": "{cmd}; do not use the unpinned form while it is set; otherwise use your manual.",
+    "not-optional": "{cmd}; the pinned interpreter is not optional; otherwise use your manual.",
+    "never-skip-it": "{cmd} (never skip it); otherwise use your manual.",
+    "never-the-bare-form": "{cmd}; never use the bare form while it is set; otherwise use your manual.",
+    "no-other-runtime": "{cmd}, and do not replace it with another runtime; otherwise use your manual.",
+    "not-to-be-omitted": "{cmd}, which is not to be omitted; otherwise use your manual.",
+}
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("name", sorted(VALID_AFTER))
+def test_a_negation_about_something_else_or_in_support_of_the_rule_still_states_the_rule(
+    tmp_path, kind, shell, name
+) -> None:
+    rule = "When AGENTTALK_PY is set, run " + VALID_AFTER[name].format(cmd=f"`{PINNED_FORMS[shell]}`") + "\n"
+    assert sc._states_pinned_rule(rule), rule
+    assert pinned_findings(tmp_path, kind, rule + "Run `python -m agenttalk x`.\n") == []
+
+
+INVALID_AFTER = {
+    "do-not-use-it": "{cmd}; do not use it; otherwise use python -m agenttalk.",
+    "it-must-not-be-used": "{cmd}; it must not be used; otherwise use python -m agenttalk.",
+    "do-not-use-the-pinned-command": "{cmd}; do not use the pinned command; otherwise use python -m agenttalk.",
+    "same-clause": "{cmd} must not be used; otherwise use python -m agenttalk.",
+    "never-permitted": "{cmd} is never permitted; otherwise use python -m agenttalk.",
+    "never-run-this": "{cmd}. Never run this; otherwise use python -m agenttalk.",
+}
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("name", sorted(INVALID_AFTER))
+def test_a_negation_that_forbids_the_pinned_command_still_does_not_state_the_rule(tmp_path, kind, shell, name) -> None:
+    rule = "When AGENTTALK_PY is set, run " + INVALID_AFTER[name].format(cmd=f"`{PINNED_FORMS[shell]}`") + "\n"
+    assert not sc._states_pinned_rule(rule), rule
+    assert pinned_findings(tmp_path, kind, rule + "Run `python -m agenttalk x`.\n")
+
+
+def test_the_example_from_the_review_is_accepted_and_its_opposite_is_not(tmp_path) -> None:
+    valid = (
+        'When AGENTTALK_PY is set, run "$AGENTTALK_PY" -m agenttalk; do not use the unpinned form while it is set; '
+        "otherwise use your manual. Run `python -m agenttalk send`.\n"
+    )
+    assert pinned_findings(tmp_path, "codex", valid) == []
+    opposite = valid.replace("do not use the unpinned form", "do not use the pinned form")
+    assert pinned_findings(tmp_path, "codex", opposite)

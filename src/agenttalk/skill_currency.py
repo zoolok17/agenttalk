@@ -48,8 +48,9 @@ _PLAIN_PYTHON_RE = re.compile(
 )
 _PLAIN_PYTHON_FORM = "python -m agenttalk"
 # A rule needs the condition, a Bash or PowerShell invocation, then the fallback nearby.
-# Reject negation between the condition and invocation AND between the invocation and the fallback (a guide that says
-# the pinned command "must not be used" states the opposite of the rule); require the invocation before the fallback.
+# Reject negation between the condition and invocation; require the invocation before the fallback. What follows the
+# invocation, up to the fallback, is read by `_forbids_the_pinned_command` (a guide that says the pinned command "must
+# not be used" states the opposite of the rule, but a "do not" about another command, or "not optional", does not).
 # PowerShell accepts both quoted and unquoted executable variables after its call operator.
 # Conditions may wrap at a line end or quote the name in backticks; bare mentions and
 # HTML comments do not state the rule.
@@ -60,10 +61,26 @@ _RULE_RE = re.compile(
     r"\b(?:if|when)\b[^.]{0,60}?(?<![\w])AGENTTALK_PY(?![\w])`?\s+is\s+set"
     + _UP_TO_FALLBACK_WITHOUT_NEGATION
     + r'(?:"\$AGENTTALK_PY"|&\s+(?:"\$env:AGENTTALK_PY"|\$env:AGENTTALK_PY))\s+-m\s+agenttalk(?![\w-])'
-    + _UP_TO_FALLBACK_WITHOUT_NEGATION
+    + r"(?P<after>[\s\S]{0,600}?)"
     + rf"(?:{_FALLBACK})",
     re.IGNORECASE,
 )
+# A negation that supports the rule ("not optional", "never skip it") is not a prohibition of the pinned command.
+_REINFORCEMENT_RE = re.compile(
+    r"\b(?:not|never)\s+(?:to\s+)?(?:be\s+)?(?:optional|negotiable|skipp?(?:ed)?|omitt?(?:ed)?|ignor(?:ed?)|"
+    r"replac(?:ed?)|bypass(?:ed)?|dropp?(?:ed)?|left\s+out)\b",
+    re.IGNORECASE,
+)
+# In a clause after the one that holds the command, a negation counts only when it points back at the pinned command:
+# "do not use it", "it must not be used", "do not use the pinned command" (but not "do not use the unpinned form").
+_POINTS_BACK_RE = re.compile(
+    rf"{_NEGATION}[^;.:!?]{{0,20}}?\b(?:use|used|run|call|invoke|follow|permit\w*|allow\w*)\b"
+    r"\s+(?:it|this|that|them)\b"
+    rf"|\b(?:it|this|that)\s+(?:\w+\s+){{0,2}}?{_NEGATION}"
+    rf"|{_NEGATION}[^;.:!?]*\bpinned\b",
+    re.IGNORECASE,
+)
+_CLAUSE_END_RE = re.compile(r"[;.:!?]|\n\s*\n")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
@@ -381,12 +398,28 @@ def _join_fenced_continuations(text: str) -> str:
     return "\n".join(joined_lines)
 
 
+def _forbids_the_pinned_command(after: str) -> bool:
+    """Whether the words after the pinned command, up to the rule's fallback, forbid that command ("... must not be
+    used", "... is never permitted"). A negation in the command's own clause does; one in a later clause does only
+    when it points back at the command; a negation about another command ("do not use the unpinned form") or one that
+    supports the rule ("not optional") does not. Known limit: this reads wording, so a prohibition phrased without any
+    of the listed negation words (`forbidden`) is not seen."""
+    for number, clause in enumerate(_CLAUSE_END_RE.split(after)):
+        clause = _REINFORCEMENT_RE.sub("", clause)
+        if not re.search(_NEGATION, clause, re.IGNORECASE):
+            continue
+        if number == 0 or _POINTS_BACK_RE.search(clause):
+            return True
+    return False
+
+
 def _states_pinned_rule(text: str) -> bool:
     """True when the skill states the pinned-runtime rule itself: a condition on ``AGENTTALK_PY`` being set, then the
     pinned command (not forbidden, and a command split over two lines counts), with what to do otherwise close by. A
     mention, the name inside an HTML comment or inside a longer name, or the condition without its fallback does not
     count."""
-    return bool(_RULE_RE.search(_join_fenced_continuations(_HTML_COMMENT_RE.sub("", text))))
+    joined = _join_fenced_continuations(_HTML_COMMENT_RE.sub("", text))
+    return any(not _forbids_the_pinned_command(found.group("after")) for found in _RULE_RE.finditer(joined))
 
 
 def _pinned_runtime_findings(rel: str, text: str, kind: str) -> list[Finding]:
