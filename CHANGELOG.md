@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Capacity headings now omit account identifiers by default.** This makes routine
   output safer to share. To see the operating-system login and home-folder fingerprint
-  as before, run `agenttalk capacity --show-account`.
+  as before, run `agenttalk capacity --show-account`. `agenttalk status --json` still
+  includes the account for now; that is tracked separately.
 - **The release checklist now names the README as the only install pin.** Since the user manuals
   stopped carrying their own install line (#835), step 1 of the release ritual in
   `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
