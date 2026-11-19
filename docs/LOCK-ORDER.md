@@ -15,7 +15,7 @@ must not hold locks from two different stores at once.
 | 20 | Assurance `coverage.lock`, held over coverage execution. |
 | 30 | Assurance `coverage-handoff.lock`, coordinates scan release and gate commit. It may remain held after rank 20 is released; it never reacquires rank 20. |
 | 40 | `supervisor-lifecycle.lock`: supervisor, lifecycle helpers, CLI launch/refresh, store instance management. |
-| 50 | `powershell-host.lock`: supervisor lifecycle and watchdog host selection. |
+| 50 | `powershell-host.lock`: supervisor lifecycle and watchdog host selection, and the read-only host check of `agenttalk doctor` (it takes no other ordered lock under it). |
 | 60 | `supervisor.instance.lock` file family (legacy instance coordination). |
 | 70 | `locks/lane-reset.lock`: lane delivery/reset. |
 | 80 | `locks/lane-*.transaction.lock`: delivery, resume and recovery. |
@@ -68,8 +68,8 @@ through the new session and cursor writes. CLI reset first takes lane-reset (70)
 A requeue keeps its recovery decision, record writes and publication inside
 retirement (150), then publication (160); it always re-reads config there.
 Reset never takes acceptance underneath publication. The persistent publication
-mutex lives outside the folders reset clears. The census is now 215 sites,
-including 70 in `store.py`; all other per-file counts are unchanged.
+mutex lives outside the folders reset clears. The census is now 217 sites,
+including 70 in `store.py` and 1 in `doctor.py` (the host check, rank 50); all other per-file counts are unchanged.
 
 Stop agents before reset: every sender waits for its publication hold, and a wait
 longer than 10 seconds fails. Wrapper operation sends and compaction batches can
@@ -78,7 +78,7 @@ This barrier does not make an interrupted plain reset recoverable, and an older
 reset writer that bypasses it is outside the protection.
 
 The acquisition-site census covers `store`, `close`, `cli`, `assurance`,
-`attention`, `checkpoint`, `gates`, `knowledge`, `lanes`, `lesson_context`,
+`attention`, `checkpoint`, `doctor`, `gates`, `knowledge`, `lanes`, `lesson_context`,
 `onboarding`, `recovery`, `supervisor`, `supervisor_lifecycle`, `work_board_facts`,
 `wrapper/obligations` and `wrapper/turn_watchdog`. Other primitives found by the
 package scan are the gateway lifecycle, comprehension scan and process-local
