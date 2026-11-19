@@ -4581,6 +4581,11 @@ def cmd_close(args: argparse.Namespace) -> int:
             wc, index_reason = _worktree_clean_detail(store.root)
             if index_reason:
                 _print_index_recovery(store.root, index_reason, action="reopen")
+            if wc is None:
+                sys.stderr.write(
+                    "agenttalk close reopen: WARNING - Git could not report whether this checkout is clean; "
+                    "it is not recorded as clean.\n"
+                )
             clean = wc is True
         try:
             with close_mod.close_transaction(store, args.id) as transaction:

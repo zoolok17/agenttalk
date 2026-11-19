@@ -70,7 +70,7 @@ def test_worktree_clean_without_git_is_unknown(tmp_path, monkeypatch):
     assert cli._worktree_clean(tmp_path) is None
 
 
-def test_close_reopen_does_not_record_clean_when_git_status_fails(repo, monkeypatch):
+def test_close_reopen_does_not_record_clean_when_git_status_fails(repo, monkeypatch, capsys):
     root, git = repo
     store = Store(root)
     store.init(["lead"])
@@ -106,9 +106,13 @@ def test_close_reopen_does_not_record_clean_when_git_status_fails(repo, monkeypa
         return original_git(path, args)
 
     monkeypatch.setattr(cli, "_git", git_status_fails)
+    capsys.readouterr()
     assert cli.main(common + ["reopen", "--id", "check", "--from", "lead", "--revision", revision]) == 0
     assert status_calls == [True]
     assert close.load_close(store, "check")["revision_clean"] is False
+    assert (
+        "Git could not report whether this checkout is clean; it is not recorded as clean." in capsys.readouterr().err
+    )
 
 
 @pytest.mark.parametrize("action", ["open", "reopen"])

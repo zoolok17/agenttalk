@@ -382,7 +382,7 @@ def compute_verdict(record: dict, gate_check: dict,
     if "dirty_artifact" not in record or (artifact is not None and not isinstance(artifact, str)):
         hold(HOLD_REVISION, _close_field_damage(record, "dirty_artifact", "a text pointer or null",
                                                "a valid --dirty-artifact pointer or no artifact"))
-    isolation = record.get("non_lane_isolation_not_asserted")
+    isolation = record.get("non_lane_isolation_not_asserted", False)
     if not isinstance(isolation, bool):
         hold(HOLD_WORKTREE_ISOLATION, _close_field_damage(
             record, "non_lane_isolation_not_asserted", "true or false",

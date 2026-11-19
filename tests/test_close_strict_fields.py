@@ -5,6 +5,7 @@ import json
 import pytest
 
 from agenttalk import cli, close, printed_commands as pc
+from agenttalk.store import Store
 from test_close import _gate_go, _satisfied
 
 
@@ -19,12 +20,25 @@ def test_bad_isolation_field_holds_and_names_repair(value):
     assert cli._close_worktree_eval(None, record)["status"] != "not_applicable"
 
 
-def test_missing_isolation_field_holds():
+def test_missing_isolation_field_does_not_waive_release():
     record = _satisfied()
     record.pop("non_lane_isolation_not_asserted")
     result = close.compute_verdict(record, _gate_go())
     assert result["verdict"] == "HOLD"
-    assert any("non_lane_isolation_not_asserted" in h["detail"] and "missing" in h["detail"] for h in result["holds"])
+    assert any(h["code"] == close.HOLD_WORKTREE_ISOLATION and "verified" in h["detail"] for h in result["holds"])
+    assert all("non_lane_isolation_not_asserted" not in h["detail"] for h in result["holds"])
+
+
+def test_legacy_record_without_isolation_keeps_docs_verdict(tmp_path):
+    store = Store(tmp_path)
+    store.init(["lead"])
+    record = _satisfied()
+    record["scope"] = record["gate_scope"] = "docs"
+    record.pop("non_lane_isolation_not_asserted")
+    close.create_close(store, record)
+    loaded = close.load_close(store, record["close_id"])
+    assert "non_lane_isolation_not_asserted" not in loaded
+    assert close.compute_verdict(loaded, _gate_go())["verdict"] == "GO"
 
 
 @pytest.mark.parametrize("value", [True, False])
