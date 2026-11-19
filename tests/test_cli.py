@@ -3958,8 +3958,9 @@ def test_301_an_old_reading_is_shown_stale_by_capacity_and_status(
     assert "capacity" not in rows["beta"]
 
 
+@pytest.mark.parametrize("show_account", [False, True])
 def test_301_r2_seats_on_one_account_each_show_their_own_row(
-    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch, show_account: bool,
 ) -> None:
     from agenttalk import capacity as capmod
 
@@ -3975,13 +3976,59 @@ def test_301_r2_seats_on_one_account_each_show_their_own_row(
         store.write_capacity(agent, snap.to_dict())
     capsys.readouterr()
 
-    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    assert cli.main(["--root", str(tmp_path), "capacity", *(["--show-account"] if show_account else [])]) == 0
     out = capsys.readouterr().out
-    assert out.count("codex account of OS user tester") == 1 and "2 seats: alpha, beta" in out
+    header = "  codex account of OS user tester, 2 seats: alpha, beta" if show_account else (
+        "  codex account, 2 seats: alpha, beta")
+    assert header in out.splitlines()
     rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("    ")}
     assert "12% used" in rows["alpha"] and "plan=pro" in rows["alpha"] and "3min ago" in rows["alpha"]
     assert "40% used" in rows["beta"] and "plan=plus" in rows["beta"] and "1min ago" in rows["beta"]
     assert out.index("    beta") < out.index("    alpha")          # newest first
+
+
+def test_616_capacity_account_display_privacy_and_grouping(tmp_path: Path, capsys, monkeypatch) -> None:
+    from agenttalk import capacity as capmod
+
+    monkeypatch.setattr(capmod.getpass, "getuser", lambda: "invented-login")
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta,gamma,legacy"])
+    store = Store(tmp_path)
+    first = capmod.account_key("codex", tmp_path / "invented-home-one")
+    second = capmod.account_key("codex", tmp_path / "invented-home-two")
+    for agent, account in (("alpha", first), ("beta", first), ("gamma", second), ("legacy", None)):
+        snapshot = capmod.CapacitySnapshot.unknown(agent, account=account).to_dict()
+        if account is None:
+            snapshot.pop("account")
+            snapshot.pop("schema_version")
+        store.write_capacity(agent, snapshot)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    out = capsys.readouterr().out
+    assert "invented-login" not in out and "home-" not in out
+    headers = [line for line in out.splitlines() if line.startswith("  codex account,")]
+    assert len(headers) == 2
+    assert set(headers) == {"  codex account, 2 seats: alpha, beta", "  codex account, 1 seat: gamma"}
+    assert any(line.startswith("  legacy") for line in out.splitlines())
+
+    assert cli.main(["--root", str(tmp_path), "capacity", "--show-account"]) == 0
+    out = capsys.readouterr().out
+    first_header = f"  codex account of OS user invented-login ({first.rsplit(':', 1)[1]}), 2 seats: alpha, beta"
+    second_header = f"  codex account of OS user invented-login ({second.rsplit(':', 1)[1]}), 1 seat: gamma"
+    assert first_header in out.splitlines()
+    assert second_header in out.splitlines()
+    assert store.read_capacity("alpha")["account"] == first
+
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    rows = {row["name"]: row for row in json.loads(capsys.readouterr().out)["agents"]}
+    assert rows["alpha"]["capacity"]["account"] == first
+
+
+def test_616_capacity_show_account_help(capsys) -> None:
+    with pytest.raises(SystemExit) as result:
+        cli.main(["capacity", "--help"])
+    assert result.value.code == 0
+    assert "operating-system login name" in capsys.readouterr().out
 
 
 def test_301_r2_an_expired_reading_is_never_shown_as_current(

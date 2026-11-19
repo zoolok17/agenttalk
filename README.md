@@ -1379,7 +1379,8 @@ in agenttalk waits for it or is held back by it.
 
 **What you will see**
 
-- `agenttalk capacity` lists the seats that share an account under one line naming that account.
+- `agenttalk capacity` lists the seats that share an account under a provider heading.
+  Add `--show-account` to include the operating-system login name and home-folder fingerprint.
   Below it, each seat shows its own reading, newest first, with how long ago it was seen. Readings
   are never merged across seats: to judge the account, read the newest seat's row.
 - `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or

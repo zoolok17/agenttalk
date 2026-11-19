@@ -12264,9 +12264,11 @@ def cmd_capacity(args: argparse.Namespace) -> int:
         indent = "  "
         if account:  # a file written before #301 names no account: rows stand alone
             provider, _, rest = account.partition(":")
-            user, _, home = rest.partition(":")
-            print(f"  {provider} account of OS user {user}{f' ({home})' if home else ''}, "
-                  f"{len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
+            label = f"{provider} account"
+            if args.show_account:
+                user, _, home = rest.partition(":")
+                label += f" of OS user {user}{f' ({home})' if home else ''}"
+            print(f"  {label}, {len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
             indent = "    "
         ages = {a: capmod.age_seconds(str(capmod.newest_observed_at(caps[a]) or "")) for a in agents}
         for agent in sorted(agents, key=lambda a: float("inf") if ages[a] is None else ages[a]):
@@ -20191,6 +20193,8 @@ def build_parser() -> argparse.ArgumentParser:
     pcap.add_argument("mode", nargs="?", choices=["show", "refresh"], default="show",
                       help="show (default) the team's published budgets, or refresh (publish your own)")
     pcap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    pcap.add_argument("--show-account", action="store_true",
+                      help="On show, print the operating-system login name and home-folder fingerprint")
     pcap.add_argument("--source", choices=["auto", "claude", "codex"], default="auto",
                       help="On refresh, which local source to read (default: auto-detect)")
     pcap.add_argument("--threshold", type=float, default=80.0,
