@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It covers the rule for the agenttalk command a strict seat is given (the interpreter's path
   written out, with the rule the wrapper prints from #828 on, and the older `PATH` workaround for
   versions before it), the rule that lets a seat write its reply drafts (with the two-slash form
-  for absolute paths on Linux and macOS), which settings files Claude Code adds together, and how
-  to test your own rules. Every statement about Claude Code says whether the other team reported
+  for absolute paths on Linux and macOS), which settings files Claude Code adds together, how a
+  strict seat gets its own rules when its launch does not load `CLAUDE.local.md`
+  (`--append-system-prompt-file`), and how to test your own rules. Every statement about Claude Code says whether the other team reported
   it, agenttalk's maintainers measured it, or Claude Code's documentation says it. It also says
   what such rules cannot catch: git options and settings that write or read files or start a
   program, `git branch` changes, reads that name no file such as `grep -r`, and agenttalk's own
