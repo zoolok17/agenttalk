@@ -22,6 +22,7 @@ How store A comes to hold a row `x` that names B's checkout:
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -637,7 +638,8 @@ def test_a_git_entry_that_is_a_link_is_refused_whatever_it_leads_to(two_stores, 
 
 
 def test_a_real_symbolic_link_for_the_git_entry_is_refused(two_stores, monkeypatch, capsys):
-    """The arrangement itself, where the machine allows a file symlink (Windows without Developer Mode does not)."""
+    """The arrangement itself. It skips only on Windows, where a file symlink needs a privilege (Developer Mode) the
+    machine may not give; on Linux and macOS a symlink that cannot be made fails the test, it never skips."""
     from test_lanes import _commit
 
     root_a, root_b, base, target = two_stores
@@ -649,7 +651,9 @@ def test_a_real_symbolic_link_for_the_git_entry_is_refused(two_stores, monkeypat
     try:
         os.symlink(original / ".git", copy / ".git")
     except OSError as exc:
-        pytest.skip(f"this machine does not allow a file symlink here ({exc})")
+        if sys.platform != "win32":
+            raise
+        pytest.skip(f"this Windows account does not allow a file symlink here ({exc})")
     capsys.readouterr()
 
     rc = cli.main(["--root", str(root_a), "lane", "deliver", "--id", LANE, "--from", "dev"])
