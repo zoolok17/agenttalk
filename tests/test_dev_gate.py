@@ -1820,7 +1820,8 @@ def test_manifest_rejects_pytest_args_without_the_timing_or_skip_flags(args: lis
 
 def test_committed_pytest_time_limits_are_pinned_per_os() -> None:
     """#378: retain 9,000 s per Windows group and 7,200 s per full POSIX run
-    after two hosted runs showed the remaining room and runner variation."""
+    after two hosted runs showed the remaining room and runner variation; the
+    Windows job ceiling went from 330 to 360 minutes on 2026-11-18 (ceiling stops)."""
     spec = dev_gate.validate_manifest(_manifest())["checks"]["pytest"]
     assert spec["timeout_seconds"] == 7200
     assert spec["windows_timeout_seconds"] == 9000
@@ -1828,7 +1829,8 @@ def test_committed_pytest_time_limits_are_pinned_per_os() -> None:
     reason = spec["windows_timeout_reason"]
     for observed in ("3962 s (44%)", "4 h 18 min (78%)", "72 minutes", "A and B balanced on every leg",
                      "234", "240", "five recent ungrouped runs", "41-65 s", "42306971465", "42419154846",
-                     "+17.5%", "retain 9000 seconds", "330-minute"):
+                     "+17.5%", "retain 9000 seconds", "330-minute", "360 minutes", "44264760386",
+                     "no failing test"):
         assert observed in reason, observed
 
 
