@@ -3298,6 +3298,24 @@ def _resolve_revision(root, ref: str) -> tuple[str, str]:
         "pass a full 40-char SHA or run inside the repo")
 
 
+def _reopen_revision(root, ref: str) -> str:
+    """Require the store's enclosing checkout to be at the requested commit."""
+    from agenttalk import close as close_mod
+    rc, inside = _git(root, ["rev-parse", "--is-inside-work-tree"])
+    if rc != 0 or inside.strip() != "true":
+        raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
+    rc, resolved = _git(root, ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"])
+    revision = resolved.strip()
+    if rc != 0 or not close_mod._FULL_SHA_RE.fullmatch(revision):
+        raise close_mod.CloseError("requested revision could not be resolved in this checkout")
+    rc, head = _git(root, ["rev-parse", "--verify", "HEAD^{commit}"])
+    if rc != 0 or not close_mod._FULL_SHA_RE.fullmatch(head.strip()):
+        raise close_mod.CloseError("checkout HEAD could not be verified")
+    if head.strip() != revision:
+        raise close_mod.CloseError("checkout HEAD differs from the requested revision; inspect the checkout")
+    return revision
+
+
 def _worktree_clean(root) -> bool | None:
     """None only for unavailable status; False also includes index uncertainty."""
     return _worktree_clean_detail(root)[0]
@@ -4227,6 +4245,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             lane_delivery_artifact=getattr(args, "lane_artifact", None),
             non_lane_isolation_not_asserted=bool(
                 getattr(args, "non_lane_isolation_not_asserted", False)))
+        record["revision_clean_state"] = "unknown" if unknown_cleanliness else ("clean" if clean else "not_clean")
         record["worktree_isolation"] = _close_worktree_eval(store, record)
         if prepared:
             # A crash before the freeze transaction must leave a HOLD-only close.
@@ -4589,24 +4608,18 @@ def cmd_close(args: argparse.Namespace) -> int:
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "reopen")
         revision = None
-        clean = None
-        if getattr(args, "revision", None):
-            try:
-                revision, _kind = _resolve_revision(store.root, args.revision)
-            except close_mod.CloseError as e:
-                sys.stderr.write(f"agenttalk close reopen: {e}\n")
-                return 2
-            wc, index_reason = _close_clean_detail(store.root)
-            if index_reason:
-                _print_index_recovery(store.root, index_reason, action="reopen")
-            if wc is None:
-                _print_unknown_cleanliness("reopen")
-            clean = wc is True
         try:
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
+                revision = _reopen_revision(store.root, args.revision or record.get("revision", ""))
+                wc, index_reason = _close_clean_detail(store.root)
+                if index_reason:
+                    _print_index_recovery(store.root, index_reason, action="reopen")
+                if wc is None:
+                    _print_unknown_cleanliness("reopen")
                 close_mod.reopen(record, by=actor, at=_iso_now(),
-                                 revision=revision, revision_clean=clean)
+                                 revision=revision, revision_clean=wc is True)
+                record["revision_clean_state"] = "unknown" if wc is None else ("clean" if wc else "not_clean")
                 transaction.commit()
         except (close_mod.CloseConflict, TimeoutError) as e:
             return _close_conflict_result("reopen", e)

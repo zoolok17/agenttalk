@@ -111,6 +111,7 @@ def test_close_open_unknown_status_is_not_clean(repo, monkeypatch, capsys, extra
     assert status_calls == [True]
     record = close.load_close(store, "c")
     assert record["revision_clean"] is False
+    assert record["revision_clean_state"] == "unknown"
     assert record["dirty_artifact"] == ("diff:one" if "--dirty-artifact" in extra else None)
     err = capsys.readouterr().err
     assert "Git could not report whether this checkout is clean" in err
@@ -226,6 +227,7 @@ def test_close_reopen_does_not_record_clean_when_git_status_fails(repo, monkeypa
     assert cli.main(common + ["reopen", "--id", "check", "--from", "lead", "--revision", revision]) == 0
     assert status_calls == [True]
     assert close.load_close(store, "check")["revision_clean"] is False
+    assert close.load_close(store, "check")["revision_clean_state"] == "unknown"
     assert (
         "Git could not report whether this checkout is clean; it is not recorded as clean." in capsys.readouterr().err
     )
@@ -270,6 +272,7 @@ def test_close_records_untracked_files_as_dirty(repo, action, relative):
         args.extend(["--scope", "release", "--non-lane-isolation-not-asserted"])
     assert cli.main(args) == 0
     assert close.load_close(store, "clean-check")["revision_clean"] is False
+    assert close.load_close(store, "clean-check")["revision_clean_state"] == "not_clean"
 
 
 @pytest.mark.parametrize("relative", ["untracked.txt", "new-folder/untracked.txt"])
@@ -365,3 +368,102 @@ def test_status_mode_normal_for_yes_no_checks(tmp_path, monkeypatch, site):
         ]
     ]
     assert len(index_calls) == (4 if site == "post-commit" else 1)
+
+
+@pytest.mark.parametrize("revision_mode", ["different", "missing", "omitted"])
+def test_reopen_refuses_unverified_or_mismatched_revision(repo, capsys, revision_mode):
+    root, git = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    original = git("rev-parse", "HEAD")
+    common = ["--root", str(root), "close"]
+    assert cli.main(common + ["open", "--id", "c", "--from", "lead", "--scope", "docs", "--revision", original]) == 0
+    (root / "tracked.txt").write_text("next\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("-c", "commit.gpgsign=false", "commit", "-qm", "next")
+    before = close.load_close(store, "c")
+    args = [] if revision_mode == "omitted" else ["--revision", original if revision_mode == "different" else "a" * 40]
+    assert cli.main(common + ["reopen", "--id", "c", "--from", "lead"] + args) == 2
+    assert close.load_close(store, "c") == before
+    assert "revision" in capsys.readouterr().err.lower()
+
+
+def test_reopen_refuses_when_git_unavailable(repo, monkeypatch, capsys):
+    root, git = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    revision = git("rev-parse", "HEAD")
+    common = ["--root", str(root), "close"]
+    assert cli.main(common + ["open", "--id", "c", "--from", "lead", "--scope", "docs", "--revision", revision]) == 0
+    before = close.load_close(store, "c")
+    monkeypatch.setattr(cli, "_git", lambda *args: (-1, ""))
+    assert cli.main(common + ["reopen", "--id", "c", "--from", "lead", "--revision", revision]) == 2
+    assert close.load_close(store, "c") == before
+    assert "Git or the checkout is unavailable" in capsys.readouterr().err
+
+
+def test_reopen_outside_repository_refuses_but_open_still_accepts_pin(tmp_path, capsys):
+    store = Store(tmp_path)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    common = ["--root", str(tmp_path), "close"]
+    revision = "a" * 40
+    assert cli.main(common + ["open", "--id", "c", "--from", "lead", "--scope", "docs", "--revision", revision]) == 0
+    before = close.load_close(store, "c")
+    assert cli.main(common + ["reopen", "--id", "c", "--from", "lead"]) == 2
+    assert close.load_close(store, "c") == before
+    assert "Git or the checkout is unavailable" in capsys.readouterr().err
+
+
+def test_other_revision_callers_keep_full_pin_fallback(repo):
+    root, _ = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    revision = "a" * 40
+    assert cli._lane_resolve(store, revision) == revision
+    assert (
+        cli.main(
+            [
+                "--root",
+                str(root),
+                "request-launch",
+                "--from",
+                "lead",
+                "--profile",
+                "review",
+                "--skill",
+                "review-code",
+                "--revision",
+                revision,
+                "--request-id",
+                "lr-test",
+                "-m",
+                "review",
+            ]
+        )
+        == 0
+    )
+    assert store.read_launch_request("lr-test")["scope"]["revision"] == revision
+
+
+def test_reopen_accepts_short_revision_detached_in_subfolder(repo):
+    root, git = repo
+    revision = git("rev-parse", "HEAD")
+    git("checkout", "--detach", "-q", revision)
+    sub = root / "sub"
+    sub.mkdir()
+    (root / ".gitignore").write_text(".agenttalk/\nsub/\n", encoding="utf-8")
+    git("add", ".gitignore")
+    git("-c", "commit.gpgsign=false", "commit", "-qm", "ignore store")
+    revision = git("rev-parse", "HEAD")
+    store = Store(sub)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    common = ["--root", str(sub), "close"]
+    assert cli.main(common + ["open", "--id", "c", "--from", "lead", "--scope", "docs", "--revision", revision]) == 0
+    assert cli.main(common + ["reopen", "--id", "c", "--from", "lead", "--revision", revision[:12]]) == 0
+    assert close.load_close(store, "c")["revision"] == revision
+    assert cli.main(common + ["reopen", "--id", "c", "--from", "lead"]) == 0

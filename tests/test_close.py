@@ -1437,7 +1437,8 @@ def test_cli_publish_hold_never_bumps_barrier(tmp_path: Path) -> None:
 
 def test_cli_post_publish_ack_rejected_until_reopen(tmp_path: Path) -> None:
     root = _init(tmp_path)
-    _open(root)
+    revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    _open(root, "--revision", revision)
     _accept(root)
     _run(["close", "publish", "--id", "rel", "--from", "lead", "--verdict", "go"], root)
     # post-publish ack is refused (stale-proof without a global bump)...

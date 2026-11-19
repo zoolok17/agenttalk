@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Reopening a close now checks the revision against the checkout.** Git must
+  resolve the requested revision and show it as HEAD, including when the close
+  keeps its existing revision. A missing checkout, unavailable Git, unresolved
+  revision, or different HEAD stops reopening without changing the record.
+  The close record also distinguishes unknown cleanliness from a checkout not
+  shown clean, and the hold message no longer calls an unchecked checkout dirty.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states

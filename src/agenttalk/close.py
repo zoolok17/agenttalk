@@ -392,7 +392,7 @@ def compute_verdict(record: dict, gate_check: dict,
     if not isinstance(clean, bool):
         hold(HOLD_REVISION, _revision_clean_damage(record))
     elif clean is False and not record.get("dirty_artifact"):
-        hold(HOLD_REVISION, "revision worktree was dirty with no recorded diff artifact")
+        hold(HOLD_REVISION, "revision worktree was not shown clean and has no recorded diff artifact")
     if not _FULL_SHA_RE.match(str(record.get("revision", ""))):
         hold(HOLD_REVISION, "revision is not a resolved full 40-char SHA")
 
@@ -2167,6 +2167,7 @@ def reopen(record: dict, *, by: str, at: str, revision: str | None = None,
         record["revision"] = revision
     if revision_clean is not None:
         record["revision_clean"] = revision_clean
+        record.pop("revision_clean_state", None)
     _event(record, "reopen", by, at, revision=revision)
     return record
 

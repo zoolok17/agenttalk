@@ -59,7 +59,7 @@ def test_boolean_cleanliness_keeps_existing_contract(value, artifact):
     result = close.compute_verdict(record, _gate_go())
     assert result["ok"] is (value or bool(artifact))
     if not result["ok"]:
-        assert detail(record) == "revision worktree was dirty with no recorded diff artifact"
+        assert detail(record) == "revision worktree was not shown clean and has no recorded diff artifact"
 
 
 def test_damage_display_is_distinct_bounded_and_one_line():
