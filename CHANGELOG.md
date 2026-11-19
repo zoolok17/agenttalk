@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Windows test jobs in CI may now run for 360 minutes instead of 330.** Between 16 and 18 November,
+  18 Windows test jobs were stopped at the 330-minute limit without a single failing test, so pull
+  requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
+  limit for each test group inside the job is unchanged, and splitting the Windows job is the follow-up
+  (#378). The evidence is recorded in `windows_timeout_reason` in `dev-gate.json`.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
@@ -238,6 +243,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON gains one new `code` value and no new fields.
 
 - **The README first install keeps agenttalk in its own Python environment (#716).** Before, setup could install into another Python, and assistants could find an older agenttalk on PATH. Now both platform recipes keep using the environment's Python after changing folders and put its commands first on PATH in every assistant terminal. Quick setup links to the same recipe, and the README and lead setup brief name the Debian/Ubuntu venv package.
+
+- **The user manuals install agenttalk the same way as the README (#716).** The two manuals still told readers to install agenttalk into whatever Python was active and then run plain `agenttalk`, so a reader could end up running an older copy. They now send readers to the README's do-it-yourself install steps (up to its project setup, which the manual replaces), which give agenttalk its own environment and put it first on PATH, and say not to activate another Python environment in a terminal where agenttalk runs (and how to check which copy runs). The Codex-sandbox example in the user manual uses that environment's Python, and a test keeps the old bare install line from coming back.
 
 - **The first `agenttalk doctor` run reads less like a failure (Part of #716).** Three lines
   changed their words; no result, exit code, check name or JSON field changed.
