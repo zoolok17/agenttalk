@@ -451,3 +451,59 @@ def test_unquoted_powershell_pinned_invocation_states_the_rule(tmp_path):
     rule = f"When AGENTTALK_PY is set, use `{command}`; otherwise use your manual.\n"
     assert sc._states_pinned_rule(rule)
     assert pinned_findings(tmp_path, "codex", rule + "Run `python -m agenttalk x`.\n") == []
+
+
+# --------------------- a "do not" after the command, and a command split over two lines (#801, after #799)
+
+PINNED_FORMS = {
+    "bash": '"$AGENTTALK_PY" -m agenttalk',
+    "powershell": '& "$env:AGENTTALK_PY" -m agenttalk',
+}
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("negation", ["must not be used", "is never permitted"])
+def test_a_do_not_after_the_pinned_command_does_not_state_the_rule(tmp_path, kind, shell, negation) -> None:
+    """#801 gap 1: the guide says the opposite of the rule, so the plain command that follows is a finding."""
+    rule = f"When AGENTTALK_PY is set, `{PINNED_FORMS[shell]}` {negation}; otherwise use python -m agenttalk.\n"
+    assert not sc._states_pinned_rule(rule)
+    assert pinned_findings(tmp_path, kind, rule + "Run `python -m agenttalk x`.\n")
+
+
+SPLIT_FORMS = {
+    "bash": ('"$AGENTTALK_PY" \\\n  -m agenttalk <subcommand> ...', "bash"),
+    "powershell": ('& "$env:AGENTTALK_PY" `\n  -m agenttalk <subcommand> ...', "powershell"),
+}
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(SPLIT_FORMS))
+def test_a_pinned_command_split_over_two_lines_still_states_the_rule(tmp_path, kind, shell) -> None:
+    """#801 gap 2: the rule is the same guide whether the pinned command is on one line or continued onto the next."""
+    command, fence = SPLIT_FORMS[shell]
+    body = (
+        "When `AGENTTALK_PY` is set, run the pinned interpreter:\n\n"
+        f"```{fence}\n{command}\n```\n\n"
+        "Otherwise use the form your project's agent manual gives, for example:\n\n"
+        "```bash\npython -m agenttalk lane workspace --id x\n```\n"
+    )
+    assert sc._states_pinned_rule(body)
+    assert pinned_findings(tmp_path, kind, body) == []
+
+
+@pytest.mark.parametrize("shell", sorted(SPLIT_FORMS))
+def test_a_split_pinned_command_with_a_do_not_after_it_still_does_not_state_the_rule(tmp_path, shell) -> None:
+    command, fence = SPLIT_FORMS[shell]
+    body = (
+        f"When `AGENTTALK_PY` is set, this must not be used:\n\n```{fence}\n{command}\n```\n\n"
+        "Otherwise run:\n\n```bash\npython -m agenttalk lane workspace --id x\n```\n"
+    )
+    assert not sc._states_pinned_rule(body)
+    assert pinned_findings(tmp_path, "codex", body)
+
+
+def test_a_backslash_or_backtick_outside_a_fence_joins_nothing() -> None:
+    """Only a fenced command is continued (as the plain-command scan does it): prose that ends in a backtick is not."""
+    prose = 'When AGENTTALK_PY is set, run `"$AGENTTALK_PY"`\n-m agenttalk; otherwise use your manual.\n'
+    assert not sc._states_pinned_rule(prose)

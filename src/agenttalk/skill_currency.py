@@ -48,16 +48,20 @@ _PLAIN_PYTHON_RE = re.compile(
 )
 _PLAIN_PYTHON_FORM = "python -m agenttalk"
 # A rule needs the condition, a Bash or PowerShell invocation, then the fallback nearby.
-# Reject negation between the condition and invocation; require the invocation before the fallback.
+# Reject negation between the condition and invocation AND between the invocation and the fallback (a guide that says
+# the pinned command "must not be used" states the opposite of the rule); require the invocation before the fallback.
 # PowerShell accepts both quoted and unquoted executable variables after its call operator.
 # Conditions may wrap at a line end or quote the name in backticks; bare mentions and
 # HTML comments do not state the rule.
+_FALLBACK = r"\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b"
+_NEGATION = r"\b(?:not|never|avoid|without|refrain|cannot|no|don['’]t|mustn['’]t|shouldn['’]t|can['’]t)\b"
+_UP_TO_FALLBACK_WITHOUT_NEGATION = rf"(?:(?!{_FALLBACK}|{_NEGATION})[\s\S]){{0,600}}?"
 _RULE_RE = re.compile(
     r"\b(?:if|when)\b[^.]{0,60}?(?<![\w])AGENTTALK_PY(?![\w])`?\s+is\s+set"
-    r"(?:(?!\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b|"
-    r"\b(?:not|never|avoid|without|refrain|cannot|no|don['’]t|mustn['’]t|shouldn['’]t|can['’]t)\b)[\s\S]){0,600}?"
-    r'(?:"\$AGENTTALK_PY"|&\s+(?:"\$env:AGENTTALK_PY"|\$env:AGENTTALK_PY))\s+-m\s+agenttalk(?![\w-])'
-    r"[\s\S]{0,600}?(?:\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b)",
+    + _UP_TO_FALLBACK_WITHOUT_NEGATION
+    + r'(?:"\$AGENTTALK_PY"|&\s+(?:"\$env:AGENTTALK_PY"|\$env:AGENTTALK_PY))\s+-m\s+agenttalk(?![\w-])'
+    + _UP_TO_FALLBACK_WITHOUT_NEGATION
+    + rf"(?:{_FALLBACK})",
     re.IGNORECASE,
 )
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -359,11 +363,30 @@ def current_major_minor(version: str) -> tuple[int, int]:
 
 # --------------------------------------------------------------------------- per-file
 
+def _join_fenced_continuations(text: str) -> str:
+    """``text`` with every shell continuation inside a fenced block joined into one line, as the command scan joins it
+    (a trailing ``\\`` for Bash or a trailing backtick for PowerShell, never across a boundary line), so a pinned
+    command split over two lines reads as one. Prose is left as it is."""
+    lines, joined_lines, in_fence, i = text.splitlines(), [], False, 0
+    while i < len(lines):
+        line = lines[i]
+        if _is_fence(line):
+            in_fence = not in_fence
+        elif in_fence:
+            while line.rstrip().endswith(("\\", "`")) and i + 1 < len(lines) and not _is_boundary_line(lines[i + 1]):
+                i += 1
+                line = line.rstrip()[:-1] + " " + lines[i]
+        joined_lines.append(line)
+        i += 1
+    return "\n".join(joined_lines)
+
+
 def _states_pinned_rule(text: str) -> bool:
-    """True when the skill states the pinned-runtime rule itself: a condition on ``AGENTTALK_PY`` being set, with
-    what to do otherwise close by. A mention, the name inside an HTML comment or inside a longer name, or the
-    condition without its fallback does not count."""
-    return bool(_RULE_RE.search(_HTML_COMMENT_RE.sub("", text)))
+    """True when the skill states the pinned-runtime rule itself: a condition on ``AGENTTALK_PY`` being set, then the
+    pinned command (not forbidden, and a command split over two lines counts), with what to do otherwise close by. A
+    mention, the name inside an HTML comment or inside a longer name, or the condition without its fallback does not
+    count."""
+    return bool(_RULE_RE.search(_join_fenced_continuations(_HTML_COMMENT_RE.sub("", text))))
 
 
 def _pinned_runtime_findings(rel: str, text: str, kind: str) -> list[Finding]:
