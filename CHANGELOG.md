@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The release checklist now names the README as the only install pin.** Since the user manuals
+  stopped carrying their own install line (#835), step 1 of the release ritual in
+  `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
+  refuses. It now says to update the README's install line and its link to the lead setup brief only.
+  Wording only.
 - **Windows test jobs in CI may now run for 360 minutes instead of 330.** Between 16 and 18 November,
   18 Windows test jobs were stopped at the 330-minute limit without a single failing test, so pull
   requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
@@ -52,6 +57,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
+  Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
+  variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run
+  `"$AGENTTALK_PY" -m agenttalk ...` (issue #822). Before this, such a seat could not reply, report
+  progress or send by command. Now the wrapper writes the Python interpreter's full path into that
+  seat's instructions (`"<path with forward slashes>" -m agenttalk ...`), tells it to use the Bash tool,
+  and prints at start the allow rule the team can add, for example
+  `Bash("<env>/Scripts/python.exe" -m agenttalk *)`. The wrapper never adds the rule itself: in a
+  strict profile the team decides what a seat may run. Seats in the default `bypassPermissions` mode,
+  and Codex seats, see no change. A strict seat keeps the old form when the interpreter's path is not
+  an existing full path, is not safe inside double quotes, or holds a character that has a meaning in
+  the printed rule. Those characters are `*`, which a rule reads as "any text" even inside quotes, so
+  a path such as `/opt/pinned*/bin/python` would let the rule allow other programs too, and `(` and
+  `)`, which enclose the rule. The source is Claude Code's permissions page
+  (code.claude.com/docs/en/permissions, "Wildcard patterns"). Not changed here: the skills (they keep
+  their `AGENTTALK_PY` rule), the supervisor's own resume rule `Bash(agenttalk *)`, the PowerShell
+  forms, and the lead setup brief (#826 changes it).
 - **A settings file nested too deeply no longer crashes agenttalk (#846).** A team
   configuration or PowerShell host selection file holding JSON nested so deeply that
   Python cannot read it is now reported as damaged: doctor names it and goes on with its
