@@ -4854,3 +4854,82 @@ def test_only_the_checkouts_own_git_entry_is_skipped_by_the_scan(tmp_path):
     assert cli._lane_checkout_hazard(str(other)) is None
     (other / "deeper" / ".worktrees" / "inner" / ".git" / ".agenttalk").mkdir(parents=True)
     assert cli._lane_checkout_hazard(str(other)) is not None
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 28 (zteam's read of d2b7d908): `os.path.realpath` without strict=True swallows some failures while following a
+# junction (access denied, a sharing violation) and returns a partial path that still starts where the link is, so the
+# "does the target lie inside the checkout?" check passed for a link it could not follow. A path that cannot be
+# resolved completely is not proven inside; it is refused.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _realpath_cannot_follow(monkeypatch, link: Path, error: OSError) -> list[str]:
+    """Make resolving `link` fail the way Windows does: the plain call hands back the unresolved path, the strict one
+    raises `error`. Everything else resolves as usual. Returns the list of times the fault fired."""
+    real = os.path.realpath
+    wanted = os.path.normcase(os.path.normpath(str(link)))
+    fired: list[str] = []
+
+    def realpath(path, *args, strict=False, **kwargs):
+        if os.path.normcase(os.path.normpath(os.fspath(path))) == wanted:
+            fired.append("strict" if strict else "plain")
+            if strict:
+                raise error
+            return os.fspath(path)
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    return fired
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a followed junction is a Windows case")
+@pytest.mark.parametrize("command", ["abandon", "deliver", "gc"])
+@pytest.mark.parametrize("error", [PermissionError(5, "access denied"), OSError(32, "sharing violation")],
+                         ids=["access-denied", "sharing-violation"])
+def test_a_junction_that_cannot_be_resolved_is_refused_not_trusted(tmp_path, monkeypatch, capsys, command, error):
+    store, selected, checkout, argv = _checkout_and_command(tmp_path, monkeypatch, command)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("outside data\n", encoding="utf-8")
+    (checkout / ".worktrees").mkdir()  # a folder the repository's .gitignore ignores
+    link = checkout / ".worktrees" / "out"
+    _link_directory(link, outside)
+    fired = _realpath_cannot_follow(monkeypatch, link, error)
+    capsys.readouterr()
+
+    cli.main(["--root", str(store.root), *argv])
+
+    shown = capsys.readouterr()
+    assert fired, "the injected failure never fired"
+    assert sentinel.read_text(encoding="utf-8") == "outside data\n"
+    _assert_untouched(checkout)
+    said = shown.err + shown.out
+    if command == "deliver":
+        said = lanes.load_lanes(store)["lanes"][selected].get("worktree_cleanup_error", "") or said
+    assert "holds a directory link" in said
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a followed junction is a Windows case")
+def test_a_folder_that_cannot_be_resolved_is_not_proven_inside_the_store(tmp_path, monkeypatch):
+    """The other place the same check is made: whether a checkout lies inside this store's folder."""
+    store_root = tmp_path / "store"
+    (store_root / ".worktrees").mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    link = store_root / ".worktrees" / "via-link"
+    _link_directory(link, outside)
+    assert cli._lane_checkout_outside_store(Store(store_root), str(link)) is not None  # resolves out: not inside
+    fired = _realpath_cannot_follow(monkeypatch, link, PermissionError(5, "access denied"))
+
+    assert cli._lane_checkout_outside_store(Store(store_root), str(link)) is not None  # cannot resolve: not proven
+    assert fired
+
+
+def test_a_checkout_that_resolves_completely_is_still_inside_the_store(tmp_path):
+    """The control: strict resolution changes nothing for an ordinary folder."""
+    store_root = tmp_path / "store"
+    (store_root / ".worktrees" / "x").mkdir(parents=True)
+    assert cli._lane_checkout_outside_store(Store(store_root), str(store_root / ".worktrees" / "x")) is None
+    assert cli._lane_checkout_hazard(str(store_root / ".worktrees" / "x")) is None

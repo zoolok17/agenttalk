@@ -5074,17 +5074,26 @@ def _lane_dir_has_store_folder(directory: str) -> bool:
         return any(_is_store_folder_name(entry.name) and entry.is_dir() for entry in entries)
 
 
+def _strict_real(path) -> str:
+    """The case-folded real path of `path`, resolved completely. Plain `os.path.realpath` swallows some failures (on
+    Windows an access-denied or sharing-violation while following a junction) and returns a partial path that still
+    begins where the link is, so a check that asks "does this lie inside that folder?" would say yes for a path it
+    could not follow. Here any failure raises OSError, and every caller treats that as "not proven" and refuses."""
+    return os.path.normcase(os.path.realpath(path, strict=True))
+
+
 def _lane_checkout_outside_store(store, *folders: str) -> str | None:
     """None when every one of `folders` lies inside this store's folder, where `lane assign` always makes a lane's
     checkout (a worktrees root outside the store folder is refused), and under no other store of its own; otherwise
     the first folder that does not. This is the store's own evidence that a checkout is its own. A row can name a
     checkout that belongs to ANOTHER store sharing the repository (a copied store folder, a restored lanes.json),
     and every check on such a row passes, because every field in it is genuine: only where the folder is tells.
-    Paths are compared as they resolve (a link or junction into another store's folder counts as that folder)."""
+    Paths are compared as they resolve (a link or junction into another store's folder counts as that folder), and
+    only when they resolve completely: a path that cannot be resolved (`_strict_real` raises) is not proven inside."""
     try:
-        root = os.path.normcase(os.path.realpath(store.root))
+        root = _strict_real(store.root)
         for folder in folders:
-            real = os.path.normcase(os.path.realpath(folder))
+            real = _strict_real(folder)
             if not real.startswith(root.rstrip(os.sep) + os.sep):
                 return folder
             parent = os.path.dirname(real)
@@ -5114,7 +5123,7 @@ def _lane_checkout_hazard(folder: str) -> tuple[str, str] | None:
       so only the store-named link counts there.
 
     A folder that cannot be read raises OSError: it is not known to be free of either."""
-    root_real = os.path.normcase(os.path.realpath(folder)).rstrip(os.sep) + os.sep
+    root_real = _strict_real(folder).rstrip(os.sep) + os.sep  # fails (OSError) when the checkout cannot be resolved
     pending = [folder]
     while pending:
         current = pending.pop()
@@ -5129,7 +5138,10 @@ def _lane_checkout_hazard(folder: str) -> tuple[str, str] | None:
                     if _is_store_folder_name(entry.name):
                         return "link", entry.path
                     if os.name == "nt" and attributes & 0x10:  # a directory junction or directory symbolic link
-                        target = os.path.normcase(os.path.realpath(entry.path))
+                        try:
+                            target = _strict_real(entry.path)
+                        except (OSError, ValueError):
+                            return "link", entry.path  # a link that cannot be followed is not proven to stay inside
                         if not (target + os.sep).startswith(root_real):
                             return "link", entry.path
                     continue
