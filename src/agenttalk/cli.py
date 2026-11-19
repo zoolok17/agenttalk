@@ -5289,6 +5289,12 @@ def _lane_checkout_registration(folder: str, git_dir: str) -> tuple[str, str] | 
     return None
 
 
+# The step for a checkout moved by hand, as a person reads it. It is run from INSIDE the moved checkout, with nothing
+# after it, so the command holds no path to quote (`git worktree repair` run from the repository with no path mends
+# nothing). The folder is only shown, in the words around the command, through `pc.line`.
+_LANE_REPAIR_STEP = "open the moved folder {folder} and run `git worktree repair` there"
+
+
 def _lane_checkout_registration_text(folder: str, found: tuple[str, str]) -> str:
     kind, detail = found
     if kind == "link":
@@ -5301,12 +5307,14 @@ def _lane_checkout_registration_text(folder: str, found: tuple[str, str]) -> str
         return (
             f"Git's own record of this checkout says it lives at {pc.line(detail)}, not at {pc.line(folder)}: this "
             "folder looks like a copy of another checkout (another store's, perhaps), so it is not proven to be this "
-            "lane's and it was left alone. If you moved the checkout by hand, run `git worktree repair` from the "
-            "repository and try again")
+            "lane's and it was left alone. If it is in fact your checkout, moved by hand, and the old folder is gone, "
+            f"{_LANE_REPAIR_STEP.format(folder=pc.line(folder))}, then try again; if the old folder is still there, "
+            "leave this one alone: the repair would take Git's record away from the original")
     return (
         f"Git's own record of where this checkout lives could not be examined ({pc.line(detail)}), so it is not "
         f"proven that {pc.line(folder)} is the checkout Git registered, and it was left alone. Make the record "
-        "readable (`git worktree repair` if it is damaged) and run the command again")
+        f"readable (if you moved the checkout by hand, {_LANE_REPAIR_STEP.format(folder=pc.line(folder))}) and run "
+        "the command again")
 
 
 def _lane_proof_identity(

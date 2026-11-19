@@ -5222,10 +5222,26 @@ def test_a_checkout_moved_with_git_worktree_move_is_still_delivered(tmp_path, ca
     assert lanes.load_lanes(Store(root))["lanes"]["mv"]["status"] == lanes.STATUS_DELIVERED
 
 
+def _printed_repair_step(err: str, repository: Path) -> tuple[list[str], Path]:
+    """The repair step a refusal prints, read back from the message the way a person reads it: the command between
+    the backticks, and the folder it is to be run in (the moved checkout the message names, or, when it names none,
+    the repository). Nothing here knows the path the step needs."""
+    step = re.search(r"`(git worktree repair[^`]*)`", err)
+    assert step, err
+    named = re.search(r"open the moved folder (.+?) and run `git worktree repair`", err)
+    if named:
+        return step.group(1).split(), Path(named.group(1))
+    return step.group(1).split(), repository  # no other folder is named: the step is run where the repository is
+
+
 def test_a_checkout_renamed_by_hand_is_refused_until_git_worktree_repair(tmp_path, capsys) -> None:
     """And what it costs one moved without Git: Git's record still names the old folder, so the delivery is refused
-    with the way out; after `git worktree repair` it is delivered."""
-    from test_lanes import _assign_worktree, _commit, _git_rc, _repo
+    with the way out; the step the refusal PRINTS, run as printed where it says, repairs the record and the delivery
+    then goes through (zteam's P2: the earlier text said to run it from the repository, which repairs nothing
+    without the checkout's path)."""
+    import subprocess
+
+    from test_lanes import _assign_worktree, _commit, _repo
 
     root, base = _repo(tmp_path)
     mine = Path(_assign_worktree(root, base, "hand")["worktree_path"])
@@ -5240,9 +5256,48 @@ def test_a_checkout_renamed_by_hand_is_refused_until_git_worktree_repair(tmp_pat
     assert "git worktree repair" in err and "Git's own record" in err
     _nothing_was_published(Store(root), "hand")
 
-    assert _git_rc(root, "worktree", "repair", str(renamed)).returncode == 0
+    argv, folder = _printed_repair_step(err, root)
+    assert subprocess.run(argv, cwd=folder, capture_output=True, text=True, encoding="utf-8").returncode == 0
     capsys.readouterr()
-    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "hand", "--from", "dev"]) == 0
+    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "hand", "--from", "dev"]) == 0, err
+    assert argv == ["git", "worktree", "repair"] and folder == renamed, (argv, folder, err)
+
+
+def test_the_printed_repair_step_is_a_plain_command_with_no_path_to_quote(tmp_path, capsys) -> None:
+    """The step names no folder in the command, so a checkout whose path holds spaces or quotes needs no quoting: the
+    folder is only shown, once, in the sentence that says where to run it."""
+    import subprocess
+
+    from test_lanes import _assign_worktree, _commit, _repo
+
+    root, base = _repo(tmp_path)
+    mine = Path(_assign_worktree(root, base, "odd")["worktree_path"])
+    _commit(mine, "src/core/a.py", "base\nodd\n")
+    renamed = mine.with_name("it's a renamed " + mine.name)
+    mine.rename(renamed)
+    _point_lane_at(Store(root), "odd", renamed)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "odd", "--from", "dev"]) == 3
+    err = capsys.readouterr().err
+    argv, folder = _printed_repair_step(err, root)
+    assert subprocess.run(argv, cwd=folder, capture_output=True, text=True, encoding="utf-8").returncode == 0
+    capsys.readouterr()
+    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "odd", "--from", "dev"]) == 0, err
+    assert argv == ["git", "worktree", "repair"] and folder == renamed, (argv, folder, err)
+
+
+def test_the_repair_step_warns_that_a_copy_with_the_old_folder_still_there_is_not_to_be_repaired(
+        tmp_path, capsys) -> None:
+    """From inside a COPY the repair would take Git's record away from the original: the message says so."""
+    moved = str(tmp_path / "new")
+    text = cli._lane_checkout_registration_text(moved, ("mismatch", str(tmp_path / "old")))
+    assert "if the old folder is still there" in text and "take Git's record away from the original" in text, text
+    assert f"open the moved folder {moved} and run `git worktree repair` there" in text, text
+    assert "from the repository" not in text, text
+    unknown = cli._lane_checkout_registration_text(moved, ("unknown", "no such file"))
+    assert f"open the moved folder {moved} and run `git worktree repair` there" in unknown, unknown
+    assert "from the repository" not in unknown, unknown
 
 
 # ---------------------------------------------------------------------------------------------------------------------
