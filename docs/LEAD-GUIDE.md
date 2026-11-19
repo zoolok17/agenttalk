@@ -73,7 +73,15 @@ cause. Run doctor first:
 ```
 agenttalk doctor
 ```
-If you see `[FAIL] powershell_host ... no PowerShell host is selected`, fix it:
+If doctor shows `N/A` for `powershell_host`, nothing found here says a host is needed: no host is
+selected, no supervisor setup files exist, no continuous Codex wrapper (a Codex lead loop included) has
+left its marker, and doctor could read all of those files and markers. A host that is selected is
+checked as usual and can pass or fail, and a file or marker that cannot be read or looked at is a
+`[FAIL]`, never `N/A`. Select a host before you use the supervisor or a continuous Codex wrapper on
+Windows (its hang watchdog uses the host too); the scheduled-task state is not checked for `N/A`, and
+the plain `agenttalk doctor` output does not print the next step on that line (`doctor --json` does). If
+you see
+`[FAIL] powershell_host ... no PowerShell host is selected`, fix it:
 ```
 agenttalk supervise --select-pwsh
 ```
