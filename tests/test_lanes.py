@@ -9328,3 +9328,453 @@ def test_786_printed_checkout_index_refuses_existing_content(tmp_path, monkeypat
     assert (wt / "src/core/a.py").read_bytes() == b"edited tracked content must survive\n"
     assert (wt / "src/core/b.py").read_bytes() == original_b
     assert (wt / "precious.txt").read_bytes() == b"untracked content must survive\n"
+
+
+# ---- #671: the lane check judges what the merge really writes -------------------------------------------------------
+#
+# One comparison says what the lane did (its own merge base with the target); only the merge result says where that
+# lands. Every test that claims what a merge writes takes it from `git merge-tree --write-tree` plus
+# `git diff --no-renames`, never from the rule under test.
+
+_L671 = "lane-l1"
+
+
+def _m671_setup(tmp_path: Path) -> tuple[Path, str, str]:
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    assert _run(["lane", "assign", "--id", "l1", "--from", "lead", "--assignee", "dev", "--domain", "core",
+                 "--base", base, "--target", br, "--path", "src/core"], root) == 0
+    return root, base, br
+
+
+def _m671_to(root: Path, ref: str) -> None:
+    _git(root, "checkout", "-q", ref)
+
+
+def _m671_head(root: Path) -> str:
+    return _git(root, "rev-parse", "HEAD").strip()
+
+
+def _m671_check(root: Path, head: str, capsys: pytest.CaptureFixture) -> dict:
+    capsys.readouterr()
+    rc = cli.main(["--root", str(root), "lane", "check", "--id", "l1", "--head", head, "--json"])
+    data = json.loads(capsys.readouterr().out)
+    codes = [h["code"] for h in data["holds"]]
+    outside = {m.group(1) for h in data["holds"] for m in [re.match(r"'([^']+)' is outside", h["detail"])] if m}
+    return {"rc": rc, "verdict": data["verdict"], "codes": codes, "outside": outside, "merge": data["merge"],
+            "details": [h["detail"] for h in data["holds"]]}
+
+
+def _m671_oracle(root: Path, br: str, head: str) -> tuple[int, list[str]]:
+    """What a real merge writes on the target: merge-tree's exit status and the paths its tree changes, no renames."""
+    done = _git_rc(root, "merge-tree", "--write-tree", br, head)
+    if done.returncode != 0:
+        return done.returncode, []
+    tree = done.stdout.strip().splitlines()[0]
+    return 0, sorted(_git(root, "diff", "--name-only", "--no-renames", br, tree).split())
+
+
+def _m671_bases(root: Path, br: str, head: str) -> list[str]:
+    return _git(root, "merge-base", "--all", br, head).split()
+
+
+def _m671_move(root: Path, old: str, new: str) -> None:
+    (root / new).parent.mkdir(parents=True, exist_ok=True)
+    _git(root, "mv", old, new)
+    _git(root, "commit", "-q", "-m", "rename")
+
+
+def _m671_lane(root: Path, base: str) -> None:
+    _git(root, "checkout", "-q", "-b", _L671, base)
+
+
+def _m671_merge_target(root: Path, br: str) -> str:
+    _git(root, "merge", "-q", "--no-edit", br)
+    return _m671_head(root)
+
+
+def _g671_merges_target(root, base, br):
+    _m671_lane(root, base)
+    _commit(root, "src/core/a.py", "base\nlane\n")
+    _m671_to(root, br)
+    _commit(root, "src/other/b.py", "o\ntarget\n")
+    _m671_to(root, _L671)
+    return _m671_merge_target(root, br)
+
+
+def _g671_two_merges(root, base, br):
+    _g671_merges_target(root, base, br)
+    _commit(root, "src/core/a.py", "base\nlane\nmore\n")
+    _m671_to(root, br)
+    _commit(root, "src/other/c.py", "two\n")
+    _m671_to(root, _L671)
+    return _m671_merge_target(root, br)
+
+
+def _g671_target_moved_after_merge(root, base, br):
+    head = _g671_merges_target(root, base, br)
+    _m671_to(root, br)
+    _commit(root, "src/other/d.py", "later\n")
+    _m671_to(root, _L671)
+    return head
+
+
+def _g671_rebased(root, base, br):
+    _m671_lane(root, base)
+    _commit(root, "src/core/a.py", "base\nlane\n")
+    _m671_to(root, br)
+    _commit(root, "src/other/b.py", "o\ntarget\n")
+    _m671_to(root, _L671)
+    _git(root, "rebase", "-q", br)
+    return _m671_head(root)
+
+
+def _g671_target_deleted(root, base, br):
+    _m671_lane(root, base)
+    _commit(root, "src/core/a.py", "base\nlane\n")
+    _m671_to(root, br)
+    _git(root, "rm", "-q", "src/other/b.py")
+    _git(root, "commit", "-q", "-m", "drop")
+    _m671_to(root, _L671)
+    return _m671_merge_target(root, br)
+
+
+def _g671_target_moved(root, base, br):
+    """The control: the target moved on, the lane did not merge it."""
+    _m671_lane(root, base)
+    head = _commit(root, "src/core/a.py", "base\nlane\n")
+    _m671_to(root, br)
+    _commit(root, "src/other/b.py", "o\ntarget\n")
+    _m671_to(root, _L671)
+    return head
+
+
+def _g671_rename_inside(root, base, br):
+    _m671_lane(root, base)
+    head = _commit(root, "src/core/a.py", "base\nlane\n")
+    _m671_to(root, br)
+    _m671_move(root, "src/core/a.py", "src/core/c.py")
+    _m671_to(root, _L671)
+    return head
+
+
+def _g671_rename_out(root, base, br):
+    """The maintainers' graph: the lane merges the target, edits its file, then the target moves that file out."""
+    _m671_lane(root, base)
+    _m671_to(root, br)
+    _commit(root, "src/other/b.py", "o\ntarget\n")
+    _m671_to(root, _L671)
+    _m671_merge_target(root, br)
+    head = _commit(root, "src/core/a.py", "base\nlane\n")
+    _m671_to(root, br)
+    _m671_move(root, "src/core/a.py", "src/other/a.py")
+    _m671_to(root, _L671)
+    return head
+
+
+def _g671_undo(root, base, br):
+    _g671_merges_target(root, base, br)
+    return _commit(root, "src/other/b.py", "o\n")
+
+
+def _g671_lane_renames_out(root, base, br):
+    _m671_lane(root, base)
+    _m671_move(root, "src/core/a.py", "src/other/a.py")
+    return _m671_head(root)
+
+
+def _g671_equal_content(root, base, br):
+    """The lane re-creates a target change by hand, outside its paths: held, deliberately."""
+    _m671_lane(root, base)
+    _commit(root, "src/other/b.py", "o\nsame\n")
+    _m671_to(root, br)
+    _commit(root, "src/other/b.py", "o\nsame\n")
+    _m671_to(root, _L671)
+    return _m671_head(root)
+
+
+def _g671_hidden_in_merge(root, base, br):
+    _g671_merges_target(root, base, br)
+    (root / "src" / "other" / "smuggled.py").write_text("hidden\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "--amend", "--no-edit")
+    return _m671_head(root)
+
+
+def _g671_stray_then_merge(root, base, br):
+    _m671_lane(root, base)
+    _commit(root, "src/core/a.py", "base\nlane\n")
+    _commit(root, "src/other/mine.py", "stray\n")
+    _m671_to(root, br)
+    _commit(root, "src/other/b.py", "o\ntarget\n")
+    _m671_to(root, _L671)
+    return _m671_merge_target(root, br)
+
+
+def _g671_side_branch(root, base, br):
+    _m671_lane(root, base)
+    _commit(root, "src/core/a.py", "base\nlane\n")
+    _git(root, "checkout", "-q", "-b", "side", base)
+    _commit(root, "src/other/side.py", "side\n")
+    _m671_to(root, _L671)
+    return _m671_merge_target(root, "side")
+
+
+def _g671_head_is_target_tip(root, base, br):
+    return _commit(root, "src/other/b.py", "o\nstray\n")
+
+
+def _g671_already_merged(root, base, br):
+    """The lane's head is already inside the target: comparing with the merge base would compare nothing."""
+    _m671_lane(root, base)
+    _commit(root, "src/core/a.py", "base\nlane\n")
+    head = _commit(root, "src/other/mine.py", "stray\n")
+    _m671_to(root, br)
+    _git(root, "merge", "-q", "--no-edit", _L671)
+    return head
+
+
+def _g671_no_common_ancestor(root, base, br):
+    _git(root, "checkout", "-q", "--orphan", _L671)
+    return _commit(root, "src/core/a.py", "orphan\n")
+
+
+# graph -> (verdict, the paths named as outside the lane, or None when only the verdict matters)
+_G671 = {
+    "merges-target": (_g671_merges_target, "GO", set()),
+    "two-merges": (_g671_two_merges, "GO", set()),
+    "target-moved-after-merge": (_g671_target_moved_after_merge, "GO", set()),
+    "rebased": (_g671_rebased, "GO", set()),
+    "target-deleted": (_g671_target_deleted, "GO", set()),
+    "target-moved-not-merged": (_g671_target_moved, "GO", set()),
+    "rename-inside": (_g671_rename_inside, "GO", set()),
+    "undo-after-merge": (_g671_undo, "HOLD", {"src/other/b.py"}),
+    "rename-out": (_g671_rename_out, "HOLD", {"src/other/a.py"}),
+    "lane-renames-out": (_g671_lane_renames_out, "HOLD", {"src/other/a.py"}),
+    "equal-content": (_g671_equal_content, "HOLD", {"src/other/b.py"}),
+    "hidden-in-merge": (_g671_hidden_in_merge, "HOLD", {"src/other/smuggled.py"}),
+    "stray-then-merge": (_g671_stray_then_merge, "HOLD", {"src/other/mine.py"}),
+    "side-branch": (_g671_side_branch, "HOLD", None),
+    "head-is-target-tip": (_g671_head_is_target_tip, "HOLD", None),
+    "already-merged": (_g671_already_merged, "HOLD", {"src/other/mine.py"}),
+    "no-common-ancestor": (_g671_no_common_ancestor, "HOLD", None),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_G671))
+def test_lane_check_judges_what_the_merge_really_writes(
+        tmp_path: Path, capsys: pytest.CaptureFixture, name: str) -> None:
+    build, verdict, outside = _G671[name]
+    root, base, br = _m671_setup(tmp_path)
+    head = build(root, base, br)
+    rc_merge, writes = _m671_oracle(root, br, head)
+    result = _m671_check(root, head, capsys)
+    assert result["verdict"] == verdict and result["rc"] == (0 if verdict == "GO" else 3), result
+    if outside is not None:
+        assert result["outside"] == outside, result  # exactly the paths outside the lane, no false entry
+    if rc_merge == 0 and verdict == "GO":
+        assert result["merge"]["status"] == "clean"
+    # the property: when the merge is clean, every path it writes is judged (named in bounds, or held as outside)
+    if rc_merge == 0:
+        named = {p["path"] for p in _m671_named(root, head)}
+        assert set(writes) <= named, (writes, named)
+    assert sorted(result["merge"]) == ["detail", "status"]  # the recorded merge evidence keeps its shape
+
+
+def _m671_named(root: Path, head: str) -> list[dict]:
+    store = Store(root)
+    _, ctx = cli._lane_eval(store, lanes.load_lanes(store)["lanes"]["l1"], [], head, None)
+    assert "tree" not in ctx["merge"]
+    return [p for p in ctx["changed"]["paths"] if p.get("touched")]
+
+
+def test_the_maintainers_rename_graph_is_held_naming_the_real_destination(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base, br = _m671_setup(tmp_path)
+    head = _g671_rename_out(root, base, br)
+    assert len(_m671_bases(root, br, head)) == 1
+    assert _m671_oracle(root, br, head) == (0, ["src/other/a.py"])
+    result = _m671_check(root, head, capsys)
+    assert result["rc"] == 3 and result["codes"] == [lanes.HOLD_OUT_OF_BOUNDS]
+    assert result["outside"] == {"src/other/a.py"}
+    capsys.readouterr()
+    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "l1", "--from", "dev", "--head", head]) == 3
+    assert [x["lane_id"] for x in lanes.active_lanes(lanes.load_lanes(Store(root)))] == ["l1"]
+    assert not list((Store(root).dir / "lane-deliveries").glob("*.json"))
+
+
+def test_the_maintainers_rename_graph_publishes_nothing_for_a_provisioned_lane(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    lane = _assign_worktree(root, base, "l1")
+    wt = Path(lane["worktree_path"])
+    assert lane["release_class"] is True
+    _commit(root, "src/other/b.py", "o\ntarget\n")
+    _git(wt, "merge", "-q", "--no-edit", br)
+    head = _commit(wt, "src/core/a.py", "base\nlane\n")
+    _m671_move(root, "src/core/a.py", "src/other/a.py")
+    assert _m671_oracle(root, br, head) == (0, ["src/other/a.py"])
+    capsys.readouterr()
+    assert _run_raw(["lane", "deliver", "--id", "l1", "--from", "dev"], root) == 3
+    folder = Store(root).dir / "lane-deliveries"
+    assert (list(folder.glob("l1-*.json")) if folder.exists() else []) == []
+    assert lanes.load_lanes(Store(root))["lanes"]["l1"]["status"] == lanes.STATUS_ACTIVE
+
+
+def test_a_rename_inside_the_lane_is_delivered_and_records_the_real_destination(tmp_path: Path) -> None:
+    root, base, br = _m671_setup(tmp_path)
+    head = _g671_rename_inside(root, base, br)
+    assert _m671_oracle(root, br, head) == (0, ["src/core/c.py"])
+    assert _run(["lane", "deliver", "--id", "l1", "--from", "dev", "--head", head], root) == 0
+    artifact = next((Store(root).dir / "lane-deliveries").glob("l1-*.json"))
+    assert {"src/core/a.py", "src/core/c.py"} <= set(json.loads(artifact.read_text(encoding="utf-8"))["changed_paths"])
+
+
+def test_a_real_delivery_after_merging_the_target_records_only_the_lanes_own_file(tmp_path: Path) -> None:
+    root, base, br = _m671_setup(tmp_path)
+    head = _g671_merges_target(root, base, br)
+    assert _run(["lane", "deliver", "--id", "l1", "--from", "dev", "--head", head], root) == 0
+    artifact = next((Store(root).dir / "lane-deliveries").glob("l1-*.json"))
+    assert json.loads(artifact.read_text(encoding="utf-8"))["changed_paths"] == ["src/core/a.py"]
+
+
+def test_a_rename_into_another_active_lane_is_an_overlap(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    for lane_id, assignee, path in (("l1", "dev", "src/core/a.py"), ("l2", "dev2", "src/core/sub")):
+        assert _run(["lane", "assign", "--id", lane_id, "--from", "lead", "--assignee", assignee, "--domain", "core",
+                     "--base", base, "--target", br, "--path", path], root) == 0
+    _m671_lane(root, base)
+    _commit(root, "src/core/a.py", "base\nlane\n")
+    _m671_to(root, br)
+    _m671_move(root, "src/core/a.py", "src/core/sub/a.py")
+    _m671_to(root, _L671)
+    head = _m671_head(root)
+    assert _m671_oracle(root, br, head) == (0, ["src/core/sub/a.py"])
+    result = _m671_check(root, head, capsys)
+    assert result["verdict"] == "HOLD" and lanes.HOLD_ACTIVE_LANE_OVERLAP in result["codes"]
+
+
+@pytest.mark.parametrize("setting", ["default", "directoryRenames", "renames-off"])
+def test_the_rule_agrees_with_the_real_merge_whatever_the_rename_settings(
+        tmp_path: Path, capsys: pytest.CaptureFixture, setting: str) -> None:
+    """A folder move, and rename following switched off: the outcome follows what the real merge does here.
+    A conflict is held on `merge_conflict`; a clean merge's destination is held as outside the lane. Never GO."""
+    root, base, br = _m671_setup(tmp_path)
+    if setting == "directoryRenames":
+        _git(root, "config", "merge.directoryRenames", "true")
+    if setting == "renames-off":
+        _git(root, "config", "merge.renames", "false")
+    if setting == "renames-off":
+        head = _g671_rename_out(root, base, br)
+    else:
+        _m671_lane(root, base)
+        (root / "src/core/new.py").write_text("n\n", encoding="utf-8")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "new")
+        _m671_to(root, br)
+        _m671_move(root, "src/core/a.py", "src/moved/a.py")
+        _m671_to(root, _L671)
+        head = _m671_head(root)
+    rc_merge, writes = _m671_oracle(root, br, head)
+    result = _m671_check(root, head, capsys)
+    assert result["verdict"] == "HOLD" and result["rc"] == 3
+    if rc_merge == 1:
+        assert result["codes"] == [lanes.HOLD_MERGE_CONFLICT]
+    else:
+        assert rc_merge == 0 and result["codes"] == [lanes.HOLD_OUT_OF_BOUNDS]
+        assert result["outside"] >= {p for p in writes if not p.startswith("src/core")}
+
+
+def _m671_criss_cross(root: Path, base: str, br: str) -> None:
+    _m671_lane(root, base)
+    lane_one = _commit(root, "src/core/a.py", "base\nlane\n")
+    _m671_to(root, br)
+    target_one = _commit(root, "src/other/b.py", "o\ntarget\n")
+    _git(root, "merge", "-q", "--no-edit", lane_one)
+    _m671_to(root, _L671)
+    _git(root, "merge", "-q", "--no-edit", target_one)
+
+
+def test_two_merge_bases_hold_until_the_target_is_merged_in(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base, br = _m671_setup(tmp_path)
+    _m671_criss_cross(root, base, br)
+    undone = _commit(root, "src/other/b.py", "o\n")
+    assert len(_m671_bases(root, br, undone)) == 2 and _m671_oracle(root, br, undone) == (0, ["src/other/b.py"])
+    held = _m671_check(root, undone, capsys)
+    assert held["rc"] == 3 and held["codes"] == [lanes.HOLD_AMBIGUOUS_MERGE_BASE]
+    capsys.readouterr()
+    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "l1", "--from", "dev", "--head", undone]) == 3
+    assert [x["lane_id"] for x in lanes.active_lanes(lanes.load_lanes(Store(root)))] == ["l1"]
+    assert not list((Store(root).dir / "lane-deliveries").glob("*.json"))
+    # the way out cannot launder the undo: one merge base now, and the undone file is named
+    after = _m671_check(root, _m671_merge_target(root, br), capsys)
+    assert len(_m671_bases(root, br, _m671_head(root))) == 1
+    assert after["codes"] == [lanes.HOLD_OUT_OF_BOUNDS] and after["outside"] == {"src/other/b.py"}
+
+
+def test_two_merge_bases_without_an_undo_are_held_then_released_by_merging_the_target(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base, br = _m671_setup(tmp_path)
+    _m671_criss_cross(root, base, br)
+    head = _commit(root, "src/core/a.py", "base\nlane\nmore\n")
+    assert _m671_check(root, head, capsys)["codes"] == [lanes.HOLD_AMBIGUOUS_MERGE_BASE]
+    assert _m671_check(root, _m671_merge_target(root, br), capsys)["verdict"] == "GO"
+
+
+def _m671_fake_git(monkeypatch: pytest.MonkeyPatch, wanted, answer) -> None:
+    real = cli._git
+
+    def fake(root, args, *a, **k):  # noqa: ANN001, ANN002, ANN003
+        return answer(args) if wanted(args) else real(root, args, *a, **k)
+
+    monkeypatch.setattr(cli, "_git", fake)
+
+
+@pytest.mark.parametrize("order", ["strict-first", "permissive-first"])
+def test_several_merge_bases_answered_by_git_always_hold(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, order: str) -> None:
+    """Git's answer is replaced at the boundary, so dropping `--all` or taking the first base fails on every run."""
+    root, base, br = _m671_setup(tmp_path)
+    head = _commit(root, "src/core/a.py", "base\nlane\n")
+    pair = [base, head[::-1]] if order == "strict-first" else [head[::-1], base]
+    _m671_fake_git(monkeypatch, lambda args: args[:1] == ["merge-base"] and "--is-ancestor" not in args,
+                   lambda args: (0, "\n".join(pair) + "\n") if "--all" in args else (0, base + "\n"))
+    result = _m671_check(root, head, capsys)
+    assert result["verdict"] == "HOLD" and result["codes"] == [lanes.HOLD_AMBIGUOUS_MERGE_BASE]
+
+
+@pytest.mark.parametrize("answer", [(128, ""), (2, ""), (0, "")], ids=["rc128", "rc2", "empty"])
+def test_a_failing_or_empty_merge_base_answer_is_diff_unavailable(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, answer: tuple) -> None:
+    root, base, br = _m671_setup(tmp_path)
+    head = _g671_target_moved(root, base, br)
+    _m671_fake_git(monkeypatch, lambda args: args[:2] == ["merge-base", "--all"], lambda args: answer)
+    assert _m671_check(root, head, capsys)["codes"] == [lanes.HOLD_DIFF_UNAVAILABLE]
+
+
+@pytest.mark.parametrize("failure", ["effects-rc128", "effects-rc2", "empty-merge-tree"])
+def test_a_failing_merge_effects_answer_fails_closed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, failure: str) -> None:
+    root, base, br = _m671_setup(tmp_path)
+    head = _g671_rename_out(root, base, br)
+    if failure == "empty-merge-tree":
+        _m671_fake_git(monkeypatch, lambda args: args[:1] == ["merge-tree"], lambda args: (0, ""))
+    else:
+        rc = 128 if failure.endswith("128") else 2
+        _m671_fake_git(monkeypatch, lambda args: "--no-renames" in args, lambda args: (rc, ""))
+    assert _m671_check(root, head, capsys)["codes"] == [lanes.HOLD_DIFF_UNAVAILABLE]
+
+
+def test_the_merge_effects_comparison_lists_every_path_under_its_own_name(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """The merge result is compared with the target without rename detection, so no similarity threshold decides."""
+    root, base, br = _m671_setup(tmp_path)
+    head = _g671_rename_out(root, base, br)
+    seen: list[list[str]] = []
+    real = cli._git
+    monkeypatch.setattr(cli, "_git", lambda r, args, *a, **k: (seen.append(list(args)), real(r, args, *a, **k))[1])
+    _m671_check(root, head, capsys)
+    diffs = [a for a in seen if a[:1] == ["diff"]]
+    assert sum("--no-renames" in a for a in diffs) == 1 and sum("-M" in a for a in diffs) == 1
