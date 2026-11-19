@@ -5243,3 +5243,111 @@ def test_a_checkout_renamed_by_hand_is_refused_until_git_worktree_repair(tmp_pat
     assert _git_rc(root, "worktree", "repair", str(renamed)).returncode == 0
     capsys.readouterr()
     assert cli.main(["--root", str(root), "lane", "deliver", "--id", "hand", "--from", "dev"]) == 0
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 31b (codex-rev's P2): `os.path.realpath` keeps the Windows extended-path prefix when it was given one, so
+# Git's record of a checkout, written with the prefix, compared unequal with the checkout's ordinary spelling and a
+# legitimate delivery was refused. The prefix is removed from every `_strict_real` answer where it is the same folder.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "written, same",
+    [
+        ("\\\\?\\C:\\x\\y", "C:\\x\\y"),
+        ("//?/c:/x/y", "c:/x/y"),
+        ("\\\\?\\C:", "C:"),
+        ("\\\\?\\c:\\", "c:\\"),
+        ("\\\\?\\UNC\\srv\\share\\x", "\\\\srv\\share\\x"),
+        ("\\\\?\\UNC\\srv\\share", "\\\\srv\\share"),
+        ("//?/UNC/srv/share/x", "\\\\srv/share/x"),
+    ],
+)
+def test_the_extended_prefix_is_removed_where_it_names_the_same_folder(written, same) -> None:
+    assert cli._without_extended_prefix(written, windows=True) == same
+
+
+@pytest.mark.parametrize(
+    "written",
+    ["\\\\?\\Volume{1234}\\x", "\\\\.\\pipe\\x", "\\\\?\\GLOBALROOT\\x", "\\\\?\\UNC\\\\x", "\\\\?\\C", "C:\\x",
+     "\\\\srv\\share\\x", "\\x"],
+)
+def test_any_other_spelling_is_left_as_it_is(written) -> None:
+    """A volume or device spelling stays different from every ordinary spelling: the safe side."""
+    assert cli._without_extended_prefix(written, windows=True) == written
+
+
+def test_nothing_is_changed_on_a_system_that_has_no_such_prefix() -> None:
+    assert cli._without_extended_prefix("\\\\?\\C:\\x", windows=False) == "\\\\?\\C:\\x"
+
+
+windows_only = pytest.mark.skipif(os.name != "nt", reason="the extended-path prefix is a Windows spelling")
+
+
+@windows_only
+def test_one_real_folder_written_with_and_without_the_prefix_compares_equal(tmp_path) -> None:
+    folder = tmp_path / "there"
+    folder.mkdir()
+    ordinary = cli._strict_real(str(folder))
+    assert cli._strict_real("\\\\?\\" + str(folder)) == ordinary
+    assert cli._strict_real("//?/" + str(folder).replace("\\", "/")) == ordinary
+    assert not ordinary.startswith("\\\\?\\")
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    assert cli._strict_real("\\\\?\\" + str(other)) != ordinary          # a different folder stays different
+
+
+def _record_the_checkout_as(checkout: Path, text: str) -> None:
+    """Rewrite Git's record of where the checkout lives (the administrative folder's `gitdir` file)."""
+    (Path(cli._git_dir(str(checkout))) / "gitdir").write_text(text + "\n", encoding="utf-8")
+
+
+@windows_only
+def test_a_record_spelled_with_the_extended_prefix_still_names_the_checkout(tmp_path) -> None:
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    mine = Path(_assign_worktree(root, base, "mine")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    admin = cli._git_dir(str(mine))
+    assert cli._lane_checkout_registration(str(mine), admin) is None
+    _record_the_checkout_as(mine, "\\\\?\\" + str(mine / ".git"))
+    assert cli._lane_checkout_registration(str(mine), admin) is None           # the same file, spelled with the prefix
+    _record_the_checkout_as(mine, "\\\\?\\" + str(other / ".git"))
+    assert cli._lane_checkout_registration(str(mine), admin)[0] == "mismatch"    # a really different folder
+
+
+@windows_only
+@pytest.mark.parametrize("spelling", ["extended-drive", "ordinary"])
+def test_a_delivery_is_not_refused_for_the_way_git_spelled_its_record(tmp_path, capsys, spelling) -> None:
+    from test_lanes import _assign_worktree, _commit, _repo
+
+    root, base = _repo(tmp_path)
+    mine = Path(_assign_worktree(root, base, "mine")["worktree_path"])
+    _commit(mine, "src/core/a.py", "base\nmine\n")
+    if spelling == "extended-drive":
+        _record_the_checkout_as(mine, "\\\\?\\" + str(mine / ".git"))
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root), "lane", "deliver", "--id", "mine", "--from", "dev"])
+
+    assert rc == 0, capsys.readouterr().err
+    assert lanes.load_lanes(Store(root))["lanes"]["mine"]["status"] == lanes.STATUS_DELIVERED
+
+
+@windows_only
+def test_a_delivery_is_still_refused_when_the_prefixed_record_names_another_folder(tmp_path, capsys) -> None:
+    from test_lanes import _assign_worktree, _commit, _repo
+
+    root, base = _repo(tmp_path)
+    mine = Path(_assign_worktree(root, base, "mine")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    _commit(mine, "src/core/a.py", "base\nmine\n")
+    _record_the_checkout_as(mine, "\\\\?\\" + str(other / ".git"))
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root), "lane", "deliver", "--id", "mine", "--from", "dev"])
+
+    assert rc == 3 and "Git's own record of this checkout says it lives at" in capsys.readouterr().err
+    _nothing_was_published(Store(root), "mine")

@@ -5086,6 +5086,27 @@ def _lane_dir_has_store_folder(directory: str) -> bool:
         return any(_is_store_folder_name(entry.name) and entry.is_dir() for entry in entries)
 
 
+_EXTENDED_DRIVE_OR_UNC_RE = re.compile(
+    r"^[\\/]{2}\?[\\/](?:(?P<drive>[A-Za-z]:(?:[\\/].*)?)|UNC[\\/](?P<unc>[^\\/].*))$", re.IGNORECASE)
+
+
+def _without_extended_prefix(text: str, *, windows: bool | None = None) -> str:
+    """`text` with the Windows extended-path prefix removed where that names the same folder: `\\\\?\\C:\\x` is `C:\\x`
+    and `\\\\?\\UNC\\server\\share\\x` is `\\\\server\\share\\x`. `os.path.realpath` keeps the prefix when it was given
+    one, so the same folder written two ways would compare unequal (and a record Git wrote with the prefix would not
+    match the checkout's ordinary spelling). Anything else is left as it is, a volume-GUID or device spelling
+    included: it stays different from every ordinary spelling, which is the safe side. On other systems nothing
+    changes (`windows` is for the tests)."""
+    if not (os.name == "nt" if windows is None else windows):
+        return text
+    found = _EXTENDED_DRIVE_OR_UNC_RE.match(text)
+    if found is None:
+        return text
+    if found.group("drive") is not None:
+        return found.group("drive")
+    return "\\\\" + found.group("unc")
+
+
 def _strict_real(path, *, missing_tail_ok: bool = False) -> str:
     """The case-folded real path of `path`, resolved completely. Plain `os.path.realpath` swallows some failures (on
     Windows an access-denied or sharing-violation while following a junction) and returns a partial path that still
@@ -5095,17 +5116,20 @@ def _strict_real(path, *, missing_tail_ok: bool = False) -> str:
     With `missing_tail_ok`, a path whose last parts are simply not there (a registered checkout whose folder was
     deleted) is judged by its nearest existing ancestor, resolved the same strict way, plus the missing names as
     written: nothing that is not there can be a link. An entry that IS there but cannot be followed (a dangling link)
-    still raises."""
+    still raises.
+
+    The Windows extended-path prefix is removed from the answer (`_without_extended_prefix`), so every comparison of
+    two answers, the back-link of a checkout's Git record included, sees one folder spelled two ways as one."""
     text = os.fspath(path)
     try:
-        return os.path.normcase(os.path.realpath(text, strict=True))
+        return os.path.normcase(_without_extended_prefix(os.path.realpath(text, strict=True)))
     except FileNotFoundError:
         if not missing_tail_ok or os.path.lexists(text):
             raise
         parent, name = os.path.split(text.rstrip("\\/"))
         if not name or not parent or parent == text:
             raise
-        return os.path.normcase(os.path.join(_strict_real(parent, missing_tail_ok=True), name))
+        return os.path.normcase(os.path.join(_strict_real(parent, missing_tail_ok=True), name))  # parent: already clean
 
 
 def _lane_checkout_place(store, *folders: str) -> tuple[str, str, str] | None:
