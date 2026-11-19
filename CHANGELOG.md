@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Windows test jobs in CI may now run for 360 minutes instead of 330.** Between 16 and 18 November,
+  18 Windows test jobs were stopped at the 330-minute limit without a single failing test, so pull
+  requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
+  limit for each test group inside the job is unchanged, and splitting the Windows job is the follow-up
+  (#378). The evidence is recorded in `windows_timeout_reason` in `dev-gate.json`.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
