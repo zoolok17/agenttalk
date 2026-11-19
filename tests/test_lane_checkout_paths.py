@@ -5343,13 +5343,16 @@ def test_a_copy_whose_original_cannot_be_examined_is_refused_with_the_warning(tm
 
 
 def test_the_text_for_a_linked_git_entry_gives_a_step_that_works_as_printed() -> None:
-    """Round 31d (P2): a `.git` entry that is a link is replaced by the checkout's real `.git` file, or the folder is
-    removed and the lane assigned again; no repair step is printed, because `git worktree repair` from the repository
-    without a path mends nothing."""
+    """Rounds 31d and 31e: a `.git` entry that is a link is replaced by this checkout's real `.git` file. No repair
+    step is printed (`git worktree repair` from the repository without a path mends nothing), and no advice to remove
+    the folder or assign the lane again: this refusal comes before the work checks, so the folder may hold the only
+    copy of uncommitted or untracked work, and removing a folder does not remove the lane's row."""
     text = cli._lane_checkout_registration_text("C:\\x\\wt", ("link", "C:\\x\\wt\\.git"))
-    assert "Replace the link with the real `.git` file of this checkout" in text, text
-    assert "remove this folder and assign the lane again" in text, text
-    assert "git worktree repair" not in text and "from the repository" not in text, text
+    assert ("Replace the link with this checkout's real `.git` file and try again; if you cannot, copy any work in "
+            "this folder somewhere else first and ask for help: do not delete this folder") in text, text
+    advice = text.lower().replace("do not delete this folder", "")
+    for forbidden in ("remove", "delete", "assign", "repair", "from the repository", "discard", "rm "):
+        assert forbidden not in advice, (forbidden, text)
 
 
 

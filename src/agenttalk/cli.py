@@ -5306,8 +5306,8 @@ def _lane_checkout_registration_text(folder: str, found: tuple[str, str]) -> str
         return (
             f"this checkout's own `.git` entry, {pc.line(detail)}, is a link, so Git's record cannot show that "
             f"{pc.line(folder)} is the checkout Git registered (a link can lead to another checkout's `.git` file), "
-            "and it was left alone. Replace the link with the real `.git` file of this checkout (or remove this "
-            "folder and assign the lane again) and try again")
+            "and it was left alone. Replace the link with this checkout's real `.git` file and try again; if you "
+            "cannot, copy any work in this folder somewhere else first and ask for help: do not delete this folder")
     if kind == "mismatch":
         return (
             f"Git's own record of this checkout says it lives at {pc.line(detail)}, not at {pc.line(folder)}: this "
