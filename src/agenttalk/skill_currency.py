@@ -82,14 +82,21 @@ _POINTS_BACK_RE = re.compile(
 )
 # A clause ends at ; ! ? a blank line, any colon except the two below, or a period before whitespace or the end of the
 # text, closing quotes and brackets allowed between a period and that whitespace ("... is required.) Do not ...").
-# A colon is exempt only as a drive-letter colon (one letter, the colon, then \ or /: `C:\temp`, `C:/temp`) or a URL
-# scheme colon (followed by //), and a period only inside a word (`agenttalk.assurance`, `reply.md`, 0.105.0), written
-# without backticks. Any other colon, one followed by `**` or a letter included, still ends the clause.
+# A colon is exempt only as a drive-letter colon or a URL scheme colon (two or more letters, then //), and a period only
+# inside a word (`agenttalk.assurance`, `reply.md`, 0.105.0), written without backticks. A drive is one letter that is
+# no part of a longer word, the colon, and a path character at once: `C:\temp`, `C:/temp`, and also `C:file`, a path
+# with no slash. Without a slash after the colon, the lone letter must also stand at the start or after whitespace, a
+# quote, = ( or [ , so a one-letter word before a colon ("Option A:do not ...", "x:y") reads as a drive: that choice
+# merges the next words into the command's clause, which is the stricter reading. Any other colon, one followed by
+# whitespace, `**` or a backtick, one after a digit ("Step 1:do", 10:30) or after two letters, still ends the clause.
+_PATH_CHAR = "[^\\s*`\"'\u2019\u201d)\\]},;:!?]"  # what may follow a drive colon: not whitespace, emphasis, a closer
+_ALONE_BEFORE_A_DRIVE_LETTER = "\\s\"'=(\\[\u2018\u2019\u201c\u201d"
 _CLAUSE_END_RE = re.compile(
     "[;!?]"
-    "|:(?![\\\\/])"  # a colon not followed by a slash
-    "|(?<![A-Za-z]):(?=[\\\\/])"  # a colon and slash that follow no letter
-    "|(?<=[A-Za-z]{2}):(?=[\\\\/])(?!//)"  # after two letters (not a drive letter), unless it is a URL scheme
+    f"|:(?!{_PATH_CHAR})"  # a colon followed by whitespace, the end, emphasis, a closer: no path
+    "|(?<![A-Za-z]):"  # a colon after no letter (a digit, a mark, the start)
+    "|(?<=[A-Za-z]{2}):(?!//)"  # after two letters (not a drive letter), unless it is a URL scheme
+    f"|(?<=[^{_ALONE_BEFORE_A_DRIVE_LETTER}A-Za-z][A-Za-z]):(?![\\\\/])"  # one letter after a mark, no slash: no drive
     "|\\.[)\\]}\"'\u2019\u201d]*(?!\\S)"
     "|\\n\\s*\\n"
 )

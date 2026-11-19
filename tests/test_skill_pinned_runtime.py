@@ -786,9 +786,106 @@ def test_a_time_of_day_or_other_colon_is_an_ordinary_colon(shell) -> None:
         ("x:\ny", True),
         ("x:", True),
         ("x:**y**", True),
-        ("x:y", True),
         ("10:30", True),
     ],
 )
 def test_which_colons_end_a_clause(text, ends) -> None:
     assert (len(sc._CLAUSE_END_RE.split(text)) > 1) is ends, text
+
+
+# ----------------------------------- a drive letter and a colon is a path with or without a slash (#865)
+# A path such as C:file (drive-relative, no slash) is as much a path as C:\file. The rule that decides: one letter that
+# stands alone (at the start, or after whitespace, a quote, "=", "(" or "[") followed at once by a path character
+# (anything but whitespace, "*", a backtick, a quote or a closing bracket, or a clause mark) is a drive. With a slash
+# after the colon the letter only has to be no part of a longer word, as in #864.
+
+DRIVE_RELATIVE_PATHS = {
+    "plain": "C:file.txt",
+    "lower": "d:a.txt",
+    "backslash-below": r"C:sub\a.txt",
+    "double-quoted": '"C:file.txt"',
+    "single-quoted": "'C:file.txt'",
+    "after-equals": "--file=C:file.txt",
+    "in-brackets": "(C:file.txt)",
+    "dot-start": "C:.hidden",
+}
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("path", sorted(DRIVE_RELATIVE_PATHS))
+@pytest.mark.parametrize("negation", sorted(FORBIDDING_AFTER_A_PATH))
+def test_a_drive_relative_path_without_a_slash_does_not_end_the_clause(tmp_path, kind, shell, path, negation) -> None:
+    """#865: `... --file C:file must not be used` is about the pinned command, so the skill does not state the rule."""
+    rule = (
+        f"When AGENTTALK_PY is set, {PINNED_FORMS[shell]} send --file {DRIVE_RELATIVE_PATHS[path]} "
+        f"{FORBIDDING_AFTER_A_PATH[negation]}; otherwise run python -m agenttalk send.\n"
+    )
+    assert not sc._states_pinned_rule(rule), rule
+    assert pinned_findings(tmp_path, kind, rule), rule
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("path", sorted(DRIVE_RELATIVE_PATHS))
+def test_a_valid_rule_with_a_drive_relative_path_still_states_the_rule(tmp_path, kind, shell, path) -> None:
+    rule = (
+        f"When AGENTTALK_PY is set, run {PINNED_FORMS[shell]} send --file {DRIVE_RELATIVE_PATHS[path]}; "
+        "do not use the unpinned form while it is set; otherwise use your manual.\n"
+    )
+    assert sc._states_pinned_rule(rule), rule
+    assert pinned_findings(tmp_path, kind, rule + "Run `python -m agenttalk send`.\n") == []
+
+
+@pytest.mark.parametrize(
+    "text, ends",
+    [
+        # a drive path, with or without a slash: no end
+        ("C:file", False),
+        ("--file C:file.txt", False),
+        ("c:sub\\a.txt", False),
+        ('say "C:file"', False),
+        ("--file=C:file", False),
+        ("(C:file", False),
+        ("[C:file", False),
+        ("C:.\\x", False),
+        # the other reading of "x:y": a one-letter word, a colon and a letter. It reads as a drive; this is the choice
+        ("x:y", False),
+        ("see x:y", False),
+        ("Option A:do not use it", False),
+        # not a drive: still the end of a clause
+        ("Step 1:do", True),
+        ("Note:do", True),
+        ("ab:file", True),
+        ("box:y", True),
+        ("1x:y", True),
+        ("-x:y", True),
+        ("a1:y", True),
+        ("10:30", True),
+        ("C:", True),
+        ("see C: do", True),
+        ("C:**bold**", True),
+        ("C:`code`", True),
+        ('"C:" is a label', True),
+        ("(drive C:)", True),
+        ("C:;", True),
+        # a slash after the colon: as in #864, the letter only has to be no part of a longer word
+        ("1C:\\x", False),
+        ("file:///C:/x", False),
+        ("ab:\\x", True),
+        ("C:file https://example.org/a", False),
+    ],
+)
+def test_which_colons_end_a_clause_with_and_without_a_slash(text, ends) -> None:
+    assert (len(sc._CLAUSE_END_RE.split(text)) > 1) is ends, text
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("separator", ["Step 1:", "Note:", "ab:", "1x:"])
+def test_a_colon_that_is_not_a_drive_still_cuts_a_prohibition_off_the_command(shell, separator) -> None:
+    """The other reading: "run the command, then <label>:do not use the unpinned form" is about another command."""
+    rule = (
+        f"When AGENTTALK_PY is set, run {PINNED_FORMS[shell]} send {separator}do not use the unpinned form; "
+        "otherwise use your manual.\n"
+    )
+    assert sc._states_pinned_rule(rule), rule
