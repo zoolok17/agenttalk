@@ -317,6 +317,19 @@ def _revision_clean_damage(record):
     return text + " Replace marked placeholders before running."
 
 
+def _close_field_damage(record: dict, field: str, expected: str, repair: str) -> str:
+    if field not in record:
+        description = f"close record field {field} is missing"
+    else:
+        value = record[field]
+        try:
+            shown = pc.shown(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False), limit=60)
+        except (TypeError, ValueError):
+            shown = "<a value that cannot be shown>"
+        description = f"close record field {field} holds {shown}, not {expected}"
+    return f"{description}; the record is damaged. Start a new close with {repair}."
+
+
 def compute_verdict(record: dict, gate_check: dict,
                     signoff_eval: dict | None = None,
                     worktree_eval: dict | None = None,
@@ -365,6 +378,16 @@ def compute_verdict(record: dict, gate_check: dict,
         # `check` on a published close reports it rather than implying re-publish.
         hold(HOLD_PUBLISH_NOT_ALLOWED, "close is already published; reopen to change it")
 
+    artifact = record.get("dirty_artifact")
+    if "dirty_artifact" not in record or (artifact is not None and not isinstance(artifact, str)):
+        hold(HOLD_REVISION, _close_field_damage(record, "dirty_artifact", "a text pointer or null",
+                                               "a valid --dirty-artifact pointer or no artifact"))
+    isolation = record.get("non_lane_isolation_not_asserted")
+    if not isinstance(isolation, bool):
+        hold(HOLD_WORKTREE_ISOLATION, _close_field_damage(
+            record, "non_lane_isolation_not_asserted", "true or false",
+            "the correct --lane-artifact or --non-lane-isolation-not-asserted option"))
+
     clean = record.get("revision_clean")
     if not isinstance(clean, bool):
         hold(HOLD_REVISION, _revision_clean_damage(record))
@@ -378,7 +401,7 @@ def compute_verdict(record: dict, gate_check: dict,
         hold(HOLD_GATE, f"gate check for scope is HOLD (blockers: {names})")
 
     if str(record.get("scope") or "").lower() in RELEASE_CLASS_SCOPES:
-        if record.get("non_lane_isolation_not_asserted"):
+        if isolation is True:
             pass
         elif not isinstance(worktree_eval, dict):
             hold(HOLD_WORKTREE_ISOLATION,

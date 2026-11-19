@@ -4049,7 +4049,7 @@ def _print_verdict(close_id: str, result: dict) -> None:
 def _close_worktree_eval(store, record: dict) -> dict | None:
     if not isinstance(record, dict):
         return {"status": "unverified", "reason": "close record is malformed"}
-    if record.get("non_lane_isolation_not_asserted"):
+    if record.get("non_lane_isolation_not_asserted") is True:
         return {"status": "not_applicable", "reason": "non-lane close; isolation not asserted"}
     artifact_raw = record.get("lane_delivery_artifact")
     if not artifact_raw:
