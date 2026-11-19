@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Reopening a close no longer records a checkout as clean when Git cannot check it (#810).**
   The close instead records the checkout as not clean and warns that Git could not check it.
 
+- **Opening a close no longer records a checkout as clean when Git cannot check it (#862).**
+  Teams whose store is outside a Git checkout will see ordinary closes hold until they record a diff artifact.
+
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,
   including unedited files marked assume-unchanged or present skipped files. Files

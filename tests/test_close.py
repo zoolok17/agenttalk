@@ -8,9 +8,7 @@ Two layers, mirroring gates/build_report/plan_actions:
   waivers drive HOLD/GO, that a refused GO does not publish, and that a GO
   publish with --bump-barrier fires the release barrier (and a HOLD never does).
 
-Integration tests use a full 40-char SHA as --revision so revision freeze is
-hermetic: pytest's tmp_path is not a git repo, so `_resolve_revision` falls
-through to the pinned-SHA branch and `_worktree_clean` reports None -> clean.
+Integration tests use a clean temporary Git repository and a pinned revision.
 """
 
 from __future__ import annotations
@@ -20,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+import subprocess
 from pathlib import Path
 import threading
 
@@ -426,6 +425,15 @@ def test_reopen_revision_change_clears_prior_dirty_artifact() -> None:
 # --------------------------------------------------------------- integration
 
 def _init(tmp_path: Path) -> Path:
+    def git(*args):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    (tmp_path / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    git("add", ".gitignore")
+    git("-c", "commit.gpgsign=false", "commit", "-qm", "test baseline")
     s = Store(tmp_path)
     s.init(["lead", "codex", "dev2"])
     s.set_role("lead", "lead")

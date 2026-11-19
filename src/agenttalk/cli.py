@@ -3313,6 +3313,14 @@ def _worktree_clean_detail(root) -> tuple[bool | None, str | None]:
     return result.state == "safe", result.reason
 
 
+def _print_unknown_cleanliness(action, *, hold_hint=False):
+    message = (f"agenttalk close {action}: WARNING - Git could not report whether this checkout is clean; "
+               "it is not recorded as clean.")
+    if hold_hint:
+        message += " close check will HOLD on revision until a recorded diff artifact is provided."
+    sys.stderr.write(message + "\n")
+
+
 def _print_index_recovery(root, reason, *, action=None):
     if action:
         sys.stderr.write(
@@ -4197,8 +4205,10 @@ def cmd_close(args: argparse.Namespace) -> int:
         clean, index_reason = (True, None) if prepared else _worktree_clean_detail(store.root)
         if index_reason:
             _print_index_recovery(store.root, index_reason, action="open")
-        if clean is None:  # git could not report; trust the explicit flags
-            clean = not bool(args.dirty_artifact) if not args.allow_dirty else False
+        unknown_cleanliness = clean is None
+        if unknown_cleanliness:
+            clean = False
+            _print_unknown_cleanliness("open", hold_hint=not args.dirty_artifact)
         opener = _resolve_self(getattr(args, "actor", None), roster=roster)
         record = close_mod.empty_close(
             close_id, scope=args.scope, revision=revision, revision_kind=kind,
@@ -4214,7 +4224,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             # A crash before the freeze transaction must leave a HOLD-only close.
             record["schema_version"] = close_mod.ACCEPTANCE_SCHEMA_VERSION
             record["acceptance_route"] = {"pending": True}
-        if not clean and not args.dirty_artifact and not index_reason:
+        if not clean and not unknown_cleanliness and not args.dirty_artifact and not index_reason:
             sys.stderr.write(
                 "agenttalk close open: WARNING - worktree is dirty and no "
                 "--dirty-artifact was recorded; close check will HOLD on revision "
@@ -4582,10 +4592,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             if index_reason:
                 _print_index_recovery(store.root, index_reason, action="reopen")
             if wc is None:
-                sys.stderr.write(
-                    "agenttalk close reopen: WARNING - Git could not report whether this checkout is clean; "
-                    "it is not recorded as clean.\n"
-                )
+                _print_unknown_cleanliness("reopen")
             clean = wc is True
         try:
             with close_mod.close_transaction(store, args.id) as transaction:
@@ -18014,7 +18021,8 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--allow", action="append",
                        help="Authorize a lens ack: LENS:AGENT or LENS:@ROLE (repeatable).")
     copen.add_argument("--dirty-artifact", help="Pointer to a recorded diff when the worktree is dirty.")
-    copen.add_argument("--allow-dirty", action="store_true", help="Proceed on a dirty worktree (records dirty).")
+    copen.add_argument("--allow-dirty", action="store_true",
+                       help="Kept for compatibility; a checkout not shown clean is recorded as not clean.")
     copen.add_argument("--lane-artifact",
                        help="Path to a lane delivery artifact proving worktree isolation.")
     copen.add_argument("--non-lane-isolation-not-asserted", action="store_true",

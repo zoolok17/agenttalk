@@ -70,6 +70,122 @@ def test_worktree_clean_without_git_is_unknown(tmp_path, monkeypatch):
     assert cli._worktree_clean(tmp_path) is None
 
 
+@pytest.mark.parametrize("extra", [[], ["--allow-dirty"], ["--dirty-artifact", "diff:one"]])
+def test_close_open_unknown_status_is_not_clean(repo, monkeypatch, capsys, extra):
+    root, git = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    revision = git("rev-parse", "HEAD")
+    original = cli._git
+    status_calls = []
+
+    def git_status_fails(path, args):
+        if args == cli.index_safety.STATUS_ARGS:
+            status_calls.append(True)
+            return 1, ""
+        return original(path, args)
+
+    monkeypatch.setattr(cli, "_git", git_status_fails)
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "--root",
+                str(root),
+                "close",
+                "open",
+                "--id",
+                "c",
+                "--from",
+                "lead",
+                "--scope",
+                "docs",
+                "--revision",
+                revision,
+                *extra,
+            ]
+        )
+        == 0
+    )
+    assert status_calls == [True]
+    record = close.load_close(store, "c")
+    assert record["revision_clean"] is False
+    assert record["dirty_artifact"] == ("diff:one" if "--dirty-artifact" in extra else None)
+    err = capsys.readouterr().err
+    assert "Git could not report whether this checkout is clean" in err
+    assert "worktree is dirty" not in err
+    assert ("close check will HOLD" in err) is (not record["dirty_artifact"])
+    result = close.compute_verdict(record, {"verdict": "GO", "blockers": []})
+    assert any(hold["code"] == close.HOLD_REVISION for hold in result["holds"]) is (not record["dirty_artifact"])
+
+
+def test_close_open_outside_git_is_not_clean(tmp_path, capsys):
+    store = Store(tmp_path)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "--root",
+                str(tmp_path),
+                "close",
+                "open",
+                "--id",
+                "c",
+                "--from",
+                "lead",
+                "--scope",
+                "docs",
+                "--revision",
+                "a" * 40,
+            ]
+        )
+        == 0
+    )
+    assert close.load_close(store, "c")["revision_clean"] is False
+    err = capsys.readouterr().err
+    assert "Git could not report whether this checkout is clean" in err
+    assert "close check will HOLD" in err
+    assert "worktree is dirty" not in err
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_close_open_reports_known_checkout_state(repo, capsys, dirty):
+    root, git = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    revision = git("rev-parse", "HEAD")
+    if dirty:
+        (root / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "--root",
+                str(root),
+                "close",
+                "open",
+                "--id",
+                "c",
+                "--from",
+                "lead",
+                "--scope",
+                "docs",
+                "--revision",
+                revision,
+            ]
+        )
+        == 0
+    )
+    assert close.load_close(store, "c")["revision_clean"] is (not dirty)
+    err = capsys.readouterr().err
+    assert ("worktree is dirty" in err) is dirty
+    assert "Git could not report whether this checkout is clean" not in err
+
+
 def test_close_reopen_does_not_record_clean_when_git_status_fails(repo, monkeypatch, capsys):
     root, git = repo
     store = Store(root)
