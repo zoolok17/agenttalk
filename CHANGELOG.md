@@ -57,7 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Bash("<env>/Scripts/python.exe" -m agenttalk *)`. The wrapper never adds the rule itself: in a
   strict profile the team decides what a seat may run. Seats in the default `bypassPermissions` mode,
   and Codex seats, see no change. A strict seat keeps the old form when the interpreter's path is not
-  an existing full path or is not safe inside double quotes. Not changed here: the skills (they keep
+  an existing full path, is not safe inside double quotes, or holds a character that has a meaning in
+  the printed rule. Those characters are `*`, which a rule reads as "any text" even inside quotes, so
+  a path such as `/opt/pinned*/bin/python` would let the rule allow other programs too, and `(` and
+  `)`, which enclose the rule. The source is Claude Code's permissions page
+  (code.claude.com/docs/en/permissions, "Wildcard patterns"). Not changed here: the skills (they keep
   their `AGENTTALK_PY` rule), the supervisor's own resume rule `Bash(agenttalk *)`, the PowerShell
   forms, and the lead setup brief (#826 changes it).
 

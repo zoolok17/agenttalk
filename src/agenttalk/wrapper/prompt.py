@@ -66,7 +66,8 @@ def strict_reply_invocation(cli: str, argv: list[str], agenttalk_py: object) -> 
     In such a mode (``dontAsk`` was measured) Claude Code refuses every command that starts with a variable, even
     with a matching allow rule, so ``"$AGENTTALK_PY" -m agenttalk`` cannot run there, while the same path written
     out does. ``argv`` is the final launch argv (``wrap`` has already added its default mode when the tail named
-    none). A path that cannot be written safely inside bash double quotes keeps the usual form."""
+    none). A path that cannot be written safely inside bash double quotes, or inside the allow rule ``wrap`` prints
+    for it, keeps the usual form."""
     if cli != "claude" or not isinstance(agenttalk_py, str):
         return None
     modes = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--permission-mode"]
@@ -79,7 +80,13 @@ def strict_reply_invocation(cli: str, argv: list[str], agenttalk_py: object) -> 
         return None
     # Windows accepts forward slashes, and Git Bash would read a backslash as an escape.
     path = agenttalk_py.replace("\\", "/") if os.name == "nt" else agenttalk_py
-    if any(c in '"$`\\' or unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in path):
+    # `"`, `$`, backtick and backslash change their meaning inside bash double quotes. The rest are special in
+    # the allow rule `Bash(<this form> *)` (code.claude.com/docs/en/permissions, "Wildcard patterns" and
+    # "Exec wrappers and find actions"): `*` matches any text there, quotes do not make it literal and there is
+    # no escape, so a star in the path would let the rule allow other programs; `(` and `)` enclose the rule,
+    # and the page does not say how one inside a Bash rule is read. `:` is special only as `:*` at the very end
+    # of a rule, never right after this path, and every Windows drive path holds one.
+    if any(c in '"$`\\*()' or unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in path):
         return None
     return f'"{path}" -m agenttalk'
 

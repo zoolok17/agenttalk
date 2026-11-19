@@ -4,6 +4,8 @@ interpreter's written-out path, because that mode refuses a command that starts 
 from __future__ import annotations
 
 import os
+import posixpath
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,6 +62,22 @@ def test_a_posix_path_holding_a_backslash_keeps_the_old_form(tmp_path) -> None:
 def test_a_path_unsafe_in_double_quotes_keeps_the_old_form(tmp_path, folder) -> None:
     if os.name == "nt" and '"' in folder:
         pytest.skip("Windows cannot name a folder with a double quote")
+    assert prompt.strict_reply_invocation("claude", STRICT, _python(tmp_path, folder)) is None
+
+
+def test_a_posix_path_with_a_star_keeps_the_old_form(monkeypatch) -> None:
+    # Bash double quotes keep the star literal, but in the printed rule Bash("/opt/pinned*/bin/python" -m agenttalk *)
+    # it is a wildcard that also allows /opt/pinned-other/bin/python. Windows cannot name a file with a star, so the
+    # helper gets POSIX path rules and finds a file at every path.
+    monkeypatch.setattr(prompt, "os", SimpleNamespace(
+        name="posix", path=SimpleNamespace(isabs=posixpath.isabs, isfile=lambda _path: True)))
+    assert prompt.strict_reply_invocation("claude", STRICT, "/opt/pinned/bin/python") == (
+        '"/opt/pinned/bin/python" -m agenttalk')
+    assert prompt.strict_reply_invocation("claude", STRICT, "/opt/pinned*/bin/python") is None
+
+
+@pytest.mark.parametrize("folder", ["open(paren", "close)paren"])
+def test_a_path_with_a_parenthesis_of_the_rule_keeps_the_old_form(tmp_path, folder) -> None:
     assert prompt.strict_reply_invocation("claude", STRICT, _python(tmp_path, folder)) is None
 
 
@@ -162,6 +180,14 @@ def test_wrap_names_the_allow_rule_and_hands_the_form_to_the_loop(tmp_path, monk
 @pytest.mark.parametrize("tail", [(), ("--permission-mode", "bypassPermissions")])
 def test_wrap_in_bypass_mode_prints_no_rule_and_keeps_the_old_form(tmp_path, monkeypatch, capsys, tail) -> None:
     seen = _wrap(tmp_path, monkeypatch, _python(tmp_path), *tail)
+
+    assert seen["reply_invocation"] is None
+    assert "allow rule" not in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot name a file with a star")
+def test_wrap_prints_no_rule_for_an_interpreter_path_with_a_star(tmp_path, monkeypatch, capsys) -> None:
+    seen = _wrap(tmp_path, monkeypatch, _python(tmp_path, "pinned*"), "--permission-mode", "dontAsk")
 
     assert seen["reply_invocation"] is None
     assert "allow rule" not in capsys.readouterr().err
