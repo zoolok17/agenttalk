@@ -1371,3 +1371,21 @@ def test_rotate_intents_byte_eviction_sorts_by_mtime_then_name(
     assert not (audit / "wi-b-old.json").exists()
     assert (audit / "wi-a-new.json").exists()
     assert (audit / "wi-c-mid.json").exists()
+
+
+def test_store_refusal_marks_web_intent_send_rejected(tmp_path, monkeypatch):
+    from agenttalk.store import PreparedMessageRefused
+
+    store = _store(tmp_path)
+    rec = store.write_intent("send", {"target": "dev", "body": "hello", "message_kind": "question"})
+
+    def refuse(**kwargs):
+        raise PreparedMessageRefused("nothing was published")
+
+    monkeypatch.setattr(store, "send", refuse)
+    intents.drain_intents(store, pid=123, max_per_tick=1)
+    result = store.read_intent(rec["intent_id"])
+    assert result["state"] == Store.INTENT_FAILED
+    assert result["code"] == "send_rejected"
+    assert "nothing was published" in result["error"]
+    assert not store.messages_for("dev")

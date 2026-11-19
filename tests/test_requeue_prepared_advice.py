@@ -1,6 +1,5 @@
 """A vanished preparation needs kind-appropriate, executable recovery advice."""
 
-import re
 import shlex
 
 import pytest
@@ -12,7 +11,7 @@ from test_dead_letter import _rec, _requeue, _requeue_store, _send
 
 def dead_letter(store, kind):
     correlation = {"in_reply_to": "20200101-000000-000000-Abcd"}
-    if kind in {"review-request", "review-result"}:
+    if kind in {"task", "review-request", "review-result"}:
         correlation["request_id"] = "tk-original"
     if kind == "review-result":
         correlation["status"] = "approved"
@@ -55,12 +54,6 @@ def test_vanished_requeue_advice_preserves_the_right_route(tmp_path, monkeypatch
     assert cli._dead_letter_resolution_state(store).get(("beta", original.id)) != "resolved"
     assert store.read_dead_letter_payload("beta", original.id) == payload
 
-    if kind == "review-request":
-        assert "new request id" in output.err
-        assert "agenttalk send --from <you> --to beta --kind review-request" in output.err
-        assert re.search(r"--meta request_id=tk-[0-9a-f]{12}", output.err)
-        return
-
     command = f"agenttalk dead-letter requeue --agent beta --id {original.id}"
     assert command in output.err
     assert "after the reset" in output.err.lower()
@@ -83,9 +76,10 @@ def test_vanished_requeue_advice_preserves_the_right_route(tmp_path, monkeypatch
     assert store.read_dead_letter_payload("beta", original.id) == payload
 
 
-def test_vanished_resolved_reply_keeps_the_original_reopen_options(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("kind", ["review-result", "review-request", "task"])
+def test_vanished_resolved_reply_keeps_the_original_reopen_options(tmp_path, monkeypatch, capsys, kind):
     store = _requeue_store(tmp_path, monkeypatch, False)
-    original = dead_letter(store, "review-result")
+    original = dead_letter(store, kind)
     assert (
         cli.main(
             [
