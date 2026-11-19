@@ -5267,22 +5267,36 @@ def _lane_checkout_registration(folder: str, git_dir: str) -> tuple[str, str] | 
     in it could not be read or resolved). A linked checkout's administrative folder (`git_dir`) holds a `gitdir` file
     naming the checkout's `.git` file; the checkout's `.git` file names the administrative folder. A copy of a
     checkout, `.git` file included, reaches the same administrative folder and passes every check made from the
-    checkout's side, but the record still names the ORIGINAL, so only this back-link tells the copy. Both sides are
-    resolved completely (`_strict_real`), which compares case as the disk does."""
+    checkout's side, but the record still names the ORIGINAL, so only this back-link tells the copy. The FOLDER the
+    record names (the parent of the `.git` file it names) is compared with this folder, both resolved completely
+    (`_strict_real`, which compares case as the disk does); the `.git` entry itself is never resolved, because a
+    checkout whose `.git` is a link to another checkout's `.git` file would then resolve to the very file the record
+    names. A `.git` entry that is itself a link is `("link", entry)`: it cannot show which checkout this is."""
+    entry = os.path.join(folder, ".git")
     try:
+        if lane_mod._is_link(entry):  # `lstat`: the link is looked at, not followed
+            return "link", entry
         with open(os.path.join(git_dir, "gitdir"), encoding="utf-8") as record:
             named = record.read().strip()
         if not os.path.isabs(named):  # a relative record is relative to the administrative folder
             named = os.path.join(git_dir, named)
-        recorded = _strict_real(named)
-        here = _strict_real(os.path.join(folder, ".git"))
+        recorded_folder = _strict_real(os.path.dirname(named))
+        here = _strict_real(folder)
     except (OSError, ValueError) as exc:
         return "unknown", str(exc)
-    return None if recorded == here else ("mismatch", named)
+    if os.path.basename(named).casefold() != ".git" or recorded_folder != here:
+        return "mismatch", named
+    return None
 
 
 def _lane_checkout_registration_text(folder: str, found: tuple[str, str]) -> str:
     kind, detail = found
+    if kind == "link":
+        return (
+            f"this checkout's own `.git` entry, {pc.line(detail)}, is a link, so Git's record cannot show that "
+            f"{pc.line(folder)} is the checkout Git registered (a link can lead to another checkout's `.git` file), "
+            "and it was left alone. Replace the link with the checkout's real `.git` file (`git worktree repair` "
+            "from the repository) and try again")
     if kind == "mismatch":
         return (
             f"Git's own record of this checkout says it lives at {pc.line(detail)}, not at {pc.line(folder)}: this "
@@ -5421,7 +5435,7 @@ def _verify_lane_worktree(
         # Git's own record of where this checkout lives must name THIS folder: a copy of another checkout (its `.git`
         # pointer file included) shares that checkout's administrative folder and passes every check from this side.
         registration = _lane_checkout_registration(wt, wt_git_dir)
-        if registration is not None and (registration[0] == "mismatch" or for_removal or not terminal):
+        if registration is not None and (registration[0] in ("mismatch", "link") or for_removal or not terminal):
             raise lane_mod.LaneError(_lane_checkout_registration_text(wt, registration))
     head = _git_read_one(wt, ["rev-parse", "--verify", "HEAD^{commit}"], "worktree HEAD")
     if expected_base is not None and head != expected_base:

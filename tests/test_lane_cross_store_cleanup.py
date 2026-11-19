@@ -549,3 +549,112 @@ def test_the_registration_of_a_copy_names_the_original_and_the_original_names_it
         os.path.realpath(original / ".git")
     )
     assert cli._lane_checkout_registration(str(original), str(original / "no-such-admin-folder"))[0] == "unknown"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 31b (codex-rev's second item): a copy of B's checkout whose own `.git` entry is a LINK to B's `.git` file. Git's
+# record names B's checkout, and resolving the copy's `.git` entry reaches that very file, so a check that resolved the
+# entry would call the copy registered. The record's FOLDER is compared with this folder instead, and a `.git` entry
+# that is itself a link is refused. (A file symlink cannot be made on every machine: most cases patch the resolution.)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _git_entry_resolves_to(monkeypatch, entry: Path, target: Path) -> None:
+    """Looking at `entry` (strictly) answers as if it were a link to `target`."""
+    real = os.path.realpath
+    wanted = os.path.normcase(os.path.abspath(entry))
+
+    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if strict and os.path.normcase(os.path.abspath(os.fspath(path))) == wanted:
+            return real(target, *args, strict=True, **kwargs)
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+
+
+def test_a_git_entry_that_leads_to_another_checkouts_git_file_is_not_this_checkouts_registration(
+    two_stores, monkeypatch
+):
+    root_a, root_b, base, target = two_stores
+    b_row = _assign(root_b, base, target)
+    original = Path(b_row["worktree_path"])
+    copy = _copy_of_b_checkout_in_a(root_a, b_row, monkeypatch)
+    admin = cli._git_dir(str(original))
+    _git_entry_resolves_to(monkeypatch, copy / ".git", original / ".git")
+
+    assert cli._lane_checkout_registration(str(original), admin) is None
+    kind, _named = cli._lane_checkout_registration(str(copy), admin)
+    assert kind == "mismatch"
+
+
+def test_store_a_never_publishes_a_copy_whose_git_entry_leads_to_b_git_file(two_stores, monkeypatch, capsys):
+    from test_lanes import _commit
+
+    root_a, root_b, base, target = two_stores
+    b_row = _assign(root_b, base, target)
+    original = Path(b_row["worktree_path"])
+    _commit(original, "src/core/a.py", "base\nB's work in progress\n")
+    copy = _copy_of_b_checkout_in_a(root_a, b_row, monkeypatch)
+    store_a = Store(root_a)
+    _git_entry_resolves_to(monkeypatch, copy / ".git", original / ".git")
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root_a), "lane", "deliver", "--id", LANE, "--from", "dev"])
+
+    err = capsys.readouterr().err
+    assert rc == 3 and "Git's own record of this checkout says it lives at" in err, err
+    left = [p.name for p in (store_a.dir / lanes.DELIVERIES_DIRNAME).rglob("*") if p.is_file() and p.name[0] != "."]
+    assert not left, left
+    assert lanes.load_lanes(store_a)["lanes"][LANE]["status"] == lanes.STATUS_ACTIVE
+    _b_checkout_is_intact(root_b, original)
+
+
+def test_a_git_entry_that_is_a_link_is_refused_whatever_it_leads_to(two_stores, monkeypatch, capsys):
+    from agenttalk import lanes as lane_mod
+    from test_lanes import _commit
+
+    root_a, root_b, base, target = two_stores
+    b_row = _assign(root_b, base, target)
+    original = Path(b_row["worktree_path"])
+    _commit(original, "src/core/a.py", "base\nB's work in progress\n")
+    copy = _copy_of_b_checkout_in_a(root_a, b_row, monkeypatch)
+    real_is_link = lane_mod._is_link
+    wanted = os.path.normcase(os.path.abspath(copy / ".git"))
+    monkeypatch.setattr(
+        lane_mod, "_is_link",
+        lambda path: True if os.path.normcase(os.path.abspath(path)) == wanted else real_is_link(path),
+    )
+    admin = cli._git_dir(str(original))
+
+    assert cli._lane_checkout_registration(str(copy), admin) == ("link", str(copy / ".git"))
+    assert cli._lane_checkout_registration(str(original), admin) is None
+    capsys.readouterr()
+    rc = cli.main(["--root", str(root_a), "lane", "deliver", "--id", LANE, "--from", "dev"])
+
+    err = capsys.readouterr().err
+    assert rc == 3 and "own `.git` entry" in err and "is a link" in err, err
+    _b_checkout_is_intact(root_b, original)
+
+
+def test_a_real_symbolic_link_for_the_git_entry_is_refused(two_stores, monkeypatch, capsys):
+    """The arrangement itself, where the machine allows a file symlink (Windows without Developer Mode does not)."""
+    from test_lanes import _commit
+
+    root_a, root_b, base, target = two_stores
+    b_row = _assign(root_b, base, target)
+    original = Path(b_row["worktree_path"])
+    _commit(original, "src/core/a.py", "base\nB's work in progress\n")
+    copy = _copy_of_b_checkout_in_a(root_a, b_row, monkeypatch)
+    (copy / ".git").unlink()
+    try:
+        os.symlink(original / ".git", copy / ".git")
+    except OSError as exc:
+        pytest.skip(f"this machine does not allow a file symlink here ({exc})")
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root_a), "lane", "deliver", "--id", LANE, "--from", "dev"])
+
+    assert rc != 0
+    row = lanes.load_lanes(Store(root_a))["lanes"][LANE]
+    assert row["status"] == lanes.STATUS_ACTIVE and "delivery_artifact" not in row
+    _b_checkout_is_intact(root_b, original)
