@@ -291,10 +291,12 @@ def test_acceptance_attach_is_immutable(case):
     assert close.load_close(case["store"], "attempt") == before
 
 
-def test_acceptance_force_and_reopen_cannot_erase_route(case):
+def test_acceptance_force_and_reopen_cannot_erase_route(case, capsys):
     assert open_attempt(case) == 0
     before = close.load_close(case["store"], "attempt")
     assert command(case, "reopen", "--id", "attempt", "--from", "lead") == 2
+    assert ("acceptance reopen requires --successor and a new plan/project/revision; preserve this attempt"
+            in capsys.readouterr().err)
     assert command(case, "open", "--id", "attempt", "--from", "lead", "--scope", "milestone",
                    "--revision", case["sha"], "--force", "--non-lane-isolation-not-asserted") == 2
     assert close.load_close(case["store"], "attempt") == before

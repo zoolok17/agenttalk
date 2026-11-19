@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolve the requested revision and show it as HEAD, including when the close
   keeps its existing revision. A missing checkout, unavailable Git, unresolved
   revision, or different HEAD stops reopening without changing the record.
+  Reopening without `--revision` checks cleanliness again, so a previously clean
+  close can go on HOLD. A store outside a Git checkout can open with a full pin,
+  but cannot reopen. Check out the revision in the checkout that holds the store,
+  or pass `--revision` with its current HEAD.
   The close record also distinguishes unknown cleanliness from a checkout not
   shown clean, and the hold message no longer calls an unchecked checkout dirty.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**

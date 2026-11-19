@@ -1251,9 +1251,13 @@ Ordinary `close reopen` checks the Git checkout enclosing the store. Git must
 resolve the requested revision and the checkout's HEAD must match it; when
 `--revision` is omitted, the recorded revision is checked. If Git or the
 checkout is unavailable, the revision cannot be resolved, or HEAD differs,
-reopen stops without changing the record. Select the intended checkout before
-retrying. Reopen records an unchecked worktree as not clean; without a recorded
-diff artifact the close remains on HOLD. Ordinary open and reopen records use
+reopen stops without changing the record. Check out the revision in the checkout
+that holds the store, or pass `--revision` with its current HEAD. A store outside
+a Git checkout can open a close with a full revision pin, but cannot reopen it.
+Reopen checks cleanliness again even when `--revision` is omitted, so a close
+previously recorded clean can go on HOLD if the checkout has changed. Reopen
+records an unchecked worktree as not clean; without a recorded diff artifact the
+close remains on HOLD. Ordinary open and reopen records use
 `revision_clean_state` to distinguish `unknown`, `not_clean`, and `clean`;
 older records may lack that field. Acceptance successors check their explicitly
 named project checkout separately.

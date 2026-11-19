@@ -467,3 +467,106 @@ def test_reopen_accepts_short_revision_detached_in_subfolder(repo):
     assert cli.main(common + ["reopen", "--id", "c", "--from", "lead", "--revision", revision[:12]]) == 0
     assert close.load_close(store, "c")["revision"] == revision
     assert cli.main(common + ["reopen", "--id", "c", "--from", "lead"]) == 0
+
+
+@pytest.mark.parametrize("bad", [None, "short", 123, "missing"])
+def test_reopen_requires_recorded_full_revision(repo, capsys, monkeypatch, bad):
+    root, git = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    common = ["--root", str(root), "close"]
+    revision = git("rev-parse", "HEAD")
+    assert cli.main(common + ["open", "--id", "c", "--from", "lead", "--scope", "docs", "--revision", revision]) == 0
+    real_load = close.load_close
+
+    def damaged_load(*args):
+        record = real_load(*args)
+        if bad == "missing":
+            record.pop("revision")
+        else:
+            record["revision"] = bad
+        return record
+
+    monkeypatch.setattr(close, "load_close", damaged_load)
+    assert cli.main(common + ["reopen", "--id", "c", "--from", "lead"]) == 2
+    assert "this close has no recorded full revision; pass --revision" in capsys.readouterr().err
+
+
+def test_reopen_reports_stale_acks_only_when_revision_changes(repo, capsys):
+    root, git = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    common = ["--root", str(root), "close"]
+    revision = git("rev-parse", "HEAD")
+    assert cli.main(common + ["open", "--id", "c", "--from", "lead", "--scope", "docs", "--revision", revision]) == 0
+    capsys.readouterr()
+    assert cli.main(common + ["reopen", "--id", "c", "--from", "lead"]) == 0
+    assert "prior lens acks now stale" not in capsys.readouterr().out
+    (root / "tracked.txt").write_text("next\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("-c", "commit.gpgsign=false", "commit", "-qm", "next")
+    assert cli.main(common + ["reopen", "--id", "c", "--from", "lead", "--revision", git("rev-parse", "HEAD")]) == 0
+    assert "prior lens acks now stale" in capsys.readouterr().out
+
+
+def test_reopen_slow_git_does_not_lock_other_close(repo, monkeypatch):
+    import threading
+
+    root, git = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    common = ["--root", str(root), "close"]
+    revision = git("rev-parse", "HEAD")
+    for cid in ("a", "b"):
+        args = ["open", "--id", cid, "--from", "lead", "--scope", "docs", "--revision", revision]
+        assert cli.main(common + args) == 0
+    entered = threading.Event()
+    release = threading.Event()
+    real_git = cli._git
+
+    def slow_git(*args):
+        if "rev-parse" in args[1]:
+            entered.set()
+            assert release.wait(10)
+        return real_git(*args)
+
+    monkeypatch.setattr(cli, "_git", slow_git)
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(cli.main(common + ["reopen", "--id", "a", "--from", "lead"]))
+    )
+    worker.start()
+    try:
+        assert entered.wait(10)
+        with close.close_transaction(store, "b", lock_timeout=1):
+            pass
+    finally:
+        release.set()
+        worker.join(20)
+    assert result == [0]
+
+
+def test_reopen_refuses_if_recorded_revision_changes_during_git_check(repo, monkeypatch, capsys):
+    root, git = repo
+    store = Store(root)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    common = ["--root", str(root), "close"]
+    revision = git("rev-parse", "HEAD")
+    assert cli.main(common + ["open", "--id", "c", "--from", "lead", "--scope", "docs", "--revision", revision]) == 0
+    real_check = cli._reopen_revision
+
+    def change_revision(root, ref):
+        result = real_check(root, ref)
+        with close.close_transaction(store, "c") as transaction:
+            transaction.record["revision"] = "a" * 40
+            transaction.commit()
+        return result
+
+    monkeypatch.setattr(cli, "_reopen_revision", change_revision)
+    assert cli.main(common + ["reopen", "--id", "c", "--from", "lead"]) == 3
+    assert close.load_close(store, "c")["revision"] == "a" * 40
+    assert "revision changed" in capsys.readouterr().err

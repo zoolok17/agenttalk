@@ -4607,16 +4607,26 @@ def cmd_close(args: argparse.Namespace) -> int:
     if action == "reopen":
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "reopen")
-        revision = None
         try:
+            initial = close_mod.load_close(store, args.id)
+            if "acceptance_route" in initial:
+                raise close_mod.CloseError("acceptance reopen requires --successor and a new plan/project/revision; "
+                                           "preserve this attempt")
+            recorded_revision = initial.get("revision")
+            if args.revision is None and (not isinstance(recorded_revision, str)
+                                          or not close_mod._FULL_SHA_RE.fullmatch(recorded_revision)):
+                raise close_mod.CloseError("this close has no recorded full revision; pass --revision")
+            revision = _reopen_revision(store.root, args.revision if args.revision is not None else recorded_revision)
+            wc, index_reason = _close_clean_detail(store.root)
+            if index_reason:
+                _print_index_recovery(store.root, index_reason, action="reopen")
+            if wc is None:
+                _print_unknown_cleanliness("reopen")
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
-                revision = _reopen_revision(store.root, args.revision or record.get("revision", ""))
-                wc, index_reason = _close_clean_detail(store.root)
-                if index_reason:
-                    _print_index_recovery(store.root, index_reason, action="reopen")
-                if wc is None:
-                    _print_unknown_cleanliness("reopen")
+                if args.revision is None and record.get("revision") != recorded_revision:
+                    raise close_mod.CloseConflict("recorded revision changed while reopening; retry")
+                changed = revision != record.get("revision")
                 close_mod.reopen(record, by=actor, at=_iso_now(),
                                  revision=revision, revision_clean=wc is True)
                 record["revision_clean_state"] = "unknown" if wc is None else ("clean" if wc else "not_clean")
@@ -4627,7 +4637,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             sys.stderr.write(f"agenttalk close reopen: {e}\n")
             return 2
         print(f"reopened close {args.id} by {actor}"
-              + (f" @ {revision[:12]} (prior lens acks now stale)" if revision else ""))
+              + f" @ {revision[:12]}" + (" (prior lens acks now stale)" if changed else ""))
         return 0
 
     if action == "list":
