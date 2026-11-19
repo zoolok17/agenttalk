@@ -11,12 +11,19 @@ from agenttalk.store import Store
 DEPTH = 30000
 DEEP_JSON = "[" * DEPTH + "]" * DEPTH
 
+try:
+    json.loads(DEEP_JSON)
+except RecursionError:
+    DEEP_DECODER_RAISES = True
+else:
+    DEEP_DECODER_RAISES = False
+
 
 @pytest.fixture(params=["deep", "forced"])
 def bad_json(request, monkeypatch):
     if request.param == "deep":
-        with pytest.raises(RecursionError):
-            json.loads(DEEP_JSON)
+        if not DEEP_DECODER_RAISES:
+            pytest.skip("JSON decoder accepts the 30,000-level input on this runtime")
         return DEEP_JSON
     content = '{"force_recursion": true}'
     original = json.loads
