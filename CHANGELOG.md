@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The release checklist now names the README as the only install pin.** Since the user manuals
+  stopped carrying their own install line (#835), step 1 of the release ritual in
+  `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
+  refuses. It now says to update the README's install line and its link to the lead setup brief only.
+  Wording only.
 - **Windows test jobs in CI may now run for 360 minutes instead of 330.** Between 16 and 18 November,
   18 Windows test jobs were stopped at the 330-minute limit without a single failing test, so pull
   requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
