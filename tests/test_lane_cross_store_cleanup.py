@@ -351,3 +351,70 @@ def test_a_checkout_made_by_a_store_nested_inside_this_one_is_not_this_stores(tm
     cli.main(["--root", str(outer), "lane", "abandon", "--id", LANE])
 
     _b_checkout_is_intact(nested, checkout)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 25 (zteam's challenger): gc pairs a lane branch with a checkout of that branch from Git's repository-wide list.
+# With one `lane/x` checked out in EACH store (Git allows it with --force), the pairing must be this store's own,
+# whichever one Git happens to list last.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("b_listed", ["last", "first"])
+@pytest.mark.parametrize("managed", [True, False], ids=["under-a-managed-root", "plain-folder-in-a"])
+@pytest.mark.parametrize("a_row", ["advisory-retired", "no-row"])
+def test_gc_in_store_a_never_pairs_lane_x_with_the_checkout_store_b_made(
+    two_stores, monkeypatch, capsys, a_row, managed, b_listed
+):
+    """Two checkouts of lane/x are registered in the one repository: store B's (made by B's `lane assign`) and one
+    inside store A's folder (added with --force). Store A's gc may only ever take its own, whatever order Git lists
+    them in, and must keep B's checkout and B's branch."""
+    root_a, root_b, base, target = two_stores
+    monkeypatch.chdir(root_a)
+    if a_row == "advisory-retired":  # A's lane x: advisory, no checkout path in the row (made and retired by the CLI)
+        assert cli.main([
+            "--root", str(root_a), "lane", "assign", "--id", LANE, "--from", "lead", "--assignee", "dev",
+            "--domain", "core", "--base", base, "--target", target, "--path", "src/core", "--advisory",
+            "--no-worktree", "--worktree-waiver-reason", "coordination only",
+        ]) == 0
+        assert cli.main(["--root", str(root_a), "lane", "abandon", "--id", LANE]) == 0
+    b_row = _assign(root_b, base, target)
+    b_checkout = Path(b_row["worktree_path"])
+    own = root_a / ".worktrees" / f"{LANE}-{base[:12]}-00000000"
+    own.parent.mkdir(exist_ok=True)
+    if managed:
+        (own.parent / lanes.WORKTREE_MARKER_FILENAME).write_text("agenttalk managed worktrees\n", encoding="utf-8")
+    added = subprocess.run(
+        ["git", "-C", str(root_a), "worktree", "add", "--force", str(own), f"lane/{LANE}"],
+        capture_output=True, text=True,
+    )
+    assert added.returncode == 0, added.stderr
+    listed = _git(root_b, "worktree", "list", "--porcelain").replace("\\", "/")
+    assert str(own).replace("\\", "/") in listed and str(b_checkout).replace("\\", "/") in listed  # both on lane/x
+
+    real_records = cli._worktree_records
+
+    def in_a(record) -> bool:
+        return root_a in Path(str(record.get("worktree"))).resolve().parents
+
+    def reordered(root):
+        records = real_records(root)
+        if records is None:
+            return None
+        return sorted(records, key=lambda rec: (not in_a(rec)) if b_listed == "last" else in_a(rec))
+
+    monkeypatch.setattr(cli, "_worktree_records", reordered)
+    on_x = [r for r in cli._worktree_records(root_a) if r.get("branch") == f"refs/heads/lane/{LANE}"]
+    assert Path(on_x[-1 if b_listed == "last" else 0]["worktree"]).name == b_checkout.name  # the order asked for
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root_a), "lane", "gc", "--delete", "--json"])
+
+    out = capsys.readouterr().out
+    print(f"[gc two checkouts a_row={a_row} managed={managed} b_{b_listed}] rc={rc} out={out.strip()!r}")
+    _b_checkout_is_intact(root_b, b_checkout)
+    assert _git(root_b, "branch", "--list", f"lane/{LANE}").strip()  # B's branch stays
+    items = [row for row in json.loads(out)["items"] if row["lane_id"] == LANE]
+    assert items and all(row.get("worktree") is None or root_a in Path(row["worktree"]).resolve().parents
+                         for row in items)  # whatever gc paired, it is not B's folder
+    assert all(row.get("branch_deleted") is not True for row in items)
