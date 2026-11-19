@@ -5291,8 +5291,13 @@ def _lane_checkout_registration(folder: str, git_dir: str) -> tuple[str, str] | 
 
 # The step for a checkout moved by hand, as a person reads it. It is run from INSIDE the moved checkout, with nothing
 # after it, so the command holds no path to quote (`git worktree repair` run from the repository with no path mends
-# nothing). The folder is only shown, in the words around the command, through `pc.line`.
+# nothing). The folder is only shown, in the words around the command, through `pc.line`. The step is only for a
+# checkout whose old folder is GONE: run from a copy, Git rewrites its record to name the copy whether or not the
+# original is there (and, when the original cannot be examined, nothing here proves it is gone), so the warning goes
+# wherever the step does.
 _LANE_REPAIR_STEP = "open the moved folder {folder} and run `git worktree repair` there"
+_LANE_REPAIR_WARNING = ("if the old folder still exists or cannot be checked, leave this one alone: the repair would "
+                        "take Git's record away from the original")
 
 
 def _lane_checkout_registration_text(folder: str, found: tuple[str, str]) -> str:
@@ -5301,8 +5306,8 @@ def _lane_checkout_registration_text(folder: str, found: tuple[str, str]) -> str
         return (
             f"this checkout's own `.git` entry, {pc.line(detail)}, is a link, so Git's record cannot show that "
             f"{pc.line(folder)} is the checkout Git registered (a link can lead to another checkout's `.git` file), "
-            "and it was left alone. Replace the link with the checkout's real `.git` file (`git worktree repair` "
-            "from the repository) and try again")
+            "and it was left alone. Replace the link with the real `.git` file of this checkout (or remove this "
+            "folder and assign the lane again) and try again")
     if kind == "mismatch":
         return (
             f"Git's own record of this checkout says it lives at {pc.line(detail)}, not at {pc.line(folder)}: this "
@@ -5313,8 +5318,8 @@ def _lane_checkout_registration_text(folder: str, found: tuple[str, str]) -> str
     return (
         f"Git's own record of where this checkout lives could not be examined ({pc.line(detail)}), so it is not "
         f"proven that {pc.line(folder)} is the checkout Git registered, and it was left alone. Make the record "
-        f"readable (if you moved the checkout by hand, {_LANE_REPAIR_STEP.format(folder=pc.line(folder))}) and run "
-        "the command again")
+        "readable and run the command again. If you moved the checkout by hand and the old folder is really gone, "
+        f"{_LANE_REPAIR_STEP.format(folder=pc.line(folder))}, then run the command again; {_LANE_REPAIR_WARNING}")
 
 
 def _lane_proof_identity(

@@ -5300,6 +5300,59 @@ def test_the_repair_step_warns_that_a_copy_with_the_old_folder_still_there_is_no
     assert "from the repository" not in unknown, unknown
 
 
+def test_the_could_not_be_examined_text_carries_the_old_folder_condition_and_warning(tmp_path) -> None:
+    """Round 31d (codex-rev): "could not be examined" does not prove the original folder is gone, so the repair is
+    offered only if the old folder is really gone, with the warning for when it still exists or cannot be checked."""
+    moved = str(tmp_path / "new")
+    unknown = cli._lane_checkout_registration_text(moved, ("unknown", "PermissionError: access denied"))
+    assert "and the old folder is really gone" in unknown, unknown
+    assert ("if the old folder still exists or cannot be checked, leave this one alone: the repair would take "
+            "Git's record away from the original") in unknown, unknown
+
+
+def test_a_copy_whose_original_cannot_be_examined_is_refused_with_the_warning(tmp_path, monkeypatch, capsys) -> None:
+    """codex-rev's case: the original folder is there but looking at it fails (PermissionError). The copy is refused,
+    and the message does not offer the repair without the warning that it would take the original's record."""
+    import shutil
+
+    from test_lanes import _assign_worktree, _commit, _repo
+
+    root, base = _repo(tmp_path)
+    original = Path(_assign_worktree(root, base, "cp")["worktree_path"])
+    _commit(original, "src/core/a.py", "base\ncopy\n")
+    copy = original.with_name("copy-of-" + original.name)
+    shutil.copytree(original, copy)
+    _point_lane_at(Store(root), "cp", copy)
+    real = cli._strict_real
+
+    def unreadable_original(path, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        if os.path.normcase(os.fspath(path)) == os.path.normcase(str(original)):
+            raise PermissionError(13, "Access is denied", str(original))
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(cli, "_strict_real", unreadable_original)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "cp", "--from", "dev"]) == 3
+    err = capsys.readouterr().err
+    assert "could not be examined" in err, err
+    assert "if the old folder still exists or cannot be checked, leave this one alone" in err, err
+    assert "take Git's record away from the original" in err, err
+    _nothing_was_published(Store(root), "cp")
+    _assert_untouched(original, copy)
+
+
+def test_the_text_for_a_linked_git_entry_gives_a_step_that_works_as_printed() -> None:
+    """Round 31d (P2): a `.git` entry that is a link is replaced by the checkout's real `.git` file, or the folder is
+    removed and the lane assigned again; no repair step is printed, because `git worktree repair` from the repository
+    without a path mends nothing."""
+    text = cli._lane_checkout_registration_text("C:\\x\\wt", ("link", "C:\\x\\wt\\.git"))
+    assert "Replace the link with the real `.git` file of this checkout" in text, text
+    assert "remove this folder and assign the lane again" in text, text
+    assert "git worktree repair" not in text and "from the repository" not in text, text
+
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Round 31b (codex-rev's P2): `os.path.realpath` keeps the Windows extended-path prefix when it was given one, so
 # Git's record of a checkout, written with the prefix, compared unequal with the checkout's ordinary spelling and a
