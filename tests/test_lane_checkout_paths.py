@@ -4933,3 +4933,36 @@ def test_a_checkout_that_resolves_completely_is_still_inside_the_store(tmp_path)
     (store_root / ".worktrees" / "x").mkdir(parents=True)
     assert cli._lane_checkout_outside_store(Store(store_root), str(store_root / ".worktrees" / "x")) is None
     assert cli._lane_checkout_hazard(str(store_root / ".worktrees" / "x")) is None
+
+
+@pytest.mark.parametrize("command", ["abandon"])
+def test_another_lanes_path_that_cannot_be_resolved_blocks_a_removal(tmp_path, monkeypatch, capsys, command):
+    """The owner scan decides by resolved paths: another lane whose saved path cannot be resolved (here a link to the
+    checkout, with the resolution and the file-identity comparison both failing) could be the owner, so it blocks."""
+    from test_lanes import _assign_worktree, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    store = Store(root)
+    assert _git_rc(first, "checkout", "--detach", base).returncode == 0
+    assert _git_rc(other, "checkout", "--detach", base).returncode == 0
+    _point_lane_at(store, "first", other)
+    via = tmp_path / "via-link"
+    _link_directory(via, other)
+    _update_row(store, "other", worktree_path=str(via), worktree_toplevel_canonical=None)
+    fired = _realpath_cannot_follow(monkeypatch, via, PermissionError(5, "access denied"))
+    real_samefile = os.path.samefile
+
+    def samefile(a, b):
+        if os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(via))):
+            raise PermissionError(5, "access denied")
+        return real_samefile(a, b)
+
+    monkeypatch.setattr(os.path, "samefile", samefile)
+    capsys.readouterr()
+
+    cli.main(["--root", str(root), "lane", "abandon", "--id", "first"])
+
+    assert "strict" in fired
+    _assert_untouched(first, other)

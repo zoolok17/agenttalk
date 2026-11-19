@@ -5011,6 +5011,7 @@ def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> tuple
     reassignment moves out of the two fields) name folders too, and a claim that cannot be read as a full path
     cannot be ruled out either: the full canonical path of the current checkout says nothing about an earlier one."""
     rows = lane_mod.load_lanes(store).get("lanes") or {}
+    folder_reals = [_strict_real(folder) for folder in folders]  # OSError when a folder cannot be resolved: refused
     for key, row in rows.items():
         if key == lane_id or not isinstance(row, dict):
             continue
@@ -5045,15 +5046,22 @@ def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> tuple
                     placed = False
                 elif field == "occupancy_worktrees":
                     claim_unplaced = True
-            for folder in folders:
-                for candidate in named:
-                    if _same_folder(candidate, folder):
+            for candidate in named:
+                try:
+                    candidate_real = _strict_real(candidate)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue  # nothing is there, so it cannot be any of these folders
+                except (OSError, ValueError):
+                    return key, False  # it could not be resolved (access denied, a sharing violation): it could be
+                    # one of these folders, and a path that cannot be followed is not ruled out
+                for folder, folder_real in zip(folders, folder_reals, strict=True):
+                    if candidate_real == folder_real:
                         return key, True
                     try:
                         if os.path.samefile(candidate, folder):
                             return key, True
                     except (OSError, ValueError):
-                        pass  # one of them is not there: only the spelling comparison above could say
+                        pass  # the file-identity comparison could not be made; the resolved paths above differ
         if claim_unplaced or (not placed and not anchored):
             return key, False
     return None
@@ -5287,7 +5295,12 @@ def _verify_lane_worktree(
                 f"({', '.join(repr(path) for path in elsewhere)}), so this checkout is not proven to be this lane's")
         detached_at_lane_tip = True
     # Whatever the branch says, a folder that another lane's row names is that lane's, never this one's.
-    owner = _lane_checkout_owned_by_another(store, lane_id, wt, toplevel)
+    try:
+        owner = _lane_checkout_owned_by_another(store, lane_id, wt, toplevel)
+    except (OSError, ValueError) as exc:
+        raise lane_mod.LaneError(
+            f"whether another lane owns this checkout could not be established ({pc.line(str(exc))}); it was left "
+            "alone") from exc
     if owner is not None and owner[1]:
         raise lane_mod.LaneError(
             f"this checkout is also the saved checkout of lane {pc.line(owner[0])}, so it is not proven to be lane "
