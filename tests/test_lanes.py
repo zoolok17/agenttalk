@@ -3289,35 +3289,52 @@ def test_delivery_does_not_record_the_cleanup_as_done_when_the_worktree_cannot_b
     assert wt.exists() and fired
 
 
-def _checkout_cannot_be_resolved(monkeypatch: pytest.MonkeyPatch, *folders: Path) -> list[str]:
+def _checkout_cannot_be_resolved(
+        monkeypatch: pytest.MonkeyPatch, *folders: Path, only_during: str | None = None) -> list[str]:
     """`os.path.realpath(..., strict=True)` of exactly these folders fails with an access-denied error, on every system
     (`_hidden_error` reaches it only where `realpath` is built on `os.lstat`, which is not Windows: there it asks the
-    system for the final path name instead). Without `strict` the answer is unchanged. Returns the calls it fired on."""
+    system for the final path name instead). Without `strict` the answer is unchanged. With `only_during`, the fault is
+    armed only while that `cli` function runs (as in `_hidden_error`). Returns the calls it fired on."""
     bad = {os.path.normcase(os.path.abspath(folder)) for folder in folders}
     bad |= {os.path.normcase(os.path.realpath(folder)) for folder in folders}
     real = os.path.realpath
     fired: list[str] = []
+    armed = {"on": only_during is None}
 
     def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        if strict and os.path.normcase(os.path.abspath(os.fspath(path))) in bad:
+        if armed["on"] and strict and os.path.normcase(os.path.abspath(os.fspath(path))) in bad:
             fired.append(os.fspath(path))
             raise PermissionError(13, "injected: access denied")
         return real(path, *args, strict=strict, **kwargs)
 
     monkeypatch.setattr(os.path, "realpath", realpath)
+    if only_during is not None:
+        real_fn = getattr(cli, only_during)
+
+        def armed_fn(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            armed["on"] = True
+            try:
+                return real_fn(*args, **kwargs)
+            finally:
+                armed["on"] = False
+
+        monkeypatch.setattr(cli, only_during, armed_fn)
     return fired
 
 
 def test_delivery_is_published_when_the_checkout_cannot_be_examined_and_the_cleanup_keeps_it(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
-    """Round 29 (CI red on Linux): the same scenario as the test above, made to run on Windows too. A checkout that
-    cannot be examined is not proven to be outside this store, so the delivery (which removes nothing) is published;
-    the cleanup that follows is a removal, so it keeps the checkout and says why, and the lane stays cleanup pending."""
+    """Round 29 (CI red on Linux), as changed in round 30: the same scenario as the test above (which breaks the look
+    only from `_lane_finalize_delivery` on), made to run on Windows too. The fresh evaluation proved the checkout is
+    this store's; when it can no longer be examined at the terminal recheck, the same command's earlier proof stands
+    (the checkout is the same one by Git's own account), so the delivery is published; the cleanup that follows is a
+    removal, so it keeps the checkout and says why, and the lane stays cleanup pending. (Round 29 broke the look for
+    the whole command, which let a checkout nobody had examined be published: that is refused now, see below.)"""
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "unexam")
     wt = Path(lane["worktree_path"])
     _commit(wt, "src/core/a.py", "base\nunexamined\n")
-    fired = _checkout_cannot_be_resolved(monkeypatch, wt)
+    fired = _checkout_cannot_be_resolved(monkeypatch, wt, only_during="_lane_finalize_delivery")
     capsys.readouterr()
 
     assert _run_raw(["lane", "deliver", "--id", "unexam", "--from", "dev"], root) == 0
@@ -3377,7 +3394,16 @@ def test_the_worktree_check_tells_proven_outside_from_could_not_be_examined(
     with pytest.raises(lanes.LaneError, match="could not be examined") as removal:
         cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True, for_removal=True)
     assert "is not inside this store's folder" not in str(removal.value)
-    provenance = cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True)      # a delivery
+    # Round 30: a fresh delivery evaluation refuses too (nothing is published on a checkout nobody could look at), and
+    # so does a terminal recheck that has no earlier proof from this command; with the proof it goes on.
+    with pytest.raises(lanes.LaneError, match="could not be examined"):
+        cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True)
+    with pytest.raises(lanes.LaneError, match="nothing earlier in this delivery proved"):
+        cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True, terminal=True)
+    monkeypatch.undo()
+    cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True)       # a fresh evaluation proves it
+    _checkout_cannot_be_resolved(monkeypatch, wt)
+    provenance = cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True, terminal=True)
     assert provenance["tracked_tree_clean"] is True
 
 

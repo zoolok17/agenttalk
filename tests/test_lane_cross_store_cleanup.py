@@ -295,6 +295,37 @@ def test_the_refusal_for_store_b_checkout_says_it_is_outside_not_that_it_could_n
     _b_checkout_is_intact(root_b, checkout)
 
 
+@pytest.mark.parametrize("armed", [None, "_lane_finalize_delivery"], ids=["whole-command", "final-steps-only"])
+def test_store_a_never_publishes_store_b_checkout_it_could_not_examine(two_stores, monkeypatch, capsys, armed):
+    """Round 30 (codex-rev's probe): store B's lane row is copied into store A, B's work is committed in B's checkout,
+    and looking at that checkout fails. Whether the fault is there from the start or only from the final steps on,
+    A's `lane deliver` writes nothing: not a committed final, not a pending delivery, the row stays active, and B's
+    checkout is untouched. (From the start, the fresh evaluation cannot show the checkout is A's; from the final steps
+    on, the fresh evaluation has already seen that it is not.)"""
+    from test_lanes import _checkout_cannot_be_resolved, _commit
+
+    root_a, root_b, base, target = two_stores
+    b_row = _assign(root_b, base, target)
+    checkout = Path(b_row["worktree_path"])
+    _commit(checkout, "src/core/a.py", "base\nother store work\n")
+    _row_in_a(root_a, root_b, b_row, "copied", monkeypatch)
+    store_a = Store(root_a)
+    fired = _checkout_cannot_be_resolved(monkeypatch, checkout, only_during=armed)
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root_a), "lane", "deliver", "--id", LANE, "--from", "dev"])
+
+    err = capsys.readouterr().err
+    assert rc == 3 and "was left alone" in err
+    assert ("could not be examined" in err) if armed is None else ("is not inside this store's folder" in err)
+    deliveries = store_a.dir / lanes.DELIVERIES_DIRNAME
+    assert not deliveries.exists() or not [p for p in deliveries.rglob("*") if p.is_file()]
+    row = lanes.load_lanes(store_a)["lanes"][LANE]
+    assert row["status"] == lanes.STATUS_ACTIVE and "publish_pending" not in row and "delivery_artifact" not in row
+    _b_checkout_is_intact(root_b, checkout)
+    assert fired or armed is not None
+
+
 def test_store_a_still_removes_its_own_lanes_checkout_beside_store_b_lane(two_stores, monkeypatch, capsys):
     """The control: abandon and gc in A take A's own lane `y` (its checkout is inside A's folder), and B's `x` stays."""
     root_a, root_b, base, target = two_stores

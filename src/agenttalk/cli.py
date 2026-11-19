@@ -5233,12 +5233,54 @@ def _lane_checkout_unexamined_text(store, folder: str, detail: str) -> str:
         "and run the command again")
 
 
+def _lane_proof_identity(
+        store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str) -> tuple[tuple, dict]:
+    """The key and the facts of one checkout's ownership proof: which lane instance, and what Git itself says the
+    checkout is (its toplevel and its own administrative folder, which no other checkout shares), plus every other
+    lane's saved row (the other-owner scan reads exactly those)."""
+    rows = lane_mod.load_lanes(store).get("lanes") or {}
+    facts = {
+        "folder": os.path.normcase(folder), "toplevel": toplevel_c, "git_dir": git_dir,
+        "other_rows": lane_mod.fingerprint({key: row for key, row in rows.items() if key != lane_id}),
+    }
+    return (lane_id, lane.get("instance_id"), lane.get("generation")), facts
+
+
+def _lane_record_proof(store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str) -> None:
+    """Remember, for the rest of THIS command, that the fresh delivery evaluation proved this store owns the checkout
+    (it lies inside the store's folder, and no other lane claims it). Kept on the store object the command opened,
+    so no other command, and no later run, ever relies on it."""
+    key, facts = _lane_proof_identity(store, lane_id, lane, folder, toplevel_c, git_dir)
+    proofs = store.__dict__.setdefault("_lane_delivery_proofs", {})
+    proofs[key] = facts
+
+
+def _lane_proof_holds(store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str) -> bool:
+    """Whether the proof this command made earlier still describes the checkout the terminal recheck is looking at:
+    the same lane instance, the same folder, and the same toplevel and administrative folder according to Git, with
+    every other lane's saved row unchanged. A checkout swapped in since (another store's, another lane's) has its own
+    administrative folder, so it does not match. False when no proof was made in this command."""
+    try:
+        key, facts = _lane_proof_identity(store, lane_id, lane, folder, toplevel_c, git_dir)
+    except (OSError, ValueError, lane_mod.LaneError):
+        return False
+    return store.__dict__.get("_lane_delivery_proofs", {}).get(key) == facts
+
+
 def _verify_lane_worktree(
     store, lane: dict, *, lane_id: str, expected_base: str | None = None, check_paths: bool = True,
-    store_owned: bool = False, for_removal: bool = False,
+    store_owned: bool = False, for_removal: bool = False, terminal: bool = False,
 ) -> dict:
     """`lane_id` is the registry key: it names the row in every refusal. The id written inside the row is a separate
     fact (it picks the lane branch below, as before) and must never stand in for the key.
+
+    Whose checkout it is (`store_owned`) is proven or the call refuses, with one exception. Where the proof could not be
+    made (the checkout, or another lane's saved paths, could not be examined) a removal and a FRESH delivery
+    evaluation refuse: nothing was published yet. Only the terminal recheck of a delivery (`terminal=True`, run on the
+    row's saved snapshot after the first state save and before the evidence is published) may go on without it, and
+    only when this same command proved it earlier for the same checkout (`_lane_proof_holds`): that proof is bound to
+    what Git itself says the checkout is (its own admin folder and toplevel), so a checkout swapped in since is not
+    accepted. Without that earlier proof (a recovery run by another command) it refuses.
 
     `check_paths=False` is for one caller only: the persisted snapshot of a delivery whose committed final is already
     valid (see `_lane_candidate`). There a blank or relative saved canonical path is not read as a folder: a relative
@@ -5274,14 +5316,16 @@ def _verify_lane_worktree(
     if toplevel_c != expected_c:
         raise lane_mod.LaneError(
             f"registered worktree path {expected_c!r} does not match git toplevel {toplevel_c!r}")
+    place = None
     if store_owned:  # for a removal or a delivery: only a checkout this store can show it made (see the helper)
         place = _lane_checkout_place(store, wt, toplevel)
         if place is not None and place[0] == "outside":
             raise lane_mod.LaneError(_lane_checkout_not_ours_text(store, place[1]))
-        if place is not None and for_removal:  # nothing proves it is ours: an unexaminable checkout is never removed
+        if place is not None and (for_removal or not terminal):
+            # Nothing proves it is ours. A removal never goes on; a fresh delivery has written nothing yet, so it
+            # stops here, and the publication is never made on the strength of a checkout nobody could look at.
             raise lane_mod.LaneError(_lane_checkout_unexamined_text(store, place[1], place[2]))
-        # A delivery removes nothing, so a checkout that merely could not be examined here does not refuse it: it is
-        # published, and the cleanup that follows runs this same check as a removal and keeps the checkout (pending).
+        # What is left is the terminal recheck of a delivery, which is judged by `_lane_proof_holds` below.
     if for_removal:  # a store inside the checkout, or a link the removal can follow out of it, is lost unseen by Git
         try:
             hazard = _lane_checkout_hazard(toplevel)
@@ -5302,7 +5346,8 @@ def _verify_lane_worktree(
     wt_common = _common_git_dir(wt)
     if repo_common != wt_common:
         raise lane_mod.LaneError("worktree common git dir does not match the store repository")
-    if _git_dir(wt) == wt_common:
+    wt_git_dir = _git_dir(wt)
+    if wt_git_dir == wt_common:
         raise lane_mod.LaneError("registered worktree is the primary checkout")
     head = _git_read_one(wt, ["rev-parse", "--verify", "HEAD^{commit}"], "worktree HEAD")
     if expected_base is not None and head != expected_base:
@@ -5337,16 +5382,24 @@ def _verify_lane_worktree(
         detached_at_lane_tip = True
     # Whatever the branch says, a folder that another lane's row names is that lane's, never this one's.
     owner = None
+    scan_failed: Exception | None = None
     try:
         owner = _lane_checkout_owned_by_another(store, lane_id, wt, toplevel)
     except (OSError, ValueError) as exc:
-        if for_removal:  # an unexaminable checkout is never removed
+        if for_removal or not terminal:  # not removed, not published, not assigned on a scan nobody could make
             raise lane_mod.LaneError(
                 f"whether another lane owns this checkout could not be established ({pc.line(str(exc))}); it was "
                 "left alone") from exc
-        # Anything that removes nothing (a delivery and its terminal recheck, `lane check`, `lane assign`) is not
-        # refused for a checkout that could not be examined: the cleanup that follows runs this scan again as a
-        # removal. Same as the containment check above.
+        scan_failed = exc  # the terminal recheck of a delivery: see `_lane_proof_holds` below
+    if store_owned and terminal and (place is not None or scan_failed is not None):
+        if not _lane_proof_holds(store, lane_id, lane, wt, toplevel_c, wt_git_dir):
+            if place is not None:
+                raise lane_mod.LaneError(
+                    _lane_checkout_unexamined_text(store, place[1], place[2])
+                    + ", and nothing earlier in this delivery proved it is this lane's")
+            raise lane_mod.LaneError(
+                f"whether another lane owns this checkout could not be established ({pc.line(str(scan_failed))}), "
+                "and nothing earlier in this delivery proved that it does not; it was left alone")
     if owner is not None and owner[1]:
         raise lane_mod.LaneError(
             f"this checkout is also the saved checkout of lane {pc.line(owner[0])}, so it is not proven to be lane "
@@ -5362,6 +5415,8 @@ def _verify_lane_worktree(
         raise lane_mod.LaneError(f"could not verify worktree tracked status (git rc={rc})")
     if status.strip():
         raise lane_mod.LaneError("worktree has staged/unstaged tracked changes")
+    if store_owned and not terminal and not for_removal:  # a fresh delivery evaluation: ownership was just proven
+        _lane_record_proof(store, lane_id, lane, wt, toplevel_c, wt_git_dir)
     return {
         "head": head,
         "worktree_toplevel_canonical": toplevel_c,
@@ -6103,6 +6158,7 @@ def _lane_committed_checkout_folder(store, lane: dict, lane_id: str) -> str:
 
 def _lane_candidate(
     store, lane: dict, requested_head: str | None, *, lane_id: str, delivery: bool, check_paths: bool = True,
+    terminal: bool = False,
 ):
     """`check_paths=False` carries the committed-publication exception to the signed snapshot: a delivery an older
     version prepared with a blank or relative canonical path already in the row has that damage inside its snapshot
@@ -6116,7 +6172,8 @@ def _lane_candidate(
         # checkout is refused here, before anything is written; the retry of an already committed delivery
         # (`check_paths=False`) is not judged again, and its cleanup is.
         provenance = _verify_lane_worktree(
-            store, lane, lane_id=lane_id, check_paths=check_paths, store_owned=delivery and check_paths)
+            store, lane, lane_id=lane_id, check_paths=check_paths, store_owned=delivery and check_paths,
+            terminal=terminal)
         head = provenance["head"]
         if requested_head:
             requested = _lane_resolve(store, requested_head)
@@ -6383,14 +6440,14 @@ def _lane_rebind_pending_delivery(
         # saved checkout paths (a non-committed delivery is, as before).
         paths_matter = committed is None
         rebound_head, provenance = _lane_candidate(
-            store, lane_snapshot, head, lane_id=lane_id, delivery=True, check_paths=paths_matter,
+            store, lane_snapshot, head, lane_id=lane_id, delivery=True, check_paths=paths_matter, terminal=True,
         )
         verdict, ctx = _lane_eval(
             store, lane_snapshot, others, rebound_head,
             str(expected_snapshot.get("gate_scope")),
         )
         final_head, final_provenance = _lane_candidate(
-            store, lane_snapshot, head, lane_id=lane_id, delivery=True, check_paths=paths_matter,
+            store, lane_snapshot, head, lane_id=lane_id, delivery=True, check_paths=paths_matter, terminal=True,
         )
         final_target = _lane_resolve(store, str(lane_snapshot.get("target_ref")))
     except _LaneRetryFromDeliveryFolder:

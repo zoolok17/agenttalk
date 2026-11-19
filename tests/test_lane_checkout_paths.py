@@ -4975,3 +4975,150 @@ def test_a_checkout_that_is_not_there_is_judged_by_where_it_would_be(tmp_path):
     (store_root / ".worktrees").mkdir(parents=True)
     assert cli._lane_checkout_outside_store(Store(store_root), str(store_root / ".worktrees" / "gone-x")) is None
     assert cli._lane_checkout_outside_store(Store(store_root), str(tmp_path / "elsewhere" / "gone-x")) is not None
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 30 (codex-rev's read of round 29): a checkout nobody could look at must never be what a delivery publishes.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _other_lanes_checkout_claimed_by_first(tmp_path):
+    """Two lanes, work committed in the other lane's checkout, both checkouts detached at that commit, the lane branch
+    of `first` moved to it (so its tip matches), and the row of `first` pointed at the OTHER checkout. Returns
+    (root, store, first_checkout, other_checkout)."""
+    from test_lanes import _assign_worktree, _commit, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    _commit(other, "src/core/a.py", "base\nanother lane work\n")
+    head = _git_rc(other, "rev-parse", "HEAD").stdout.strip()
+    assert _git_rc(first, "checkout", "--detach", base).returncode == 0
+    assert _git_rc(other, "checkout", "--detach", head).returncode == 0
+    assert _git_rc(root, "branch", "-f", "lane/first", head).returncode == 0
+    store = Store(root)
+    _point_lane_at(store, "first", other)
+    return root, store, first, other
+
+
+def _nothing_was_published(store: Store, lane_id: str) -> None:
+    deliveries = store.dir / lanes.DELIVERIES_DIRNAME
+    left = [p.name for p in deliveries.rglob("*") if p.is_file() and not p.name.startswith(".")]
+    assert not left, left        # dot-files are bookkeeping that any attempt leaves; no evidence file may be left
+    row = lanes.load_lanes(store)["lanes"][lane_id]
+    assert row["status"] == lanes.STATUS_ACTIVE and "publish_pending" not in row and "delivery_artifact" not in row
+
+
+def test_delivery_never_publishes_another_lanes_checkout_it_could_not_examine(tmp_path, capsys, monkeypatch):
+    """codex-rev's second probe: the checkout the row of `first` names is the other lane's, and looking at it fails.
+    Nothing is published; the other lane's checkout is untouched."""
+    from test_lanes import _checkout_cannot_be_resolved
+
+    root, store, _first, other = _other_lanes_checkout_claimed_by_first(tmp_path)
+    fired = _checkout_cannot_be_resolved(monkeypatch, other)
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root), "lane", "deliver", "--id", "first", "--from", "dev"])
+
+    err = capsys.readouterr().err
+    assert fired and rc == 3 and "could not be examined" in err
+    _nothing_was_published(store, "first")
+    _assert_untouched(other)
+
+
+def test_delivery_is_refused_when_the_scan_for_another_lanes_claim_cannot_be_made(tmp_path, capsys, monkeypatch):
+    """The same set-up, but only the other-owner scan fails (the checkout itself can be examined and is inside the
+    store): an error in that scan is not set aside for a delivery. Without it nothing else in the set-up stops the
+    delivery."""
+    root, store, _first, other = _other_lanes_checkout_claimed_by_first(tmp_path)
+    scans: list[str] = []
+
+    def scan_fails(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        scans.append("scan")
+        raise PermissionError(13, "injected: a saved path of another lane cannot be read")
+
+    monkeypatch.setattr(cli, "_lane_checkout_owned_by_another", scan_fails)
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root), "lane", "deliver", "--id", "first", "--from", "dev"])
+
+    err = capsys.readouterr().err
+    assert scans and rc == 3 and "whether another lane owns this checkout could not be established" in err
+    _nothing_was_published(store, "first")
+    _assert_untouched(other)
+
+
+def test_a_terminal_recheck_with_no_earlier_proof_from_this_command_refuses(tmp_path, capsys, monkeypatch):
+    """What a recovery run by another command looks like: nothing in this command proved the checkout is the lane's, and
+    from the final steps on it cannot be examined. The delivery is rolled back, not published."""
+    from test_lanes import _assign_worktree, _checkout_cannot_be_resolved, _commit, _repo
+
+    root, base = _repo(tmp_path)
+    mine = Path(_assign_worktree(root, base, "mine")["worktree_path"])
+    _commit(mine, "src/core/a.py", "base\nmine\n")
+    monkeypatch.setattr(cli, "_lane_record_proof", lambda *args, **kwargs: None)   # no proof was made in this command
+    fired = _checkout_cannot_be_resolved(monkeypatch, mine, only_during="_lane_finalize_delivery")
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root), "lane", "deliver", "--id", "mine", "--from", "dev"])
+
+    err = capsys.readouterr().err
+    assert fired and rc == 3 and "nothing earlier in this delivery proved" in err
+    _nothing_was_published(Store(root), "mine")
+    _assert_untouched(mine)
+
+
+def test_a_checkout_swapped_in_after_the_fresh_evaluation_is_not_published(tmp_path, capsys, monkeypatch):
+    """The folder of `first` is replaced, between the fresh evaluation and the terminal recheck, by a link to the other
+    lane's checkout (same commit, both detached), and from then on `first`'s folder cannot be resolved. The recheck
+    sees another checkout by Git's own account, so nothing is published."""
+    from test_lanes import _assign_worktree, _checkout_cannot_be_resolved, _commit, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    _commit(first, "src/core/a.py", "base\nfirst\n")
+    head = _git_rc(first, "rev-parse", "HEAD").stdout.strip()
+    assert _git_rc(first, "checkout", "--detach", head).returncode == 0
+    assert _git_rc(other, "checkout", "--detach", head).returncode == 0
+    store = Store(root)
+    real_prepare = cli._lane_prepare_publication
+
+    def swap_then_prepare(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        first.rename(first.with_name(first.name + "-away"))
+        _link_directory(first, other)
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_lane_prepare_publication", swap_then_prepare)
+    fired = _checkout_cannot_be_resolved(monkeypatch, first, only_during="_lane_prepare_publication")
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root), "lane", "deliver", "--id", "first", "--from", "dev"])
+
+    assert fired and rc == 3, capsys.readouterr().err
+    _nothing_was_published(store, "first")
+    _assert_untouched(other)
+
+
+def test_the_proof_made_by_the_fresh_evaluation_holds_only_for_the_same_checkout(tmp_path):
+    """The proof is bound to the lane instance, the folder, what Git says the checkout is (toplevel and its own
+    administrative folder) and every other lane's row. Anything else does not match."""
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    mine = _assign_worktree(root, base, "mine")
+    other = _assign_second_lane(root, base)
+    store = Store(root)
+    folder = mine["worktree_path"]
+    top = lanes.canonical_host_path(folder)
+    git_dir = cli._git_dir(folder)
+    assert not cli._lane_proof_holds(store, "mine", mine, folder, top, git_dir)             # nothing recorded yet
+    cli._lane_record_proof(store, "mine", mine, folder, top, git_dir)
+
+    assert cli._lane_proof_holds(store, "mine", mine, folder, top, git_dir)
+    assert not cli._lane_proof_holds(store, "mine", mine, folder, top, cli._git_dir(other))   # another admin folder
+    assert not cli._lane_proof_holds(store, "mine", mine, str(other), top, git_dir)           # another folder
+    assert not cli._lane_proof_holds(store, "mine", mine, folder, lanes.canonical_host_path(other), git_dir)
+    assert not cli._lane_proof_holds(store, "mine", dict(mine, generation=99), folder, top, git_dir)
+    _update_row(store, "other", notes="changed")                                              # another lane's row
+    assert not cli._lane_proof_holds(store, "mine", mine, folder, top, git_dir)
