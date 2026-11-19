@@ -52,7 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Doctor now reports a PowerShell host selection or config file nested too deeply instead of crashing (#846).
+- **A settings file nested too deeply no longer crashes agenttalk (#846).** A team
+  configuration or PowerShell host selection file holding JSON nested so deeply that
+  Python cannot read it is now reported as damaged: doctor names it and goes on with its
+  other checks, other commands print one line and stop, and `init --force` can repair
+  such a configuration.
 
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,
