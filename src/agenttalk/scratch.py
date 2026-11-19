@@ -39,7 +39,7 @@ def _read_scratch_config(project_root: Path) -> dict:
     config_path = project_root / ".agenttalk" / "config.json"
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(raw, dict):
         return {}
