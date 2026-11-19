@@ -157,8 +157,10 @@ jobs:
     # #378 layout 3a: four Windows runners, each runs source A, source B,
     # wheel A and wheel B. Each group retains the 9000s run limit.
     # Two hosted runs gave the margins recorded in windows_timeout_reason in
-    # dev-gate.json, and the 330-minute job ceiling was retained; changing it
-    # needs new evidence. Grouping shortens each run, not the whole job.
+    # dev-gate.json. The job ceiling was raised from 330 to 360 minutes (the
+    # hosted runner maximum) on 2026-11-18 after 18 ceiling stops with no
+    # failing test (evidence in the same reason); splitting the job is the
+    # follow-up. Grouping shortens each run, not the whole job.
     # Linux/macOS keep one run per mode and the 90-minute job ceiling.
     timeout-minutes: ${{ matrix.os.timeout_minutes }}
     strategy:
@@ -170,7 +172,7 @@ jobs:
             timeout_minutes: 90
           - id: windows
             runner: windows-latest
-            timeout_minutes: 330  # #378 layout 3a; retained after two hosted runs (see above)
+            timeout_minutes: 360  # #378: the hosted maximum; raised from 330 on 2026-11-18 (see above)
           - id: macos
             runner: macos-latest
             timeout_minutes: 90
@@ -386,7 +388,7 @@ jobs:
     if: github.ref == 'refs/heads/master' && ((github.event_name == 'schedule' && github.event.schedule == '23 2 * * *') || github.event_name == 'workflow_dispatch')
     runs-on: windows-latest
     # Non-voting experiment. The two existing jobs above remain authoritative.
-    timeout-minutes: 330
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
