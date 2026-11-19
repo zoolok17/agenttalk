@@ -80,11 +80,19 @@ _POINTS_BACK_RE = re.compile(
     rf"|{_NEGATION}[^;.:!?]*\bpinned\b",
     re.IGNORECASE,
 )
-# A clause ends at ; ! ? a blank line, a colon or a period before whitespace or the end of the text, closing quotes and
-# brackets allowed between a period and that whitespace ("... is required.) Do not ..."). So the period inside
-# `agenttalk.assurance`, `reply.md` or 0.105.0 and the colon of a drive path (`C:\temp`, `C:/temp`), written without
-# backticks, end nothing.
-_CLAUSE_END_RE = re.compile("[;!?]|:(?!\\S)|\\.[)\\]}\"'’”]*(?!\\S)|\\n\\s*\\n")
+# A clause ends at ; ! ? a blank line, any colon except the two below, or a period before whitespace or the end of the
+# text, closing quotes and brackets allowed between a period and that whitespace ("... is required.) Do not ...").
+# A colon is exempt only as a drive-letter colon (one letter, the colon, then \ or /: `C:\temp`, `C:/temp`) or a URL
+# scheme colon (followed by //), and a period only inside a word (`agenttalk.assurance`, `reply.md`, 0.105.0), written
+# without backticks. Any other colon, one followed by `**` or a letter included, still ends the clause.
+_CLAUSE_END_RE = re.compile(
+    "[;!?]"
+    "|:(?![\\\\/])"  # a colon not followed by a slash
+    "|(?<![A-Za-z]):(?=[\\\\/])"  # a colon and slash that follow no letter
+    "|(?<=[A-Za-z]{2}):(?=[\\\\/])(?!//)"  # after two letters (not a drive letter), unless it is a URL scheme
+    "|\\.[)\\]}\"'\u2019\u201d]*(?!\\S)"
+    "|\\n\\s*\\n"
+)
 _INLINE_CODE_RE = re.compile(r"(?<!`)`(?!`)[^`\n]+`(?!`)")
 _CLAUSE_PUNCTUATION_RE = re.compile(r"[;.:!?]")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)

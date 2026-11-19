@@ -729,3 +729,66 @@ def test_a_colon_ends_a_clause_before_whitespace_or_the_end_of_the_text_and_a_dr
         assert len(sc._CLAUSE_END_RE.split(text)) == 2, text
     for text in ("C:\\temp\\a.txt", "C:/temp/a.txt", "d:\\x"):
         assert len(sc._CLAUSE_END_RE.split(text)) == 1, text
+
+# ----------------------------------- only a drive-letter or URL colon is exempt from ending a clause (#861/#864 fix 2)
+
+AFTER_A_COLON = {
+    "bold": "When AGENTTALK_PY is set, run `{cmd}`:**do not use the unpinned form**; otherwise use your manual.",
+    "plain": "When AGENTTALK_PY is set, run `{cmd}`:do not use the unpinned form; otherwise use your manual.",
+    "letter-after": "When AGENTTALK_PY is set, run `{cmd}`:never use the unpinned form; otherwise use your manual.",
+    "underscores": "When AGENTTALK_PY is set, run `{cmd}`:__do not use the unpinned form__; otherwise use your manual.",
+}
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("name", sorted(AFTER_A_COLON))
+def test_a_colon_followed_by_text_still_ends_the_clause(tmp_path, kind, shell, name) -> None:
+    """#861/#864 fix 2: "...`pinned command`:**do not use the unpinned form**" is two clauses, the second about another
+    command; only a drive-letter or URL colon is exempt."""
+    rule = AFTER_A_COLON[name].format(cmd=PINNED_FORMS[shell]) + "\n"
+    assert sc._states_pinned_rule(rule), rule
+    assert pinned_findings(tmp_path, kind, rule + "Run `python -m agenttalk send`.\n") == []
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+def test_a_url_colon_in_an_unquoted_argument_does_not_end_the_clause(shell) -> None:
+    rule = (
+        f"When AGENTTALK_PY is set, {PINNED_FORMS[shell]} send --file https://example.org/a.txt must not be used; "
+        "otherwise run python -m agenttalk send.\n"
+    )
+    assert not sc._states_pinned_rule(rule), rule
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+def test_a_time_of_day_or_other_colon_is_an_ordinary_colon(shell) -> None:
+    """The controls: a colon that is neither a drive letter nor a URL scheme ends the clause, as before #864."""
+    rule = (
+        f"When AGENTTALK_PY is set, run {PINNED_FORMS[shell]} at 10:30; do not use the unpinned form; "
+        "otherwise use your manual.\n"
+    )
+    assert sc._states_pinned_rule(rule), rule
+    assert len(sc._CLAUSE_END_RE.split("at 10:30")) == 2
+
+
+@pytest.mark.parametrize(
+    "text, ends",
+    [
+        ("C:\\temp\\a.txt", False),
+        ("c:/temp/a.txt", False),
+        ("see D:\\x", False),
+        ("https://example.org/a", False),
+        ("ftp://host/a", False),
+        ("ab:\\x", True),
+        ("word:/x", True),
+        (":/x", True),
+        ("x: y", True),
+        ("x:\ny", True),
+        ("x:", True),
+        ("x:**y**", True),
+        ("x:y", True),
+        ("10:30", True),
+    ],
+)
+def test_which_colons_end_a_clause(text, ends) -> None:
+    assert (len(sc._CLAUSE_END_RE.split(text)) > 1) is ends, text
