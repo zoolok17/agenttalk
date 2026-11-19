@@ -950,7 +950,8 @@ def _check_powershell_host(store: Store) -> Check:
                           "removed, and its wrapper may still be running")
                 fix += (". If no wrapper runs for that seat any more, remove its marker file, "
                         "state/<seat>.health.json in the store folder (a wrapper that is still running writes it "
-                        "again), then run agenttalk doctor again")
+                        "again, but health writes are best effort and can be delayed), then run agenttalk doctor "
+                        "again")
         return Check(
             name="powershell_host",
             status="error",

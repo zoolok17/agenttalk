@@ -3245,6 +3245,7 @@ def test_a_departed_seats_continuous_codex_marker_keeps_the_host_error(tmp_path,
     # How to clear it, and only what is true: a marker is advisory, a running wrapper writes it again.
     assert "If no wrapper runs for that seat any more, remove its marker file, state/<seat>.health.json" in check.fix
     assert "a wrapper that is still running writes it again" in check.fix
+    assert "but health writes are best effort and can be delayed" in check.fix  # not a prompt or sure rewrite
     assert check.fix.startswith(doctor.psh.INSTALL_REMEDIATION)
 
 
