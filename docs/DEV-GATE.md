@@ -415,9 +415,11 @@ is 7,200 seconds on Linux and macOS. On Windows the limit is `windows_timeout_se
 chooses the limit.
 
 The CI job ceilings in `.github/workflows/tests.yml` follow from these limits:
-- **Windows: 330 minutes.** This whole-job ceiling stays independent of the four
-  group limits. Layout 3a shortens each run but keeps the job near its previous
-  length; four groups reaching their individual limits would exceed the ceiling.
+- **Windows: 360 minutes**, the hosted runner maximum (raised from 330 on 2026-11-18,
+  after 18 jobs stopped at 330 minutes with no failing test; see `windows_timeout_reason`).
+  This whole-job ceiling stays independent of the four group limits. Layout 3a shortens
+  each run but keeps the job near its previous length; four groups reaching their
+  individual limits would exceed the ceiling. Splitting the Windows job is the follow-up.
 - **Linux and macOS: 90 minutes.**
 
 The margins recorded in `windows_timeout_reason` in `dev-gate.json` come from two hosted
@@ -466,7 +468,8 @@ exactly one. Nothing runs in parallel inside either Windows pytest process.
 All check deadlines stay the same. The Windows pytest allowance is 9,000
 seconds per group run, retained under #378: two hosted runs gave the margins recorded
 in `windows_timeout_reason`, and changing the limit needs new evidence. The existing
-330-minute Windows job ceiling and 20-minute aggregation ceiling remain in use.
+Windows job ceiling (360 minutes since 2026-11-18, previously 330) and the 20-minute
+aggregation ceiling remain in use.
 
 Trial timings are not directly comparable with earlier trial data: each mode
 now runs a full collection pass followed by groups A and B, each collecting

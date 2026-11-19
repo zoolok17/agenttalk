@@ -5499,11 +5499,13 @@ def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
     return True, "worktree is clean and idle"
 
 
-def _lane_diff(root, base: str, head: str) -> dict:
-    """`git diff --name-status -z -M -C base..head` parsed structurally. touched =
-    paths a delivery WRITES (M/A/D/T, rename old+new, copy DEST); a copy SOURCE is
-    evidence-only. Fails closed: unavailable / parse_error."""
-    rc, out = _git(root, ["diff", "--name-status", "-z", "-M", "-C", f"{base}..{head}"])
+def _lane_diff(root, base: str, head: str, *, renames: bool = True) -> dict:
+    """`git diff --name-status -z -M -C base..head` parsed structurally (`renames=False`:
+    `--no-renames`, every path under its own name). touched = paths a delivery WRITES
+    (M/A/D/T, rename old+new, copy DEST); a copy SOURCE is evidence-only. Fails closed:
+    unavailable / parse_error."""
+    detect = ["-M", "-C"] if renames else ["--no-renames"]
+    rc, out = _git(root, ["diff", "--name-status", "-z", *detect, f"{base}..{head}"])
     if rc != 0:
         return {"error": "unavailable", "paths": []}
     toks = out.split("\x00")
@@ -5542,10 +5544,39 @@ def _lane_merge(root, target_head: str, head: str) -> dict:
     honest-degraded unknown — NEVER inferred clean."""
     rc, out = _git(root, ["merge-tree", "--write-tree", target_head, head])
     if rc == 0:
-        return {"status": "clean", "detail": (out.strip().splitlines() or [""])[0][:40]}
+        tree = (out.strip().splitlines() or [""])[0]
+        return {"status": "clean", "detail": tree[:40], "tree": tree}  # `tree` is for _lane_add_merge_effects only
     if rc == 1:
         return {"status": "conflict", "detail": "merge-tree reported conflicts"}
     return {"status": "unknown", "detail": f"merge-tree rc={rc} (requires Git>=2.38?)"}
+
+
+def _lane_diff_base(root, target_head: str, head: str, stored: str):
+    """The commit a lane is compared with: its one merge base with the target, which says what the lane did.
+    Returns (commit, None) or (None, error). Several merge bases are ambiguous; empty or failing answers fail closed."""
+    rc, out = _git(root, ["merge-base", "--all", target_head, head])
+    if rc == 1:  # no common ancestor: today's behaviour; the conflict check already holds such a lane
+        return stored, None
+    bases = out.split() if rc == 0 else []
+    if not bases:
+        return None, "unavailable"
+    if len(bases) > 1:
+        return None, "ambiguous_base"
+    return (stored if bases[0] == head else bases[0]), None  # head already in the target: nothing to compare
+
+
+def _lane_add_merge_effects(root, changed: dict, target_head: str, merge: dict) -> dict:
+    """Add the paths the real merge writes on the target that the lane's own diff does not name: only the
+    merge result says where the lane's edits land (a target rename can carry one outside the lane)."""
+    tree = merge.pop("tree", None)
+    if changed.get("error") or merge.get("status") != "clean":
+        return changed
+    effects = _lane_diff(root, target_head, tree, renames=False) if tree else {"error": "unavailable", "paths": []}
+    if effects.get("error"):
+        return effects
+    seen = {p["path"] for p in changed["paths"] if p.get("touched")}
+    extra = [{**p, "role": "merge-effect"} for p in effects["paths"] if p["path"] not in seen]
+    return {"error": None, "paths": [*changed["paths"], *extra]}
 
 
 def _lane_resolve(store, ref: str):
@@ -5563,8 +5594,11 @@ def _lane_eval(store, lane: dict, other_active: list[dict], head: str,
     carries changed/merge/gate_check/head/target_head_now for the artifact + output."""
     cfg_casefold = dom.default_casefold_paths()
     reg = _load_domain_registry(store)
-    base = lane.get("base_sha")
-    changed = _lane_diff(store.root, base, head)
+    target_head_now = _lane_resolve(store, lane.get("target_ref"))
+    base, base_error = _lane_diff_base(store.root, target_head_now, head, lane.get("base_sha"))
+    changed = {"error": base_error, "paths": []} if base_error else _lane_diff(store.root, base, head)
+    merge = _lane_merge(store.root, target_head_now, head)
+    changed = _lane_add_merge_effects(store.root, changed, target_head_now, merge)
     touched = [p["path"] for p in changed.get("paths", []) if p.get("touched")]
     # Resolve shared-path approver authority at eval time so compute_verdict can
     # REVALIDATE each recorded approval against the current registry (audit fix):
@@ -5589,8 +5623,6 @@ def _lane_eval(store, lane: dict, other_active: list[dict], head: str,
         return cls
 
     classifications = {p: _classify(p) for p in touched}
-    target_head_now = _lane_resolve(store, lane.get("target_ref"))
-    merge = _lane_merge(store.root, target_head_now, head)
     scope = gate_scope or f"lane:{lane.get('lane_id')}"
     gate_check = gate_mod.check_gates(store.root, scope=scope)
     current_epoch = store.current_epoch()
