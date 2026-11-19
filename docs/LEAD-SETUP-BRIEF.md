@@ -1194,11 +1194,14 @@ deny rules below matter as much as the allow rules.
 
 **Where each statement comes from.** In this part:
 
-- *reported* means the team that wrote issue #823 saw it. It ran Claude Code 2.1.326 and
-  agenttalk 0.105.0 on Windows 11, with Claude seats only, wrapped with `wrap --loop` and no
-  supervisor. agenttalk's maintainers have not run that team's tests again.
+- *reported* means a team using agenttalk saw it: the team that wrote issue #823
+  ([its report](https://github.com/zoolok17/agenttalk/issues/823#issuecomment-6945814780)),
+  unless the text names another report. That team ran Claude Code 2.1.326 and agenttalk 0.105.0
+  on Windows 11, with Claude seats only, wrapped with `wrap --loop` and no supervisor.
+  agenttalk's maintainers have not run that team's tests again.
 - *measured* means agenttalk's maintainers ran it with Claude Code 2.1.312 on Windows 11, reading
-  Claude Code's own record of refused calls (pull request #828 describes the runs).
+  Claude Code's own record of refused calls
+  ([pull request #828](https://github.com/zoolok17/agenttalk/pull/828) describes the runs).
 - *documented* means Claude Code's documentation says so; the link goes to the page.
 
 How rules match commands is Claude Code's behaviour, not agenttalk's, and it can change in any
@@ -1297,8 +1300,12 @@ top of such a boundary, not instead of it.
      interpreter's path holds a character the wrapper refuses to put in the command or the rule:
      `"`, `$` or a backtick, which change meaning inside the command; `*`, which a rule reads as
      "any text"; and `(` or `)`, refused as a precaution because Claude Code's documentation does
-     not say how a parenthesis inside a Bash rule is read (read from agenttalk's code, #828). Move
-     the agenttalk environment to a plain path, or use the older workaround.
+     not say how a parenthesis inside a Bash rule is read (read from agenttalk's code, #828). A
+     live probe by another team found that a parenthesis in the path does not widen the rule
+     (reported: one Windows machine, Claude Code 2.1.325,
+     [issue #860](https://github.com/zoolok17/agenttalk/issues/860#issuecomment-7011457380)), so a
+     later agenttalk version may allow them. Move the agenttalk environment to a plain path, or
+     use the older workaround.
    - **The older workaround.** Put the agenttalk environment's program folder first on the seats'
      `PATH` (`$env:PATH = "<env>\Scripts;$env:PATH"` on Windows, `export PATH="<env>/bin:$PATH"`
      on Linux and macOS), and add this line to each seat's rules file (the one passed with
@@ -1345,10 +1352,17 @@ top of such a boundary, not instead of it.
   `agenttalk knowledge publish -m "... endpoint ..."`, and `Bash(git * config*)` refused
   `git -C <repo> ls-files -- config/<file>` (reported). Write the command, then the fixed words,
   and a `*` only at the end.
+- **`echo` can ride along with an allowed command.** Claude Code treats `echo` as read-only, so
+  `<allowed command> ; echo ...` and `<allowed command> && echo ...` also ran under the single
+  allow rule, while a second program that no rule allows was refused (reported by another team's
+  live probe: one Windows machine, Claude Code 2.1.325,
+  [issue #860](https://github.com/zoolok17/agenttalk/issues/860#issuecomment-7011457380)). In that
+  probe, Claude Code applied the project's allow rules only after each throwaway folder had been
+  accepted once in its "trust this folder" dialog, so accept your test folder there too.
 - **No `cd`.** `cd <folder> && git ...` was refused in each case the team tried, and a `cd` on its
   own did not carry over to the next command (reported). So the seats use `git -C <folder> ...`,
-  and the rules name each repository folder, as in `Bash(git -C <repo> log *)`. Another spelling
-  of the same folder is not matched by these rules.
+  and the rules name each repository folder, as in `Bash(git -C <repo> log *)`. Rules match the
+  command text, so keep to one spelling of each folder in the rules and in the seats' commands.
 - **File writes follow `Edit(...)` rules.** `Write(...)` rules had no effect in the team's tests
   (reported).
 - **A deny rule wins over an allow rule**
@@ -1473,8 +1487,9 @@ profile allows can still do what the Read and Edit rules refuse:
   deletes them, records an upstream branch (a write to git's settings file) and starts an editor
   for a branch description. git accepted shortened forms of those options in the check (for
   example `--set-upstream-t` and `--edit-desc`), so no deny rule on the text catches them all.
-  That is why the profile allows only the two exact read forms. A builder that must create
-  branches needs `Bash(git -C <repo> branch *)`, and then has all of this. A builder's allowed
+  That is why the profile allows only the two exact read forms. Ordinary branch creation works
+  with the builder's allowed `checkout` and `switch`; only a builder that must use `git branch`
+  itself needs `Bash(git -C <repo> branch *)`, and then has all of this. A builder's allowed
   `checkout` and `switch` can do part of it too: `checkout -b <name> --track <branch>` and
   `switch -c <name> --track <branch>` create a branch and record its upstream in git's settings
   file (checked with git 2.39.1;
@@ -1706,10 +1721,15 @@ and a seat stopped in the middle of a turn.
 
 **Step 10a (a strict mode for Claude seats) was not run as a whole by agenttalk's maintainers.**
 The first rules, the matching notes and the test method come from the team that reported issue
-#823, which tested them on Windows 11 with Claude Code 2.1.326 and agenttalk 0.105.0, then
-confirmed them on live seats. agenttalk's maintainers measured, with Claude Code 2.1.312 on
-Windows 11, the agenttalk command forms (a variable at the start refused, the interpreter's path
-written out allowed) and the refused first draft (pull request #828). The statements about how
+#823 ([its report](https://github.com/zoolok17/agenttalk/issues/823#issuecomment-6945814780)),
+which tested them on Windows 11 with Claude Code 2.1.326 and agenttalk 0.105.0, then confirmed
+them on live seats. agenttalk's maintainers measured, with Claude Code 2.1.312 on Windows 11, the
+agenttalk command forms (a variable at the start refused, the interpreter's path written out
+allowed) and the refused first draft
+([pull request #828](https://github.com/zoolok17/agenttalk/pull/828)). The notes on parentheses
+and on `echo` come from another team's live probe on issue #860
+([its result](https://github.com/zoolok17/agenttalk/issues/860#issuecomment-7011457380)), on one
+Windows machine with Claude Code 2.1.325. The statements about how
 `dontAsk`, settings files and rule patterns work are from Claude Code's documentation, read on
 2026-11-19 and linked where they are used. The two example start-script lines were written for
 this brief and not run. The reply-draft folder was read from agenttalk's code. The notes in step
