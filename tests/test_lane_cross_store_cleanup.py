@@ -473,3 +473,79 @@ def test_gc_in_store_a_never_pairs_lane_x_with_the_checkout_store_b_made(
     assert items and all(row.get("worktree") is None or root_a in Path(row["worktree"]).resolve().parents
                          for row in items)  # whatever gc paired, it is not B's folder
     assert all(row.get("branch_deleted") is not True for row in items)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 31 (zteam's read of round 30): a COPY of store B's checkout, its `.git` pointer file included, reaches the same
+# administrative folder as the original and passes every check made from the checkout's side. Only Git's own record of
+# where the checkout lives (the administrative folder's `gitdir` back-link) still names the original.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _copy_of_b_checkout_in_a(root_a: Path, b_row: dict, monkeypatch) -> Path:
+    """B's checkout copied (`.git` file and all) into A's worktree folder, and A's row `x` (B's row) pointed at it:
+    the copy is in place before the first check."""
+    import shutil
+
+    original = Path(b_row["worktree_path"])
+    copy = root_a / ".worktrees" / ("copy-of-" + original.name)
+    copy.parent.mkdir(exist_ok=True)
+    shutil.copytree(original, copy, symlinks=True)
+    row = json.loads(json.dumps(b_row))
+    row["worktree_path"] = str(copy)
+    row["worktree_toplevel_canonical"] = lanes.canonical_host_path(copy)
+    monkeypatch.chdir(root_a)
+    store_a = Store(root_a)
+    data = lanes.load_lanes(store_a)
+    data.setdefault("lanes", {})[LANE] = row
+    lanes.save_lanes(store_a, data)
+    return copy
+
+
+@pytest.mark.parametrize("armed", [False, "_lane_finalize_delivery"], ids=["readable", "fails-at-final-recheck"])
+def test_store_a_never_publishes_a_copy_of_store_b_checkout(two_stores, monkeypatch, capsys, armed):
+    """zteam's P1: nothing is published, whether the copy stays readable or looking at it fails only from the final
+    steps on. The refusal says what Git's own record says, and B's checkout, branch and lane are untouched."""
+    from test_lanes import _checkout_cannot_be_resolved, _commit
+
+    root_a, root_b, base, target = two_stores
+    b_row = _assign(root_b, base, target)
+    original = Path(b_row["worktree_path"])
+    _commit(original, "src/core/a.py", "base\nB's work in progress\n")
+    copy = _copy_of_b_checkout_in_a(root_a, b_row, monkeypatch)
+    store_a = Store(root_a)
+    if armed:  # looking at the copy fails only from the final steps on; otherwise it stays readable
+        _checkout_cannot_be_resolved(monkeypatch, copy, only_during=armed)
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root_a), "lane", "deliver", "--id", LANE, "--from", "dev"])
+
+    err = capsys.readouterr().err
+    assert rc == 3 and "Git's own record of this checkout says it lives at" in err, err
+    deliveries = store_a.dir / lanes.DELIVERIES_DIRNAME
+    left = [p.name for p in deliveries.rglob("*") if p.is_file() and not p.name.startswith(".")]
+    assert not left, left
+    row = lanes.load_lanes(store_a)["lanes"][LANE]
+    assert row["status"] == lanes.STATUS_ACTIVE and "publish_pending" not in row and "delivery_artifact" not in row
+    _b_checkout_is_intact(root_b, original)
+    assert copy.is_dir()
+
+
+def test_the_registration_of_a_copy_names_the_original_and_the_original_names_itself(two_stores):
+    """The check itself: the administrative folder's record names the original checkout, so the original matches and
+    its copy does not (a copy's `.git` file is the same, byte for byte)."""
+    import shutil
+
+    root_a, root_b, base, target = two_stores
+    original = Path(_assign(root_b, base, target)["worktree_path"])
+    copy = root_a / ".worktrees" / "copy"
+    copy.parent.mkdir(exist_ok=True)
+    shutil.copytree(original, copy, symlinks=True)
+    admin = cli._git_dir(original)
+
+    assert cli._lane_checkout_registration(str(original), admin) is None
+    kind, named = cli._lane_checkout_registration(str(copy), admin)
+    assert kind == "mismatch" and os.path.normcase(os.path.realpath(named)) == os.path.normcase(
+        os.path.realpath(original / ".git")
+    )
+    assert cli._lane_checkout_registration(str(original), str(original / "no-such-admin-folder"))[0] == "unknown"

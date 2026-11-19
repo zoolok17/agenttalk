@@ -5113,7 +5113,7 @@ def test_the_proof_made_by_the_fresh_evaluation_holds_only_for_the_same_checkout
     top = lanes.canonical_host_path(folder)
     git_dir = cli._git_dir(folder)
     assert not cli._lane_proof_holds(store, "mine", mine, folder, top, git_dir)             # nothing recorded yet
-    cli._lane_record_proof(store, "mine", mine, folder, top, git_dir)
+    cli._lane_record_proof(store, "mine", mine, folder, top, git_dir, lanes.load_lanes(store).get("lanes") or {})
 
     assert cli._lane_proof_holds(store, "mine", mine, folder, top, git_dir)
     assert not cli._lane_proof_holds(store, "mine", mine, folder, top, cli._git_dir(other))   # another admin folder
@@ -5122,3 +5122,124 @@ def test_the_proof_made_by_the_fresh_evaluation_holds_only_for_the_same_checkout
     assert not cli._lane_proof_holds(store, "mine", dict(mine, generation=99), folder, top, git_dir)
     _update_row(store, "other", notes="changed")                                              # another lane's row
     assert not cli._lane_proof_holds(store, "mine", mine, folder, top, git_dir)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 31 (zteam's read of round 30): the proof vouches for exactly the rows that were scanned, and Git's own record
+# of the checkout names its folder.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _retired_claim_on(store: Store, lane_id: str, checkout: Path) -> None:
+    """A retired, cleanup-pending row of another lane that claims `checkout`."""
+    data = lanes.load_lanes(store)
+    row = dict(data["lanes"][lane_id])
+    for pending in ("publish_pending", "prepared_artifact", "delivery_transaction_id", "terminal_hold"):
+        row.pop(pending, None)
+    # a delivered, finished lane whose checkout cleanup is still pending: it reserves no paths, so only the scan for
+    # another lane's claim can see that it names the checkout
+    row.update(lane_id="ghost", status=lanes.STATUS_DELIVERED, publish_pending=False, instance_id="2" * 32,
+               cleanup_pending=True, worktree_path=str(checkout),
+               worktree_toplevel_canonical=lanes.canonical_host_path(checkout))
+    data["lanes"]["ghost"] = row
+    lanes.save_lanes(store, data)
+
+
+def _delivery_with_a_claim_inserted(tmp_path, monkeypatch, capsys, *, when: str):
+    """A delivery of `mine`, a retired claim on its checkout inserted `when` ("between-scan-and-proof": right after the
+    fresh evaluation's last scan; "after-the-proof": before the terminal steps), and looking at the checkout failing
+    from the final steps on. Returns (rc, stderr, root, checkout)."""
+    from test_lanes import _assign_worktree, _checkout_cannot_be_resolved, _commit, _repo
+
+    root, base = _repo(tmp_path)
+    mine = Path(_assign_worktree(root, base, "mine")["worktree_path"])
+    _commit(mine, "src/core/a.py", "base\nmine\n")
+    store = Store(root)
+    if when == "between-scan-and-proof":
+        real_scan, calls = cli._lane_checkout_owned_by_another, []
+
+        def scan_then_insert(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            found = real_scan(*args, **kwargs)
+            calls.append(1)
+            if len(calls) == 2:                         # the fresh evaluation scans twice; this is after the last
+                _retired_claim_on(store, "mine", mine)
+            return found
+
+        monkeypatch.setattr(cli, "_lane_checkout_owned_by_another", scan_then_insert)
+    else:
+        real_prepare = cli._lane_prepare_publication
+
+        def insert_then_prepare(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            _retired_claim_on(store, "mine", mine)
+            return real_prepare(*args, **kwargs)
+
+        monkeypatch.setattr(cli, "_lane_prepare_publication", insert_then_prepare)
+    for step in ("_lane_prepare_publication", "_lane_finalize_delivery"):   # every terminal step looks at a dead folder
+        _checkout_cannot_be_resolved(monkeypatch, mine, only_during=step)
+    capsys.readouterr()
+    rc = cli.main(["--root", str(root), "lane", "deliver", "--id", "mine", "--from", "dev"])
+    return rc, capsys.readouterr().err, root, mine
+
+
+@pytest.mark.parametrize("when", ["between-scan-and-proof", "after-the-proof"])
+def test_a_claim_inserted_after_the_scan_is_never_vouched_for(tmp_path, monkeypatch, capsys, when) -> None:
+    """zteam's P2 and its control. A retired claim on the checkout that was not scanned must not end up inside the
+    proof: when looking at the checkout then fails at the final steps, nothing is published, as it is when the same row
+    comes in after the proof was made."""
+    rc, err, root, mine = _delivery_with_a_claim_inserted(tmp_path, monkeypatch, capsys, when=when)
+
+    assert rc == 3 and "nothing earlier in this delivery proved" in err, err
+    _nothing_was_published(Store(root), "mine")
+    _assert_untouched(mine)
+
+
+def test_the_proof_is_made_from_the_rows_that_were_scanned() -> None:
+    """The proof is given the scanned rows and does not read the registry itself: the fingerprint it keeps is that of
+    the snapshot, whatever the saved registry says by then."""
+    import inspect
+
+    assert "rows" in inspect.signature(cli._lane_record_proof).parameters
+    scanned = {"mine": {"lane_id": "mine"}, "other": {"lane_id": "other"}}
+    store = types.SimpleNamespace(__dict__={})
+    key, facts = cli._lane_proof_identity(store, "mine", {"instance_id": "i", "generation": 1}, "f", "t", "g", scanned)
+    assert facts["other_rows"] == lanes.fingerprint({"other": {"lane_id": "other"}})
+
+
+def test_a_checkout_moved_with_git_worktree_move_is_still_delivered(tmp_path, capsys) -> None:
+    """What the registration check costs a legitimate checkout: nothing when Git itself moved it (it rewrites the
+    record), as long as the lane's row names the new folder."""
+    from test_lanes import _assign_worktree, _commit, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    mine = Path(_assign_worktree(root, base, "mv")["worktree_path"])
+    _commit(mine, "src/core/a.py", "base\nmoved\n")
+    moved = mine.with_name("moved-" + mine.name)
+    assert _git_rc(root, "worktree", "move", str(mine), str(moved)).returncode == 0
+    _point_lane_at(Store(root), "mv", moved)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "mv", "--from", "dev"]) == 0
+    assert lanes.load_lanes(Store(root))["lanes"]["mv"]["status"] == lanes.STATUS_DELIVERED
+
+
+def test_a_checkout_renamed_by_hand_is_refused_until_git_worktree_repair(tmp_path, capsys) -> None:
+    """And what it costs one moved without Git: Git's record still names the old folder, so the delivery is refused
+    with the way out; after `git worktree repair` it is delivered."""
+    from test_lanes import _assign_worktree, _commit, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    mine = Path(_assign_worktree(root, base, "hand")["worktree_path"])
+    _commit(mine, "src/core/a.py", "base\nrenamed\n")
+    renamed = mine.with_name("renamed-" + mine.name)
+    mine.rename(renamed)
+    _point_lane_at(Store(root), "hand", renamed)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "hand", "--from", "dev"]) == 3
+    err = capsys.readouterr().err
+    assert "git worktree repair" in err and "Git's own record" in err
+    _nothing_was_published(Store(root), "hand")
+
+    assert _git_rc(root, "worktree", "repair", str(renamed)).returncode == 0
+    capsys.readouterr()
+    assert cli.main(["--root", str(root), "lane", "deliver", "--id", "hand", "--from", "dev"]) == 0

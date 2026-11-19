@@ -5001,7 +5001,8 @@ def _lane_checkout_folder(saved: str) -> str:
     return str(path.absolute())
 
 
-def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> tuple[str, bool] | None:
+def _lane_checkout_owned_by_another(
+        store, lane_id: str, *folders: str, rows: dict | None = None) -> tuple[str, bool] | None:
     """`(key, names)` for another lane whose saved checkout fields leave it possible that it owns one of `folders`, or
     None when every other row is ruled out. `names` is True when a field names the folder (the same folder under
     another spelling, a link or a junction included), and False when the row's `worktree_path` is not a full path (so
@@ -5009,8 +5010,11 @@ def _lane_checkout_owned_by_another(store, lane_id: str, *folders: str) -> tuple
     row is never skipped, because it could be the owner. A blank, empty or non-text field names no folder.
     The lane's retained claims (`occupancy_worktrees`, the checkouts of its earlier generations, which a forced
     reassignment moves out of the two fields) name folders too, and a claim that cannot be read as a full path
-    cannot be ruled out either: the full canonical path of the current checkout says nothing about an earlier one."""
-    rows = lane_mod.load_lanes(store).get("lanes") or {}
+    cannot be ruled out either: the full canonical path of the current checkout says nothing about an earlier one.
+    `rows` is the registry snapshot to scan (the caller keeps it, so what it later vouches for is exactly what was
+    scanned); without it the saved registry is read now."""
+    if rows is None:
+        rows = lane_mod.load_lanes(store).get("lanes") or {}
     folder_reals = [_strict_real(folder) for folder in folders]  # OSError when a folder cannot be resolved: refused
     for key, row in rows.items():
         if key == lane_id or not isinstance(row, dict):
@@ -5233,12 +5237,49 @@ def _lane_checkout_unexamined_text(store, folder: str, detail: str) -> str:
         "and run the command again")
 
 
+def _lane_checkout_registration(folder: str, git_dir: str) -> tuple[str, str] | None:
+    """None when Git's own record of this checkout names THIS folder, else `("mismatch", where)` (it names another
+    folder: this one is a copy, or was moved without `git worktree repair`) or `("unknown", why)` (the record or a path
+    in it could not be read or resolved). A linked checkout's administrative folder (`git_dir`) holds a `gitdir` file
+    naming the checkout's `.git` file; the checkout's `.git` file names the administrative folder. A copy of a
+    checkout, `.git` file included, reaches the same administrative folder and passes every check made from the
+    checkout's side, but the record still names the ORIGINAL, so only this back-link tells the copy. Both sides are
+    resolved completely (`_strict_real`), which compares case as the disk does."""
+    try:
+        with open(os.path.join(git_dir, "gitdir"), encoding="utf-8") as record:
+            named = record.read().strip()
+        if not os.path.isabs(named):  # a relative record is relative to the administrative folder
+            named = os.path.join(git_dir, named)
+        recorded = _strict_real(named)
+        here = _strict_real(os.path.join(folder, ".git"))
+    except (OSError, ValueError) as exc:
+        return "unknown", str(exc)
+    return None if recorded == here else ("mismatch", named)
+
+
+def _lane_checkout_registration_text(folder: str, found: tuple[str, str]) -> str:
+    kind, detail = found
+    if kind == "mismatch":
+        return (
+            f"Git's own record of this checkout says it lives at {pc.line(detail)}, not at {pc.line(folder)}: this "
+            "folder looks like a copy of another checkout (another store's, perhaps), so it is not proven to be this "
+            "lane's and it was left alone. If you moved the checkout by hand, run `git worktree repair` from the "
+            "repository and try again")
+    return (
+        f"Git's own record of where this checkout lives could not be examined ({pc.line(detail)}), so it is not "
+        f"proven that {pc.line(folder)} is the checkout Git registered, and it was left alone. Make the record "
+        "readable (`git worktree repair` if it is damaged) and run the command again")
+
+
 def _lane_proof_identity(
-        store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str) -> tuple[tuple, dict]:
+        store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str,
+        rows: dict | None = None) -> tuple[tuple, dict]:
     """The key and the facts of one checkout's ownership proof: which lane instance, and what Git itself says the
     checkout is (its toplevel and its own administrative folder, which no other checkout shares), plus every other
-    lane's saved row (the other-owner scan reads exactly those)."""
-    rows = lane_mod.load_lanes(store).get("lanes") or {}
+    lane's saved row (the other-owner scan reads exactly those). `rows` is the registry snapshot the scan read, when
+    the proof is made: it is not read again then, so the proof never vouches for a row that was not scanned."""
+    if rows is None:
+        rows = lane_mod.load_lanes(store).get("lanes") or {}
     facts = {
         "folder": os.path.normcase(folder), "toplevel": toplevel_c, "git_dir": git_dir,
         "other_rows": lane_mod.fingerprint({key: row for key, row in rows.items() if key != lane_id}),
@@ -5246,11 +5287,13 @@ def _lane_proof_identity(
     return (lane_id, lane.get("instance_id"), lane.get("generation")), facts
 
 
-def _lane_record_proof(store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str) -> None:
+def _lane_record_proof(
+        store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str, rows: dict) -> None:
     """Remember, for the rest of THIS command, that the fresh delivery evaluation proved this store owns the checkout
-    (it lies inside the store's folder, and no other lane claims it). Kept on the store object the command opened,
-    so no other command, and no later run, ever relies on it."""
-    key, facts = _lane_proof_identity(store, lane_id, lane, folder, toplevel_c, git_dir)
+    (it lies inside the store's folder, Git's record of it names this folder, and no other lane in `rows`, the very
+    snapshot that was scanned, claims it). Kept on the store object the command opened, so no other command, and no
+    later run, ever relies on it."""
+    key, facts = _lane_proof_identity(store, lane_id, lane, folder, toplevel_c, git_dir, rows)
     proofs = store.__dict__.setdefault("_lane_delivery_proofs", {})
     proofs[key] = facts
 
@@ -5349,6 +5392,13 @@ def _verify_lane_worktree(
     wt_git_dir = _git_dir(wt)
     if wt_git_dir == wt_common:
         raise lane_mod.LaneError("registered worktree is the primary checkout")
+    registration = None
+    if store_owned:
+        # Git's own record of where this checkout lives must name THIS folder: a copy of another checkout (its `.git`
+        # pointer file included) shares that checkout's administrative folder and passes every check from this side.
+        registration = _lane_checkout_registration(wt, wt_git_dir)
+        if registration is not None and (registration[0] == "mismatch" or for_removal or not terminal):
+            raise lane_mod.LaneError(_lane_checkout_registration_text(wt, registration))
     head = _git_read_one(wt, ["rev-parse", "--verify", "HEAD^{commit}"], "worktree HEAD")
     if expected_base is not None and head != expected_base:
         raise lane_mod.LaneError(
@@ -5383,19 +5433,25 @@ def _verify_lane_worktree(
     # Whatever the branch says, a folder that another lane's row names is that lane's, never this one's.
     owner = None
     scan_failed: Exception | None = None
+    scanned: dict = {}
     try:
-        owner = _lane_checkout_owned_by_another(store, lane_id, wt, toplevel)
+        scanned = lane_mod.load_lanes(store).get("lanes") or {}  # read once: a proof vouches for what was scanned
+        owner = _lane_checkout_owned_by_another(store, lane_id, wt, toplevel, rows=scanned)
     except (OSError, ValueError) as exc:
         if for_removal or not terminal:  # not removed, not published, not assigned on a scan nobody could make
             raise lane_mod.LaneError(
                 f"whether another lane owns this checkout could not be established ({pc.line(str(exc))}); it was "
                 "left alone") from exc
         scan_failed = exc  # the terminal recheck of a delivery: see `_lane_proof_holds` below
-    if store_owned and terminal and (place is not None or scan_failed is not None):
+    if store_owned and terminal and (place is not None or registration is not None or scan_failed is not None):
         if not _lane_proof_holds(store, lane_id, lane, wt, toplevel_c, wt_git_dir):
             if place is not None:
                 raise lane_mod.LaneError(
                     _lane_checkout_unexamined_text(store, place[1], place[2])
+                    + ", and nothing earlier in this delivery proved it is this lane's")
+            if registration is not None:
+                raise lane_mod.LaneError(
+                    _lane_checkout_registration_text(wt, registration)
                     + ", and nothing earlier in this delivery proved it is this lane's")
             raise lane_mod.LaneError(
                 f"whether another lane owns this checkout could not be established ({pc.line(str(scan_failed))}), "
@@ -5416,7 +5472,7 @@ def _verify_lane_worktree(
     if status.strip():
         raise lane_mod.LaneError("worktree has staged/unstaged tracked changes")
     if store_owned and not terminal and not for_removal:  # a fresh delivery evaluation: ownership was just proven
-        _lane_record_proof(store, lane_id, lane, wt, toplevel_c, wt_git_dir)
+        _lane_record_proof(store, lane_id, lane, wt, toplevel_c, wt_git_dir, scanned)
     return {
         "head": head,
         "worktree_toplevel_canonical": toplevel_c,
