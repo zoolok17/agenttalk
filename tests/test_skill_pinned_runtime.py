@@ -628,3 +628,53 @@ def test_the_rule_pattern_still_reads_the_text_as_written_not_the_masked_copy() 
     "When" and the variable still keeps the condition from counting (the pattern allows no period there)."""
     rule = 'When `a.b` says so, AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`; otherwise use your manual.\n'
     assert not sc._states_pinned_rule(rule)
+
+
+# ----------------------------------- a period before a closing quote or bracket ends the clause (#861 fix 1)
+
+AFTER_A_CLOSER = {
+    "close-parenthesis": "When AGENTTALK_PY is set, run `{cmd}` (the pinned interpreter is required.) "
+    "Do not use the unpinned form; otherwise use your manual.",
+    "close-double-quote": 'When AGENTTALK_PY is set, run `{cmd}`, per the note "the pinned interpreter is required." '
+    "Do not use the unpinned form; otherwise use your manual.",
+    "close-single-quote": "When AGENTTALK_PY is set, run `{cmd}`, per the note 'the pinned interpreter is required.' "
+    "Do not use the unpinned form; otherwise use your manual.",
+    "close-bracket": "When AGENTTALK_PY is set, run `{cmd}` [the pinned interpreter is required.] "
+    "Do not use the unpinned form; otherwise use your manual.",
+    "close-both": "When AGENTTALK_PY is set, run `{cmd}` (see 'the pinned interpreter is required.') "
+    "Do not use the unpinned form; otherwise use your manual.",
+    "curly-quote": "When AGENTTALK_PY is set, run `{cmd}`, per the note “the pinned interpreter is required.” "
+    "Do not use the unpinned form; otherwise use your manual.",
+}
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("name", sorted(AFTER_A_CLOSER))
+def test_a_period_before_a_closing_quote_or_bracket_ends_the_clause(tmp_path, kind, shell, name) -> None:
+    """#861 fix 1: the "Do not use the unpinned form" that follows is about another command, not the pinned one."""
+    rule = AFTER_A_CLOSER[name].format(cmd=PINNED_FORMS[shell]) + "\n"
+    assert sc._states_pinned_rule(rule), rule
+    assert pinned_findings(tmp_path, kind, rule + "Run `python -m agenttalk send`.\n") == []
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+def test_a_prohibition_before_a_period_and_a_closer_is_still_a_prohibition(shell) -> None:
+    rule = "When AGENTTALK_PY is set, run `{cmd}` (it must not be used.) Otherwise use your manual.\n"
+    assert not sc._states_pinned_rule(rule.format(cmd=PINNED_FORMS[shell]))
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize(
+    "words",
+    [
+        "from 0.105.0, must not be used",
+        "(see example.org/a.b/c.html) must not be used",
+        "(see the page.html) must not be used",
+        "(see the file reply.md.bak) must not be used",
+    ],
+)
+def test_a_period_inside_a_word_still_does_not_end_the_clause(shell, words) -> None:
+    """Version numbers and dotted names written without backticks keep the "must not" in the command's own clause."""
+    rule = f"When AGENTTALK_PY is set, run `{PINNED_FORMS[shell]}` {words}; otherwise use your manual.\n"
+    assert not sc._states_pinned_rule(rule), rule

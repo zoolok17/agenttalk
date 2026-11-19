@@ -80,9 +80,10 @@ _POINTS_BACK_RE = re.compile(
     rf"|{_NEGATION}[^;.:!?]*\bpinned\b",
     re.IGNORECASE,
 )
-# A clause ends at ; : ! ? a blank line, or a period before whitespace or the end of the text (so the period inside
-# `agenttalk.assurance` or `reply.md`, written without backticks, ends nothing).
-_CLAUSE_END_RE = re.compile(r"[;:!?]|\.(?!\S)|\n\s*\n")
+# A clause ends at ; : ! ? a blank line, or a period before whitespace or the end of the text, closing quotes and
+# brackets allowed in between ("... is required.) Do not ..."), so the period inside `agenttalk.assurance`, `reply.md`
+# or 0.105.0, written without backticks, ends nothing.
+_CLAUSE_END_RE = re.compile("[;:!?]|\\.[)\\]}\"'’”]*(?!\\S)|\\n\\s*\\n")
 _INLINE_CODE_RE = re.compile(r"(?<!`)`(?!`)[^`\n]+`(?!`)")
 _CLAUSE_PUNCTUATION_RE = re.compile(r"[;.:!?]")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
