@@ -279,7 +279,8 @@ def test_the_doctor_host_details_print_a_stored_path_on_one_line(
     record = host_cases._record(store)
     record["path"] = hostile
     record["_warning"] = "the selected host is older than the one installed"
-    monkeypatch.setattr(doctor.supervisor_lifecycle, "read_selected_host", lambda s: record)
+    (store.dir / doctor.psh.SELECTION_FILENAME).write_text("{}", encoding="utf-8")  # a selection is on file
+    monkeypatch.setattr(doctor.supervisor_lifecycle, "read_selected_host_locked", lambda s: record)
     monkeypatch.setattr(doctor, "_inspect_selected_task", lambda *a: {"status": "ok"})
     monkeypatch.setattr(doctor.sys, "platform", "win32")
 

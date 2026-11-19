@@ -106,9 +106,17 @@ def test_package_acquisition_site_inventory():
     # acceptance-writer (110) and config (130) around the final activity check and removal.
     # cli.py 33 -> 34 (#672): `lane restamp` takes acceptance-writer (110) and config (130), then, inside them,
     # the non-waiting occupancy claim, which adds no rank; `lane abandon` takes them in the same order.
+    # doctor.py 0 -> 1 (#716 item 3b): `_check_powershell_host` of an initialized store holds the PowerShell host
+    # selection lock (powershell-host.lock, rank 50) over its reads: config.json (`load_config`, no lock), the roster's
+    # health markers, the setup files (`lstat`, and one `open` per marker), the PowerShell 7 file search (file
+    # existence tests only) and `read_selected_host_locked`, which is the unlocked primitive (a file read, the host's
+    # native identity and, past its cache age, one PowerShell probe, a child process and no store lock). It takes no
+    # other ordered lock and no store write lock, so it is a leaf for this order, and nothing in doctor holds a lock
+    # when it is called (the other checks take none). It is the read side of the same lock `read_selected_host` and
+    # the supervisor lifecycle already take at rank 50; it never calls `read_selected_host`, which would take it again.
     assert found == {
         "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 34,
-        "close.py": 3, "gates.py": 1, "knowledge.py": 2, "knowledge_pack.py": 2, "lanes.py": 1,
+        "close.py": 3, "doctor.py": 1, "gates.py": 1, "knowledge.py": 2, "knowledge_pack.py": 2, "lanes.py": 1,
         "lead_routine.py": 2, "lesson_context.py": 1, "onboarding.py": 2, "recovery.py": 1, "store.py": 70,
 
         "supervisor.py": 4, "supervisor_lifecycle.py": 14, "work_board_facts.py": 2, "worktree_release.py": 1,

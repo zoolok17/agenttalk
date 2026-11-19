@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Windows test jobs in CI may now run for 360 minutes instead of 330.** Between 16 and 18 November,
+  18 Windows test jobs were stopped at the 330-minute limit without a single failing test, so pull
+  requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
+  limit for each test group inside the job is unchanged, and splitting the Windows job is the follow-up
+  (#378). The evidence is recorded in `windows_timeout_reason` in `dev-gate.json`.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
@@ -241,6 +246,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The README first install keeps agenttalk in its own Python environment (#716).** Before, setup could install into another Python, and assistants could find an older agenttalk on PATH. Now both platform recipes keep using the environment's Python after changing folders and put its commands first on PATH in every assistant terminal. Quick setup links to the same recipe, and the README and lead setup brief name the Debian/Ubuntu venv package.
 
+- **The user manuals install agenttalk the same way as the README (#716).** The two manuals still told readers to install agenttalk into whatever Python was active and then run plain `agenttalk`, so a reader could end up running an older copy. They now send readers to the README's do-it-yourself install steps (up to its project setup, which the manual replaces), which give agenttalk its own environment and put it first on PATH, and say not to activate another Python environment in a terminal where agenttalk runs (and how to check which copy runs). The Codex-sandbox example in the user manual uses that environment's Python, and a test keeps the old bare install line from coming back.
+
 - **The first `agenttalk doctor` run reads less like a failure (Part of #716).** Three lines
   changed their words; no result, exit code, check name or JSON field changed.
   In a folder that is not set up, `store.initialized` now says "not set up yet" and names the missing
@@ -281,8 +288,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the folder with the shorter name instead, which might not exist or might hold a different
   `pwsh.exe`; the suggestions of `agenttalk supervise --select-pwsh` use the same search, so they now
   name the right file too.
-  Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
-  has just been set up can still end with `overall: ERROR` on Windows until that step is done.
+  Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before.
+  On Windows, `powershell_host` is no longer a permanent error for a team that does not use a supervisor.
+  When no host is selected, none of the supervisor setup files exists and no continuous Codex wrapper has
+  left its marker in the team folder, it says `N/A` (not an error, so a set-up team can now end with exit
+  code 0), explains that the supervisor and the hang watchdog of a continuous Codex wrapper both need a
+  selected host, and says the scheduled-task state was not checked (its data says `unknown`, not
+  `not_configured`: a task can outlive its files). It is a snapshot of local files, not proof that the
+  features are unneeded. A continuous Codex wrapper here means a Codex marker for a loop or for a managed
+  lead loop (both keep the hang watchdog on by default); a Codex one-shot, or a Claude loop of either kind,
+  needs no host by default. It stays an error when a setup file is there, and when a Codex wrapper in the
+  team has left a continuous marker, even an old one (it names those agents). It also stays an error, saying
+  it could not check, when a file, a marker or the team list cannot be read or looked at, when a marker holds
+  a value the wrapper never writes or JSON nested too deeply to read, or when a marker (or the config or selection) sits under a folder link
+  that cannot be followed: nothing is called absent unless it was not found where it could be looked for. A
+  folder with no store at all gets the same `N/A`, and the separate store check still reports it. Its advice
+  is unchanged when a host is selected. The plain `agenttalk doctor` output prints the next step only for a
+  check that is not ok, so on the `N/A` line the optional next step (and the advice for a PowerShell 7 file
+  that was found) is in the `--json` output only; the line itself carries the explanation.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note
   for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report
   it to the agenttalk maintainers and that the maintenance advice is for them.
