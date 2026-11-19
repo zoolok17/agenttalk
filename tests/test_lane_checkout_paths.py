@@ -4721,3 +4721,112 @@ def test_the_store_folder_name_is_recognised_in_any_case_by_both_walks(tmp_path,
     assert cli._lane_dir_has_store_folder(str(tmp_path / "mid"))
     assert cli._lane_checkout_outside_store(Store(tmp_path), str(tmp_path / "mid" / "made-checkout")) is not None
     assert cli._lane_checkout_outside_store(Store(tmp_path), str(tmp_path / "checkout")) is None  # the control
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Round 26 (zteam's Windows probes at afa826a4): a directory link inside a checkout can lead out of it, and a removal
+# can follow it. Git 2.39.1 on Windows follows a junction while removing a worktree and deletes what it points at; an
+# ignored junction is invisible to `git status`. The rollback of a failed `lane assign` ends in the same removal.
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _checkout_and_command(tmp_path, monkeypatch, command):
+    """A lane's own, clean checkout and the command that removes it: (store, selected, checkout, argv)."""
+    from test_lanes import _assign_worktree, _repo
+
+    if command == "deliver":
+        store, selected, checkout, _head, _artifact = _published_with_cleanup_postponed(tmp_path, monkeypatch)
+        return store, selected, checkout, ["lane", "deliver", "--id", selected, "--from", "dev"]
+    root, base = _repo(tmp_path)
+    store, selected = Store(root), "first"
+    checkout = Path(_assign_worktree(root, base, selected)["worktree_path"])
+    if command == "abandon":
+        return store, selected, checkout, ["lane", "abandon", "--id", selected]
+    _update_row(store, selected, status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_ABANDONED)
+    return store, selected, checkout, ["lane", "gc", "--delete", "--target", "HEAD", "--json"]
+
+
+@pytest.mark.parametrize("command", ["abandon", "deliver", "gc"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "store-named-link",
+        "store-named-link-other-case",
+        pytest.param("link-out", marks=pytest.mark.skipif(os.name != "nt", reason="a followed link is a Windows case")),
+        pytest.param(
+            "link-inside", marks=pytest.mark.skipif(os.name != "nt", reason="a followed link is a Windows case")
+        ),
+        "none",
+    ],
+)
+def test_a_removal_never_follows_a_directory_link_out_of_the_checkout(tmp_path, monkeypatch, capsys, command, kind):
+    """A link or junction named like a store folder, and on Windows any directory link that leads out of the checkout,
+    stops the removal (the checkout and what it leads to stay). The controls: a link that leads to a folder inside the
+    checkout, and no link at all, are removed as before."""
+    store, selected, checkout, argv = _checkout_and_command(tmp_path, monkeypatch, command)
+    independent = tmp_path.parent / f"{tmp_path.name}-independent"
+    Store(independent).init(["lead"])  # a real, separate store
+    sentinel = independent / ".agenttalk" / "independent-data.txt"
+    sentinel.write_text("independent store data\n", encoding="utf-8")
+    (independent / "shared-data.txt").write_text("shared data\n", encoding="utf-8")
+    if kind.startswith("store-named-link"):
+        name = ".agenttalk" if kind == "store-named-link" else ".AgentTalk"
+        _link_directory(checkout / name, independent / ".agenttalk")
+    elif kind == "link-out":
+        (checkout / ".worktrees").mkdir()  # a folder the repository's .gitignore ignores
+        _link_directory(checkout / ".worktrees" / "out", independent)
+    elif kind == "link-inside":
+        (checkout / ".worktrees").mkdir()
+        _link_directory(checkout / ".worktrees" / "self", checkout / "src")
+    capsys.readouterr()
+
+    cli.main(["--root", str(store.root), *argv])
+
+    shown = capsys.readouterr()
+    assert sentinel.read_text(encoding="utf-8") == "independent store data\n"
+    assert (independent / "shared-data.txt").read_text(encoding="utf-8") == "shared data\n"
+    said = shown.err + shown.out
+    if command == "deliver":  # the delivery cleanup keeps its reason in the row (`lane status` shows it)
+        said = lanes.load_lanes(store)["lanes"][selected].get("worktree_cleanup_error", "") or said
+    if kind in ("none", "link-inside"):
+        assert not (checkout / ".git").exists()  # removed, as before
+        assert "directory link" not in said
+    else:
+        _assert_untouched(checkout)
+        assert "holds a directory link" in said
+
+
+def test_the_rollback_of_a_failed_assign_never_deletes_a_store_a_hook_made_in_the_new_checkout(
+    tmp_path, monkeypatch, capsys
+):
+    """A post-checkout hook that makes a store in the new checkout and then fails: the rollback removes the checkout it
+    made, and used to take the hook's store with it (Git ignores the store, so no clean check sees it)."""
+    import sys
+
+    from test_lanes import _branch, _repo
+
+    root, base = _repo(tmp_path)
+    hook = root / ".git" / "hooks" / "post-checkout"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    python = Path(sys.executable).as_posix()
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'"{python}" -c "import sys; from pathlib import Path; from agenttalk.store import Store; '
+        "s = Store(Path.cwd()); s.init(['lead']); (s.dir / 'independent-data.txt').write_text('data'); "
+        'sys.exit(1)"\n',
+        encoding="utf-8", newline="\n",
+    )
+    hook.chmod(0o755)
+    capsys.readouterr()
+
+    rc = cli.main([
+        "--root", str(root), "lane", "assign", "--id", "hooked", "--from", "lead", "--assignee", "dev",
+        "--domain", "core", "--base", base, "--target", _branch(root), "--path", "src/core",
+        "--worktrees-root", str(root / ".worktrees"),
+    ])
+
+    shown = capsys.readouterr()
+    assert rc == 2
+    made = list((root / ".worktrees").glob("hooked-*/.agenttalk/independent-data.txt"))
+    assert made, f"the store the hook made was deleted by the rollback: {shown.err!r}"
+    assert made[0].read_text(encoding="utf-8") == "data"

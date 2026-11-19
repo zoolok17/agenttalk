@@ -3214,6 +3214,14 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
                 return 1, "", "could not verify worktree status; the worktree was not removed"
             if not clean:
                 return 1, "", "worktree has uncommitted changes or untracked files; the worktree was not removed"
+            # The adapter every removal ends in, the rollback of a failed `lane assign` included (a hook can make a
+            # store in the new checkout): nothing is removed that would take a store or a followed link with it.
+            try:
+                hazard = _lane_checkout_hazard(str(target))
+            except OSError:
+                return 1, "", "could not look inside the worktree for a store or a link; the worktree was not removed"
+            if hazard is not None:
+                return 1, "", _lane_checkout_hazard_text(hazard)
         # Git gets its own final untracked-file check; callers still submit only the narrow allowed shape.
         execution_argv = ["-c", "status.showUntrackedFiles=all", *argv[:3], str(target)]
     env = dict(os.environ)
@@ -5089,12 +5097,22 @@ def _lane_checkout_outside_store(store, *folders: str) -> str | None:
     return None
 
 
-def _lane_checkout_holds_a_store(folder: str) -> str | None:
-    """The first `.agenttalk` folder found at the checkout's root or anywhere below it, or None. A store made inside a
-    lane checkout (agenttalk was initialised there, by hand or by a command run from it) is store data, which Git
-    ignores, so the clean checks never see it, and removing the checkout deletes it. Links and junctions are not
-    followed (a folder the checkout only points at is not removed with it), and `.git` is not entered. A folder that
-    cannot be read raises OSError: it is not known to be free of a store."""
+def _lane_checkout_hazard(folder: str) -> tuple[str, str] | None:
+    """What inside a checkout would make removing it delete something that is not the checkout's own, as
+    `(kind, path)`, or None. Two kinds, found in one walk (`.git` is not entered, links are not descended into):
+
+    - "store": an `.agenttalk` folder (any letter case) at the checkout's root or anywhere below it. A store made inside
+      a lane checkout (agenttalk was initialised there, by hand or by a hook) is store data, which Git ignores, so the
+      clean checks never see it, and removing the checkout deletes it.
+    - "link": a directory link that the removal can follow out of the checkout. On every system a link or junction
+      named like a store folder is one, whatever it points at (it can only be a way into a store). On Windows, any
+      directory junction or directory symbolic link whose target does not lie inside this checkout is one too: some
+      Git versions (2.39.1 was seen) follow a junction while removing a worktree and delete what it points at, and an
+      ignored junction is invisible to `git status`. On other systems Git removes a symbolic link without following it,
+      so only the store-named link counts there.
+
+    A folder that cannot be read raises OSError: it is not known to be free of either."""
+    root_real = os.path.normcase(os.path.realpath(folder)).rstrip(os.sep) + os.sep
     pending = [folder]
     while pending:
         current = pending.pop()
@@ -5103,14 +5121,40 @@ def _lane_checkout_holds_a_store(folder: str) -> str | None:
                 if entry.name == ".git":
                     continue
                 info = entry.stat(follow_symlinks=False)
-                if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                attributes = getattr(info, "st_file_attributes", 0)
+                is_link = stat.S_ISLNK(info.st_mode) or bool(attributes & 0x400)  # 0x400: a reparse point
+                if is_link:
+                    if _is_store_folder_name(entry.name):
+                        return "link", entry.path
+                    if os.name == "nt" and attributes & 0x10:  # a directory junction or directory symbolic link
+                        target = os.path.normcase(os.path.realpath(entry.path))
+                        if not (target + os.sep).startswith(root_real):
+                            return "link", entry.path
                     continue
                 if not stat.S_ISDIR(info.st_mode):
                     continue
                 if _is_store_folder_name(entry.name):
-                    return entry.path
+                    return "store", entry.path
                 pending.append(entry.path)
     return None
+
+
+def _lane_checkout_holds_a_store(folder: str) -> str | None:
+    """The first `.agenttalk` folder (a real one, not a link) at the checkout's root or anywhere below it, or None."""
+    hazard = _lane_checkout_hazard(folder)
+    return hazard[1] if hazard is not None and hazard[0] == "store" else None
+
+
+def _lane_checkout_hazard_text(hazard: tuple[str, str]) -> str:
+    kind, found = hazard
+    if kind == "store":
+        return _lane_checkout_holds_a_store_text(found)
+    return (
+        f"this checkout holds a directory link, {pc.line(found)}, that points out of it (or cannot be followed) and "
+        "that removing the checkout can follow, deleting what it points at, so it was left alone. If the checkout is "
+        "no longer needed: inspect where the link leads, remove the link itself (not what it points at), remove the "
+        "checkout with `git worktree remove` (naming that folder), then retire the lane with "
+        "`lane abandon --acknowledge-missing-worktree`")
 
 
 def _lane_checkout_holds_a_store_text(found: str) -> str:
@@ -5175,15 +5219,15 @@ def _verify_lane_worktree(
         elsewhere_folder = _lane_checkout_outside_store(store, wt, toplevel)
         if elsewhere_folder is not None:
             raise lane_mod.LaneError(_lane_checkout_not_ours_text(store, elsewhere_folder))
-    if for_removal:  # a store inside the checkout (at its root or deeper) is deleted with it, unseen by Git
+    if for_removal:  # a store inside the checkout, or a link the removal can follow out of it, is lost unseen by Git
         try:
-            held_store = _lane_checkout_holds_a_store(toplevel)
+            hazard = _lane_checkout_hazard(toplevel)
         except OSError as exc:
             raise lane_mod.LaneError(
                 f"the inside of this checkout could not be read ({pc.line(str(exc))}), so it is not known that it "
-                "holds no store of its own; it was left alone") from exc
-        if held_store is not None:
-            raise lane_mod.LaneError(_lane_checkout_holds_a_store_text(held_store))
+                "holds no store of its own and no link out of it; it was left alone") from exc
+        if hazard is not None:
+            raise lane_mod.LaneError(_lane_checkout_hazard_text(hazard))
     stored_c = lane.get("worktree_toplevel_canonical")
     ambiguous = not check_paths and (
         not isinstance(stored_c, str) or not stored_c.strip()
