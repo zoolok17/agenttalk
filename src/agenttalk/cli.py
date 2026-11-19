@@ -5082,12 +5082,26 @@ def _lane_dir_has_store_folder(directory: str) -> bool:
         return any(_is_store_folder_name(entry.name) and entry.is_dir() for entry in entries)
 
 
-def _strict_real(path) -> str:
+def _strict_real(path, *, missing_tail_ok: bool = False) -> str:
     """The case-folded real path of `path`, resolved completely. Plain `os.path.realpath` swallows some failures (on
     Windows an access-denied or sharing-violation while following a junction) and returns a partial path that still
     begins where the link is, so a check that asks "does this lie inside that folder?" would say yes for a path it
-    could not follow. Here any failure raises OSError, and every caller treats that as "not proven" and refuses."""
-    return os.path.normcase(os.path.realpath(path, strict=True))
+    could not follow. Here any failure raises OSError, and every caller treats that as "not proven" and refuses.
+
+    With `missing_tail_ok`, a path whose last parts are simply not there (a registered checkout whose folder was
+    deleted) is judged by its nearest existing ancestor, resolved the same strict way, plus the missing names as
+    written: nothing that is not there can be a link. An entry that IS there but cannot be followed (a dangling link)
+    still raises."""
+    text = os.fspath(path)
+    try:
+        return os.path.normcase(os.path.realpath(text, strict=True))
+    except FileNotFoundError:
+        if not missing_tail_ok or os.path.lexists(text):
+            raise
+        parent, name = os.path.split(text.rstrip("\\/"))
+        if not name or not parent or parent == text:
+            raise
+        return os.path.normcase(os.path.join(_strict_real(parent, missing_tail_ok=True), name))
 
 
 def _lane_checkout_outside_store(store, *folders: str) -> str | None:
@@ -5101,7 +5115,7 @@ def _lane_checkout_outside_store(store, *folders: str) -> str | None:
     try:
         root = _strict_real(store.root)
         for folder in folders:
-            real = _strict_real(folder)
+            real = _strict_real(folder, missing_tail_ok=True)
             if not real.startswith(root.rstrip(os.sep) + os.sep):
                 return folder
             parent = os.path.dirname(real)

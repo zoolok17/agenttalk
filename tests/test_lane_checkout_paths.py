@@ -4966,3 +4966,12 @@ def test_another_lanes_path_that_cannot_be_resolved_blocks_a_removal(tmp_path, m
 
     assert "strict" in fired
     _assert_untouched(first, other)
+
+
+def test_a_checkout_that_is_not_there_is_judged_by_where_it_would_be(tmp_path):
+    """A registered checkout whose folder was deleted is judged by its nearest existing ancestor, resolved strictly,
+    plus the missing names; nothing that is not there can be a link."""
+    store_root = tmp_path / "store"
+    (store_root / ".worktrees").mkdir(parents=True)
+    assert cli._lane_checkout_outside_store(Store(store_root), str(store_root / ".worktrees" / "gone-x")) is None
+    assert cli._lane_checkout_outside_store(Store(store_root), str(tmp_path / "elsewhere" / "gone-x")) is not None
