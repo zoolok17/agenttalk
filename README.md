@@ -1347,8 +1347,10 @@ in agenttalk waits for it or is held back by it.
   Below it, each seat shows its own reading, newest first, with how long ago it was seen. Readings
   are never merged across seats: to judge the account, read the newest seat's row.
 - `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or
-  `capacity=unknown(<reason>)` to each seat that has written a reading. A Claude seat with no
-  reading yet shows `capacity=unknown(no reading yet)`; `status --json` keeps the reason code.
+  `capacity=unknown(<reason>)` to each seat that has written a reading; a seat that has written
+  none, such as a newly set-up seat, shows no `capacity=` field. When a Claude seat's reading has
+  no figures yet (reason `claude_source_not_configured`), the field reads
+  `capacity=unknown(no reading yet)`; `status --json` keeps the reason code.
 - The web console and `agenttalk attention` show and warn only on figures that are still current.
 
 **Where the figures come from**

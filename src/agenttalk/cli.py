@@ -12397,8 +12397,11 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
     counts = res.counts()
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     print(f"\nagenttalk install-skills: {summary or 'no actions'}")
-    if devkit and (args.claude_only or args.codex_only):
-        flag = "--claude-only" if args.claude_only else "--codex-only"
+    flag = "--claude-only" if args.claude_only else "--codex-only" if args.codex_only else None
+    if flag and args.devkit_only:
+        print(f"{flag} has no effect with --devkit-only: the dev-discipline pack goes to both the Claude "
+              "and the Codex skills folders.")
+    elif flag and devkit:
         print(f"{flag} covers only the agenttalk bus skills: the dev-discipline pack still goes to both "
               "the Claude and the Codex skills folders. Add --no-devkit to leave it out.")
 
@@ -20190,15 +20193,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pis.add_argument("--claude-only", action="store_true",
                      help="Install only Claude-side bus skills (the dev-discipline pack still goes to both "
-                          "the Claude and the Codex skills folders unless --no-devkit)")
+                          "the Claude and the Codex skills folders unless --no-devkit; no effect with "
+                          "--devkit-only)")
     pis.add_argument("--codex-only", action="store_true",
                      help="Install only Codex-side bus skills (the dev-discipline pack still goes to both "
-                          "the Claude and the Codex skills folders unless --no-devkit)")
-    pis.add_argument("--no-devkit", action="store_true",
-                     help="Skip the dev-discipline pack; install only the agenttalk bus skills")
-    pis.add_argument("--devkit-only", action="store_true",
-                     help="Install ONLY the dev-discipline pack (to the Agent-Skills dirs), "
-                          "not the agenttalk bus skills")
+                          "the Claude and the Codex skills folders unless --no-devkit; no effect with "
+                          "--devkit-only)")
+    # #829: the two contradict each other, and --devkit-only used to win silently.
+    devkit_choice = pis.add_mutually_exclusive_group()
+    devkit_choice.add_argument("--no-devkit", action="store_true",
+                               help="Skip the dev-discipline pack; install only the agenttalk bus skills")
+    devkit_choice.add_argument("--devkit-only", action="store_true",
+                               help="Install ONLY the dev-discipline pack (to the Agent-Skills dirs), "
+                                    "not the agenttalk bus skills")
     pis.add_argument("--claude-dir", help="Override Claude bus-command dir (default: ~/.claude/commands)")
     pis.add_argument("--codex-dir", help="Override Codex bus-skills dir (default: ~/.codex/skills)")
     pis.add_argument("--claude-skills-dir",

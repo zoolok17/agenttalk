@@ -53,7 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that sets several seats can tell them apart. `install-skills --claude-only` and `--codex-only`
   installed the dev-discipline pack into both the Claude and the Codex skills folders without saying
   so; now their output adds one line that says this and that `--no-devkit` leaves the pack out, and
-  their help says the same. What gets installed is unchanged. A Claude seat with no capacity reading
+  their help says the same. With `--devkit-only` the line says instead that the flag has no effect.
+  What gets installed is unchanged, with one exception: `--devkit-only` together with `--no-devkit`
+  used to install the pack anyway, and is now refused before anything is written, because the two
+  contradict each other. A Claude seat with no capacity reading
   yet read like a fault: `status` showed `capacity=unknown(claude_source_not_configured)` and
   `capacity` said "Claude capacity source not configured", even for a seat that had simply not had its
   first turn. Now `status` shows `capacity=unknown(no reading yet)`, and `capacity` explains that a

@@ -351,7 +351,43 @@ def test_one_side_flag_help_names_the_devkit_folders(flag: str, side: str) -> No
     commands = next(action for action in cli.build_parser()._actions if action.dest == "cmd")
     option = next(action for action in commands.choices["install-skills"]._actions if flag in action.option_strings)
     assert option.help == (f"Install only {side}-side bus skills (the dev-discipline pack still goes to both "
-                           "the Claude and the Codex skills folders unless --no-devkit)")
+                           "the Claude and the Codex skills folders unless --no-devkit; no effect with "
+                           "--devkit-only)")
+
+
+def test_devkit_only_conflicts_with_no_devkit_suggestion(tmp_path: Path, capsys) -> None:
+    """#829 read: `--devkit-only` used to win over `--no-devkit` silently, so the printed advice "Add --no-devkit"
+    installed the pack anyway. The two are now refused together, before anything is written."""
+    dirs = [tmp_path / name for name in ("buscl", "buscx", "cl", "cx")]
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "install-skills", "--devkit-only", "--claude-only", "--no-devkit",
+            "--claude-dir", str(dirs[0]), "--codex-dir", str(dirs[1]),
+            "--claude-skills-dir", str(dirs[2]), "--codex-skills-dir", str(dirs[3]),
+        ])
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--no-devkit" in err and "--devkit-only" in err and "not allowed with" in err
+    assert not any(folder.exists() for folder in dirs)
+
+
+@pytest.mark.parametrize("flag", ["--claude-only", "--codex-only"])
+def test_devkit_only_with_a_one_side_flag_suggests_no_refused_flag(tmp_path: Path, capsys, flag: str) -> None:
+    bus_cl, bus_cx, cl, cx = (tmp_path / name for name in ("buscl", "buscx", "cl", "cx"))
+    rc = cli.main([
+        "install-skills", "--devkit-only", flag,
+        "--claude-dir", str(bus_cl), "--codex-dir", str(bus_cx),
+        "--claude-skills-dir", str(cl), "--codex-skills-dir", str(cx),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert (f"{flag} has no effect with --devkit-only: the dev-discipline pack goes to both the Claude and the "
+            "Codex skills folders.\n") in out
+    assert "--no-devkit" not in out and _ONE_SIDE_NOTE not in out
+    assert (cl / "craft-code" / "SKILL.md").is_file() and (cx / "craft-code" / "SKILL.md").is_file()
+    assert not bus_cl.exists() and not bus_cx.exists()
 
 
 # ---------------------------------------------------- retired skills (sk-loop)
