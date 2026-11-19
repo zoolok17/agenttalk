@@ -4662,6 +4662,9 @@ def test_gc_removes_the_checkout_of_a_retired_lane_whose_row_names_no_folder(tmp
         # opens as `.agenttalk`; the name is compared without regard to case on every system (refusing one on a
         # case-sensitive disk costs only the manual exit).
         ("root", ".AGENTTALK"), ("deeper", ".AGENTTALK"), ("root", ".AgentTalk"), ("deeper", ".AgentTalk"),
+        # Round 27: a store inside a NESTED `.git` folder (a nested repository's metadata can hold anything). Only
+        # the checkout's own `.git` is skipped by the scan.
+        ("nested-git", ".agenttalk"), ("sub-git", ".agenttalk"),
     ],
 )
 def test_a_removal_never_deletes_a_store_made_inside_the_checkout(
@@ -4683,7 +4686,12 @@ def test_a_removal_never_deletes_a_store_made_inside_the_checkout(
             argv = ["lane", "gc", "--delete", "--target", "HEAD", "--json"]
     kept = None
     if where != "none":
-        inner = checkout if where == "root" else checkout / "sub" / "deeper"
+        inner = {
+            "root": checkout,
+            "deeper": checkout / "sub" / "deeper",
+            "nested-git": checkout / ".worktrees" / "inner" / ".git",
+            "sub-git": checkout / "sub" / ".git",
+        }[where]
         inner.mkdir(parents=True, exist_ok=True)
         if spelling != ".agenttalk":
             (inner / spelling).mkdir()  # the store folder spelled in another case, made before the store is
@@ -4830,3 +4838,19 @@ def test_the_rollback_of_a_failed_assign_never_deletes_a_store_a_hook_made_in_th
     made = list((root / ".worktrees").glob("hooked-*/.agenttalk/independent-data.txt"))
     assert made, f"the store the hook made was deleted by the rollback: {shown.err!r}"
     assert made[0].read_text(encoding="utf-8") == "data"
+
+
+def test_only_the_checkouts_own_git_entry_is_skipped_by_the_scan(tmp_path):
+    """The root's `.git` (a file in a linked checkout) is Git's own metadata and is skipped; a `.git` folder anywhere
+    else is walked like any folder, and a store in it is found."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+    assert cli._lane_checkout_hazard(str(checkout)) is None
+    (checkout / "sub" / ".git" / ".agenttalk").mkdir(parents=True)
+    assert cli._lane_checkout_hazard(str(checkout)) == ("store", str(checkout / "sub" / ".git" / ".agenttalk"))
+    other = tmp_path / "other"
+    (other / ".git" / ".agenttalk").mkdir(parents=True)  # the root's own `.git` is never entered
+    assert cli._lane_checkout_hazard(str(other)) is None
+    (other / "deeper" / ".worktrees" / "inner" / ".git" / ".agenttalk").mkdir(parents=True)
+    assert cli._lane_checkout_hazard(str(other)) is not None

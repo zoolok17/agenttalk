@@ -5099,7 +5099,9 @@ def _lane_checkout_outside_store(store, *folders: str) -> str | None:
 
 def _lane_checkout_hazard(folder: str) -> tuple[str, str] | None:
     """What inside a checkout would make removing it delete something that is not the checkout's own, as
-    `(kind, path)`, or None. Two kinds, found in one walk (`.git` is not entered, links are not descended into):
+    `(kind, path)`, or None. Two kinds, found in one walk (links are not descended into; only the checkout root's own
+    `.git` entry is skipped, by its exact place: any other folder named `.git`, such as a nested repository's, is
+    walked like every other folder, because it can hold anything, a store included, and the removal deletes it):
 
     - "store": an `.agenttalk` folder (any letter case) at the checkout's root or anywhere below it. A store made inside
       a lane checkout (agenttalk was initialised there, by hand or by a hook) is store data, which Git ignores, so the
@@ -5118,8 +5120,8 @@ def _lane_checkout_hazard(folder: str) -> tuple[str, str] | None:
         current = pending.pop()
         with os.scandir(current) as entries:
             for entry in entries:
-                if entry.name == ".git":
-                    continue
+                if current == folder and os.path.normcase(entry.name) == os.path.normcase(".git"):
+                    continue  # the checkout's own Git metadata only (a file in a linked checkout), see the docstring
                 info = entry.stat(follow_symlinks=False)
                 attributes = getattr(info, "st_file_attributes", 0)
                 is_link = stat.S_ISLNK(info.st_mode) or bool(attributes & 0x400)  # 0x400: a reparse point
