@@ -1793,7 +1793,7 @@ def _status_redact_home(value):
             continue
         parts = re.split(r"[\\/]", folder.rstrip("\\/"))
         pattern = r"[\\/]".join(re.escape(part) for part in parts)
-        value = re.sub(pattern, lambda match: replacement, value, flags=re.IGNORECASE if os.name == "nt" else 0)
+        value = re.sub(pattern, lambda match, r=replacement: r, value, flags=re.IGNORECASE if os.name == "nt" else 0)
     return value
 
 
