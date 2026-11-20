@@ -944,3 +944,63 @@ def test_878_quoted_argument_can_contain_words_that_look_like_a_ban():
     rule = ('When AGENTTALK_PY is set, "$AGENTTALK_PY" -m agenttalk send '
             '-m "do not use it"; otherwise use your manual.')
     assert sc._states_pinned_rule(rule)
+
+
+# The maintainers' complete skill-file inputs, followed by a real prohibition for each.
+_878_LITERAL_CASES = [
+    pytest.param(
+        'When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk send --to lead -m "do not stop"`; '
+        'otherwise use your manual.', True,
+        'When AGENTTALK_PY is set, `"$AGENTTALK_PY" -m agenttalk send --to lead -m "do not stop"` '
+        'must not be used; otherwise use your manual.', id="quoted-message"),
+    pytest.param(
+        'When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`, not `python -m agenttalk`; '
+        'otherwise use your manual.', True,
+        'When AGENTTALK_PY is set, do not run `"$AGENTTALK_PY" -m agenttalk`, not even once; '
+        'otherwise use your manual.', id="comma-unpinned"),
+    pytest.param(
+        'When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk` **This is required.** '
+        'Do not use the unpinned form; otherwise use your manual.', True,
+        'When AGENTTALK_PY is set, `"$AGENTTALK_PY" -m agenttalk` **must not be used.** '
+        'Use the unpinned form; otherwise use your manual.', id="bold-period"),
+    pytest.param(
+        'When AGENTTALK_PY is set, "$AGENTTALK_PY" -m agenttalk send --file '
+        'https://example.org:8443/a must not be used; otherwise use your manual.', False,
+        'When AGENTTALK_PY is set, "$AGENTTALK_PY" -m agenttalk send --file '
+        'https://example.org:8443/a must not be run; otherwise use your manual.', id="url-port"),
+    pytest.param(
+        'When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`; '
+        'the pinned command must not be used; otherwise use your manual.', False,
+        'When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`; '
+        'the pinned interpreter must not be used; otherwise use your manual.', id="named-subject"),
+    pytest.param(
+        'When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`:__do not use it__; '
+        'otherwise use your manual.', False,
+        'When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`:__do not run it__; '
+        'otherwise use your manual.', id="colon-underscore-negative"),
+    pytest.param(
+        'When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk` and do not use the unpinned form; '
+        'otherwise use your manual.', True,
+        'When AGENTTALK_PY is set, `"$AGENTTALK_PY" -m agenttalk` must not be used; '
+        'use the unpinned form; otherwise use your manual.', id="bot-433"),
+    pytest.param(
+        'When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`; it cannot be skipped; '
+        'otherwise use your manual.', True,
+        'When AGENTTALK_PY is set, `"$AGENTTALK_PY" -m agenttalk` cannot be used; '
+        'otherwise use your manual.', id="bot-71"),
+]
+
+
+@pytest.mark.parametrize("form", ["bash", "powershell"])
+@pytest.mark.parametrize("rule,stated,control", _878_LITERAL_CASES)
+def test_878_literal_skill_and_prohibition_control(rule, stated, control, form):
+    if form == "powershell":
+        rule = rule.replace('"$AGENTTALK_PY"', '& "$env:AGENTTALK_PY"')
+        control = control.replace('"$AGENTTALK_PY"', '& "$env:AGENTTALK_PY"')
+    tail = "\nRun `python -m agenttalk send`.\n"
+    skill = rule + tail
+    assert sc._states_pinned_rule(skill) is stated
+    assert bool(sc._pinned_runtime_findings("x/SKILL.md", skill, "codex")) is not stated
+    forbidden_skill = control + tail
+    assert not sc._states_pinned_rule(forbidden_skill), control
+    assert sc._pinned_runtime_findings("x/SKILL.md", forbidden_skill, "codex"), control
