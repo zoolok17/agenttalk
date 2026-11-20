@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 # subprocess is used ONLY for timeout-bounded diagnostic runtime probes; never shell.
 import subprocess  # nosec B404
 import sys
@@ -703,6 +704,123 @@ def _found_pwsh_fix() -> str:
     return text
 
 
+_NA_HOST_DETAILS = (
+    "N/A: no PowerShell host is selected, and no supervisor setup files or continuous Codex wrapper markers were "
+    "found here. The supervisor and the hang watchdog for a continuous Codex wrapper on Windows need a selected host. "
+    "Scheduled-task state was not checked."
+)
+_NA_HOST_FIX = (
+    "If you use either feature, install PowerShell 7 if needed, then run `agenttalk supervise --select-pwsh`."
+)
+_SETUP_FILES_UNKNOWN = (
+    "Cannot check the local supervisor or host-selection files; PowerShell host readiness is unknown.",
+    "Check access to the store folder, then run agenttalk doctor again.",
+)
+_HEALTH_RECORDS_UNKNOWN = "Cannot check wrapper health records; PowerShell host readiness is unknown."
+_HEALTH_RECORDS_FIX = "Check the team configuration and wrapper health records, then run agenttalk doctor again."
+_MARKER_MAX_BYTES = 64 * 1024
+# What a wrapper health marker can really say (see cli.py, where the launcher sets the mode, and wrapper/run.py): the
+# two wrappable CLIs, and one of four modes. Anything else is not something the wrapper wrote, so it is unknown.
+_MARKER_CLIS = frozenset({"claude", "codex"})
+_MARKER_MODES = frozenset({"wrapper", "wrapper-one-shot", "wrapper-loop", "lead-loop"})
+# A Codex marker in one of these modes is a continuous loop: its turn watchdog is on by default for Codex and runs
+# through the same wrapper drive (a managed lead loop included), and on Windows that watchdog needs a selected host.
+# A one-shot or plain wrapper, and a Claude loop of either kind, need none by default.
+_CODEX_LOOP_MODES = frozenset({"wrapper-loop", "lead-loop"})
+
+# What a look at one file system entry established. "absent" ONLY when the entry is not found (FileNotFoundError): any
+# other failure (access denied, a part of the path that is not a folder, an I/O error) leaves the question open.
+_ABSENT, _PRESENT, _UNKNOWN = "absent", "present", "unknown"
+
+
+def _is_link(info: os.stat_result) -> bool:
+    """A symbolic link or, on Windows, any reparse point (a junction is one)."""
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _entry_state(path: Path) -> str:
+    """present (anything is there: a file, a folder, a link whose target is gone), absent (not found), or unknown."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return _ABSENT
+    except (OSError, ValueError):
+        return _UNKNOWN
+    return _PRESENT
+
+
+def _setup_entry_state(store_dir: Path, relative: str) -> str:
+    """`_entry_state` of a file kept under the store folder, judged together with the folder it is in. A file that is
+    not found is reliably absent only when its parent is itself reliably absent or a plain folder: under a link (it
+    may be dangling), a file or a folder that cannot be looked at, "not found" says nothing about the file."""
+    target = store_dir / Path(relative)
+    state = _entry_state(target)
+    if state != _ABSENT:
+        return state
+    parent = target.parent
+    while True:
+        try:
+            info = os.lstat(parent)
+        except FileNotFoundError:
+            if parent == store_dir or parent == parent.parent:
+                return _ABSENT
+            parent = parent.parent  # a missing folder: judge the one above it, down to the store folder
+            continue
+        except (OSError, ValueError):
+            return _UNKNOWN
+        return _UNKNOWN if _is_link(info) or not stat.S_ISDIR(info.st_mode) else _ABSENT
+
+
+def _wrapper_loop_evidence(store: Store) -> tuple[list[str], list[str], bool]:
+    """What the roster's wrapper health markers say, as (agents with a continuous Codex wrapper marker, agents whose
+    marker could not be read, whether the roster itself could not be read). A marker is advisory, so none is not proof
+    that no wrapper runs; a marker that is there and cannot be read as one, or holds a value the wrapper never writes,
+    is unknown, never absent. A marker with cli `codex` and mode `wrapper-loop` or `lead-loop` counts whatever its age
+    or state. Other well-formed markers (a Claude loop, a Codex one-shot) need no host by default. A marker is "absent"
+    only when it is not found AND the folders above it are reliably there (or reliably missing): `store.read_health_raw`
+    cannot tell "missing" from "damaged", and a "not found" under a link that cannot be followed says nothing."""
+    try:
+        agents = store.load_config().get("agents") or []
+    except (OSError, ValueError, RecursionError):  # a damaged config.json may be too deeply nested
+        return [], [], True
+    loops: list[str] = []
+    unknown: list[str] = []
+    for agent in agents:
+        path = store.health_path(agent)
+        state = _setup_entry_state(store.dir, str(path.relative_to(store.dir)))
+        if state == _ABSENT:
+            continue
+        if state == _UNKNOWN:
+            unknown.append(agent)
+            continue
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read(_MARKER_MAX_BYTES + 1)
+            marker = json.loads(raw.decode("utf-8")) if 0 < len(raw) <= _MARKER_MAX_BYTES else None
+        except (OSError, ValueError, RecursionError):  # UnicodeDecodeError and json.JSONDecodeError are ValueErrors
+            marker = None
+        cli_name = marker.get("cli") if isinstance(marker, dict) else None
+        mode = marker.get("mode") if isinstance(marker, dict) else None
+        if not (isinstance(cli_name, str) and isinstance(mode, str)
+                and cli_name in _MARKER_CLIS and mode in _MARKER_MODES):
+            unknown.append(agent)
+        elif cli_name == "codex" and mode in _CODEX_LOOP_MODES:
+            loops.append(agent)
+    return sorted(loops), sorted(unknown), False
+
+
+def _host_unknown_check(details: str, fix: str) -> Check:
+    return Check(
+        name="powershell_host",
+        status="error",
+        details=details,
+        fix=fix,
+        data={"status": "error", "task_status": "unknown"},
+    )
+
+
 def _check_powershell_host(store: Store) -> Check:
     if not sys.platform.startswith("win"):
         return Check(
@@ -711,11 +829,26 @@ def _check_powershell_host(store: Store) -> Check:
             details="N/A: generated PowerShell supervisor and Scheduled Tasks are Windows-only",
             data={"status": "n/a", "task_status": "n/a"},
         )
+    codex_loops: list[str] = []
     try:
-        if store.initialized():
-            record = supervisor_lifecycle.read_selected_host(store)
+        config_state = _setup_entry_state(store.dir, store.config_path.name)
+        if config_state == _UNKNOWN:
+            return _host_unknown_check(*_SETUP_FILES_UNKNOWN)
+        if config_state == _PRESENT:
+            # An initialized store: the selection, the setup files and the markers are looked at under the selection
+            # lock, and the selection is read in the same hold (never `read_selected_host`, which takes the lock again).
+            with store._powershell_selection_lock():
+                early = _powershell_host_without_selection(store, initialized=True)
+                if isinstance(early, Check):
+                    return early
+                codex_loops = early
+                record = supervisor_lifecycle.read_selected_host_locked(store)
         else:
             # A diagnostic must not create a store just to lock an absent selection.
+            early = _powershell_host_without_selection(store, initialized=False)
+            if isinstance(early, Check):
+                return early
+            codex_loops = early
             record = supervisor_lifecycle.read_selected_host_locked(store)
     except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as exc:
         message = str(exc)
@@ -725,10 +858,14 @@ def _check_powershell_host(store: Store) -> Check:
             # A PowerShell 7 file is already there; "install it" would send the reader the wrong way.
             fix = found_fix
             message = message.removesuffix(f"; {psh.INSTALL_REMEDIATION}")
+        loops = ""
+        if codex_loops:
+            names = ", ".join(pc.line(name) for name in codex_loops)
+            loops = f". A continuous Codex wrapper ran here for: {names}. Its hang watchdog needs a selected host"
         return Check(
             name="powershell_host",
             status="error",
-            details=f"PowerShell Core host unavailable: {message}; task status UNKNOWN",
+            details=f"PowerShell Core host unavailable: {message}{loops}; task status UNKNOWN",
             fix=fix,
             data={"status": "error", "task_status": "unknown"},
         )
@@ -768,6 +905,51 @@ def _check_powershell_host(store: Store) -> Check:
         ),
         fix=fix,
         data=public,
+    )
+
+
+def _powershell_host_without_selection(store: Store, *, initialized: bool) -> Check | list[str]:
+    """The part of the host check that decides whether "no host is selected" is a problem at all.
+
+    Returns a finished Check (N/A, or an error because something could not be established), or the list of agents with a
+    continuous Codex wrapper marker (empty unless the selection is absent and such markers exist) for the caller to
+    explain in the missing-host error. Only a selection that is reliably absent can lead to N/A; a selection that is
+    there (valid or not) goes to the existing reader, and so does an absent one next to a footprint. The scheduled
+    task is never asked about here: it is external state that local files cannot rule out, so it stays unknown."""
+    selection = _setup_entry_state(store.dir, supervisor_lifecycle.selection_path(store).name)
+    if selection == _UNKNOWN:
+        return _host_unknown_check(*_SETUP_FILES_UNKNOWN)
+    if selection == _PRESENT:
+        return []
+    setup = [
+        _setup_entry_state(store.dir, relative) for relative in ("supervisor.json", *sup.ARTIFACT_RELATIVE_PATHS)
+    ]
+    if _UNKNOWN in setup:
+        return _host_unknown_check(*_SETUP_FILES_UNKNOWN)
+    if _PRESENT in setup:
+        return []  # a supervisor was set up here: the missing host is the error it always was
+    if initialized:
+        loops, unknown, roster_unknown = _wrapper_loop_evidence(store)
+    else:
+        # No config.json, so no roster to read the markers of. A store folder with state in it but no config is half
+        # made: what its markers say cannot be found out. No store folder at all is the plain "nothing set up" case.
+        state = _setup_entry_state(store.dir, store.state_dir.name)
+        loops, unknown, roster_unknown = [], [], state != _ABSENT
+    if loops:
+        return loops
+    if roster_unknown or unknown:
+        affected = ""
+        if unknown:
+            affected = " Affected: " + ", ".join(pc.line(name) for name in unknown) + "."
+        return _host_unknown_check(f"{_HEALTH_RECORDS_UNKNOWN}{affected}", _HEALTH_RECORDS_FIX)
+    # The plain doctor output prints a fix only for a check that is not ok, so on this N/A line the optional next step
+    # (and the found-file advice) is in the `--json` output only; the details line carries the explanation itself.
+    return Check(
+        name="powershell_host",
+        status="ok",
+        details=_NA_HOST_DETAILS,
+        fix=_found_pwsh_fix() or _NA_HOST_FIX,
+        data={"status": "n/a", "task_status": "unknown"},
     )
 
 

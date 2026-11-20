@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The release checklist now names the README as the only install pin.** Since the user manuals
+  stopped carrying their own install line (#835), step 1 of the release ritual in
+  `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
+  refuses. It now says to update the README's install line and its link to the lead setup brief only.
+  Wording only.
 - **Windows test jobs in CI may now run for 360 minutes instead of 330.** Between 16 and 18 November,
   18 Windows test jobs were stopped at the 330-minute limit without a single failing test, so pull
   requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
@@ -62,6 +67,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   period right before a closing quote or bracket now ends it. A Windows drive path, including
   the drive-relative kind like `<drive>:file`, no longer counts as the end of a sentence part.
   The bundled skills are unchanged: the check gives the same answer for all of them.
+- **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
+  Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
+  variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run
+  `"$AGENTTALK_PY" -m agenttalk ...` (issue #822). Before this, such a seat could not reply, report
+  progress or send by command. Now the wrapper writes the Python interpreter's full path into that
+  seat's instructions (`"<path with forward slashes>" -m agenttalk ...`), tells it to use the Bash tool,
+  and prints at start the allow rule the team can add, for example
+  `Bash("<env>/Scripts/python.exe" -m agenttalk *)`. The wrapper never adds the rule itself: in a
+  strict profile the team decides what a seat may run. Seats in the default `bypassPermissions` mode,
+  and Codex seats, see no change. A strict seat keeps the old form when the interpreter's path is not
+  an existing full path, is not safe inside double quotes, or holds a character that has a meaning in
+  the printed rule. Those characters are `*`, which a rule reads as "any text" even inside quotes, so
+  a path such as `/opt/pinned*/bin/python` would let the rule allow other programs too, and `(` and
+  `)`, which enclose the rule. The source is Claude Code's permissions page
+  (code.claude.com/docs/en/permissions, "Wildcard patterns"). Not changed here: the skills (they keep
+  their `AGENTTALK_PY` rule), the supervisor's own resume rule `Bash(agenttalk *)`, the PowerShell
+  forms, and the lead setup brief (#826 changes it).
+- **A settings file nested too deeply no longer crashes agenttalk (#846).** A team
+  configuration or PowerShell host selection file holding JSON nested so deeply that
+  Python cannot read it is now reported as damaged: doctor names it and goes on with its
+  other checks, other commands print one line and stop, and `init --force` can repair
+  such a configuration.
+
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,
   including unedited files marked assume-unchanged or present skipped files. Files
@@ -296,8 +324,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the folder with the shorter name instead, which might not exist or might hold a different
   `pwsh.exe`; the suggestions of `agenttalk supervise --select-pwsh` use the same search, so they now
   name the right file too.
-  Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before. A folder that
-  has just been set up can still end with `overall: ERROR` on Windows until that step is done.
+  Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before.
+  On Windows, `powershell_host` is no longer a permanent error for a team that does not use a supervisor.
+  When no host is selected, none of the supervisor setup files exists and no continuous Codex wrapper has
+  left its marker in the team folder, it says `N/A` (not an error, so a set-up team can now end with exit
+  code 0), explains that the supervisor and the hang watchdog of a continuous Codex wrapper both need a
+  selected host, and says the scheduled-task state was not checked (its data says `unknown`, not
+  `not_configured`: a task can outlive its files). It is a snapshot of local files, not proof that the
+  features are unneeded. A continuous Codex wrapper here means a Codex marker for a loop or for a managed
+  lead loop (both keep the hang watchdog on by default); a Codex one-shot, or a Claude loop of either kind,
+  needs no host by default. It stays an error when a setup file is there, and when a Codex wrapper in the
+  team has left a continuous marker, even an old one (it names those agents). It also stays an error, saying
+  it could not check, when a file, a marker or the team list cannot be read or looked at, when a marker holds
+  a value the wrapper never writes or JSON nested too deeply to read, or when a marker (or the config or selection) sits under a folder link
+  that cannot be followed: nothing is called absent unless it was not found where it could be looked for. A
+  folder with no store at all gets the same `N/A`, and the separate store check still reports it. Its advice
+  is unchanged when a host is selected. The plain `agenttalk doctor` output prints the next step only for a
+  check that is not ok, so on the `N/A` line the optional next step (and the advice for a PowerShell 7 file
+  that was found) is in the `--json` output only; the line itself carries the explanation.
   `skill_currency` now says that bundled skills last reviewed against an older version are a note
   for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report
   it to the agenttalk maintainers and that the maintenance advice is for them.
