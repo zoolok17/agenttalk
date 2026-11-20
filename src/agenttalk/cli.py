@@ -1771,11 +1771,47 @@ def _groupable_capacity_account(value: object) -> bool:
     ) is not None
 
 
+def _status_redact_home(value):
+    """Hide home and local app-data paths in status output, including nested diagnostics."""
+    if isinstance(value, dict):
+        return {key: _status_redact_home(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_status_redact_home(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    home = os.path.expanduser("~")
+    local = os.environ.get("LOCALAPPDATA", "") if os.name == "nt" else ""
+    folders = [(home, "<home>")]
+    home_key = home.replace("\\", "/").rstrip("/")
+    local_key = local.replace("\\", "/").rstrip("/")
+    if os.name == "nt":
+        home_key, local_key = home_key.casefold(), local_key.casefold()
+    if local_key and local_key != home_key and not local_key.startswith(home_key + "/"):
+        folders.append((local, "<localappdata>"))
+    for folder, replacement in sorted(folders, key=lambda pair: len(pair[0]), reverse=True):
+        if not folder or folder in ("/", "\\") or folder == "~":
+            continue
+        parts = re.split(r"[\\/]", folder.rstrip("\\/"))
+        pattern = r"[\\/]".join(re.escape(part) for part in parts)
+        value = re.sub(pattern, lambda match: replacement, value, flags=re.IGNORECASE if os.name == "nt" else 0)
+    return value
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _get_store(args)
     payload = _gather_status(store)
+    show_personal = getattr(args, "show_personal", False)
+    if not show_personal:
+        payload.pop("root", None)
+        payload.pop("project_id", None)
+        if isinstance(payload.get("hmac_key"), dict):
+            payload["hmac_key"].pop("path", None)
+        if isinstance(payload.get("powershell_host"), dict):
+            host = payload["powershell_host"]
+            payload["powershell_host"] = {key: value for key, value in host.items()
+                                          if key in {"status", "edition", "version", "age_seconds", "warning"}}
     if args.json:
-        if not getattr(args, "show_account", False):
+        if not show_personal:
             groups: dict[str, list[str]] = {}
             for row in payload["agents"]:
                 account = row.get("capacity", {}).get("account")
@@ -1786,26 +1822,29 @@ def cmd_status(args: argparse.Namespace) -> int:
                     account = row["capacity"].pop("account", None)
                     if _groupable_capacity_account(account):
                         row["capacity"]["account_group"] = sorted(groups[account])
+        if not show_personal:
+            payload = _status_redact_home(payload)
         print(json.dumps(payload, indent=2))
         return 0
-    print(f"root:       {payload['root']}")
+    if not show_personal:
+        payload = _status_redact_home(payload)
+    root = payload.get("root", "(hidden; add --show-personal to show the project folder)")
+    print(f"root:       {root}")
     print(f"session_id: {payload['session_id']}")
     print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
     print(f"messages:   {payload['message_count']}")
     print(f"operator:   {payload.get('operator_questions_pending', 0)} operator question(s) pending")
     if "powershell_host" in payload:
         host = payload["powershell_host"]
-        print(
-            "powershell: "
-            f"{host.get('status', 'unknown').upper()} "
-            f"{host.get('path', 'unavailable')}"
-        )
+        host_path = host.get("path", "unavailable") if show_personal else "(path hidden; add --show-personal)"
+        print(f"powershell: {host.get('status', 'unknown').upper()} {host_path}")
         if host.get("warning"):
             print(f"  warning:  {host['warning']}")
     if payload["signing_enforced"]:
         hk = payload.get("hmac_key") or {}
         status_label = "OK" if hk.get("exists") and hk.get("readable") and not hk.get("mode_warning") else "PROBLEM"
-        print(f"hmac:       enforced · key {status_label} ({hk.get('path', '?')})")
+        key_path = hk.get("path", "?") if show_personal else "path hidden; add --show-personal to show it"
+        print(f"hmac:       enforced · key {status_label} ({key_path})")
         if hk.get("mode_warning"):
             print(f"  warning:  {hk['mode_warning']}")
         if hk.get("in_project_dir"):
@@ -1820,7 +1859,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if legacy_flag is not None:
             print(f"            legacy require_signatures = {legacy_flag}")
         if legacy_pid is not None:
-            print(f"            legacy project_id = {legacy_pid}")
+            legacy_value = legacy_pid if show_personal else "(hidden; add --show-personal)"
+            print(f"            legacy project_id = {legacy_value}")
     if payload["invalid_messages"]:
         n = len(payload["invalid_messages"])
         print(f"INVALID:    {n} message{'s' if n != 1 else ''} failed schema/roster validation "
@@ -12275,7 +12315,7 @@ def cmd_capacity(args: argparse.Namespace) -> int:
     accounts: dict[str, list[str]] = {}
     for agent in sorted(caps):
         account = caps[agent].get("account")
-        if args.show_account:
+        if args.show_personal:
             account = str(account or "")
         elif not _groupable_capacity_account(account):
             account = ""
@@ -12287,7 +12327,7 @@ def cmd_capacity(args: argparse.Namespace) -> int:
         if account:  # a file written before #301 names no account: rows stand alone
             provider, _, rest = account.partition(":")
             label = f"{provider} account"
-            if args.show_account:
+            if args.show_personal:
                 user, _, home = rest.partition(":")
                 label += f" of OS user {user}{f' ({home})' if home else ''}"
             print(f"  {label}, {len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
@@ -17533,8 +17573,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("status", help="Show roster, message count, per-agent cursor + unread.")
     ps.add_argument("--json", action="store_true",
                     help="Emit structured JSON instead of human-readable text.")
-    ps.add_argument("--show-account", action="store_true",
-                    help="Include the operating-system login name and folder fingerprint in JSON.")
+    ps.add_argument("--show-personal", action="store_true",
+                    help="Show personal paths, project ID, operating-system login name and folder fingerprint.")
     ps.set_defaults(func=cmd_status)
 
     pov = sub.add_parser(
@@ -20217,7 +20257,7 @@ def build_parser() -> argparse.ArgumentParser:
     pcap.add_argument("mode", nargs="?", choices=["show", "refresh"], default="show",
                       help="show (default) the team's published budgets, or refresh (publish your own)")
     pcap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
-    pcap.add_argument("--show-account", action="store_true",
+    pcap.add_argument("--show-personal", action="store_true",
                       help="On show, print the operating-system login name and home-folder fingerprint")
     pcap.add_argument("--source", choices=["auto", "claude", "codex"], default="auto",
                       help="On refresh, which local source to read (default: auto-detect)")

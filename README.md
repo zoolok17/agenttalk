@@ -1380,7 +1380,7 @@ in agenttalk waits for it or is held back by it.
 **What you will see**
 
 - `agenttalk capacity` lists the seats that share an account under a provider heading.
-  Add `--show-account` to include the operating-system login name and home-folder fingerprint.
+  Add `--show-personal` to include the operating-system login name and home-folder fingerprint.
   Below it, each seat shows its own reading, newest first, with how long ago it was seen. Readings
   are never merged across seats: to judge the account, read the newest seat's row.
 - `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or
@@ -1388,8 +1388,16 @@ in agenttalk waits for it or is held back by it.
   `status --json` shows `account_group` as the sorted seats in this status output sharing an account;
   the capacity text display also counts a retired seat's old reading.
   Both group only well-formed Claude, Codex and OVH-Qwen account keys; other readings stand alone.
-  Use `--show-account` to include the login and folder fingerprint instead.
+  Use `--show-personal` to include the login and folder fingerprint instead.
   The store itself records the login, so review it before sharing the store.
+  `status` and `status --json` also hide the project folder (`root`), signing-key path
+  (`hmac_key.path`) and `project_id`. They can contain or confirm your login. Text says
+  when these are hidden; add `--show-personal` to show them and the account text.
+  Home paths in free text are replaced with `<home>`, and local app-data paths outside
+  home with `<localappdata>`. This does not cover paths outside those folders or a login
+  appearing in free text outside a path. Other commands can still show paths or project
+  IDs: `whoami --json`, `hmac-init`, `backup --json`, `doctor`, `supervisor --json` and
+  the web console.
 - The web console and `agenttalk attention` show and warn only on figures that are still current.
 
 **Where the figures come from**
