@@ -10,6 +10,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The lead setup brief explains how to run a Claude seat in a strict permission mode (#826).**
+  Before this, the brief said that a wrapped Claude seat runs with no approval prompts and no
+  sandbox unless you choose another mode, and left the rest to the team. Now its step 10a gives a
+  starting set of allow and deny rules for Claude Code's `dontAsk` mode, based on one that another
+  team built and tested on Windows with Claude Code 2.1.326 and agenttalk 0.105.0 (issue #823).
+  It covers the rule for the agenttalk command a strict seat is given (the interpreter's path
+  written out, with the rule the wrapper prints from #828 on, and the older `PATH` workaround for
+  versions before it), the rule that lets a seat write its reply drafts (with the two-slash form
+  for absolute paths on Linux and macOS), which settings files Claude Code adds together, how a
+  strict seat gets its own rules when its launch does not load `CLAUDE.local.md`
+  (`--append-system-prompt-file`), and how to test your own rules. Every statement about Claude Code says whether the other team reported
+  it, agenttalk's maintainers measured it, or Claude Code's documentation says it. It also says
+  what such rules cannot catch: git options and settings that write or read files or start a
+  program, `git branch` changes, reads that name no file such as `grep -r`, and agenttalk's own
+  `--file` option, which reads any file the account can read even when shortened to `--fi`
+  (#827). It is a guardrail, not a sandbox: anything the rules allow runs with the user account's
+  full rights, and only a separate account, virtual machine or container keeps the account's
+  secrets and the seats' settings files out of their reach.
+  Steps 4 and 5 gain two short notes: the user account's own Claude instructions reach wrapped
+  seats too, and on Windows the process number the start script saves belongs to a launcher.
+
 ### Changed
 
 - **The release checklist now names the README as the only install pin.** Since the user manuals
