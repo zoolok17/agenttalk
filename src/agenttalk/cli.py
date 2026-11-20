@@ -12268,7 +12268,10 @@ def cmd_capacity(args: argparse.Namespace) -> int:
     # is shown under the account, newest first, never merged with another seat's.
     accounts: dict[str, list[str]] = {}
     for agent in sorted(caps):
-        accounts.setdefault(str(caps[agent].get("account") or ""), []).append(agent)
+        account = caps[agent].get("account")
+        if not isinstance(account, str):
+            account = str(account or "") if args.show_account else ""
+        accounts.setdefault(account, []).append(agent)
     kw = {"threshold": args.threshold, "reset_soon_min": args.reset_soon_min,
           "context_threshold": args.context_threshold}
     for account, agents in sorted(accounts.items()):

@@ -3999,8 +3999,10 @@ def test_616_capacity_account_display_privacy_and_grouping(tmp_path: Path, capsy
     from agenttalk import capacity as capmod
 
     monkeypatch.setattr(capmod.getpass, "getuser", lambda: "invented-login")
-    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta,gamma,legacy,empty"])
+    cli.main(["init", "--path", str(tmp_path), "--agents", "beta,alpha,gamma,legacy,empty"])
     store = Store(tmp_path)
+    read_all = Store.read_all_capacities
+    monkeypatch.setattr(Store, "read_all_capacities", lambda self: dict(reversed(list(read_all(self).items()))))
     first = capmod.account_key("codex", tmp_path / "invented-home-one")
     second = capmod.account_key("codex", tmp_path / "invented-home-two")
     for agent, account in (("alpha", first), ("beta", first), ("gamma", second), ("legacy", None)):
@@ -4046,6 +4048,27 @@ def test_616_capacity_account_display_privacy_and_grouping(tmp_path: Path, capsy
         expected["account"] = account
         assert shown[agent]["capacity"] == expected
     assert "capacity" not in shown["empty"]
+
+
+@pytest.mark.parametrize("command", ["capacity", "status"])
+def test_867_malformed_account_list_does_not_expose_login(tmp_path: Path, capsys, command) -> None:
+    from agenttalk import capacity as capmod
+
+    assert cli.main(["init", "--path", str(tmp_path), "--agents", "alpha"]) == 0
+    snapshot = capmod.CapacitySnapshot.unknown("alpha").to_dict()
+    snapshot["account"] = ["invented-login"]
+    Store(tmp_path).write_capacity("alpha", snapshot)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(tmp_path), command, *(["--json"] if command == "status" else [])]) == 0
+    output = capsys.readouterr().out
+    assert "invented-login" not in output
+    if command == "status":
+        row = json.loads(output)["agents"][0]["capacity"]
+        assert "account" not in row and "account_group" not in row
+    else:
+        assert cli.main(["--root", str(tmp_path), "capacity", "--show-account"]) == 0
+        assert "invented-login" in capsys.readouterr().out
 
 
 def test_867_status_show_account_help(capsys) -> None:

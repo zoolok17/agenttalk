@@ -15,10 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Capacity headings now omit account identifiers by default.** This makes routine
   output safer to share. To see the operating-system login and home-folder fingerprint
   as before, run `agenttalk capacity --show-account`. The same protection now covers
-  `agenttalk status --json` (#867).
+  `agenttalk status --json` (#867). A malformed non-text account is not shown in the default capacity heading.
 - **Status JSON no longer exposes account text by default (#867).** Each capacity
   reading with an account now has `account_group`, the sorted seats sharing it,
-  instead of `account`. To keep the old account text, use `status --json
+  instead of `account`; a script reading `account` now finds the key missing. To keep the old account text, use `status --json
   --show-account`; to group seats, compare `account_group`. Budget readers need
   no change. The store itself records the login, so review it before sharing it.
 - **The release checklist now names the README as the only install pin.** Since the user manuals
