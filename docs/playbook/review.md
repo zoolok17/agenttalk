@@ -11,12 +11,12 @@ Contents: [the shape of a review](#the-shape-of-a-review) · [briefing a reader]
 ### R1. The sequence: build, cold read, fix round, delta read, final read
 - **The rule.** A change is built, then read by someone who did not build it (a cold read). Each finding goes to a fix round. The fix is read again (a delta read), and the last round is read once more as a whole.
 - **Why.** A builder cannot see its own blind spots, and a fix can carry new defects of its own.
-- **How to apply.** Follow [section 4.2](../ROLES-SKILLS-PROCEDURES.md#42-the-review-cycle). A verdict counts only for the exact commit it names.
+- **How to apply.** Follow [section 4.2](../ROLES-SKILLS-PROCEDURES.md#42-the-review-cycle). A verdict counts only for the exact commit it names. When no reader of another vendor is available, follow [the single-vendor rule](../ROLES-SKILLS-PROCEDURES.md#when-only-one-vendor-is-available).
 
 ### R2. A builder's own green test run is not the review
 - **The rule.** Treat the builder's passing tests as the start of the review, not the end. A reader from another vendor, told nothing about the builder's reasoning, reads the work against its stated contract.
 - **Why.** One builder's large green suite missed the wire format and the authorisation contract. A blind read from another vendor found both within one turn.
-- **How to apply.** Choose a reader of a different vendor whenever one is available, and pin the read to the exact commit.
+- **How to apply.** Choose a reader of a different vendor, and pin the read to the exact commit. When none is available, the [single-vendor rule](../ROLES-SKILLS-PROCEDURES.md#when-only-one-vendor-is-available) says what to do: wait, use a second team's read, or, last, a labelled same-vendor read that another vendor repeats later.
 
 ### R3. Match the bar of the last round to the risk of the change
 - **The rule.** Keep a strict last-round bar ("a blocker found after the second fix round parks the work") for safety, money, data-loss and security code. For display-only or wording changes, accept a follow-up for what remains.
@@ -88,7 +88,7 @@ Contents: [the shape of a review](#the-shape-of-a-review) · [briefing a reader]
 ### R16. Write review briefs in plain engineering terms
 - **The rule.** Describe findings by behaviour and impact ("a check that can be bypassed", "a folder that changes into a link while it is being removed"), not as attacker steps or payloads.
 - **Why.** The model providers' safety filters rejected ordinary defensive review briefs written with attack vocabulary. One brief was retried many times and dead-lettered without the seat ever seeing it.
-- **How to apply.** Keep literal exploit strings in tests and private notes, not in messages. If a seat's provider will not take the work, route it to another seat and record that the review was by the same vendor.
+- **How to apply.** Keep literal exploit strings in tests and private notes, not in messages. If a seat's provider will not take the work, route it to another seat. If the only seat left is of the builder's vendor, its read is a same-vendor read under [the single-vendor rule](../ROLES-SKILLS-PROCEDURES.md#when-only-one-vendor-is-available): it carries the label, and the list of what a same-vendor GO is never enough for still applies.
 
 ## What a reader checks
 

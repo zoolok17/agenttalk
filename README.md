@@ -164,24 +164,63 @@ assistant that talks to you.
 
 New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/v0.105.0/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
 agenttalk: it sets up a first team without the supervisor and tells you what only a person can decide.
-Once agenttalk is installed, the brief and the other guides for leads are on your machine too: `agenttalk doctor`
-prints the installed `module path`, and the brief is `docs/LEAD-SETUP-BRIEF.md` under it.
+Once agenttalk is installed, the brief and the other guides for leads are on your machine too. After the steps below, which set `AGENTTALK_PY`,
+`& $env:AGENTTALK_PY -m agenttalk doctor` in PowerShell, or `"$AGENTTALK_PY" -m agenttalk doctor` on Linux and macOS, prints the installed `module path`, and the brief is `docs/LEAD-SETUP-BRIEF.md` under it.
 To do it yourself, follow the steps below.
 
-Install a released version and the instructions each assistant reads:
+Give agenttalk its own Python environment, a folder that keeps its packages separate from your other software.
+Open a terminal in a folder outside your project's code and team folder. The following commands create a new
+`agenttalk-env` folder there, install a released version and install the instructions each assistant reads. If that
+folder already exists, choose another name and use it throughout.
+
+Windows (PowerShell):
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
-agenttalk install-skills
+python -m venv agenttalk-env
+$env:AGENTTALK_PY = (Resolve-Path .\agenttalk-env\Scripts\python.exe).Path
+& $env:AGENTTALK_PY -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
+& $env:AGENTTALK_PY -m agenttalk install-skills
 ```
+
+Linux and macOS (sh):
+
+On Debian or Ubuntu, install the venv package first: `sudo apt install python3-venv` (on Python 3.14 this brings `python3.14-venv`).
+
+```sh
+python3 -m venv agenttalk-env
+export AGENTTALK_PY="$(pwd)/agenttalk-env/bin/python"
+"$AGENTTALK_PY" -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
+"$AGENTTALK_PY" -m agenttalk install-skills
+```
+
+`AGENTTALK_PY` names the Python you just installed agenttalk into. Keep using that Python after you change folders.
+In the first terminal, type `$env:AGENTTALK_PY` in PowerShell or `echo "$AGENTTALK_PY"` in sh to see its full path.
+In each new terminal, set `AGENTTALK_PY` again to that same full path. Then put its command folder first on PATH,
+so assistants that run a plain `agenttalk` use this environment too. Do this in every terminal before starting an assistant.
+
+Windows (PowerShell):
+
+```powershell
+$env:PATH = (Split-Path $env:AGENTTALK_PY) + ';' + $env:PATH
+```
+
+Linux and macOS (sh):
+
+```sh
+export PATH="$(dirname "$AGENTTALK_PY"):$PATH"
+```
+
+This also makes `python` and `pip` in that terminal the ones in `agenttalk-env`. If your project has its own Python environment, do not activate it in any terminal where you or an assistant run agenttalk: activating puts that environment's folder first on PATH, and an older agenttalk installed there would then run instead of this one, against the same team folder. Call the project's Python by its full path instead, for example `& "<project-env>\Scripts\python.exe"` in PowerShell or `"<project-env>/bin/python"` in sh, where `<project-env>` stands for the full path of that environment's folder. To check which agenttalk a terminal runs, type `(Get-Command agenttalk).Source` in PowerShell or `command -v agenttalk` in sh: the path it shows must be inside `agenttalk-env`.
+
+The steps below show PowerShell; on Linux or macOS, replace `& $env:AGENTTALK_PY` with `"$AGENTTALK_PY"`.
 
 Then, in your project's top folder:
 
-1. Name the seats: `agenttalk init --here --agents claude-dev,codex-rev`.
+1. Name the seats: `& $env:AGENTTALK_PY -m agenttalk init --here --agents claude-dev,codex-rev`.
 2. In each terminal, set that seat's name before you start the assistant, for example
    `$env:AGENTTALK_SELF = 'claude-dev'` in PowerShell, or
    `export AGENTTALK_SELF=claude-dev` in bash or zsh.
-3. For Codex, read what `agenttalk codex-config --enable` allows, then run it.
+3. For Codex, read what `& $env:AGENTTALK_PY -m agenttalk codex-config --enable` allows, then run it.
 4. Start one assistant and tell it to add itself as the lead. Start the other and tell
    it to join as a reviewer and wait for the lead.
 5. Ask the lead to hand a piece of work to the other assistant for review.
@@ -235,6 +274,27 @@ model vendors, rather than running two instances of the same one, is
 that a reviewer with a different training lineage (a model trained by a
 different company) is less likely to share the first agent's blind spots. The bus is symmetric; which agent
 plays which part on a given task is your call.
+
+**If you have only one vendor.** Some teams have assistants from one AI
+company only, and a team with two can lose one for a while, for example
+when its allowance runs out. agenttalk's procedures still give such a
+team a defined way to review and merge. Wait for another vendor if the
+work can wait. Otherwise ask a second team whose reader is from another
+vendor. Otherwise have the work read by a fresh assistant of the same
+vendor that had no part in it, backed by checks that no model judges:
+the automatic tests and, for a change to code, a test that fails before
+the change and deliberately broken versions the tests must catch. Such an approval is
+labelled `review_independence=same-vendor`, and another vendor reads the
+work again when one is available. It is never enough for money or paid
+spend; security, credentials or privacy; deleting data or another step
+that cannot be undone; a release; the settings of the automatic checks
+(CI workflows, linters, scanners and secret-scan settings); or this review
+rule and the shipped instructions that state it. Those need another vendor's read, or, for a team with no other
+vendor at all, the operator's recorded approval. The cost is real: a reviewer from the same company
+shares more of the builder's blind spots, so this review is weaker than
+one across companies, and the label says so. agenttalk does not enforce
+any of this by itself; the lead's instructions do. The full rule is in
+[the merge gate](https://github.com/zoolok17/agenttalk/blob/master/docs/ROLES-SKILLS-PROCEDURES.md#when-only-one-vendor-is-available).
 
 ### What it does well that you might not guess
 
@@ -408,17 +468,14 @@ in the technical reference.
 
 ### Install (tag-pinned)
 
-```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
-agenttalk install-skills          # installs bus skills + the dev-discipline devkit
-```
+Follow [Get started](#get-started) to create a private Python environment and install agenttalk and its skills.
+Use that same Python in every terminal. The examples below shorten the command to `agenttalk`; write
+`& $env:AGENTTALK_PY -m agenttalk` in PowerShell or `"$AGENTTALK_PY" -m agenttalk` on Linux and macOS.
 
-The first line installs agenttalk itself. Pin it to a released tag
-(`@v0.105.0` above, or whatever the current release is) rather than a
-branch: the commands and the message format can change between
-releases, and a tag keeps every agent in a project on the same version.
+The install command pins a released tag (`@v0.105.0` in Get started), rather than a branch: commands and the message
+format can change between releases, and a tag keeps every agent in a project on the same version.
 
-The second line installs the skills, the instructions each agent CLI
+The `install-skills` command installs the skills, the instructions each agent CLI
 reads to use agenttalk. It writes Claude Code's bus commands under
 `~/.claude/commands` and Codex's under `~/.codex/skills`, and the
 dev-discipline pack (the devkit) under both `~/.claude/skills` and
@@ -1960,6 +2017,7 @@ can consume.
 
 This reference deliberately stays shallow. For more:
 
+- [docs/FEATURES.md](https://github.com/zoolok17/agenttalk/blob/master/docs/FEATURES.md) — every feature in plain words: what agenttalk does today and what is planned.
 - [docs/AGENTTALK-NEW-USER-MANUAL.md](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENTTALK-NEW-USER-MANUAL.md) — concept-first onboarding.
 - [docs/USER-MANUAL.md](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md) — operator-facing procedures and examples.
 - [docs/AGENT-MANUAL.md](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENT-MANUAL.md) — role-keyed operating guide for agents.

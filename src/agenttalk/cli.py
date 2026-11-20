@@ -45,6 +45,7 @@ from agenttalk.store import (
     OPENER_KINDS,
     Message,
     RequeueRefused,
+    PreparedMessageRefused,
     Store,
     _owner_identity_gone,
     escape_controls,
@@ -5540,11 +5541,13 @@ def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
     return True, "worktree is clean and idle"
 
 
-def _lane_diff(root, base: str, head: str) -> dict:
-    """`git diff --name-status -z -M -C base..head` parsed structurally. touched =
-    paths a delivery WRITES (M/A/D/T, rename old+new, copy DEST); a copy SOURCE is
-    evidence-only. Fails closed: unavailable / parse_error."""
-    rc, out = _git(root, ["diff", "--name-status", "-z", "-M", "-C", f"{base}..{head}"])
+def _lane_diff(root, base: str, head: str, *, renames: bool = True) -> dict:
+    """`git diff --name-status -z -M -C base..head` parsed structurally (`renames=False`:
+    `--no-renames`, every path under its own name). touched = paths a delivery WRITES
+    (M/A/D/T, rename old+new, copy DEST); a copy SOURCE is evidence-only. Fails closed:
+    unavailable / parse_error."""
+    detect = ["-M", "-C"] if renames else ["--no-renames"]
+    rc, out = _git(root, ["diff", "--name-status", "-z", *detect, f"{base}..{head}"])
     if rc != 0:
         return {"error": "unavailable", "paths": []}
     toks = out.split("\x00")
@@ -5583,10 +5586,39 @@ def _lane_merge(root, target_head: str, head: str) -> dict:
     honest-degraded unknown — NEVER inferred clean."""
     rc, out = _git(root, ["merge-tree", "--write-tree", target_head, head])
     if rc == 0:
-        return {"status": "clean", "detail": (out.strip().splitlines() or [""])[0][:40]}
+        tree = (out.strip().splitlines() or [""])[0]
+        return {"status": "clean", "detail": tree[:40], "tree": tree}  # `tree` is for _lane_add_merge_effects only
     if rc == 1:
         return {"status": "conflict", "detail": "merge-tree reported conflicts"}
     return {"status": "unknown", "detail": f"merge-tree rc={rc} (requires Git>=2.38?)"}
+
+
+def _lane_diff_base(root, target_head: str, head: str, stored: str):
+    """The commit a lane is compared with: its one merge base with the target, which says what the lane did.
+    Returns (commit, None) or (None, error). Several merge bases are ambiguous; empty or failing answers fail closed."""
+    rc, out = _git(root, ["merge-base", "--all", target_head, head])
+    if rc == 1:  # no common ancestor: today's behaviour; the conflict check already holds such a lane
+        return stored, None
+    bases = out.split() if rc == 0 else []
+    if not bases:
+        return None, "unavailable"
+    if len(bases) > 1:
+        return None, "ambiguous_base"
+    return (stored if bases[0] == head else bases[0]), None  # head already in the target: nothing to compare
+
+
+def _lane_add_merge_effects(root, changed: dict, target_head: str, merge: dict) -> dict:
+    """Add the paths the real merge writes on the target that the lane's own diff does not name: only the
+    merge result says where the lane's edits land (a target rename can carry one outside the lane)."""
+    tree = merge.pop("tree", None)
+    if changed.get("error") or merge.get("status") != "clean":
+        return changed
+    effects = _lane_diff(root, target_head, tree, renames=False) if tree else {"error": "unavailable", "paths": []}
+    if effects.get("error"):
+        return effects
+    seen = {p["path"] for p in changed["paths"] if p.get("touched")}
+    extra = [{**p, "role": "merge-effect"} for p in effects["paths"] if p["path"] not in seen]
+    return {"error": None, "paths": [*changed["paths"], *extra]}
 
 
 def _lane_resolve(store, ref: str):
@@ -5604,8 +5636,11 @@ def _lane_eval(store, lane: dict, other_active: list[dict], head: str,
     carries changed/merge/gate_check/head/target_head_now for the artifact + output."""
     cfg_casefold = dom.default_casefold_paths()
     reg = _load_domain_registry(store)
-    base = lane.get("base_sha")
-    changed = _lane_diff(store.root, base, head)
+    target_head_now = _lane_resolve(store, lane.get("target_ref"))
+    base, base_error = _lane_diff_base(store.root, target_head_now, head, lane.get("base_sha"))
+    changed = {"error": base_error, "paths": []} if base_error else _lane_diff(store.root, base, head)
+    merge = _lane_merge(store.root, target_head_now, head)
+    changed = _lane_add_merge_effects(store.root, changed, target_head_now, merge)
     touched = [p["path"] for p in changed.get("paths", []) if p.get("touched")]
     # Resolve shared-path approver authority at eval time so compute_verdict can
     # REVALIDATE each recorded approval against the current registry (audit fix):
@@ -5630,8 +5665,6 @@ def _lane_eval(store, lane: dict, other_active: list[dict], head: str,
         return cls
 
     classifications = {p: _classify(p) for p in touched}
-    target_head_now = _lane_resolve(store, lane.get("target_ref"))
-    merge = _lane_merge(store.root, target_head_now, head)
     scope = gate_scope or f"lane:{lane.get('lane_id')}"
     gate_check = gate_mod.check_gates(store.root, scope=scope)
     current_epoch = store.current_epoch()
@@ -14182,6 +14215,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     supervisor_launch_nonce: str | None = None,
                     lifecycle_log: object | None = None,
                     reply_shell: str = "powershell",
+                    reply_invocation: str | None = None,
                     turn_events: bool = False) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
@@ -14338,6 +14372,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
             reply_shell=reply_shell,
+            reply_invocation=reply_invocation,
             turn_watchdog=turn_watchdog,
             health_writer=health_writer,
             runtime_writer=runtime_writer,
@@ -14432,6 +14467,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
             reply_shell=reply_shell,
+            reply_invocation=reply_invocation,
             runtime_writer=runtime_writer,
             work_heartbeat=work_heartbeat,
             lifecycle_log=lifecycle_log,
@@ -15227,6 +15263,15 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
         # #wrapper-reply-channels increment B: per-agent -> global -> per-CLI
         # default, same precedence chain as the dead-letter caps above.
         reply_shell = _sup.resolve_reply_shell(sup_cfg, cfg_agent, cli=args.cli)
+        # #822: a Claude seat in a stricter permission mode is given the interpreter's written-out path. Whether
+        # the seat may run it is the team's decision, so the wrapper never adds the rule; it only names it.
+        from agenttalk.wrapper import prompt as _wprompt
+        reply_invocation = _wprompt.strict_reply_invocation(args.cli, argv, child_env.get("AGENTTALK_PY"))
+        if reply_invocation:
+            sys.stderr.write(
+                f"agenttalk wrap: {agent} runs in a Claude permission mode other than bypassPermissions, so its "
+                f"instructions write agenttalk commands as {reply_invocation} <subcommand>. To let the seat run "
+                f"them, add this allow rule to its settings: Bash({reply_invocation} *)\n")
         return _wrap_loop_mode(
             store,
             agent,
@@ -15268,6 +15313,7 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
                 None,
             ),
             reply_shell=reply_shell,
+            reply_invocation=reply_invocation,
             turn_events=_turn_events_wanted(args),
         )
     try:
@@ -15916,6 +15962,24 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 _refuse_live_request=True,
                 _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
             )
+        except PreparedMessageRefused as e:
+            if orig.get("kind") in _dl_tags.OPENERS:
+                route = _requeue_route(args, orig)
+            else:
+                template = "agenttalk dead-letter requeue --agent {agent} --id {id}"
+                values = {"agent": args.agent, "id": args.id}
+                if reopen_event is not None:
+                    template += " --force-resolved --from {actor} --reason {reason}"
+                    values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
+                route = (
+                    "After the reset has finished, retry the same dead letter to keep its original correlation:\n  "
+                    + pc.cmd(template, **values) + "."
+                )
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
+                + route + "\n"
+            )
+            return 2
         except RequeueRefused as e:
             # The advice is decided here, after the publication lock is released and from the resolution as it is now:
             # a retry is named only when the ordinary command would be accepted (a resolved one needs --force-resolved).

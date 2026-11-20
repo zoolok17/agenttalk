@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 # subprocess is used ONLY for timeout-bounded diagnostic runtime probes; never shell.
 import subprocess  # nosec B404
 import sys
@@ -35,6 +36,8 @@ from agenttalk.store import (
     Store,
     find_root,
     find_stores_upward,
+    store_fence_allows,
+    validate_agent_name,
 )
 
 
@@ -610,6 +613,294 @@ def _check_ovh_qwen_gateway(store: Store) -> Check | None:
     )
 
 
+_HOST_USERS = "the supervisor and the hang watchdog of a continuous Codex wrapper use the selected host"
+# How to get the exact path of a found file whose display is escaped. Both print plain strings, one per line, so a
+# long value is never cut with an ellipsis (a table such as `Get-Command pwsh -All` or `Get-ChildItem Env:` is), and
+# each shows only the one thing it is about: never a listing of the environment, which holds credentials.
+# The expression that prints, one full path per line, every pwsh.exe on the PATH that passes the search's entry rules.
+# It reads each entry exactly as the search does: PATH split on the separator; each entry trimmed of the same
+# explicit set (space and tab) and then of surrounding double quotes (a quoted entry is legal on Windows); an entry
+# kept only if it starts with an ASCII drive letter, a colon and a slash (the search's own rule, so empty, relative
+# and network-share entries drop out); a file printed only if it exists, with Test-Path on the literal text so no
+# wildcard in a folder name is expanded. It uses only cmdlets, operators and string methods, so it behaves the same
+# in Constrained Language mode (which refuses calls to static .NET methods such as [IO.Path]::IsPathFullyQualified:
+# the expression would run, print nothing and exit 0). Plain strings, so nothing is cut with an ellipsis. It reads
+# only the PATH variable.
+# Its list can be longer than the search's: the search also drops WindowsApps aliases and files on drives that are
+# not fixed, and pwsh lists its own folder first; the reader finds the line that matches the path shown above.
+PATH_LOOKUP = (
+    "$env:PATH -split ';' | ForEach-Object { $e = $_.Trim(' ', [char]9).Trim('\"'); "
+    "if ($e -cmatch '^[A-Za-z]:[\\\\/]') "
+    "{ $p = Join-Path $e 'pwsh.exe'; if (Test-Path -LiteralPath $p -PathType Leaf) { $p } } }"
+)
+
+
+def env_root_lookup(variable: str) -> str:
+    """The PowerShell expression that prints the full path of PowerShell\\7\\pwsh.exe under ONE Program Files
+    variable. ``variable`` is one of the four fixed names, never a stored value; the braces let a name with
+    parentheses, such as ProgramFiles(x86), be read as a variable. The value is trimmed of the same explicit set as the
+    search (space and tab) and then of surrounding double quotes, so a quoted root is read as the folder it names. Only
+    cmdlets and string methods, so it behaves the same in Constrained Language mode."""
+    return f"Join-Path (${{env:{variable}}}.Trim(' ', [char]9).Trim('\"')) 'PowerShell\\7\\pwsh.exe'"
+
+
+def _found_pwsh_fix() -> str:
+    """The fix text when a PowerShell 7 file is found but none is selected, else "".
+
+    Looks in the places `agenttalk supervise --select-pwsh` looks (its standard Program Files
+    search, then the PATH hints it prints). A file-existence test only: nothing is executed, so
+    the file is reported as found, never as a working install; `--select-pwsh` is what checks it.
+
+    The rule for a found path (the safety point): it came from the machine, so it is never put in a
+    command the reader is told to paste. No quoting is right in every shell (cmd.exe expands `%` even
+    inside double quotes, PowerShell runs `$(...)` inside them, and an unquoted `&` starts a second
+    command), and the printed-commands rule is the same: a value that is not a plain token is not
+    printed in a command. A real absolute path is never a plain token, so the PATH-only text shows the
+    command with a `<path>` placeholder, says in words that it is not ready to paste and why, and tells
+    the reader to type the path themselves. The path is only echoed for reading, through `pc.line`
+    (never able to start a line of its own); when that display differs from the real path (an unusual
+    character is written as a \\uXXXX code) the text says so and says how to get the real value FOR THE SOURCE THE
+    FILE CAME FROM: a PATH entry is printed in full by PATH_LOOKUP; a file under a Program Files variable is not on
+    the PATH, so that one gets `env_root_lookup(variable)`, which prints only that variable's folder joined with the
+    fixed place. The rule for both (security): the lookup prints plain strings, one per line, so a long value is not
+    cut with an ellipsis (a table is), and it shows ONLY the one thing named: never `Get-ChildItem Env:`, which
+    prints every environment variable, credentials included, into text people copy and share.
+    Only a plain token is shown as a command to run."""
+    try:
+        for candidate in psh.program_files_candidates():
+            if os.path.isfile(candidate):
+                return (
+                    f"PowerShell 7 found at {pc.line(candidate)}; run `agenttalk supervise --select-pwsh` "
+                    f"to check and select it ({_HOST_USERS})"
+                )
+        path, source = next(iter(psh.path_candidate_sources()), ("", ""))
+    except (OSError, ValueError):
+        return ""
+    if not path:
+        return ""
+    command, note = psh.select_pwsh_commands(path)
+    if note is None:
+        return f"PowerShell 7 found at {pc.line(path)}; run `{command}` to check and select it ({_HOST_USERS})"
+    text = (
+        f"PowerShell 7 found at {pc.line(path)}; it is checked and selected by "
+        "`agenttalk supervise --select-pwsh --pwsh <path>`, where <path> is that file's full path. "
+        "That line is not ready to paste: a path is not a plain token, and a character in it such as "
+        "& | ^ % $ ; ( ) or a backtick would be read by your shell as part of a command, so agenttalk "
+        "does not print the path for you to paste. Type the path yourself, in the quotes your shell needs "
+        f"({_HOST_USERS})"
+    )
+    if pc.line(path) != path:
+        text += (
+            ". The path shown above writes an unusual character as a \\uXXXX code, so it is not the exact file name; "
+        )
+        if source == "PATH":
+            text += f"the real path is printed in full, one per line, by `{PATH_LOOKUP}`"
+        else:
+            # not on the PATH, so the PATH lookup does not list it: name the one variable that found it, and print only
+            # that variable's folder joined with the fixed place; never a listing of the environment
+            text += (
+                f"it was found under the folder named by the environment variable {source}, as "
+                f"PowerShell\\7\\pwsh.exe inside that folder; this prints the full path: `{env_root_lookup(source)}`"
+            )
+    return text
+
+
+_NA_HOST_DETAILS = (
+    "N/A: no PowerShell host is selected, and no supervisor setup files or continuous Codex wrapper markers were "
+    "found here. The supervisor and the hang watchdog for a continuous Codex wrapper on Windows need a selected host. "
+    "Scheduled-task state was not checked."
+)
+_NA_HOST_FIX = (
+    "If you use either feature, install PowerShell 7 if needed, then run `agenttalk supervise --select-pwsh`."
+)
+_SETUP_FILES_UNKNOWN = (
+    "Cannot check the local supervisor or host-selection files; PowerShell host readiness is unknown.",
+    "Check access to the store folder, then run agenttalk doctor again.",
+)
+_HEALTH_RECORDS_UNKNOWN = "Cannot check wrapper health records; PowerShell host readiness is unknown."
+_HEALTH_RECORDS_FIX = "Check the team configuration and wrapper health records, then run agenttalk doctor again."
+_MARKER_MAX_BYTES = 64 * 1024
+# Markers of seats that are not on the roster (retired, renamed or force-removed ones leave theirs behind): the file
+# name the wrapper writes, how many are read at most, and how their names are shown. See `_off_roster_marker_evidence`.
+_MARKER_SUFFIX = ".health.json"
+_OFF_ROSTER_MARKER_LIMIT = 256
+_OFF_ROSTER = " (not on the roster)"
+# What a wrapper health marker can really say (see cli.py, where the launcher sets the mode, and wrapper/run.py): the
+# two wrappable CLIs, and one of four modes. Anything else is not something the wrapper wrote, so it is unknown.
+_MARKER_CLIS = frozenset({"claude", "codex"})
+_MARKER_MODES = frozenset({"wrapper", "wrapper-one-shot", "wrapper-loop", "lead-loop"})
+# A Codex marker in one of these modes is a continuous loop: its turn watchdog is on by default for Codex and runs
+# through the same wrapper drive (a managed lead loop included), and on Windows that watchdog needs a selected host.
+# A one-shot or plain wrapper, and a Claude loop of either kind, need none by default.
+_CODEX_LOOP_MODES = frozenset({"wrapper-loop", "lead-loop"})
+
+# What a look at one file system entry established. "absent" ONLY when the entry is not found (FileNotFoundError): any
+# other failure (access denied, a part of the path that is not a folder, an I/O error) leaves the question open.
+_ABSENT, _PRESENT, _UNKNOWN = "absent", "present", "unknown"
+
+
+def _is_link(info: os.stat_result) -> bool:
+    """A symbolic link or, on Windows, any reparse point (a junction is one)."""
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _entry_state(path: Path) -> str:
+    """present (anything is there: a file, a folder, a link whose target is gone), absent (not found), or unknown."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return _ABSENT
+    except (OSError, ValueError):
+        return _UNKNOWN
+    return _PRESENT
+
+
+def _setup_entry_state(store_dir: Path, relative: str) -> str:
+    """`_entry_state` of a file kept under the store folder, judged together with the folder it is in. A file that is
+    not found is reliably absent only when its parent is itself reliably absent or a plain folder: under a link (it
+    may be dangling), a file or a folder that cannot be looked at, "not found" says nothing about the file."""
+    target = store_dir / Path(relative)
+    state = _entry_state(target)
+    if state != _ABSENT:
+        return state
+    parent = target.parent
+    while True:
+        try:
+            info = os.lstat(parent)
+        except FileNotFoundError:
+            if parent == store_dir or parent == parent.parent:
+                return _ABSENT
+            parent = parent.parent  # a missing folder: judge the one above it, down to the store folder
+            continue
+        except (OSError, ValueError):
+            return _UNKNOWN
+        return _UNKNOWN if _is_link(info) or not stat.S_ISDIR(info.st_mode) else _ABSENT
+
+
+def _wrapper_loop_evidence(store: Store) -> tuple[list[str], list[str], bool]:
+    """What the roster's wrapper health markers say, as (agents with a continuous Codex wrapper marker, agents whose
+    marker could not be read, whether the roster itself could not be read). A marker is advisory, so none is not proof
+    that no wrapper runs; a marker that is there and cannot be read as one, or holds a value the wrapper never writes,
+    is unknown, never absent. A marker with cli `codex` and mode `wrapper-loop` or `lead-loop` counts whatever its age
+    or state. Other well-formed markers (a Claude loop, a Codex one-shot) need no host by default. A marker is "absent"
+    only when it is not found AND the folders above it are reliably there (or reliably missing): `store.read_health_raw`
+    cannot tell "missing" from "damaged", and a "not found" under a link that cannot be followed says nothing."""
+    try:
+        agents = store.load_config().get("agents") or []
+    except (OSError, ValueError, RecursionError):  # a damaged config.json may be too deeply nested
+        return [], [], True
+    loops: list[str] = []
+    unknown: list[str] = []
+    for agent in agents:
+        path = store.health_path(agent)
+        state = _setup_entry_state(store.dir, str(path.relative_to(store.dir)))
+        if state == _ABSENT:
+            continue
+        if state == _UNKNOWN:
+            unknown.append(agent)
+            continue
+        kind = _read_marker_kind(path)
+        if kind == "loop":
+            loops.append(agent)
+        elif kind == "unknown":
+            unknown.append(agent)
+    off_loops, off_unknown, listing_failed = _off_roster_marker_evidence(store, agents)
+    return sorted(loops) + off_loops, sorted(unknown) + off_unknown, listing_failed
+
+
+def _seat_label(name: str) -> str:
+    """A seat name as shown, the "(not on the roster)" note kept apart from the name that is cleaned for display."""
+    if name.endswith(_OFF_ROSTER):
+        return pc.line(name[: -len(_OFF_ROSTER)]) + _OFF_ROSTER
+    return pc.line(name)
+
+
+def _read_marker_kind(path: Path, *, plain_file_only: bool = False) -> str:
+    """"loop" (a continuous Codex wrapper), "other" (a well-formed marker that needs no host by default) or "unknown"
+    (it cannot be read as a marker the wrapper wrote). With `plain_file_only`, anything but a regular file (a link, a
+    folder, a device) is unknown and is never opened, so a link cannot be followed."""
+    if plain_file_only:
+        try:
+            info = os.lstat(path)
+        except (OSError, ValueError):
+            return "unknown"
+        if _is_link(info) or not stat.S_ISREG(info.st_mode):
+            return "unknown"
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(_MARKER_MAX_BYTES + 1)
+        marker = json.loads(raw.decode("utf-8")) if 0 < len(raw) <= _MARKER_MAX_BYTES else None
+    except (OSError, ValueError, RecursionError):  # UnicodeDecodeError and json.JSONDecodeError are ValueErrors
+        marker = None
+    cli_name = marker.get("cli") if isinstance(marker, dict) else None
+    mode = marker.get("mode") if isinstance(marker, dict) else None
+    if not (isinstance(cli_name, str) and isinstance(mode, str)
+            and cli_name in _MARKER_CLIS and mode in _MARKER_MODES):
+        return "unknown"
+    return "loop" if cli_name == "codex" and mode in _CODEX_LOOP_MODES else "other"
+
+
+def _off_roster_marker_evidence(store: Store, roster: list) -> tuple[list[str], list[str], bool]:
+    """The same evidence for seats that are NOT on the roster, as (loops, unknown, listing failed). Retiring, renaming
+    or force-removing a seat only edits the configuration: the seat's wrapper keeps running if it was, and its
+    `state/<seat>.health.json` stays, so the roster alone can say "no host needed" while a loop still needs one.
+    What counts as a marker of such a seat: a file in the store's state folder named exactly
+    `<safe agent name>.health.json` (the name the wrapper writes, as `validate_agent_name` judges it, so a temporary
+    file, a lock or any other name is ignored), whose seat is not on the roster (compared without regard to case), read
+    by the same rules as a roster marker and, on top of them, only as a regular file (a link or folder there is
+    "unknown", never followed). Names come back with " (not on the roster)" after them. More than
+    `_OFF_ROSTER_MARKER_LIMIT` of them, or a state folder that cannot be listed, is a failed listing: it is not known
+    that none of them is a loop."""
+    try:
+        info = os.lstat(store.state_dir)
+    except FileNotFoundError:
+        return [], [], False
+    except (OSError, ValueError):
+        return [], [], True
+    if _is_link(info) or not stat.S_ISDIR(info.st_mode):
+        return [], [], True
+    on_roster = {str(name).casefold() for name in roster}
+    seats: list[str] = []
+    try:
+        with os.scandir(store.state_dir) as entries:
+            for entry in entries:
+                if not entry.name.endswith(_MARKER_SUFFIX):
+                    continue
+                seat = entry.name[: -len(_MARKER_SUFFIX)]
+                try:
+                    validate_agent_name(seat)
+                except ValueError:
+                    continue  # not a name the wrapper could have written a marker for
+                if seat.casefold() in on_roster:
+                    continue
+                seats.append(seat)
+                if len(seats) > _OFF_ROSTER_MARKER_LIMIT:
+                    return [], [], True
+    except (OSError, ValueError):
+        return [], [], True
+    loops: list[str] = []
+    unknown: list[str] = []
+    for seat in sorted(seats):
+        kind = _read_marker_kind(store.health_path(seat), plain_file_only=True)
+        if kind == "loop":
+            loops.append(seat + _OFF_ROSTER)
+        elif kind == "unknown":
+            unknown.append(seat + _OFF_ROSTER)
+    return loops, unknown, False
+
+
+def _host_unknown_check(details: str, fix: str) -> Check:
+    return Check(
+        name="powershell_host",
+        status="error",
+        details=details,
+        fix=fix,
+        data={"status": "error", "task_status": "unknown"},
+    )
+
+
 def _check_powershell_host(store: Store) -> Check:
     if not sys.platform.startswith("win"):
         return Check(
@@ -618,18 +909,54 @@ def _check_powershell_host(store: Store) -> Check:
             details="N/A: generated PowerShell supervisor and Scheduled Tasks are Windows-only",
             data={"status": "n/a", "task_status": "n/a"},
         )
+    codex_loops: list[str] = []
     try:
-        if store.initialized():
-            record = supervisor_lifecycle.read_selected_host(store)
+        config_state = _setup_entry_state(store.dir, store.config_path.name)
+        if config_state == _UNKNOWN:
+            return _host_unknown_check(*_SETUP_FILES_UNKNOWN)
+        if config_state == _PRESENT:
+            # An initialized store: the selection, the setup files and the markers are looked at under the selection
+            # lock, and the selection is read in the same hold (never `read_selected_host`, which takes the lock again).
+            with store._powershell_selection_lock():
+                early = _powershell_host_without_selection(store, initialized=True)
+                if isinstance(early, Check):
+                    return early
+                codex_loops = early
+                record = supervisor_lifecycle.read_selected_host_locked(store)
         else:
             # A diagnostic must not create a store just to lock an absent selection.
+            early = _powershell_host_without_selection(store, initialized=False)
+            if isinstance(early, Check):
+                return early
+            codex_loops = early
             record = supervisor_lifecycle.read_selected_host_locked(store)
     except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as exc:
+        message = str(exc)
+        fix = psh.INSTALL_REMEDIATION
+        found_fix = _found_pwsh_fix()
+        if found_fix:
+            # A PowerShell 7 file is already there; "install it" would send the reader the wrong way.
+            fix = found_fix
+            message = message.removesuffix(f"; {psh.INSTALL_REMEDIATION}")
+        loops = ""
+        if codex_loops:
+            names = ", ".join(_seat_label(name) for name in codex_loops)
+            loops = f". A continuous Codex wrapper ran here for: {names}. Its hang watchdog needs a selected host"
+            if any(name.endswith(_OFF_ROSTER) for name in codex_loops):
+                # Retiring, renaming or removing a seat neither stops its wrapper nor removes its marker, and nothing
+                # else removes a marker: it stays after the wrapper has ended. A marker is advisory, and a wrapper that
+                # still runs writes its marker again, so removing it is safe once no wrapper runs for that seat.
+                loops += (". A seat that is not on the roster keeps its marker file after it is retired, renamed or "
+                          "removed, and its wrapper may still be running")
+                fix += (". If no wrapper runs for that seat any more, remove its marker file, "
+                        "state/<seat>.health.json in the store folder (a wrapper that is still running writes it "
+                        "again, but health writes are best effort and can be delayed), then run agenttalk doctor "
+                        "again")
         return Check(
             name="powershell_host",
             status="error",
-            details=f"PowerShell Core host unavailable: {exc}; task status UNKNOWN",
-            fix=psh.INSTALL_REMEDIATION,
+            details=f"PowerShell Core host unavailable: {message}{loops}; task status UNKNOWN",
+            fix=fix,
             data={"status": "error", "task_status": "unknown"},
         )
     warning = record.get("_warning")
@@ -668,6 +995,51 @@ def _check_powershell_host(store: Store) -> Check:
         ),
         fix=fix,
         data=public,
+    )
+
+
+def _powershell_host_without_selection(store: Store, *, initialized: bool) -> Check | list[str]:
+    """The part of the host check that decides whether "no host is selected" is a problem at all.
+
+    Returns a finished Check (N/A, or an error because something could not be established), or the list of agents with a
+    continuous Codex wrapper marker (empty unless the selection is absent and such markers exist) for the caller to
+    explain in the missing-host error. Only a selection that is reliably absent can lead to N/A; a selection that is
+    there (valid or not) goes to the existing reader, and so does an absent one next to a footprint. The scheduled
+    task is never asked about here: it is external state that local files cannot rule out, so it stays unknown."""
+    selection = _setup_entry_state(store.dir, supervisor_lifecycle.selection_path(store).name)
+    if selection == _UNKNOWN:
+        return _host_unknown_check(*_SETUP_FILES_UNKNOWN)
+    if selection == _PRESENT:
+        return []
+    setup = [
+        _setup_entry_state(store.dir, relative) for relative in ("supervisor.json", *sup.ARTIFACT_RELATIVE_PATHS)
+    ]
+    if _UNKNOWN in setup:
+        return _host_unknown_check(*_SETUP_FILES_UNKNOWN)
+    if _PRESENT in setup:
+        return []  # a supervisor was set up here: the missing host is the error it always was
+    if initialized:
+        loops, unknown, roster_unknown = _wrapper_loop_evidence(store)
+    else:
+        # No config.json, so no roster to read the markers of. A store folder with state in it but no config is half
+        # made: what its markers say cannot be found out. No store folder at all is the plain "nothing set up" case.
+        state = _setup_entry_state(store.dir, store.state_dir.name)
+        loops, unknown, roster_unknown = [], [], state != _ABSENT
+    if loops:
+        return loops
+    if roster_unknown or unknown:
+        affected = ""
+        if unknown:
+            affected = " Affected: " + ", ".join(_seat_label(name) for name in unknown) + "."
+        return _host_unknown_check(f"{_HEALTH_RECORDS_UNKNOWN}{affected}", _HEALTH_RECORDS_FIX)
+    # The plain doctor output prints a fix only for a check that is not ok, so on this N/A line the optional next step
+    # (and the found-file advice) is in the `--json` output only; the details line carries the explanation itself.
+    return Check(
+        name="powershell_host",
+        status="ok",
+        details=_NA_HOST_DETAILS,
+        fix=_found_pwsh_fix() or _NA_HOST_FIX,
+        data={"status": "n/a", "task_status": "unknown"},
     )
 
 
@@ -1767,11 +2139,81 @@ def _check_deadman_config_source(store: Store) -> Check | None:
 
 def _check_init(store: Store) -> Check:
     if not store.initialized():
+        # `agenttalk init` refuses to start a team folder inside another one (two teams at different depths talk
+        # past each other), so the init advice below would be refused there: name the folder above instead.
+        above = find_stores_upward(store.root.parent)
+        if above:
+            refusal = (
+                "`agenttalk init` refuses to start a team folder here while that one exists, on purpose, so that "
+                "two teams at different depths do not talk past each other"
+            )
+            if not store_fence_allows(above[0]):
+                # Opening a store the fence cannot vouch for (outside it, or holding an unreadable or linked
+                # entry) is refused and reported, so doctor does not look inside: it names the folder instead.
+                return Check(
+                    name="store.initialized",
+                    status="error",
+                    details=(
+                        f"not set up yet: .agenttalk/config.json not found at {pc.line(str(store.root))}; "
+                        f"a .agenttalk folder exists above it, at {pc.line(str(above[0]))}, which the store "
+                        "fence (AGENTTALK_STORE_FENCE) does not let doctor open safely (it lies outside the fence, "
+                        "or holds something the fence cannot vouch for), so doctor did not look inside it"
+                    ),
+                    fix=(
+                        "check that folder from a shell whose store fence includes it: if it is a team folder, "
+                        "use it as the root; if it is left over, look at what it holds before you move it away. "
+                        f"{refusal}"
+                    ),
+                )
+            unreadable = False
+            if Store(above[0]).initialized():
+                try:
+                    Store(above[0]).load_config()
+                except (ValueError, OSError):  # the same errors _check_init reports for a store's own config
+                    # the reason is not repeated here: some reasons carry their own init advice, which is meant for
+                    # that folder, not this one; doctor run there shows it in the right place
+                    unreadable = True
+            if unreadable:
+                found = (
+                    f"a team folder exists above it, at {pc.line(str(above[0]))}, but its config.json cannot be "
+                    "read or is not valid"
+                )
+                fix = (
+                    "that team cannot be used until its config.json is readable and valid: run `agenttalk doctor` "
+                    "with that folder as its root (the --root option, or the AGENTTALK_ROOT setting; --root wins "
+                    f"over AGENTTALK_ROOT) to see what is wrong there. {refusal}"
+                )
+            elif Store(above[0]).initialized():
+                found = f"a team folder already exists above it, at {pc.line(str(above[0]))}"
+                fix = (
+                    "to use that team, give agenttalk that folder as its root: the --root option, or the "
+                    "AGENTTALK_ROOT setting (--root wins over AGENTTALK_ROOT, and both win over the folder you run "
+                    f"from, so running agenttalk from that folder uses it only when neither is set). {refusal}"
+                )
+            else:
+                # only a .agenttalk folder, no config.json: not a team anyone can use, yet init still sees it
+                found = (
+                    f"a .agenttalk folder exists above it, at {pc.line(str(above[0]))}, but it is not set up "
+                    "either (it has no config.json)"
+                )
+                fix = (
+                    "check that folder: if it was meant to be the team folder, set it up there; if it is left "
+                    f"over, look at what it holds before you move it away. {refusal}"
+                )
+            return Check(
+                name="store.initialized",
+                status="error",
+                details=f"not set up yet: .agenttalk/config.json not found at {pc.line(str(store.root))}; {found}",
+                fix=fix,
+            )
         return Check(
             name="store.initialized",
             status="error",
-            details=f"no .agenttalk/ found at {store.root}",
-            fix="run `agenttalk init --here --agents claude,codex` from the project root",
+            details=f"not set up yet: .agenttalk/config.json not found at {store.root}",
+            fix=(
+                "from the project root, run `agenttalk init --here --agents claude-dev,codex-rev` with your own "
+                "agent names in place of claude-dev,codex-rev: one name per assistant, separated by commas, no spaces"
+            ),
         )
     try:
         cfg = store.load_config()
@@ -1897,14 +2339,27 @@ def _check_skill_currency() -> Check:
     lead = errors or warnings
     sample = "; ".join(f"{f.file}:{f.line} {f.reason}" for f in lead[:5])
     more = "" if len(lead) <= 5 else f" (+{len(lead) - 5} more)"
+    data = {"findings": [{"file": f.file, "line": f.line, "token": f.token,
+                          "reason": f.reason, "level": f.level} for f in findings]}
+    if not errors:
+        # Only version-lag notes: they are for the people who maintain the bundled skills.
+        return Check(
+            name="skill_currency", status="warn",
+            details=f"{len(warnings)} bundled skills were last reviewed against an older agenttalk "
+                    f"version ({sample}{more})",
+            # still a text fix, so the JSON `fix` keeps its type
+            fix="nothing to do: this is a note for the maintainers of the bundled skills",
+            data=data,
+        )
     return Check(
         name="skill_currency", status="warn",
         details=f"{len(errors)} blocking + {len(warnings)} advisory skill-currency "
                 f"issue(s): {sample}{more}",
-        fix="fix blocking drift (stamps/CLI tokens/parity); re-stamp reviewed-against on "
-            "review (see docs/skill-devkit-evolution-design.md)",
-        data={"findings": [{"file": f.file, "line": f.line, "token": f.token,
-                            "reason": f.reason, "level": f.level} for f in findings]},
+        fix="report it to the agenttalk maintainers: the problem is in the bundled skills of the "
+            "agenttalk package, not in your project. For the maintainers: fix blocking drift "
+            "(stamps/CLI tokens/parity); re-stamp reviewed-against on review "
+            "(see docs/skill-devkit-evolution-design.md)",
+        data=data,
     )
 
 

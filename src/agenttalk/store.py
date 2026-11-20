@@ -232,6 +232,24 @@ def check_store_fence(root: Path) -> None:
         _refuse(root, escape[0], allowed, why=escape[1])
 
 
+def store_fence_allows(root: Path) -> bool:
+    """True when ``AGENTTALK_STORE_FENCE`` is not set, or when the store at `root` would pass
+    check_store_fence. It never refuses and never writes a refusal report: it is for a
+    diagnostic that only wants to know whether it may look at a store."""
+    allowed = _fence()
+    if allowed is None:
+        return True
+    root = Path(root).resolve()
+    escape = _first_escape(root, allowed)
+    # the same settle loop as check_store_fence: a lock being taken shows a file's second name for a moment
+    for _ in range(_LINK_SETTLE_TRIES):
+        if escape is None or escape[1] != "linked":
+            break
+        time.sleep(_LINK_SETTLE_SECONDS)
+        escape = _first_escape(root, allowed)
+    return escape is None
+
+
 def check_folder_fence(folder: Path) -> None:
     """Refuse a folder that a command would create in or remove from, when
     ``AGENTTALK_STORE_FENCE`` is set and the folder lies outside the fence."""
@@ -1017,6 +1035,10 @@ def report_line(value: object) -> str:
     return escape_controls(value)
 
 
+class PreparedMessageRefused(ValueError):
+    """The prepared payload no longer belongs to this send."""
+
+
 class RequeueRefused(ValueError):
     """A requeue refused because the dead letter was already requeued. ``retry`` is a failed copy that may be
     retried instead, or None; the caller adds the advice, after the lock is released."""
@@ -1490,7 +1512,7 @@ class Store:
         if self.initialized():
             try:
                 raw = json.loads(self.config_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
+            except (ValueError, OSError, RecursionError):
                 raw = None
             raw_list = raw.get("retired") if isinstance(raw, dict) else None
             if isinstance(raw_list, list):
@@ -1699,7 +1721,12 @@ class Store:
             raise FileNotFoundError(
                 f"agenttalk not initialized in {self.root}. Run `agenttalk init` first."
             )
-        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        try:
+            cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except RecursionError as exc:
+            raise ValueError(
+                f"corrupt config at {self.config_path}: JSON is nested too deeply"
+            ) from exc
         if not isinstance(cfg, dict):
             raise ValueError(
                 f"corrupt config at {self.config_path}: root must be a JSON object"
@@ -3971,6 +3998,7 @@ class Store:
         path = self.messages_dir / f"{msg.id}.json"
         payload = json.dumps(msg.to_dict(), indent=2, ensure_ascii=False)
         pending = self.messages_dir / f".{msg.id}.{uuid.uuid4().hex}.pending"
+        prepared_session = cfg.get("session_id")
         pending_identity = _write_text_exclusive(pending, payload)
         try:
             lock = (
@@ -4020,6 +4048,22 @@ class Store:
                     )
                 if meta.get("external_deliverable") is True and kind in work_tags.OPENERS:
                     work_tags._external_opener(self, sender, kind, meta)
+                # Reset can remove preparation while this sender waits for publication.
+                # Compare identity, not size/mtime: the identity predates payload writing.
+                try:
+                    prepared_survived = _same_file(os.lstat(pending), pending_identity)
+                except FileNotFoundError:
+                    prepared_survived = False
+                if not prepared_survived:
+                    cause = (
+                        "The store was reset"
+                        if prepared_session != cfg.get("session_id")
+                        else "The store may have been reset"
+                    )
+                    raise PreparedMessageRefused(
+                        "The prepared message is missing or has changed while waiting to be published; "
+                        f"nothing was published. {cause}; send it again."
+                    )
                 claimed = None
                 if _requeue_source is not None:
                     claimed = self._claim_requeue(_requeue_source, msg.id, str(cfg.get("session_id") or ""))

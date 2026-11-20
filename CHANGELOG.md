@@ -10,6 +10,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The lead setup brief explains how to run a Claude seat in a strict permission mode (#826).**
+  Before this, the brief said that a wrapped Claude seat runs with no approval prompts and no
+  sandbox unless you choose another mode, and left the rest to the team. Now its step 10a gives a
+  starting set of allow and deny rules for Claude Code's `dontAsk` mode, based on one that another
+  team built and tested on Windows with Claude Code 2.1.326 and agenttalk 0.105.0 (issue #823).
+  It covers the rule for the agenttalk command a strict seat is given (the interpreter's path
+  written out, with the rule the wrapper prints from #828 on, and the older `PATH` workaround for
+  versions before it), the rule that lets a seat write its reply drafts (with the two-slash form
+  for absolute paths on Linux and macOS), which settings files Claude Code adds together, how a
+  strict seat gets its own rules when its launch does not load `CLAUDE.local.md`
+  (`--append-system-prompt-file`), and how to test your own rules. Every statement about Claude Code says whether the other team reported
+  it, agenttalk's maintainers measured it, or Claude Code's documentation says it. It also says
+  what such rules cannot catch: git options and settings that write or read files or start a
+  program, `git branch` changes, reads that name no file such as `grep -r`, and agenttalk's own
+  `--file` option, which reads any file the account can read even when shortened to `--fi`
+  (#827). It is a guardrail, not a sandbox: anything the rules allow runs with the user account's
+  full rights, and only a separate account, virtual machine or container keeps the account's
+  secrets and the seats' settings files out of their reach.
+  Steps 4 and 5 gain two short notes: the user account's own Claude instructions reach wrapped
+  seats too, and on Windows the process number the start script saves belongs to a launcher.
+
 ### Changed
 
 - **Reopening a close now checks the revision against the checkout.** Git must
@@ -23,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the close lock is taken, so a checkout moved in that gap is not caught.
   The close record also distinguishes unknown cleanliness from a checkout not
   shown clean, and the hold message no longer calls an unchecked checkout dirty.
+- **The release checklist now names the README as the only install pin.** Since the user manuals
+  stopped carrying their own install line (#835), step 1 of the release ritual in
+  `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
+  refuses. It now says to update the README's install line and its link to the lead setup brief only.
+  Wording only.
+- **Windows test jobs in CI may now run for 360 minutes instead of 330.** Between 16 and 18 November,
+  18 Windows test jobs were stopped at the 330-minute limit without a single failing test, so pull
+  requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
+  limit for each test group inside the job is unchanged, and splitting the Windows job is the follow-up
+  (#378). The evidence is recorded in `windows_timeout_reason` in `dev-gate.json`.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
@@ -39,6 +72,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AGENTTALK_PY` is set, give the pinned invocation in either shell, and otherwise the form the project's agent manual gives. A mention
   of the name, or the name in a comment, does not count. The lint's ignore comments work as they
   do for the command check.
+- **A team with only one AI vendor now has a written way to review and merge.** The merge gate
+  said the approving read comes "from another vendor when one is available". Read literally, a
+  read by the builder's own vendor passed whenever the other vendor was missing, with no limit,
+  no label and no later check. Now the procedures, the contributing guide, the README, the
+  review playbook, the assurance and secure-coding pages and both lead skills give one rule. The read still comes from another vendor by default. When none is
+  available, the lead waits if the change can wait; otherwise uses a second team's read by
+  another vendor; otherwise a same-vendor read by a fresh reader who had no part in the change,
+  backed by CI and, for code, a test that fails before the change plus deliberately broken
+  versions the tests must catch. Such a GO carries `review_independence=same-vendor` on the
+  reply and on the pull request, and another vendor reads the change again when one is
+  available. It is never enough for money or paid spend, security, credentials or privacy,
+  deletion or another irreversible step, a release, the settings of the automatic checks (CI
+  workflows, linters, scanners and secret-scan settings), or this review rule and the shipped
+  instructions that state it; with no other vendor at all, those need the operator's recorded approval. Nothing in the code
+  enforces this. Run `agenttalk install-skills` after upgrading so that your lead gets the new
+  text.
 
 ### Fixed
 
@@ -56,6 +105,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Opening a close no longer records a checkout as clean when Git cannot check it (#862).**
   Teams whose store is outside a Git checkout will see ordinary closes hold until they record a diff artifact.
+- **`agenttalk doctor` no longer calls the PowerShell host check "not needed" while a seat that left the
+  team list may still run a continuous Codex wrapper.** Retiring, renaming or removing a seat leaves its
+  health marker behind, and its wrapper may still be running. Doctor now reads those markers too: a
+  continuous Codex marker of a seat that is no longer on the roster keeps the missing-PowerShell error,
+  names the seat with "(not on the roster)" and says which marker file to remove once no wrapper runs for
+  it. A marker that needs no host still gives N/A, and one that cannot be read gives "could not check"
+  (#847, #869).
+- **The skills check now reads the pinned-interpreter rule correctly (#801, #861, #864,
+  #865).** The check tells whether a skill states the rule "when `AGENTTALK_PY` is set, use the
+  pinned command; otherwise the plain one" before it shows the plain `python -m agenttalk` form.
+  It was fooled in four ways, which are fixed. A "do not" after the pinned command ("must not be
+  used") now stops the sentence from counting as the rule. A command split over two lines (a
+  Bash backslash or a PowerShell backtick) is read as one command. A period inside a code span
+  (such as `-m agenttalk.assurance` or `reply.md`) no longer ends the sentence early, and a
+  period right before a closing quote or bracket now ends it. A Windows drive path, including
+  the drive-relative kind like `<drive>:file`, no longer counts as the end of a sentence part.
+  The bundled skills are unchanged: the check gives the same answer for all of them.
+- **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
+  Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
+  variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run
+  `"$AGENTTALK_PY" -m agenttalk ...` (issue #822). Before this, such a seat could not reply, report
+  progress or send by command. Now the wrapper writes the Python interpreter's full path into that
+  seat's instructions (`"<path with forward slashes>" -m agenttalk ...`), tells it to use the Bash tool,
+  and prints at start the allow rule the team can add, for example
+  `Bash("<env>/Scripts/python.exe" -m agenttalk *)`. The wrapper never adds the rule itself: in a
+  strict profile the team decides what a seat may run. Seats in the default `bypassPermissions` mode,
+  and Codex seats, see no change. A strict seat keeps the old form when the interpreter's path is not
+  an existing full path, is not safe inside double quotes, or holds a character that has a meaning in
+  the printed rule. Those characters are `*`, which a rule reads as "any text" even inside quotes, so
+  a path such as `/opt/pinned*/bin/python` would let the rule allow other programs too, and `(` and
+  `)`, which enclose the rule. The source is Claude Code's permissions page
+  (code.claude.com/docs/en/permissions, "Wildcard patterns"). Not changed here: the skills (they keep
+  their `AGENTTALK_PY` rule), the supervisor's own resume rule `Bash(agenttalk *)`, the PowerShell
+  forms, and the lead setup brief (#826 changes it).
+- **A settings file nested too deeply no longer crashes agenttalk (#846).** A team
+  configuration or PowerShell host selection file holding JSON nested so deeply that
+  Python cannot read it is now reported as damaged: doctor names it and goes on with its
+  other checks, other commands print one line and stop, and `init --force` can repair
+  such a configuration.
 
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,
@@ -71,6 +159,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by project settings: even one untracked build file can cause close HOLD; clean
   the submodule or record a truthful dirty artifact. Scratch release keeps its
   existing stricter rules.
+
+- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for dead-letter replies and control messages, retry the same requeue command to keep their original correlation.
 
 - **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
   Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail
@@ -224,6 +314,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old way of reading its output, and on Windows such a program can then keep it waiting past
   its limit. When a check refuses a lead's regular sweep, the wrapper now says why on its
   error output and in its health, and the notice after repeated failures names the reason.
+
+- **`lane check` and `lane deliver` judge what a delivery really writes (#671).** Before, a lane that
+  merged its own target branch was held with `out_of_bounds_path` for files the target had changed,
+  and a lane that undid a target change, or whose edit a target rename carried outside the lane,
+  could be waved through. Now the lane is compared with its one merge base with the target, and the
+  paths Git's own merge result would write on the current target are judged too. What you will
+  notice: a lane that only merged its target is no longer held for the target's files, unless its
+  latest commit is already part of the target (then there is nothing newer to compare, so it is
+  still compared with the commit it started from and can still be held for files outside its
+  paths that came in through its own history); a lane whose
+  edit the target moved outside the lane is held, naming the real destination, and the remedy is to
+  merge the target and move the edit, widen the lane, or ask for the move to be reversed; a lane
+  that undoes a target change is held on that file. When the lane and its target have several merge
+  bases, the new hold `ambiguous_merge_base` says to merge the current target into the lane and
+  check again. A delivery interrupted under the old rule can still resume if its saved checks match
+  the new result. If the new checks differ, it is refused at its final re-check ("terminal evaluation
+  differs from the prepared GO snapshot"); if the lane is now held, it is refused with "terminal
+  verdict is HOLD". Retry the delivery, after clearing any hold `lane check` names. A saved
+  delivery's `changed_paths` can now name where a target rename moved the lane's edit. Existing
+  JSON gains one new `code` value and no new fields.
+
+- **The README first install keeps agenttalk in its own Python environment (#716).** Before, setup could install into another Python, and assistants could find an older agenttalk on PATH. Now both platform recipes keep using the environment's Python after changing folders and put its commands first on PATH in every assistant terminal. Quick setup links to the same recipe, and the README and lead setup brief name the Debian/Ubuntu venv package.
+
+- **The user manuals install agenttalk the same way as the README (#716).** The two manuals still told readers to install agenttalk into whatever Python was active and then run plain `agenttalk`, so a reader could end up running an older copy. They now send readers to the README's do-it-yourself install steps (up to its project setup, which the manual replaces), which give agenttalk its own environment and put it first on PATH, and say not to activate another Python environment in a terminal where agenttalk runs (and how to check which copy runs). The Codex-sandbox example in the user manual uses that environment's Python, and a test keeps the old bare install line from coming back.
+
+- **The first `agenttalk doctor` run reads less like a failure (Part of #716).** Three lines
+  changed their words; no result, exit code, check name or JSON field changed.
+  In a folder that is not set up, `store.initialized` now says "not set up yet" and names the missing
+  `.agenttalk/config.json` (a folder with a `.agenttalk/` but no `config.json` counts as not set up
+  too). Its fix gives a command that runs as printed, `agenttalk init --here --agents claude-dev,codex-rev`,
+  and says to put your own agent names in place of those two, separated by commas with no spaces
+  (before, it showed the names `claude,codex` without saying they were only an example). When a
+  `.agenttalk` folder exists above, `agenttalk init` refuses on purpose, so doctor names that folder
+  instead. If it is a set-up team folder, doctor says how to use it (the `--root` option or the
+  `AGENTTALK_ROOT` setting, and which one wins); if its `config.json` cannot be read or is not valid,
+  doctor says so and to run `agenttalk doctor` there; if it is not set up either, doctor says to check it.
+  On Windows, when a PowerShell 7 file is found where `agenttalk supervise --select-pwsh` looks,
+  `powershell_host` no longer says to install it: it says where it found it and gives the one missing
+  step, `agenttalk supervise --select-pwsh`, which checks the file and selects it (the supervisor and
+  the hang watchdog of a continuous Codex wrapper use the selected host). A file found only on the
+  PATH needs the same command with `--pwsh` and its path. A real path is not a plain token, and no
+  quoting is right in every shell (an unquoted `&` or `|` in a folder name would start a second
+  command), so doctor shows that command with a `<path>` placeholder, says plainly that it is not
+  ready to paste, and tells the reader to type the path themselves. The found path is shown for
+  reading only; if it holds an unusual character, that is shown as a `\uXXXX` code, and doctor says
+  the display is not the exact file name and how to get the real one for the place it was found. For a
+  file on the PATH it gives a one-line expression that splits the PATH, trims each entry of spaces and tabs
+  and then of surrounding double quotes (as the search does, so a quoted entry is found too), keeps an
+  entry only if it starts with a drive letter, a colon and a slash (the search's own rule), and prints
+  every `pwsh.exe` that exists, one full path per line. A file under a Program Files environment
+  variable is not on the PATH, so doctor names that variable and gives one expression for it, such as
+  `Join-Path (${env:ProgramFiles}.Trim(' ', [char]9).Trim('"')) 'PowerShell\7\pwsh.exe'`, which also reads
+  a quoted value. Both print the full path as plain text on its own line (a table would cut a long path
+  with an ellipsis), and each reads only the one variable it names: doctor never recommends
+  `Get-ChildItem Env:`, which prints every environment variable, credentials included. Both use only
+  commands, operators and string methods, so they work the same when PowerShell runs in Constrained
+  Language mode, which refuses calls to .NET methods (an earlier form of the PATH expression printed
+  nothing there, without an error). The search and the expressions now trim the same two characters,
+  space and tab: before, the search also trimmed some invisible separator characters that PowerShell
+  does not, so a path padded with one was found by the search but not by the expression. So a value
+  padded with such a character is no longer found, and a folder whose real name ends in one (for
+  example a no-break space) is now found as it is. Before, the search cut that character off and looked
+  in the folder with the shorter name instead, which might not exist or might hold a different
+  `pwsh.exe`; the suggestions of `agenttalk supervise --select-pwsh` use the same search, so they now
+  name the right file too.
+  Doctor only checks that the file exists and runs nothing, so "found" is not a promise that it works. With no PowerShell 7 found, the install advice is as before.
+  On Windows, `powershell_host` is no longer a permanent error for a team that does not use a supervisor.
+  When no host is selected, none of the supervisor setup files exists and no continuous Codex wrapper has
+  left its marker in the team folder, it says `N/A` (not an error, so a set-up team can now end with exit
+  code 0), explains that the supervisor and the hang watchdog of a continuous Codex wrapper both need a
+  selected host, and says the scheduled-task state was not checked (its data says `unknown`, not
+  `not_configured`: a task can outlive its files). It is a snapshot of local files, not proof that the
+  features are unneeded. A continuous Codex wrapper here means a Codex marker for a loop or for a managed
+  lead loop (both keep the hang watchdog on by default); a Codex one-shot, or a Claude loop of either kind,
+  needs no host by default. It stays an error when a setup file is there, and when a Codex wrapper in the
+  team has left a continuous marker, even an old one (it names those agents). It also stays an error, saying
+  it could not check, when a file, a marker or the team list cannot be read or looked at, when a marker holds
+  a value the wrapper never writes or JSON nested too deeply to read, or when a marker (or the config or selection) sits under a folder link
+  that cannot be followed: nothing is called absent unless it was not found where it could be looked for. A
+  folder with no store at all gets the same `N/A`, and the separate store check still reports it. Its advice
+  is unchanged when a host is selected. The plain `agenttalk doctor` output prints the next step only for a
+  check that is not ok, so on the `N/A` line the optional next step (and the advice for a PowerShell 7 file
+  that was found) is in the `--json` output only; the line itself carries the explanation.
+  `skill_currency` now says that bundled skills last reviewed against an older version are a note
+  for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report
+  it to the agenttalk maintainers and that the maintenance advice is for them.
 
 ## [0.105.0] - 2026-11-13
 

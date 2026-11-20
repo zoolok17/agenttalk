@@ -162,7 +162,8 @@ def test_doctor_host_warning_and_task_mismatch_are_durable_in_data(
     record["_version"] = psh.PowerShellVersion(7, 3, 0)
     record["version"] = record["_version"].to_dict()
     record["_warning"] = psh.host_warning("Core", record["_version"])
-    monkeypatch.setattr(lifecycle, "read_selected_host", lambda store: record)
+    (store.dir / psh.SELECTION_FILENAME).write_text("{}", encoding="utf-8")  # a selection is on file
+    monkeypatch.setattr(lifecycle, "read_selected_host_locked", lambda store: record)
     monkeypatch.setattr(
         doctor,
         "_inspect_selected_task",
@@ -184,9 +185,10 @@ def test_doctor_without_selection_reports_task_unknown(
 ) -> None:
     store = _store(tmp_path)
     monkeypatch.setattr(doctor.sys, "platform", "win32")
+    (store.dir / "supervisor.json").write_text("{}", encoding="utf-8")  # a supervisor was set up: the error stands
     monkeypatch.setattr(
         lifecycle,
-        "read_selected_host",
+        "read_selected_host_locked",
         lambda store: (_ for _ in ()).throw(lifecycle.SupervisorLifecycleError("absent")),
     )
     check = doctor._check_powershell_host(store)
