@@ -84,7 +84,8 @@ def _scrub(value, root):
     """Text with this store's folder, message ids, times and the parser's own wording removed."""
     text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
     for form in (str(root), str(root).replace("\\", "\\\\"), str(root).replace("\\", "/")):
-        text = text.replace(form, "<root>")
+        # Case-insensitive: on Windows some checks (doctor's codex_config) print the folder case-folded.
+        text = re.sub(re.escape(form), "<root>", text, flags=re.IGNORECASE)
     for pattern in _DETAIL:
         text = pattern.sub(lambda m: m.group(1) + " <detail>", text)
     text = text.replace(BAD_NAME[:-5], "<bad>")  # the name the test chose stays readable
