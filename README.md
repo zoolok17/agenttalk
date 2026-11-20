@@ -1393,8 +1393,11 @@ in agenttalk waits for it or is held back by it.
   `status` and `status --json` also hide the project folder (`root`), signing-key path
   (`hmac_key.path`) and `project_id`. They can contain or confirm your login. Text says
   when these are hidden; add `--show-personal` to show them and the account text.
-  Home paths in free text are replaced with `<home>`, and local app-data paths outside
-  home with `<localappdata>`. This does not cover paths outside those folders or a login
+  The `powershell:` line hides its host path. In JSON, `powershell_host.path`,
+  `.identity`, `.project_id` and fields outside the host allowlist are omitted.
+  Home paths in free text are replaced with `<home>`, local app-data paths outside home
+  with `<localappdata>`, and the project root outside home with `<root>`. The project ID
+  is replaced with `<project_id>`. This does not cover other paths outside those folders or a login
   appearing in free text outside a path. Other commands can still show paths or project
   IDs: `whoami --json`, `hmac-init`, `backup --json`, `doctor`, `supervisor --json` and
   the web console.

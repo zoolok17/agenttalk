@@ -5914,3 +5914,124 @@ def test_870_real_store_under_home(tmp_path, monkeypatch, capsys, signing, as_js
         assert json.loads(shown)["project_id"] == pid
     elif signing:
         assert pid in shown
+
+
+def test_870_r1_damaged_key_hides_project_id(tmp_path, monkeypatch, capsys):
+    from agenttalk import signing
+
+    home = tmp_path / "invented-login"
+    root = home / "project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("LOCALAPPDATA", str(home / "appdata"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    assert cli.main(["init", "--path", str(root), "--agents", "alpha"]) == 0
+    store = Store(root)
+    pid = store.project_id()
+    key = signing.init_key(pid)
+    key.write_text("not-a-hex-key", encoding="utf-8")
+    capsys.readouterr()
+    args = ["--root", str(root), "status", "--json"]
+    assert cli.main(args) == 0
+    default = capsys.readouterr().out
+    assert pid not in default
+    assert "<project_id>" in json.loads(default)["hmac_key"]["key_error"]
+    assert cli.main(args + ["--show-personal"]) == 0
+    assert pid in json.loads(capsys.readouterr().out)["hmac_key"]["key_error"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX key permissions")
+@pytest.mark.parametrize("as_json", [False, True])
+def test_870_r1_key_mode_warning_hides_project_id(tmp_path, monkeypatch, capsys, as_json):
+    from agenttalk import signing
+
+    home = tmp_path / "invented-login"
+    root = home / "project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    assert cli.main(["init", "--path", str(root), "--agents", "alpha"]) == 0
+    pid = Store(root).project_id()
+    key = signing.init_key(pid)
+    key.chmod(0o644)
+    capsys.readouterr()
+    args = ["--root", str(root), "status", *(["--json"] if as_json else [])]
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    assert pid not in output and "<project_id>" in output
+    assert cli.main(args + ["--show-personal"]) == 0
+    assert pid in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_870_r1_exception_paths_hidden(tmp_path, monkeypatch, capsys, as_json):
+    home = tmp_path / "invented-login"
+    root = tmp_path / "project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    assert cli.main(["init", "--path", str(root), "--agents", "alpha"]) == 0
+    capsys.readouterr()
+    original = cli._gather_status
+    detail = str(PermissionError(13, "invented failure", str(home / "secret.txt")))
+
+    def gather(store):
+        data = original(store)
+        data["warnings"].append(detail)
+        data["powershell_host"] = {"status": "error", "warning": detail}
+        return data
+
+    monkeypatch.setattr(cli, "_gather_status", gather)
+    args = ["--root", str(root), "status", *(["--json"] if as_json else [])]
+    assert cli.main(args) == 0
+    default = capsys.readouterr().out
+    assert "invented-login" not in default
+    if as_json:
+        data = json.loads(default)
+        assert "<home>" in data["warnings"][-1]
+        assert "<home>" in data["powershell_host"]["warning"]
+    else:
+        assert default.count("<home>") == 2
+    assert cli.main(args + ["--show-personal"]) == 0
+    assert "invented-login" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("home,sample", [
+    (r"C:\Users\invented-login", r"C:\Users\invented-login2\file"),
+    ("C:\\", r"C:\Windows\file and D:\C:\x"),
+    ("\\\\", "abc"),
+])
+def test_870_r1_home_boundary_and_root(monkeypatch, home, sample):
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os, "name", "nt")
+        patch.setattr(cli.os.path, "expanduser", lambda _: home)
+        patch.delenv("LOCALAPPDATA", raising=False)
+        result = cli._status_redact_home(sample)
+    assert result == sample
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_870_r1_project_root_outside_home_hidden(tmp_path, monkeypatch, capsys, as_json):
+    home = tmp_path / "invented-home"
+    root = tmp_path / "outside-project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    assert cli.main(["init", "--path", str(root), "--agents", "alpha"]) == 0
+    capsys.readouterr()
+    original = cli._gather_status
+
+    def gather(store):
+        data = original(store)
+        data["warnings"].append(str(root / "file"))
+        return data
+
+    monkeypatch.setattr(cli, "_gather_status", gather)
+    args = ["--root", str(root), "status", *(["--json"] if as_json else [])]
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    assert "<root>" in output
+    if as_json:
+        assert "<root>" in json.loads(output)["warnings"][-1]
+    else:
+        assert str(root) not in output
+    assert cli.main(args + ["--show-personal"]) == 0
+    output = capsys.readouterr().out
+    assert str(root) in (json.loads(output)["warnings"][-1] if as_json else output)

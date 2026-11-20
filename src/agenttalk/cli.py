@@ -1771,36 +1771,57 @@ def _groupable_capacity_account(value: object) -> bool:
     ) is not None
 
 
-def _status_redact_home(value):
-    """Hide home and local app-data paths in status output, including nested diagnostics."""
+def _status_redact_home(value, *, root=None, project_id=None):
+    """Hide known personal values in status text, including nested diagnostics."""
     if isinstance(value, dict):
-        return {key: _status_redact_home(item) for key, item in value.items()}
+        return {key: _status_redact_home(item, root=root, project_id=project_id) for key, item in value.items()}
     if isinstance(value, list):
-        return [_status_redact_home(item) for item in value]
+        return [_status_redact_home(item, root=root, project_id=project_id) for item in value]
     if not isinstance(value, str):
         return value
+
     home = os.path.expanduser("~")
     local = os.environ.get("LOCALAPPDATA", "") if os.name == "nt" else ""
+
+    def path_key(path):
+        key = str(path or "").replace("\\", "/").rstrip("/")
+        return key.casefold() if os.name == "nt" else key
+
+    def inside(path, parent):
+        path, parent = path_key(path), path_key(parent)
+        return bool(parent and (path == parent or path.startswith(parent + "/")))
+
     folders = [(home, "<home>")]
-    home_key = home.replace("\\", "/").rstrip("/")
-    local_key = local.replace("\\", "/").rstrip("/")
-    if os.name == "nt":
-        home_key, local_key = home_key.casefold(), local_key.casefold()
-    if local_key and local_key != home_key and not local_key.startswith(home_key + "/"):
+    if local and not inside(local, home):
         folders.append((local, "<localappdata>"))
-    for folder, replacement in sorted(folders, key=lambda pair: len(pair[0]), reverse=True):
-        if not folder or folder in ("/", "\\") or folder == "~":
+    if root and not inside(root, home):
+        folders.append((root, "<root>"))
+
+    patterns = []
+    replacements = {}
+    for folder, replacement in sorted(folders, key=lambda pair: len(str(pair[0])), reverse=True):
+        stripped = str(folder or "").rstrip("\\/")
+        if not stripped or stripped == "~" or re.fullmatch(r"[a-zA-Z]:", stripped):
             continue
-        parts = re.split(r"[\\/]", folder.rstrip("\\/"))
-        pattern = r"[\\/]".join(re.escape(part) for part in parts)
-        value = re.sub(pattern, lambda match, r=replacement: r, value, flags=re.IGNORECASE if os.name == "nt" else 0)
-    return value
+        parts = re.split(r"[\\/]", stripped)
+        pattern = r"[\\/]+".join(re.escape(part) for part in parts)
+        name = f"path{len(patterns)}"
+        patterns.append(fr"(?P<{name}>{pattern})(?=$|[\\/\s'\"])")
+        replacements[name] = replacement
+    if isinstance(project_id, str) and project_id:
+        patterns.append(fr"(?P<project_id>{re.escape(project_id)})")
+        replacements["project_id"] = "<project_id>"
+    if not patterns:
+        return value
+    return re.sub("|".join(patterns), lambda match: replacements[match.lastgroup], value,
+                  flags=re.IGNORECASE if os.name == "nt" else 0)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     store = _get_store(args)
     payload = _gather_status(store)
     show_personal = getattr(args, "show_personal", False)
+    root, project_id = payload.get("root"), payload.get("project_id")
     if not show_personal:
         payload.pop("root", None)
         payload.pop("project_id", None)
@@ -1823,11 +1844,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                     if _groupable_capacity_account(account):
                         row["capacity"]["account_group"] = sorted(groups[account])
         if not show_personal:
-            payload = _status_redact_home(payload)
+            payload = _status_redact_home(payload, root=root, project_id=project_id)
         print(json.dumps(payload, indent=2))
         return 0
     if not show_personal:
-        payload = _status_redact_home(payload)
+        payload = _status_redact_home(payload, root=root, project_id=project_id)
     root = payload.get("root", "(hidden; add --show-personal to show the project folder)")
     print(f"root:       {root}")
     print(f"session_id: {payload['session_id']}")

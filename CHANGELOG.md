@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use `--show-personal` to recover them. Text marks them hidden. The option also
   replaces the unreleased `--show-account` on status and capacity. Home and external
   local app-data paths in status free text are replaced by placeholders by default.
+  The text `powershell:` line hides its path; JSON omits `powershell_host.path`,
+  `.identity`, `.project_id` and fields outside its allowlist. The project root outside
+  home and the project ID are replaced in free text as well.
 - **Capacity headings now omit account identifiers by default.** This makes routine
   output safer to share. To see the operating-system login and home-folder fingerprint
   as before, run `agenttalk capacity --show-personal`. The same protection now covers
