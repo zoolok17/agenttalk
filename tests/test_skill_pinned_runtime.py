@@ -1004,3 +1004,32 @@ def test_878_literal_skill_and_prohibition_control(rule, stated, control, form):
     forbidden_skill = control + tail
     assert not sc._states_pinned_rule(forbidden_skill), control
     assert sc._pinned_runtime_findings("x/SKILL.md", forbidden_skill, "codex"), control
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("words", [
+    "is not to be used", "should not ever be used", "must not be executed",
+    "no longer works", "will not work", "- avoid it", "- avoid using it",
+    "- refrain from using it", ", never do this", "but do not rely on it",
+])
+def test_878_r3_first_clause_bans(shell, words):
+    rule = f"When AGENTTALK_PY is set, `{PINNED_FORMS[shell]}` {words}; otherwise use your manual."
+    assert not sc._states_pinned_rule(rule)
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("url", ["https://example.org/a?x=1", "https://example.org/a!b", "https://example.org/a;b"])
+def test_878_r3_url_punctuation_keeps_ban(shell, url):
+    rule = f"When AGENTTALK_PY is set, {PINNED_FORMS[shell]} send --file {url} must not be used; otherwise use your manual."
+    assert not sc._states_pinned_rule(rule)
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+def test_878_r3_double_dash_is_not_a_flag(shell):
+    rule = f'When AGENTTALK_PY is set, run {PINNED_FORMS[shell]} -- "do not use it"; otherwise use your manual.'
+    assert not sc._states_pinned_rule(rule)
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+def test_878_r3_other_target_does_not_mask_a_real_ban(shell):
+    rule = f"When AGENTTALK_PY is set, run `{PINNED_FORMS[shell]}` and do not use the unpinned form but do not rely on it; otherwise use your manual."
+    assert not sc._states_pinned_rule(rule)

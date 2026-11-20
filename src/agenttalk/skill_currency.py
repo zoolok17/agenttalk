@@ -82,7 +82,7 @@ _POINTS_BACK_RE = re.compile(
 )
 # A clause ends at ; ! ? a blank line, any colon except the two below, or a period before whitespace or the end of the
 # text, closing quotes, brackets and emphasis allowed before that whitespace ("... is required.** Do not ...").
-# URL colons are masked before splitting; drive-letter colons and URL schemes are also exempt here. A period is exempt
+# URL punctuation is masked before splitting; drive-letter colons and URL schemes are also exempt here. A period is exempt
 # inside a word (`agenttalk.assurance`, `reply.md`, 0.105.0), written without backticks. A drive is one letter that is
 # no part of a longer word, the colon, and a path character at once: `C:\temp`, `C:/temp`, and also `C:file`, a path
 # with no slash. Without a slash after the colon, the lone letter must also stand at the start or after whitespace, a
@@ -104,13 +104,14 @@ _INLINE_CODE_RE = re.compile(r"(?<!`)`(?!`)[^`\n]+`(?!`)")
 _CLAUSE_PUNCTUATION_RE = re.compile(r"[;.:!?]")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s`<>]+", re.IGNORECASE)
-_SHELL_QUOTED_ARGUMENT_RE = re.compile(r"(?:^|\s)--?[\w-]+(?:=|\s+)([\"'])(.*?)\1")
-_IMPLICIT_BAN_RE = re.compile(
-    rf"(?:\b(?:must|should|can|is|are|may|shall)\s+{_NEGATION}|{_NEGATION})\s+(?:be\s+)?"
-    r"(?:used|run|called|invoked|permitted|allowed)\b"
-    r"|\b(?:do|never)\s+(?:not\s+)?(?:use|run|call|invoke)\s+(?:while|when)\b",
+_SHELL_QUOTED_ARGUMENT_RE = re.compile(r"(?:^|\s)--?\w[\w-]*(?:=|\s+)([\"'])(.*?)\1")
+_OTHER_TARGET_RE = re.compile(
+    rf"{_NEGATION}\s+(?:(?:use|run|call|invoke|using)\s+)?(?:the\s+)?"
+    r"(?:unpinned|plain|bare)\s+(?:form|command|interpreter)\b"
+    r"|\bnot\s+`(?![^`]*AGENTTALK_PY)[^`\n]+`",
     re.IGNORECASE,
 )
+_NEGATION_RE = re.compile(_NEGATION, re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -433,7 +434,10 @@ def _forbids_the_pinned_command(after: str) -> bool:
         clause = _SHELL_QUOTED_ARGUMENT_RE.sub(lambda m: " " * len(m.group(0)), clause)
         clause = re.sub(r"(?<!\w)_{1,2}|_{1,2}(?!\w)", " ", clause)
         clause = _REINFORCEMENT_RE.sub("", clause)
-        if _POINTS_BACK_RE.search(clause) or (number == 0 and _IMPLICIT_BAN_RE.search(clause)):
+        if number == 0:
+            if _NEGATION_RE.search(_OTHER_TARGET_RE.sub("", clause)):
+                return True
+        elif _POINTS_BACK_RE.search(clause):
             return True
     return False
 
@@ -442,9 +446,9 @@ def _mask_inline_code_punctuation(text: str) -> str:
     """``text`` with every clause-ending character inside a one-line inline code span replaced by a space, so the copy
     is as long as the text and every word stays where it was: the dot in `` `agenttalk.assurance` `` or the colon in
     `` `--meta status:done` `` does not end the clause the command is in. A span that is not closed on its line, and a
-    double-backtick span, are left as they are. URL colons are also masked."""
+    double-backtick span, are left as they are. URL punctuation is also masked."""
     text = _INLINE_CODE_RE.sub(lambda span: _CLAUSE_PUNCTUATION_RE.sub(" ", span.group(0)), text)
-    return _URL_RE.sub(lambda url: url.group(0).replace(":", " "), text)
+    return _URL_RE.sub(lambda url: _CLAUSE_PUNCTUATION_RE.sub(" ", url.group(0)), text)
 
 
 def _states_pinned_rule(text: str) -> bool:
