@@ -889,3 +889,58 @@ def test_a_colon_that_is_not_a_drive_still_cuts_a_prohibition_off_the_command(sh
         "otherwise use your manual.\n"
     )
     assert sc._states_pinned_rule(rule), rule
+
+
+@pytest.mark.parametrize("suffix", [' send -m "do not stop"', ', not the plain command'])
+def test_878_a_first_clause_other_negation_is_not_a_ban(suffix):
+    rule = f'When AGENTTALK_PY is set, run "$AGENTTALK_PY" -m agenttalk{suffix}; otherwise use your manual.'
+    assert sc._states_pinned_rule(rule)
+
+
+@pytest.mark.parametrize("warning", ["Do not use the unpinned form", "The plain command must not be used"])
+def test_878_b_emphasis_after_sentence_period_ends_clause(warning):
+    rule = ('When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk` **This is required.** '
+            f'{warning}; otherwise use your manual.')
+    assert sc._states_pinned_rule(rule)
+
+
+def test_878_c_url_port_keeps_the_ban_in_the_command_clause():
+    rule = ('When AGENTTALK_PY is set, "$AGENTTALK_PY" -m agenttalk send --file '
+            'https://example.org:8443/a must not be used; otherwise use your manual.')
+    assert not sc._states_pinned_rule(rule)
+
+
+def test_878_d_named_pinned_command_as_subject_is_a_ban():
+    rule = ('When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`; '
+            'the pinned command must not be used; otherwise use your manual.')
+    assert not sc._states_pinned_rule(rule)
+
+
+def test_878_e_underscore_emphasis_does_not_hide_a_ban():
+    rule = ('When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`; '
+            '__do not use it__; otherwise use your manual.')
+    assert not sc._states_pinned_rule(rule)
+
+
+def test_878_f_first_clause_warning_about_unpinned_form_is_allowed():
+    rule = ('When AGENTTALK_PY is set, run "$AGENTTALK_PY" -m agenttalk '
+            'and do not use the unpinned form; otherwise use your manual.')
+    assert sc._states_pinned_rule(rule)
+
+
+def test_878_g_cannot_be_skipped_reinforces_the_rule():
+    rule = ('When AGENTTALK_PY is set, run `"$AGENTTALK_PY" -m agenttalk`; '
+            'it cannot be skipped; otherwise use your manual.')
+    assert sc._states_pinned_rule(rule)
+
+
+@pytest.mark.parametrize("words", ["cannot be used", "can't be used", "mustn't be used", "shouldn't be used"])
+def test_878_implicit_contracted_bans_still_forbid_the_pinned_command(words):
+    rule = f'When AGENTTALK_PY is set, "$AGENTTALK_PY" -m agenttalk {words}; otherwise use your manual.'
+    assert not sc._states_pinned_rule(rule)
+
+
+def test_878_quoted_argument_can_contain_words_that_look_like_a_ban():
+    rule = ('When AGENTTALK_PY is set, "$AGENTTALK_PY" -m agenttalk send '
+            '-m "do not use it"; otherwise use your manual.')
+    assert sc._states_pinned_rule(rule)

@@ -67,22 +67,22 @@ _RULE_RE = re.compile(
 )
 # A negation that supports the rule ("not optional", "never skip it") is not a prohibition of the pinned command.
 _REINFORCEMENT_RE = re.compile(
-    r"\b(?:not|never)\s+(?:to\s+)?(?:be\s+)?(?:optional|negotiable|skipp?(?:ed)?|omitt?(?:ed)?|ignor(?:ed?)|"
+    rf"{_NEGATION}\s+(?:to\s+)?(?:be\s+)?(?:optional|negotiable|skipp?(?:ed)?|omitt?(?:ed)?|ignor(?:ed?)|"
     r"replac(?:ed?)|bypass(?:ed)?|dropp?(?:ed)?|left\s+out)\b",
     re.IGNORECASE,
 )
-# In a clause after the one that holds the command, a negation counts only when it points back at the pinned command:
+# A negation counts as a prohibition when it points back at the pinned command:
 # "do not use it", "it must not be used", "do not use the pinned command" (but not "do not use the unpinned form").
 _POINTS_BACK_RE = re.compile(
     rf"{_NEGATION}[^;.:!?]{{0,20}}?\b(?:use|used|run|call|invoke|follow|permit\w*|allow\w*)\b"
     r"\s+(?:it|this|that|them)\b"
-    rf"|\b(?:it|this|that)\s+(?:\w+\s+){{0,2}}?{_NEGATION}"
+    rf"|\b(?:it|this|that|the\s+pinned\s+(?:command|form|interpreter))\s+(?:\w+\s+){{0,2}}?{_NEGATION}"
     rf"|{_NEGATION}[^;.:!?]*\bpinned\b",
     re.IGNORECASE,
 )
 # A clause ends at ; ! ? a blank line, any colon except the two below, or a period before whitespace or the end of the
-# text, closing quotes and brackets allowed between a period and that whitespace ("... is required.) Do not ...").
-# A colon is exempt only as a drive-letter colon or a URL scheme colon (two or more letters, then //), and a period only
+# text, closing quotes, brackets and emphasis allowed before that whitespace ("... is required.** Do not ...").
+# URL colons are masked before splitting; drive-letter colons and URL schemes are also exempt here. A period is exempt
 # inside a word (`agenttalk.assurance`, `reply.md`, 0.105.0), written without backticks. A drive is one letter that is
 # no part of a longer word, the colon, and a path character at once: `C:\temp`, `C:/temp`, and also `C:file`, a path
 # with no slash. Without a slash after the colon, the lone letter must also stand at the start or after whitespace, a
@@ -97,12 +97,20 @@ _CLAUSE_END_RE = re.compile(
     "|(?<![A-Za-z]):"  # a colon after no letter (a digit, a mark, the start)
     "|(?<=[A-Za-z]{2}):(?!//)"  # after two letters (not a drive letter), unless it is a URL scheme
     f"|(?<=[^{_ALONE_BEFORE_A_DRIVE_LETTER}A-Za-z][A-Za-z]):(?![\\\\/])"  # one letter after a mark, no slash: no drive
-    "|\\.[)\\]}\"'\u2019\u201d]*(?!\\S)"
+    "|\\.[)*_\\]}\"'\u2019\u201d]*(?!\\S)"
     "|\\n\\s*\\n"
 )
 _INLINE_CODE_RE = re.compile(r"(?<!`)`(?!`)[^`\n]+`(?!`)")
 _CLAUSE_PUNCTUATION_RE = re.compile(r"[;.:!?]")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s`<>]+", re.IGNORECASE)
+_SHELL_QUOTED_ARGUMENT_RE = re.compile(r"(?:^|\s)--?[\w-]+(?:=|\s+)([\"'])(.*?)\1")
+_IMPLICIT_BAN_RE = re.compile(
+    rf"(?:\b(?:must|should|can|is|are|may|shall)\s+{_NEGATION}|{_NEGATION})\s+(?:be\s+)?"
+    r"(?:used|run|called|invoked|permitted|allowed)\b"
+    r"|\b(?:do|never)\s+(?:not\s+)?(?:use|run|call|invoke)\s+(?:while|when)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -420,16 +428,12 @@ def _join_fenced_continuations(text: str) -> str:
 
 
 def _forbids_the_pinned_command(after: str) -> bool:
-    """Whether the words after the pinned command, up to the rule's fallback, forbid that command ("... must not be
-    used", "... is never permitted"). A negation in the command's own clause does; one in a later clause does only
-    when it points back at the command; a negation about another command ("do not use the unpinned form") or one that
-    supports the rule ("not optional") does not. Known limit: this reads wording, so a prohibition phrased without any
-    of the listed negation words (`forbidden`) is not seen."""
+    """Find prohibitions of the pinned command, not negation about other commands or shell arguments."""
     for number, clause in enumerate(_CLAUSE_END_RE.split(after)):
+        clause = _SHELL_QUOTED_ARGUMENT_RE.sub(lambda m: " " * len(m.group(0)), clause)
+        clause = re.sub(r"(?<!\w)_{1,2}|_{1,2}(?!\w)", " ", clause)
         clause = _REINFORCEMENT_RE.sub("", clause)
-        if not re.search(_NEGATION, clause, re.IGNORECASE):
-            continue
-        if number == 0 or _POINTS_BACK_RE.search(clause):
+        if _POINTS_BACK_RE.search(clause) or (number == 0 and _IMPLICIT_BAN_RE.search(clause)):
             return True
     return False
 
@@ -438,8 +442,9 @@ def _mask_inline_code_punctuation(text: str) -> str:
     """``text`` with every clause-ending character inside a one-line inline code span replaced by a space, so the copy
     is as long as the text and every word stays where it was: the dot in `` `agenttalk.assurance` `` or the colon in
     `` `--meta status:done` `` does not end the clause the command is in. A span that is not closed on its line, and a
-    double-backtick span, are left as they are."""
-    return _INLINE_CODE_RE.sub(lambda span: _CLAUSE_PUNCTUATION_RE.sub(" ", span.group(0)), text)
+    double-backtick span, are left as they are. URL colons are also masked."""
+    text = _INLINE_CODE_RE.sub(lambda span: _CLAUSE_PUNCTUATION_RE.sub(" ", span.group(0)), text)
+    return _URL_RE.sub(lambda url: url.group(0).replace(":", " "), text)
 
 
 def _states_pinned_rule(text: str) -> bool:
