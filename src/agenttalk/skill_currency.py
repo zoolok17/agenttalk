@@ -81,8 +81,8 @@ _POINTS_BACK_RE = re.compile(
     re.IGNORECASE,
 )
 # A clause ends at ; ! ? a blank line, any colon except the two below, or a period before whitespace or the end of the
-# text, closing quotes, brackets and emphasis allowed before that whitespace ("... is required.** Do not ...").
-# URL punctuation is masked before splitting; drive-letter colons and URL schemes are also exempt here. A period is exempt
+# text, closing quotes, brackets and emphasis allowed before that whitespace ("... is required.** Do not ..."). URL
+# punctuation is masked before splitting; drive-letter colons and URL schemes are also exempt here. A period is exempt
 # inside a word (`agenttalk.assurance`, `reply.md`, 0.105.0), written without backticks. A drive is one letter that is
 # no part of a longer word, the colon, and a path character at once: `C:\temp`, `C:/temp`, and also `C:file`, a path
 # with no slash. Without a slash after the colon, the lone letter must also stand at the start or after whitespace, a
