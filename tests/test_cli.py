@@ -5994,18 +5994,43 @@ def test_870_r1_exception_paths_hidden(tmp_path, monkeypatch, capsys, as_json):
     assert "invented-login" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("home,sample", [
-    (r"C:\Users\invented-login", r"C:\Users\invented-login2\file"),
-    ("C:\\", r"C:\Windows\file and D:\C:\x"),
-    ("\\\\", "abc"),
+@pytest.mark.parametrize("platform,home,root,sample,expected", [
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-login2\file",
+     r"C:\Users\invented-login2\file"),
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-login.old\file",
+     r"C:\Users\invented-login.old\file"),
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-loginX\file",
+     r"C:\Users\invented-loginX\file"),
+    ("nt", "C:\\", None, r"C:\Windows\file and D:\C:\x", r"C:\Windows\file and D:\C:\x"),
+    ("nt", "\\\\", None, "abc", "abc"),
+    ("nt", r"C:\Users\invented-login", None, r"under C:\Users\invented-login.", "under <home>."),
+    ("nt", r"C:\Users\invented-login", None, r"under C:\Users\invented-login, then D:", "under <home>, then D:"),
+    ("nt", r"C:\Users\invented-login", None, r"(home C:\Users\invented-login)", "(home <home>)"),
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-login: access denied", "<home>: access denied"),
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-login; retry", "<home>; retry"),
+    ("nt", r"C:\Users\invented-login", r"D:\invented-login-work", r"(D:\invented-login-work)", "(<root>)"),
+    ("posix", "/home/invented-login", None, "under /home/invented-login.", "under <home>."),
 ])
-def test_870_r1_home_boundary_and_root(monkeypatch, home, sample):
+def test_870_r1_home_boundary_and_root(monkeypatch, platform, home, root, sample, expected):
     with monkeypatch.context() as patch:
-        patch.setattr(cli.os, "name", "nt")
+        patch.setattr(cli.os, "name", platform)
         patch.setattr(cli.os.path, "expanduser", lambda _: home)
         patch.delenv("LOCALAPPDATA", raising=False)
-        result = cli._status_redact_home(sample)
-    assert result == sample
+        result = cli._status_redact_home(sample, root=root)
+    assert result == expected
+
+
+def test_870_r2_root_home_keeps_local_and_project(monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os, "name", "nt")
+        patch.setattr(cli.os.path, "expanduser", lambda _: "C:\\")
+        patch.setenv("USERPROFILE", "C:\\")
+        patch.setenv("LOCALAPPDATA", r"C:\Users\invented-login\AppData\Local")
+        result = cli._status_redact_home(
+            r"C:\Users\invented-login\AppData\Local\file and C:\project\file",
+            root=r"C:\project",
+        )
+    assert result == r"<localappdata>\file and <root>\file"
 
 
 @pytest.mark.parametrize("as_json", [False, True])

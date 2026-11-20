@@ -1781,6 +1781,9 @@ def _status_redact_home(value, *, root=None, project_id=None):
         return value
 
     home = os.path.expanduser("~")
+    home_stripped = home.rstrip("\\/")
+    if not home_stripped or home_stripped == "~" or re.fullmatch(r"[a-zA-Z]:", home_stripped):
+        home = ""
     local = os.environ.get("LOCALAPPDATA", "") if os.name == "nt" else ""
 
     def path_key(path):
@@ -1806,7 +1809,7 @@ def _status_redact_home(value, *, root=None, project_id=None):
         parts = re.split(r"[\\/]", stripped)
         pattern = r"[\\/]+".join(re.escape(part) for part in parts)
         name = f"path{len(patterns)}"
-        patterns.append(fr"(?P<{name}>{pattern})(?=$|[\\/\s'\"])")
+        patterns.append(fr"(?P<{name}>{pattern})(?![\w-]|\.[\w-])")
         replacements[name] = replacement
     if isinstance(project_id, str) and project_id:
         patterns.append(fr"(?P<project_id>{re.escape(project_id)})")
