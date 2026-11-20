@@ -4514,6 +4514,11 @@ class Store:
             except json.JSONDecodeError as e:
                 invalid.append((p, p.stem, f"invalid JSON: {e}"))
                 continue
+            except RecursionError:
+                # Nested past what the parser can read (#874): invalid like any other unreadable file. The wording
+                # is fixed because the parser's own differs between Python versions.
+                invalid.append((p, p.stem, "invalid JSON: nested too deeply"))
+                continue
             try:
                 msg = Message.from_raw(data)
             except ValueError as e:
@@ -5217,6 +5222,10 @@ class Store:
             raise RequeueRefused(
                 f"{escape_controls(path)} cannot be read ({escape_controls(exc)}); nothing was published."
             ) from exc
+        except RecursionError as exc:  # nested too deeply to read: the same refusal (#874)
+            raise RequeueRefused(
+                f"{escape_controls(path)} cannot be read (nested too deeply); nothing was published."
+            ) from exc
         if not (
             isinstance(state, dict)
             and state.get("schema_version") == 1
@@ -5393,7 +5402,7 @@ class Store:
                         if isinstance(loaded, dict):
                             meta = loaded
                             meta_loaded = True
-                    except (OSError, ValueError):
+                    except (OSError, ValueError, RecursionError):  # RecursionError: nested too deeply (#874)
                         meta = {}
                 meta.setdefault("agent", d.name)
                 orig = meta.get("message_id")
