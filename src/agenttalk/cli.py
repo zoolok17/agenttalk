@@ -14170,6 +14170,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     supervisor_launch_nonce: str | None = None,
                     lifecycle_log: object | None = None,
                     reply_shell: str = "powershell",
+                    reply_invocation: str | None = None,
                     turn_events: bool = False) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
@@ -14326,6 +14327,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
             reply_shell=reply_shell,
+            reply_invocation=reply_invocation,
             turn_watchdog=turn_watchdog,
             health_writer=health_writer,
             runtime_writer=runtime_writer,
@@ -14420,6 +14422,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
             reply_shell=reply_shell,
+            reply_invocation=reply_invocation,
             runtime_writer=runtime_writer,
             work_heartbeat=work_heartbeat,
             lifecycle_log=lifecycle_log,
@@ -15215,6 +15218,15 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
         # #wrapper-reply-channels increment B: per-agent -> global -> per-CLI
         # default, same precedence chain as the dead-letter caps above.
         reply_shell = _sup.resolve_reply_shell(sup_cfg, cfg_agent, cli=args.cli)
+        # #822: a Claude seat in a stricter permission mode is given the interpreter's written-out path. Whether
+        # the seat may run it is the team's decision, so the wrapper never adds the rule; it only names it.
+        from agenttalk.wrapper import prompt as _wprompt
+        reply_invocation = _wprompt.strict_reply_invocation(args.cli, argv, child_env.get("AGENTTALK_PY"))
+        if reply_invocation:
+            sys.stderr.write(
+                f"agenttalk wrap: {agent} runs in a Claude permission mode other than bypassPermissions, so its "
+                f"instructions write agenttalk commands as {reply_invocation} <subcommand>. To let the seat run "
+                f"them, add this allow rule to its settings: Bash({reply_invocation} *)\n")
         return _wrap_loop_mode(
             store,
             agent,
@@ -15256,6 +15268,7 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
                 None,
             ),
             reply_shell=reply_shell,
+            reply_invocation=reply_invocation,
             turn_events=_turn_events_wanted(args),
         )
     try:

@@ -2760,6 +2760,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                sender: str | None = None, min_interval: float = 5.0,
                render: bool = True, rules: str | None = None,
                reply_shell: str = "powershell",
+               reply_invocation: str | None = None,
                clock: Callable[[], float] = time.monotonic,
                spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
                agenttalk_preflight: Callable[[], str | None] | None = None,
@@ -3344,7 +3345,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             relay_notice = None
         prompt = _prompt.assemble_turn_prompt(
             record, rules=rules, rejoin=rejoin, lessons=lesson_prompt,
-            sender_is_lead=sender_is_lead, reply_shell=reply_shell, seat=agent,
+            sender_is_lead=sender_is_lead, reply_shell=reply_shell, reply_invocation=reply_invocation, seat=agent,
             relay_notice=relay_notice)
         _apply_fresh_request(store, agent, session_state, persist,
                              _fresh_owner_check(store, agent, wrapper_generation), lifecycle_log)  # #475
@@ -3536,6 +3537,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                        sender: str | None = None, min_interval: float = 5.0,
                        render: bool = True, rules: str | None = None,
                        reply_shell: str = "powershell",
+                       reply_invocation: str | None = None,
                        clock: Callable[[], float] = time.monotonic,
                        spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
                        agenttalk_preflight: Callable[[], str | None] | None = None,
@@ -3749,7 +3751,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
 
     def cadence_drive(snapshot: dict, items: list) -> bool:
         prompt = _prompt.assemble_cadence_prompt(
-            snapshot, items, rules=rules, reply_shell=reply_shell)
+            snapshot, items, rules=rules, reply_shell=reply_shell, reply_invocation=reply_invocation)
         _apply_fresh_request(store, agent, session_state, persist,
                              _fresh_owner_check(store, agent, wrapper_generation), lifecycle_log)  # #475
         spec = _session.build_turn(session_state, prompt)
