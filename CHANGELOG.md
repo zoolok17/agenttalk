@@ -52,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The skills check now reads the pinned-interpreter rule correctly (#801, #861, #864,
+  #865).** The check tells whether a skill states the rule "when `AGENTTALK_PY` is set, use the
+  pinned command; otherwise the plain one" before it shows the plain `python -m agenttalk` form.
+  It was fooled in four ways, which are fixed. A "do not" after the pinned command ("must not be
+  used") now stops the sentence from counting as the rule. A command split over two lines (a
+  Bash backslash or a PowerShell backtick) is read as one command. A period inside a code span
+  (such as `-m agenttalk.assurance` or `reply.md`) no longer ends the sentence early, and a
+  period right before a closing quote or bracket now ends it. A Windows drive path, including
+  the drive-relative kind like `<drive>:file`, no longer counts as the end of a sentence part.
+  The bundled skills are unchanged: the check gives the same answer for all of them.
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,
   including unedited files marked assume-unchanged or present skipped files. Files
