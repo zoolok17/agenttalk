@@ -1063,3 +1063,28 @@ def test_878_r4_other_target_or_this_one_is_a_ban(shell):
     rule = f"When AGENTTALK_PY is set, run `{PINNED_FORMS[shell]}` and do not use the plain command"
     assert sc._states_pinned_rule(rule + "; otherwise use your manual.")
     assert not sc._states_pinned_rule(rule + " or this one; otherwise use your manual.")
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("url_end", [
+    "https://example.org/a;", "https://example.org/a.",
+    "https://example.org/a,;", "https://example.org/a);",
+    '"https://example.org/a";', "'https://example.org/a';",
+])
+def test_878_r5_trailing_url_punctuation_preserves_boundary(shell, url_end):
+    rule = f"When AGENTTALK_PY is set, run {PINNED_FORMS[shell]} send --file {url_end} "
+    assert sc._states_pinned_rule(rule + "the plain command must not be used; otherwise use your manual.")
+    assert not sc._states_pinned_rule(rule + "it must not be used; otherwise use your manual.")
+
+
+def test_878_r5_non_url_scan_scales_linearly():
+    from time import perf_counter
+
+    def elapsed(n):
+        start = perf_counter()
+        sc._states_pinned_rule("a+" * n)
+        return perf_counter() - start
+
+    short = min(elapsed(2000) for _ in range(2))
+    long = min(elapsed(8000) for _ in range(2))
+    assert long < short * 9 + 0.03, (short, long)

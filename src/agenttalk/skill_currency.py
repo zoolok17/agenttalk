@@ -103,7 +103,7 @@ _CLAUSE_END_RE = re.compile(
 _INLINE_CODE_RE = re.compile(r"(?<!`)`(?!`)[^`\n]+`(?!`)")
 _CLAUSE_PUNCTUATION_RE = re.compile(r"[;.:!?]")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
-_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s`<>]+", re.IGNORECASE)
+_URL_RE = re.compile(r"(?<![\w.+-])[a-z][a-z0-9+.-]*://[^\s`<>]+", re.IGNORECASE)
 _SHELL_QUOTED_ARGUMENT_RE = re.compile(r"(?:^|\s)--?\w[\w-]*(?:=|\s+)([\"'])(.*?)\1")
 _OTHER_TARGET_RE = re.compile(
     rf"{_NEGATION}\s+(?:(?:use|run|call|invoke|using)\s+)?"
@@ -455,7 +455,12 @@ def _mask_inline_code_punctuation(text: str) -> str:
     `` `--meta status:done` `` does not end the clause the command is in. A span that is not closed on its line, and a
     double-backtick span, are left as they are. URL punctuation is also masked."""
     text = _INLINE_CODE_RE.sub(lambda span: _CLAUSE_PUNCTUATION_RE.sub(" ", span.group(0)), text)
-    return _URL_RE.sub(lambda url: _CLAUSE_PUNCTUATION_RE.sub(" ", url.group(0)), text)
+    def mask_url(url: re.Match[str]) -> str:
+        token = url.group(0)
+        body = token.rstrip(";.,)'\"")
+        return _CLAUSE_PUNCTUATION_RE.sub(" ", body) + token[len(body):]
+
+    return _URL_RE.sub(mask_url, text)
 
 
 def _states_pinned_rule(text: str) -> bool:
