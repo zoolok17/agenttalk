@@ -5012,7 +5012,10 @@ def _lane_checkout_owned_by_another(
     reassignment moves out of the two fields) name folders too, and a claim that cannot be read as a full path
     cannot be ruled out either: the full canonical path of the current checkout says nothing about an earlier one.
     `rows` is the registry snapshot to scan (the caller keeps it, so what it later vouches for is exactly what was
-    scanned); without it the saved registry is read now."""
+    scanned); without it the saved registry is read now.
+    A scan that cannot be made (a saved folder cannot be followed, or `folders` cannot be resolved) raises OSError or
+    ValueError and returns no answer: "could not look" is kept apart from "owned by another" (`names` True) and from
+    "cannot be placed" (`names` False), and the caller decides what each one allows."""
     if rows is None:
         rows = lane_mod.load_lanes(store).get("lanes") or {}
     folder_reals = [_strict_real(folder) for folder in folders]  # OSError when a folder cannot be resolved: refused
@@ -5055,9 +5058,10 @@ def _lane_checkout_owned_by_another(
                     candidate_real = _strict_real(candidate)
                 except (FileNotFoundError, NotADirectoryError):
                     continue  # nothing is there, so it cannot be any of these folders
-                except (OSError, ValueError):
-                    return key, False  # it could not be resolved (access denied, a sharing violation): it could be
-                    # one of these folders, and a path that cannot be followed is not ruled out
+                # Any other failure to follow it (access denied, a sharing violation) is not an answer, so it is not
+                # caught here: the caller sees "could not be examined", which it judges apart from "owned by another"
+                # and from "not a full path" (a committed retry keeps its evidence, a terminal recheck may use its
+                # recorded proof, a removal or a fresh delivery refuses).
                 for folder, folder_real in zip(folders, folder_reals, strict=True):
                     if candidate_real == folder_real:
                         return key, True

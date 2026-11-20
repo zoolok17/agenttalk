@@ -16,18 +16,22 @@ from agenttalk.store import Store
 from agenttalk.wrapper import run as wrapper_run
 
 
-def _committed_unpublished_delivery(tmp_path, monkeypatch, canonical=None, relative_worktree=False):
+def _committed_unpublished_delivery(
+        tmp_path, monkeypatch, canonical=None, relative_worktree=False, with_other_lane=False):
     """A delivery whose committed final exists but whose publication marker was never saved.
 
     `canonical` models a delivery made by an OLDER version, which did not look at the saved checkout paths: the row's
     `worktree_toplevel_canonical` is already that value (a string, or a function of the checkout folder) BEFORE the
     delivery, so the signed snapshot and the final's lane fingerprint both carry the damage, and the path rule is
-    switched off for that one delivery."""
+    switched off for that one delivery. `with_other_lane` assigns a second, healthy lane ("other") through the public
+    command first, so the lane being delivered is not the only one in the registry."""
     from test_lanes import _assign_worktree, _commit, _committed_artifacts, _repo, _run_raw
 
     root, base = _repo(tmp_path)
     lane_id = "committed-damage"
     lane = _assign_worktree(root, base, lane_id)
+    if with_other_lane:
+        _assign_second_lane(root, base)
     worktree = Path(lane["worktree_path"])
     head = _commit(worktree, "src/core/a.py", "base\ncommitted delivery\n")
     store = Store(root)
@@ -175,6 +179,106 @@ def test_committed_delivery_with_healthy_path_resumes_cleanup(tmp_path, monkeypa
     lanes.validate_delivery_artifact(
         artifact, lane_id=lane_id, head_sha=head, store=store, require_isolation=True, require_live_marker=True
     )
+
+
+def test_a_committed_final_is_kept_when_another_lanes_healthy_checkout_cannot_be_examined(
+        tmp_path, monkeypatch, capsys):
+    """Round 32 (review bot, P1): the retry of a delivery whose committed final is valid, while ANOTHER lane's healthy
+    absolute checkout cannot be examined (access denied). Not being able to look is not the same as that lane owning
+    the folder or its path being unreadable as a full path: the final must be kept and the delivery published, not set
+    aside and the lane put back to ACTIVE. Two lanes assigned the ordinary way; the denial is injected into the
+    resolution of the other lane's folder only (a real permission denial is not possible on every system)."""
+    from test_lanes import _checkout_cannot_be_resolved
+
+    store, lane_id, _worktree, head, artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, with_other_lane=True)
+    other = Path(lanes.load_lanes(store)["lanes"]["other"]["worktree_path"])
+    original_artifact = artifact.read_bytes()
+    fired = _checkout_cannot_be_resolved(monkeypatch, other)
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"])
+
+    err = capsys.readouterr().err
+    row = lanes.load_lanes(store)["lanes"][lane_id]
+    assert fired, "the other lane's folder was never examined: the set-up does not reach the fault"
+    assert artifact.is_file() and artifact.read_bytes() == original_artifact, err   # kept, not quarantined
+    assert row["status"] != lanes.STATUS_ACTIVE, err                                # not put back to ACTIVE
+    assert rc == 0 and row["publish_pending"] is False, err                         # and the delivery goes through
+    lanes.validate_delivery_artifact(artifact, lane_id=lane_id, head_sha=head, store=store, require_isolation=True)
+    assert (other / ".git").exists()                                                # the other lane is untouched
+
+
+def _two_ordinary_lanes(tmp_path):
+    """Two lanes assigned the ordinary way, each with a healthy absolute checkout, and work committed in the first.
+    Returns (root, store, first_checkout, other_checkout)."""
+    from test_lanes import _assign_worktree, _commit, _repo
+
+    root, base = _repo(tmp_path)
+    first = Path(_assign_worktree(root, base, "first")["worktree_path"])
+    other = _assign_second_lane(root, base)
+    _commit(first, "src/core/a.py", "base\nfirst lane work\n")
+    return root, Store(root), first, other
+
+
+def test_a_fresh_delivery_says_it_could_not_look_when_another_lanes_checkout_cannot_be_examined(
+        tmp_path, monkeypatch, capsys):
+    """Nothing was published yet, so a fresh delivery stops. The reason is the true one (a look that could not be made,
+    which a retry can fix), not that the other lane's saved path is "not a full path" (advice to edit lanes.json)."""
+    from test_lanes import _checkout_cannot_be_resolved
+
+    root, store, first, other = _two_ordinary_lanes(tmp_path)
+    fired = _checkout_cannot_be_resolved(monkeypatch, other)
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root), "lane", "deliver", "--id", "first", "--from", "dev"])
+
+    err = capsys.readouterr().err
+    assert fired and rc == 3
+    assert "whether another lane owns this checkout could not be established" in err, err
+    assert "not a full path" not in err, err
+    _nothing_was_published(store, "first")
+    _assert_untouched(first, other)
+
+
+def test_an_abandon_says_it_could_not_look_when_another_lanes_checkout_cannot_be_examined(
+        tmp_path, monkeypatch, capsys):
+    """A removal never goes on without the look. The checkout is left alone, and the reason is the true one."""
+    from test_lanes import _checkout_cannot_be_resolved
+
+    root, _store, first, other = _two_ordinary_lanes(tmp_path)
+    fired = _checkout_cannot_be_resolved(monkeypatch, other)
+    capsys.readouterr()
+
+    cli.main(["--root", str(root), "lane", "abandon", "--id", "first"])
+
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert fired
+    assert "could not be established" in text, text
+    assert "not a full path" not in text, text
+    _assert_untouched(first, other)
+
+
+def test_a_terminal_recheck_uses_its_proof_when_another_lanes_checkout_can_no_longer_be_examined(
+        tmp_path, monkeypatch, capsys):
+    """The fresh evaluation scanned the other lane's row and proved the checkout is this lane's. When that same
+    command's terminal recheck can no longer look at the other lane's folder, its recorded proof stands and the
+    delivery is published (the cleanup after it is a removal, so it keeps the checkout)."""
+    from test_lanes import _checkout_cannot_be_resolved
+
+    root, store, first, other = _two_ordinary_lanes(tmp_path)
+    fired = _checkout_cannot_be_resolved(monkeypatch, other, only_during="_lane_finalize_delivery")
+    capsys.readouterr()
+
+    rc = cli.main(["--root", str(root), "lane", "deliver", "--id", "first", "--from", "dev"])
+
+    err = capsys.readouterr().err
+    row = lanes.load_lanes(store)["lanes"]["first"]
+    assert fired, "the other lane's folder was never examined during the terminal recheck"
+    assert rc == 0 and row["status"] == lanes.STATUS_DELIVERED and row["publish_pending"] is False, err
+    assert Path(row["delivery_artifact"]).is_file()
+    _assert_untouched(first, other)
 
 
 @pytest.mark.parametrize("evidence", ["missing", "invalid"])
