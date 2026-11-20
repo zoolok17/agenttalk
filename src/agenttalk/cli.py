@@ -3304,13 +3304,15 @@ def _reopen_revision(root, ref: str) -> str:
     rc, inside = _git(root, ["rev-parse", "--is-inside-work-tree"])
     if rc != 0 or inside.strip() != "true":
         raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
-    rc, resolved = _git(root, ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"])
+    rc, resolved = _git(root, ["rev-parse", "--quiet", "--verify", "--end-of-options", f"{ref}^{{commit}}"])
     revision = resolved.strip()
-    if rc != 0 or not close_mod._FULL_SHA_RE.fullmatch(revision):
+    if rc == 1:
         raise close_mod.CloseError("requested revision could not be resolved in this checkout")
+    if rc != 0 or not close_mod._FULL_SHA_RE.fullmatch(revision):
+        raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
     rc, head = _git(root, ["rev-parse", "--verify", "HEAD^{commit}"])
     if rc != 0 or not close_mod._FULL_SHA_RE.fullmatch(head.strip()):
-        raise close_mod.CloseError("checkout HEAD could not be verified")
+        raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
     if head.strip() != revision:
         raise close_mod.CloseError("checkout HEAD differs from the requested revision; inspect the checkout")
     return revision

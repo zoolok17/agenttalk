@@ -12,6 +12,37 @@ from agenttalk import cli, close, janitor
 from agenttalk.store import Store
 
 
+@pytest.mark.parametrize("result", [(-1, ""), (0, "not a sha"), (128, "")])
+def test_reopen_revision_unavailable_git_result_names_cause(tmp_path, monkeypatch, result):
+    def fake_git(root, argv):
+        return (0, "true\n") if "--is-inside-work-tree" in argv else result
+
+    monkeypatch.setattr(cli, "_git", fake_git)
+    with pytest.raises(close.CloseError, match="Git or the checkout is unavailable"):
+        cli._reopen_revision(tmp_path, "a" * 40)
+
+
+def test_reopen_revision_missing_commit_reports_unresolved(tmp_path, monkeypatch):
+    def fake_git(root, argv):
+        return (0, "true\n") if "--is-inside-work-tree" in argv else (1, "")
+
+    monkeypatch.setattr(cli, "_git", fake_git)
+    with pytest.raises(close.CloseError, match="could not be resolved"):
+        cli._reopen_revision(tmp_path, "a" * 40)
+
+
+@pytest.mark.parametrize("result", [(-1, ""), (0, "not a sha")])
+def test_reopen_revision_unreadable_head_names_cause(tmp_path, monkeypatch, result):
+    def fake_git(root, argv):
+        if "--is-inside-work-tree" in argv:
+            return 0, "true\n"
+        return result if "HEAD^{commit}" in argv else (0, "a" * 40)
+
+    monkeypatch.setattr(cli, "_git", fake_git)
+    with pytest.raises(close.CloseError, match="Git or the checkout is unavailable"):
+        cli._reopen_revision(tmp_path, "a" * 40)
+
+
 @pytest.fixture
 def repo(tmp_path):
     if shutil.which("git") is None:

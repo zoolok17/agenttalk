@@ -1254,6 +1254,7 @@ checkout is unavailable, the revision cannot be resolved, or HEAD differs,
 reopen stops without changing the record. Check out the revision in the checkout
 that holds the store, or pass `--revision` with its current HEAD. A store outside
 a Git checkout can open a close with a full revision pin, but cannot reopen it.
+The HEAD check runs just before the close lock is taken, so a checkout moved in that gap is not caught.
 Reopen checks cleanliness again even when `--revision` is omitted, so a close
 previously recorded clean can go on HOLD if the checkout has changed. Reopen
 records an unchecked worktree as not clean; without a recorded diff artifact the
