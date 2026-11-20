@@ -87,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names the seat with "(not on the roster)" and says which marker file to remove once no wrapper runs for
   it. A marker that needs no host still gives N/A, and one that cannot be read gives "could not check"
   (#847, #869).
+- **The skills check now reads the pinned-interpreter rule correctly (#801, #861, #864,
+  #865).** The check tells whether a skill states the rule "when `AGENTTALK_PY` is set, use the
+  pinned command; otherwise the plain one" before it shows the plain `python -m agenttalk` form.
+  It was fooled in four ways, which are fixed. A "do not" after the pinned command ("must not be
+  used") now stops the sentence from counting as the rule. A command split over two lines (a
+  Bash backslash or a PowerShell backtick) is read as one command. A period inside a code span
+  (such as `-m agenttalk.assurance` or `reply.md`) no longer ends the sentence early, and a
+  period right before a closing quote or bracket now ends it. A Windows drive path, including
+  the drive-relative kind like `<drive>:file`, no longer counts as the end of a sentence part.
+  The bundled skills are unchanged: the check gives the same answer for all of them.
 - **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
   Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
   variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run

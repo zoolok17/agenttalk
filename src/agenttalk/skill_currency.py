@@ -48,19 +48,71 @@ _PLAIN_PYTHON_RE = re.compile(
 )
 _PLAIN_PYTHON_FORM = "python -m agenttalk"
 # A rule needs the condition, a Bash or PowerShell invocation, then the fallback nearby.
-# Reject negation between the condition and invocation; require the invocation before the fallback.
+# Reject negation between the condition and invocation; require the invocation before the fallback. What follows the
+# invocation, up to the fallback, is read by `_forbids_the_pinned_command` (a guide that says the pinned command "must
+# not be used" states the opposite of the rule, but a "do not" about another command, or "not optional", does not).
 # PowerShell accepts both quoted and unquoted executable variables after its call operator.
 # Conditions may wrap at a line end or quote the name in backticks; bare mentions and
 # HTML comments do not state the rule.
+_FALLBACK = r"\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b"
+_NEGATION = r"\b(?:not|never|avoid|without|refrain|cannot|no|don['’]t|mustn['’]t|shouldn['’]t|can['’]t)\b"
+_UP_TO_FALLBACK_WITHOUT_NEGATION = rf"(?:(?!{_FALLBACK}|{_NEGATION})[\s\S]){{0,600}}?"
 _RULE_RE = re.compile(
     r"\b(?:if|when)\b[^.]{0,60}?(?<![\w])AGENTTALK_PY(?![\w])`?\s+is\s+set"
-    r"(?:(?!\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b|"
-    r"\b(?:not|never|avoid|without|refrain|cannot|no|don['’]t|mustn['’]t|shouldn['’]t|can['’]t)\b)[\s\S]){0,600}?"
-    r'(?:"\$AGENTTALK_PY"|&\s+(?:"\$env:AGENTTALK_PY"|\$env:AGENTTALK_PY))\s+-m\s+agenttalk(?![\w-])'
-    r"[\s\S]{0,600}?(?:\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b)",
+    + _UP_TO_FALLBACK_WITHOUT_NEGATION
+    + r'(?:"\$AGENTTALK_PY"|&\s+(?:"\$env:AGENTTALK_PY"|\$env:AGENTTALK_PY))\s+-m\s+agenttalk(?![\w-])'
+    + r"(?P<after>[\s\S]{0,600}?)"
+    + rf"(?:{_FALLBACK})",
     re.IGNORECASE,
 )
+# A negation that supports the rule ("not optional", "never skip it") is not a prohibition of the pinned command.
+_REINFORCEMENT_RE = re.compile(
+    rf"{_NEGATION}\s+(?:to\s+)?(?:be\s+)?(?:optional|negotiable|skipp?(?:ed)?|omitt?(?:ed)?|ignor(?:ed?)|"
+    r"replac(?:ed?)|bypass(?:ed)?|dropp?(?:ed)?|left\s+out)\b",
+    re.IGNORECASE,
+)
+# A negation counts as a prohibition when it points back at the pinned command:
+# "do not use it", "it must not be used", "do not use the pinned command" (but not "do not use the unpinned form").
+_POINTS_BACK_RE = re.compile(
+    rf"{_NEGATION}[^;.:!?]{{0,20}}?\b(?:use|used|run|call|invoke|follow|permit\w*|allow\w*)\b"
+    r"\s+(?:it|this|that|them)\b"
+    rf"|\b(?:it|this|that|the\s+pinned\s+(?:command|form|interpreter))\s+(?:\w+\s+){{0,2}}?{_NEGATION}"
+    rf"|{_NEGATION}[^;.:!?]*\bpinned\b",
+    re.IGNORECASE,
+)
+# A clause ends at ; ! ? a blank line, any colon except the two below, or a period before whitespace or the end of the
+# text, closing quotes, brackets and emphasis allowed before that whitespace ("... is required.** Do not ..."). URL
+# punctuation is masked before splitting; drive-letter colons and URL schemes are also exempt here. A period is exempt
+# inside a word (`agenttalk.assurance`, `reply.md`, 0.105.0), written without backticks. A drive is one letter that is
+# no part of a longer word, the colon, and a path character at once: `C:\temp`, `C:/temp`, and also `C:file`, a path
+# with no slash. Without a slash after the colon, the lone letter must also stand at the start or after whitespace, a
+# quote, = ( or [ , so a one-letter word before a colon ("Option A:do not ...", "x:y") reads as a drive: that choice
+# merges the next words into the command's clause, which is the stricter reading. Any other colon, one followed by
+# whitespace, `**` or a backtick, one after a digit ("Step 1:do", 10:30) or after two letters, still ends the clause.
+_PATH_CHAR = "[^\\s*`\"'\u2019\u201d)\\]},;:!?]"  # what may follow a drive colon: not whitespace, emphasis, a closer
+_ALONE_BEFORE_A_DRIVE_LETTER = "\\s\"'=(\\[\u2018\u2019\u201c\u201d"
+_CLAUSE_END_RE = re.compile(
+    "[;!?]"
+    f"|:(?!{_PATH_CHAR})"  # a colon followed by whitespace, the end, emphasis, a closer: no path
+    "|(?<![A-Za-z]):"  # a colon after no letter (a digit, a mark, the start)
+    "|(?<=[A-Za-z]{2}):(?!//)"  # after two letters (not a drive letter), unless it is a URL scheme
+    f"|(?<=[^{_ALONE_BEFORE_A_DRIVE_LETTER}A-Za-z][A-Za-z]):(?![\\\\/])"  # one letter after a mark, no slash: no drive
+    "|\\.[)*_\\]}\"'\u2019\u201d]*(?!\\S)"
+    "|\\n\\s*\\n"
+)
+_INLINE_CODE_RE = re.compile(r"(?<!`)`(?!`)[^`\n]+`(?!`)")
+_CLAUSE_PUNCTUATION_RE = re.compile(r"[;.:!?]")
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_URL_RE = re.compile(r"(?<![\w.+-])[a-z][a-z0-9+.-]*://[^\s`<>]+", re.IGNORECASE)
+_SHELL_QUOTED_ARGUMENT_RE = re.compile(r"(?:^|\s)--?\w[\w-]*(?:=|\s+)([\"'])(.*?)\1")
+_OTHER_TARGET_RE = re.compile(
+    rf"{_NEGATION}\s+(?:(?:use|run|call|invoke|using)\s+)?"
+    r"(?:(?:the\s+)?(?:unpinned|plain|bare)\s+(?:\w+\s+){0,2}?"
+    r"(?:form|command|interpreter|one|python)\b|`(?![^`]*AGENTTALK_PY)[^`\n]+`)",
+    re.IGNORECASE,
+)
+_SHELL_FLAG_RE = re.compile(r"(?<!\w)--?\w[\w-]*")
+_NEGATION_RE = re.compile(_NEGATION, re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -359,11 +411,69 @@ def current_major_minor(version: str) -> tuple[int, int]:
 
 # --------------------------------------------------------------------------- per-file
 
+def _join_fenced_continuations(text: str) -> str:
+    """``text`` with every shell continuation inside a fenced block joined into one line, as the command scan joins it
+    (a trailing ``\\`` for Bash or a trailing backtick for PowerShell, never across a boundary line), so a pinned
+    command split over two lines reads as one. Prose is left as it is."""
+    lines, joined_lines, in_fence, i = text.splitlines(), [], False, 0
+    while i < len(lines):
+        line = lines[i]
+        if _is_fence(line):
+            in_fence = not in_fence
+        elif in_fence:
+            while line.rstrip().endswith(("\\", "`")) and i + 1 < len(lines) and not _is_boundary_line(lines[i + 1]):
+                i += 1
+                line = line.rstrip()[:-1] + " " + lines[i]
+        joined_lines.append(line)
+        i += 1
+    return "\n".join(joined_lines)
+
+
+def _forbids_the_pinned_command(after: str) -> bool:
+    """Find prohibitions of the pinned command, not negation about other commands or shell arguments."""
+    for number, clause in enumerate(_CLAUSE_END_RE.split(after)):
+        clause = _SHELL_QUOTED_ARGUMENT_RE.sub(lambda m: " " * len(m.group(0)), clause)
+        clause = re.sub(r"(?<!\w)_{1,2}|_{1,2}(?!\w)", " ", clause)
+        clause = _REINFORCEMENT_RE.sub("", clause)
+        if number == 0:
+            if any(
+                re.match(r"\s+or\s+(?:this|that)(?:\s+one)?\b", clause[match.end():], re.IGNORECASE)
+                for match in _OTHER_TARGET_RE.finditer(clause)
+            ):
+                return True
+            clause = _OTHER_TARGET_RE.sub("", clause)
+            if _NEGATION_RE.search(_SHELL_FLAG_RE.sub("", clause)):
+                return True
+        elif _POINTS_BACK_RE.search(clause):
+            return True
+    return False
+
+
+def _mask_inline_code_punctuation(text: str) -> str:
+    """``text`` with every clause-ending character inside a one-line inline code span replaced by a space, so the copy
+    is as long as the text and every word stays where it was: the dot in `` `agenttalk.assurance` `` or the colon in
+    `` `--meta status:done` `` does not end the clause the command is in. A span that is not closed on its line, and a
+    double-backtick span, are left as they are. URL punctuation is also masked."""
+    text = _INLINE_CODE_RE.sub(lambda span: _CLAUSE_PUNCTUATION_RE.sub(" ", span.group(0)), text)
+    def mask_url(url: re.Match[str]) -> str:
+        token = url.group(0)
+        body = token.rstrip(";.,)'\"")
+        return _CLAUSE_PUNCTUATION_RE.sub(" ", body) + token[len(body):]
+
+    return _URL_RE.sub(mask_url, text)
+
+
 def _states_pinned_rule(text: str) -> bool:
-    """True when the skill states the pinned-runtime rule itself: a condition on ``AGENTTALK_PY`` being set, with
-    what to do otherwise close by. A mention, the name inside an HTML comment or inside a longer name, or the
-    condition without its fallback does not count."""
-    return bool(_RULE_RE.search(_HTML_COMMENT_RE.sub("", text)))
+    """True when the skill states the pinned-runtime rule itself: a condition on ``AGENTTALK_PY`` being set, then the
+    pinned command (not forbidden, and a command split over two lines counts), with what to do otherwise close by. A
+    mention, the name inside an HTML comment or inside a longer name, or the condition without its fallback does not
+    count."""
+    joined = _join_fenced_continuations(_HTML_COMMENT_RE.sub("", text))
+    masked = _mask_inline_code_punctuation(joined)  # read only to cut clauses; the pattern reads `joined`
+    return any(
+        not _forbids_the_pinned_command(masked[found.start("after"):found.end("after")])
+        for found in _RULE_RE.finditer(joined)
+    )
 
 
 def _pinned_runtime_findings(rel: str, text: str, kind: str) -> list[Finding]:
