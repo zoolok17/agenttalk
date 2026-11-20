@@ -106,11 +106,12 @@ _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s`<>]+", re.IGNORECASE)
 _SHELL_QUOTED_ARGUMENT_RE = re.compile(r"(?:^|\s)--?\w[\w-]*(?:=|\s+)([\"'])(.*?)\1")
 _OTHER_TARGET_RE = re.compile(
-    rf"{_NEGATION}\s+(?:(?:use|run|call|invoke|using)\s+)?(?:the\s+)?"
-    r"(?:unpinned|plain|bare)\s+(?:form|command|interpreter)\b"
-    r"|\bnot\s+`(?![^`]*AGENTTALK_PY)[^`\n]+`",
+    rf"{_NEGATION}\s+(?:(?:use|run|call|invoke|using)\s+)?"
+    r"(?:(?:the\s+)?(?:unpinned|plain|bare)\s+(?:\w+\s+){0,2}?"
+    r"(?:form|command|interpreter|one|python)\b|`(?![^`]*AGENTTALK_PY)[^`\n]+`)",
     re.IGNORECASE,
 )
+_SHELL_FLAG_RE = re.compile(r"(?<!\w)--?\w[\w-]*")
 _NEGATION_RE = re.compile(_NEGATION, re.IGNORECASE)
 
 
@@ -435,7 +436,13 @@ def _forbids_the_pinned_command(after: str) -> bool:
         clause = re.sub(r"(?<!\w)_{1,2}|_{1,2}(?!\w)", " ", clause)
         clause = _REINFORCEMENT_RE.sub("", clause)
         if number == 0:
-            if _NEGATION_RE.search(_OTHER_TARGET_RE.sub("", clause)):
+            if any(
+                re.match(r"\s+or\s+(?:this|that)(?:\s+one)?\b", clause[match.end():], re.IGNORECASE)
+                for match in _OTHER_TARGET_RE.finditer(clause)
+            ):
+                return True
+            clause = _OTHER_TARGET_RE.sub("", clause)
+            if _NEGATION_RE.search(_SHELL_FLAG_RE.sub("", clause)):
                 return True
         elif _POINTS_BACK_RE.search(clause):
             return True

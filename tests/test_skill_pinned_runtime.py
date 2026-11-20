@@ -1005,6 +1005,7 @@ def test_878_literal_skill_and_prohibition_control(rule, stated, control, form):
     assert not sc._states_pinned_rule(forbidden_skill), control
     assert sc._pinned_runtime_findings("x/SKILL.md", forbidden_skill, "codex"), control
 
+
 @pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
 @pytest.mark.parametrize("words", [
     "is not to be used", "should not ever be used", "must not be executed",
@@ -1039,3 +1040,26 @@ def test_878_r3_other_target_does_not_mask_a_real_ban(shell):
         "but do not rely on it; otherwise use your manual."
     )
     assert not sc._states_pinned_rule(rule)
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+@pytest.mark.parametrize("suffix", [
+    "and do not use `python -m agenttalk`",
+    ", never `python -m agenttalk`",
+    "and avoid `python -m agenttalk`",
+    "wait --no-sync",
+    "and do not use plain python",
+    ", not the unpinned one",
+    "and never the bare python -m agenttalk",
+])
+def test_878_r4_other_targets_and_flags_with_ban_control(shell, suffix):
+    rule = f"When AGENTTALK_PY is set, run `{PINNED_FORMS[shell]}` {suffix}"
+    assert sc._states_pinned_rule(rule + "; otherwise use your manual.")
+    assert not sc._states_pinned_rule(rule + " but do not use it; otherwise use your manual.")
+
+
+@pytest.mark.parametrize("shell", sorted(PINNED_FORMS))
+def test_878_r4_other_target_or_this_one_is_a_ban(shell):
+    rule = f"When AGENTTALK_PY is set, run `{PINNED_FORMS[shell]}` and do not use the plain command"
+    assert sc._states_pinned_rule(rule + "; otherwise use your manual.")
+    assert not sc._states_pinned_rule(rule + " or this one; otherwise use your manual.")
