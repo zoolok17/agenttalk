@@ -1097,7 +1097,9 @@ def test_backcompat_json_shapes_without_new_features(tmp_path: Path, capsys) -> 
                           "waiting_stale"}  # operator_facing ABSENT
     from agenttalk import capacity
     store = Store(root)
-    store.write_capacity("alpha", capacity.CapacitySnapshot.unknown("alpha", account="codex:test").to_dict())
+    store.write_capacity(
+        "alpha", capacity.CapacitySnapshot.unknown("alpha", account="codex:test:home-12345678").to_dict()
+    )
     status = _json_of(["status", "--json"], root, capsys)
     agent_rows = {a["name"]: a for a in status["agents"]}
     assert set(agent_rows["alpha"]["capacity"]) == {"state", "observed_at", "reason", "account_group"}

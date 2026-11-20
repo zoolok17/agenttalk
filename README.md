@@ -1387,6 +1387,7 @@ in agenttalk waits for it or is held back by it.
   `capacity=unknown(<reason>)` to each seat that has written a reading.
   `status --json` shows `account_group` as the sorted seats in this status output sharing an account;
   the capacity text display also counts a retired seat's old reading.
+  Both group only well-formed Claude, Codex and OVH-Qwen account keys; other readings stand alone.
   Use `--show-account` to include the login and folder fingerprint instead.
   The store itself records the login, so review it before sharing the store.
 - The web console and `agenttalk attention` show and warn only on figures that are still current.

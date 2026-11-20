@@ -1765,6 +1765,12 @@ def cmd_overview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _groupable_capacity_account(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(
+        r"(?:claude|codex|ovh-qwen):[^:]*:home-[0-9a-f]{8}", value
+    ) is not None
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _get_store(args)
     payload = _gather_status(store)
@@ -1773,12 +1779,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             groups: dict[str, list[str]] = {}
             for row in payload["agents"]:
                 account = row.get("capacity", {}).get("account")
-                if isinstance(account, str) and account:
+                if _groupable_capacity_account(account):
                     groups.setdefault(account, []).append(row["name"])
             for row in payload["agents"]:
                 if "capacity" in row:
                     account = row["capacity"].pop("account", None)
-                    if isinstance(account, str) and account:
+                    if _groupable_capacity_account(account):
                         row["capacity"]["account_group"] = sorted(groups[account])
         print(json.dumps(payload, indent=2))
         return 0
@@ -12269,8 +12275,10 @@ def cmd_capacity(args: argparse.Namespace) -> int:
     accounts: dict[str, list[str]] = {}
     for agent in sorted(caps):
         account = caps[agent].get("account")
-        if not isinstance(account, str):
-            account = str(account or "") if args.show_account else ""
+        if args.show_account:
+            account = str(account or "")
+        elif not _groupable_capacity_account(account):
+            account = ""
         accounts.setdefault(account, []).append(agent)
     kw = {"threshold": args.threshold, "reset_soon_min": args.reset_soon_min,
           "context_threshold": args.context_threshold}

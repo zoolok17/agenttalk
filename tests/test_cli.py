@@ -419,7 +419,9 @@ def test_status_json_schema(
     beta = next(a for a in payload["agents"] if a["name"] == "beta")
     assert beta["unread"] == 1
     from agenttalk import capacity as capmod
-    Store(store_root).write_capacity("alpha", capmod.CapacitySnapshot.unknown("alpha", account="codex:test").to_dict())
+    Store(store_root).write_capacity(
+        "alpha", capmod.CapacitySnapshot.unknown("alpha", account="codex:test:home-12345678").to_dict()
+    )
     assert _run(["status", "--json"], store_root) == 0
     rows = {a["name"]: a for a in _json.loads(capsys.readouterr().out)["agents"]}
     assert set(rows["alpha"]["capacity"]) == {"state", "observed_at", "reason", "account_group"}
@@ -3977,7 +3979,7 @@ def test_301_r2_seats_on_one_account_each_show_their_own_row(
     now = datetime.now(timezone.utc)
     store = Store(tmp_path)
     for agent, used, plan, minutes in (("alpha", 12.0, "pro", 3), ("beta", 40.0, "plus", 1)):
-        snap = capmod.CapacitySnapshot.unknown(agent, account="codex:tester")
+        snap = capmod.CapacitySnapshot.unknown(agent, account="codex:tester:home-12345678")
         snap.source, snap.confidence, snap.plan_type = "codex_rollout", "observed", plan
         snap.observed_at = (now - timedelta(minutes=minutes)).isoformat(timespec="seconds")
         snap.primary_used_percent = used
@@ -3986,7 +3988,7 @@ def test_301_r2_seats_on_one_account_each_show_their_own_row(
 
     assert cli.main(["--root", str(tmp_path), "capacity", *(["--show-account"] if show_account else [])]) == 0
     out = capsys.readouterr().out
-    header = "  codex account of OS user tester, 2 seats: alpha, beta" if show_account else (
+    header = "  codex account of OS user tester (home-12345678), 2 seats: alpha, beta" if show_account else (
         "  codex account, 2 seats: alpha, beta")
     assert header in out.splitlines()
     rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("    ")}
@@ -4051,24 +4053,45 @@ def test_616_capacity_account_display_privacy_and_grouping(tmp_path: Path, capsy
 
 
 @pytest.mark.parametrize("command", ["capacity", "status"])
-def test_867_malformed_account_list_does_not_expose_login(tmp_path: Path, capsys, command) -> None:
+@pytest.mark.parametrize("account", [["invented-login"], "invented-login", "invented-login:x:home-1",
+                                     "inventedlogin:x:home-12345678"])
+def test_867_malformed_account_list_does_not_expose_login(tmp_path: Path, capsys, command, account) -> None:
     from agenttalk import capacity as capmod
 
     assert cli.main(["init", "--path", str(tmp_path), "--agents", "alpha"]) == 0
     snapshot = capmod.CapacitySnapshot.unknown("alpha").to_dict()
-    snapshot["account"] = ["invented-login"]
+    snapshot["account"] = account
     Store(tmp_path).write_capacity("alpha", snapshot)
     capsys.readouterr()
 
     assert cli.main(["--root", str(tmp_path), command, *(["--json"] if command == "status" else [])]) == 0
     output = capsys.readouterr().out
-    assert "invented-login" not in output
+    assert "invented-login" not in output and "inventedlogin" not in output
     if command == "status":
         row = json.loads(output)["agents"][0]["capacity"]
         assert "account" not in row and "account_group" not in row
+        assert cli.main(["--root", str(tmp_path), "status", "--json", "--show-account"]) == 0
+        shown = json.loads(capsys.readouterr().out)["agents"][0]["capacity"]
+        assert shown["account"] == account
     else:
         assert cli.main(["--root", str(tmp_path), "capacity", "--show-account"]) == 0
-        assert "invented-login" in capsys.readouterr().out
+        explicit = capsys.readouterr().out
+        assert "invented-login" in explicit or "inventedlogin" in explicit
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex", "ovh-qwen"])
+def test_867_supported_account_keys_are_grouped(tmp_path: Path, capsys, monkeypatch, provider) -> None:
+    from agenttalk import capacity as capmod
+
+    monkeypatch.setattr(capmod.getpass, "getuser", lambda: "invented-login")
+    assert cli.main(["init", "--path", str(tmp_path), "--agents", "alpha"]) == 0
+    account = capmod.account_key(provider, tmp_path)
+    Store(tmp_path).write_capacity("alpha", capmod.CapacitySnapshot.unknown("alpha", account=account).to_dict())
+    capsys.readouterr()
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    assert f"{provider} account, 1 seat: alpha" in capsys.readouterr().out
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["agents"][0]["capacity"]["account_group"] == ["alpha"]
 
 
 def test_867_status_show_account_help(capsys) -> None:
