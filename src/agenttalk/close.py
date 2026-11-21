@@ -187,6 +187,20 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
 
 # --------------------------------------------------------------- pure verdict
 
+def _valid_stored_lens(lens: object) -> bool:
+    """Check fields used by verdict and repair guidance before reading a stored lens."""
+    return (
+        isinstance(lens, dict)
+        and isinstance(lens.get("id"), str)
+        and bool(lens["id"])
+        and isinstance(lens.get("required", True), bool)
+        and all(
+            isinstance(lens.get(key, []), list) and all(isinstance(value, str) for value in lens.get(key, []))
+            for key in ("allowed_agents", "allowed_roles", "allowed_groups")
+        )
+    )
+
+
 def _new_acceptance_attempt(record, *, cache):
     """Reconstruct the CLI-expressible requirements without copying evidence."""
     template = (
@@ -197,7 +211,12 @@ def _new_acceptance_attempt(record, *, cache):
     if record.get("gate_scope") != record.get("scope"):
         template += " --gate-scope {gate_scope}"
         values["gate_scope"] = record.get("gate_scope")
-    for index, lens in enumerate(record.get("required_lenses", [])):
+    lenses = record.get("required_lenses")
+    damaged_lenses = not isinstance(lenses, list)
+    for index, lens in enumerate(lenses if isinstance(lenses, list) else []):
+        if not _valid_stored_lens(lens):
+            damaged_lenses = True
+            continue
         name = lens.get("id")
         if isinstance(name, str) and (
             name.startswith(("acceptance-run-", "acceptance-repro-")) or name == "acceptance-cold"
@@ -225,6 +244,8 @@ def _new_acceptance_attempt(record, *, cache):
     text = f"`{commands[0]}`. "
     if note:
         text += note + ". "
+    if damaged_lenses:
+        text += "Not a ready command: required lenses or their authorizations are damaged; reconstruct them manually. "
     return (
         text + "The new plan must retain the acceptance review requirements. "
         "Fresh acknowledgements, counters, remediation, signoff routing, group authorizations and "
@@ -420,12 +441,21 @@ def compute_verdict(record: dict, gate_check: dict,
     acks = record.get("lens_acks", {})
     counters = record.get("counters", {})
     for lens in record.get("required_lenses", []):
-        if not (isinstance(lens, dict) and lens.get("required", True)):
+        if not _valid_stored_lens(lens):
+            hold(HOLD_MALFORMED, "required lens or its authorizations are damaged")
+            continue
+        if not lens.get("required", True):
             continue
         lid = lens.get("id")
         ack = acks.get(lid)
         if not isinstance(ack, dict):
             hold(HOLD_MISSING_LENS, f"required lens {lid!r} has no ack")
+            continue
+        groups = ack.get("from_groups")
+        if groups is not None and (
+            not isinstance(groups, list) or not all(isinstance(group, str) for group in groups)
+        ):
+            hold(HOLD_MALFORMED, f"lens {lid!r} ack group authorization is damaged")
             continue
         author = ack.get("from")
         if author in external_workers or (active_agents is not None and author not in active_agents):

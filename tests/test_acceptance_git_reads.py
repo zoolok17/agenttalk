@@ -122,6 +122,16 @@ def test_command_cannot_reuse_live_success_after_prepare(case, monkeypatch, caps
     assert "acceptance_project_unverified" in capsys.readouterr().err
 
 
+def test_index_is_rechecked_within_one_command_scope(case):
+    from agenttalk.acceptance_git import command_scope
+
+    with command_scope():
+        acceptance.verify_project(case["project"], case["sha"])
+        git(case["project"], "update-index", "--assume-unchanged", "source.txt")
+        with pytest.raises(acceptance.AcceptanceError, match="index is not verifiably clean"):
+            acceptance.verify_project(case["project"], case["sha"])
+
+
 def test_direct_project_reads_are_fresh_without_a_command(case):
     acceptance.verify_project(case["project"], case["sha"])
     (case["project"] / "source.txt").write_text("dirty\n", encoding="utf-8")

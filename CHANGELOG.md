@@ -95,7 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked.
 
 - **Closes now hold and show repair steps when their saved checkout cleanliness is damaged (#798).**
-  If the saved record cannot say whether the checkout was clean, the close stays on HOLD and shows repair steps.
+  If the saved record cannot say whether the checkout was clean, the close stays on HOLD and shows repair steps,
+  even when its saved review requirements are damaged too.
 
 - **Closes also hold when saved isolation or dirty-artifact fields are damaged (#809).**
   A damaged field no longer waives isolation or counts as a recorded diff; the close names how to start again.

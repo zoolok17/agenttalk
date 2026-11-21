@@ -116,9 +116,9 @@ def _entry(root, relative):
     raise ValueError("empty index path")
 
 
-def check_hidden_index(root, *, env=None) -> Inspection:
+def check_hidden_index(root, *, env=None, _root_verified=False) -> Inspection:
     try:
-        root = _checkout_root(root, env=env)
+        root = Path(root) if _root_verified else _checkout_root(root, env=env)
         hidden = False
         for record in _records(root, "-v", env=env):
             if len(record) < 3 or record[1:2] != b" " or record[:1] not in [bytes([c]) for c in b"HSMRCK?hsmrck"]:
@@ -160,10 +160,10 @@ def check_materialized_submodules(root) -> Inspection:
         return Inspection("unverifiable", SUBMODULE_UNKNOWN)
 
 
-def check_close_submodules(root, *, env=None) -> Inspection:
+def check_close_submodules(root, *, env=None, _root_verified=False) -> Inspection:
     """Check nested indexes and refuse content in uninitialized submodules."""
     try:
-        pending = [_checkout_root(root, env=env)]
+        pending = [Path(root) if _root_verified else _checkout_root(root, env=env)]
         while pending:
             checkout = pending.pop()
             for record in _records(checkout, "--stage", env=env):
@@ -198,7 +198,8 @@ def check_close_submodules(root, *, env=None) -> Inspection:
                     raise ValueError("submodule is not its own checkout")
                 if check_hidden_index(folder, env=env).state != "safe":
                     return Inspection("hidden", SUBMODULE_NOT_CLEAN)
-                result = subprocess.run(  # noqa: S603  # nosec B603
+                # Fixed read-only Git command, with no shell or user-selected operation.
+                result = subprocess.run(  # noqa: S603,S607  # nosec B603 B607
                     ["git", "-C", str(folder), *STATUS_ARGS], capture_output=True, timeout=15, env=env
                 )
                 if result.returncode != 0 or not isinstance(result.stdout, bytes):

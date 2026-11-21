@@ -476,3 +476,74 @@ def test_missing_repair_id_says_missing(acceptance_attempt, stored_null):
     assert "NoneType" not in text
     assert "not a ready command" in text
     assert "--id <id>" in text
+
+
+@pytest.mark.parametrize(
+    "lens",
+    [
+        "damaged",
+        {"id": "manual", "allowed_agents": 7},
+        {"id": "manual", "allowed_roles": {"bad": "shape"}},
+        {"id": "manual", "allowed_groups": [["nested"]]},
+        {"id": ["not-hashable"], "allowed_agents": []},
+    ],
+)
+def test_acceptance_cli_holds_with_two_damaged_fields(case, capsys, lens):
+    assert legacy.open_attempt(case) == 0
+    path = close.close_path(case["store"], "attempt")
+    record = close.load_close(case["store"], "attempt")
+    record["revision_clean"] = "damaged"
+    record["required_lenses"].append(lens)
+    path.write_text(json.dumps(record), encoding="utf-8")
+    capsys.readouterr()
+    result = cli.main(["--root", str(case["store"].root), "close", "check", "--id", "attempt"])
+    captured = capsys.readouterr()
+    assert result == 3
+    assert "HOLD" in captured.out and "revision_clean" in captured.out
+    assert "Start a new attempt" in captured.out or "start a new attempt" in captured.out
+    assert "Traceback" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    "lenses",
+    [
+        None,
+        7,
+        "bad",
+        ["bad"],
+        [{"id": "manual", "allowed_agents": 7}],
+        [{"id": "manual", "allowed_roles": None}],
+        [{"id": "manual", "allowed_agents": [None]}],
+    ],
+)
+def test_acceptance_repair_guidance_handles_multiple_damaged_shapes(lenses):
+    record = dict(_satisfied(), revision_clean="damaged", acceptance_route={"pending": True})
+    record["required_lenses"] = lenses
+    text = close._revision_clean_damage(record)
+    assert "damaged" in text and "start a new attempt" in text
+    assert "required lenses" in text.lower() and "not a ready command" in text.lower()
+
+
+@pytest.mark.parametrize("lens", ["bad", {"id": ["bad"]}, {"id": "sec", "allowed_groups": [["bad"]]}])
+def test_a_bad_lens_alone_cannot_be_accepted(lens):
+    record = _satisfied()
+    record["required_lenses"] = [lens]
+    result = close.compute_verdict(record, _gate_go())
+    assert result["verdict"] == "HOLD"
+    assert any(hold["code"] == close.HOLD_MALFORMED for hold in result["holds"])
+
+
+@pytest.mark.parametrize("groups", [7, [{"bad": "group"}], "not-a-list"])
+def test_damaged_ack_authorization_and_cleanliness_hold(groups):
+    record = _satisfied()
+    record["acceptance_route"] = {"pending": True}
+    record["schema_version"] = close.ACCEPTANCE_SCHEMA_VERSION
+    record["revision_clean"] = "damaged"
+    record["required_lenses"][0]["allowed_agents"] = []
+    record["required_lenses"][0]["allowed_roles"] = []
+    record["required_lenses"][0]["allowed_groups"] = ["reviewers"]
+    record["lens_acks"]["sec"]["from_groups"] = groups
+    result = close.compute_verdict(record, _gate_go())
+    assert result["verdict"] == "HOLD"
+    assert any(hold["code"] == close.HOLD_MALFORMED for hold in result["holds"])
+    assert any(hold["code"] == close.HOLD_REVISION for hold in result["holds"])

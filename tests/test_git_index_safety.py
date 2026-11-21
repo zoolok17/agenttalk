@@ -204,7 +204,11 @@ def test_close_index_refusal_never_enters_unknown_status_fallback(tmp_path, monk
     store.init(["lead"])
     store.set_role("lead", "lead")
     sha = "a" * 40
-    monkeypatch.setattr(cli, "_git", lambda root, argv: (0, "" if "status" in argv else sha))
+    monkeypatch.setattr(
+        cli,
+        "_git",
+        lambda root, argv: (0, "true" if "--is-inside-work-tree" in argv else "" if "status" in argv else sha),
+    )
     git_reads(monkeypatch, b"")
     if action == "reopen":
         assert (

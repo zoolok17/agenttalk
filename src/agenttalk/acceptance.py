@@ -331,9 +331,10 @@ def verify_project(repo, revision, *, live=True):
             details += f"\n... {len(lines) - 20} more entries"
         _fail(f"acceptance project checkout is dirty:\n{details}", "acceptance_project_unverified")
     if live:
-        if git_index_safety.check_hidden_index(repo, env=env).state != "safe":
+        # The project metadata above has already verified this exact checkout root.
+        if git_index_safety.check_hidden_index(repo, env=env, _root_verified=True).state != "safe":
             _fail("acceptance project index is not verifiably clean", "acceptance_project_unverified")
-        if git_index_safety.check_close_submodules(repo, env=env).state != "safe":
+        if git_index_safety.check_close_submodules(repo, env=env, _root_verified=True).state != "safe":
             _fail("acceptance project submodule is not verifiably clean", "acceptance_project_unverified")
     return project
 
