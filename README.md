@@ -1398,7 +1398,9 @@ in agenttalk waits for it or is held back by it.
   Home paths in free text are replaced with `<home>`, local app-data paths outside home
   with `<localappdata>`, and the project root outside home with `<root>`. The project ID
   is replaced with `<project_id>`. This does not cover other paths outside those folders or a login
-  appearing in free text outside a path. Other commands can still show paths or project
+  appearing in free text outside a path. Other spellings of the same folders are not recognised either:
+  a Windows 8.3 short name (`ANNEXA~1`), a junction or WSL path to it, or a URL-encoded path.
+  Other commands can still show paths or project
   IDs: `whoami --json`, `hmac-init`, `backup --json`, `doctor`, `supervisor --json` and
   the web console.
 - The web console and `agenttalk attention` show and warn only on figures that are still current.
