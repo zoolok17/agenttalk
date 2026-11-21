@@ -161,7 +161,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the submodule or record a truthful dirty artifact. Scratch release keeps its
   existing stricter rules.
 
-- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for dead-letter replies and control messages, retry the same requeue command to keep their original correlation.
+- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for any dead-letter kind, retry the same requeue command to keep its original correlation; the advice preserves an explicit store root and prints the command separately. A refused prepared send ends with these codes (already so since 0.105.0, now documented and tested): `send_rejected` for a web-intent send, and HTTP 409 `lead_chat_send_rejected` for a lead-chat send.
 
 - **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
   Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail

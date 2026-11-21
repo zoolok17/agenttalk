@@ -16799,18 +16799,36 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
             )
         except PreparedMessageRefused as e:
-            if orig.get("kind") in _dl_tags.OPENERS:
-                route = _requeue_route(args, orig)
-            else:
-                template = "agenttalk dead-letter requeue --agent {agent} --id {id}"
-                values = {"agent": args.agent, "id": args.id}
-                if reopen_event is not None:
-                    template += " --force-resolved --from {actor} --reason {reason}"
-                    values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
-                route = (
-                    "After the reset has finished, retry the same dead letter to keep its original correlation:\n  "
-                    + pc.cmd(template, **values) + "."
-                )
+            template = "agenttalk"
+            values = {"agent": args.agent, "id": args.id}
+            if getattr(args, "root", None) is not None:
+                template += " --root {root}"
+                values["root"] = str(store.root)
+            template += " dead-letter requeue --agent {agent} --id {id}"
+            if reopen_event is not None:
+                reason_flag = "--reason={reason}" if reopen_event["reason"].startswith("-") else "--reason {reason}"
+                template += " --force-resolved --from {actor} " + reason_flag
+                values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
+            # Single-quoted plain paths and phrases work in POSIX shells and PowerShell. Values with shell
+            # metacharacters keep the printed-command placeholder convention: cmd.exe does not honor single quotes.
+            rendered = {}
+            unsafe = []
+            for name, value in values.items():
+                if pc.is_plain(value):
+                    rendered[name] = value
+                elif (isinstance(value, str) and (name == "reason" or not value.startswith("-"))
+                      and re.fullmatch(r"[A-Za-z0-9_./:\\ -]+", value)):
+                    rendered[name] = shlex.quote(value)
+                else:
+                    rendered[name] = f"<{name}>"
+                    source = "is the resolved store folder named by --root" if name == "root" else pc.SUPPLIED_SOURCE
+                    unsafe.append(f"<{name}> is {pc.shown(value, pc.PATH_SHOWN_MAX_CHARACTERS, source=source)}")
+            note = ("Not a ready command: " + ", ".join(unsafe) + "; replace the placeholders safely.\n"
+                    if unsafe else "")
+            route = (
+                "After the reset has finished, retry the same dead letter in PowerShell or a POSIX shell "
+                "to keep its original correlation.\n" + note + "  " + template.format(**rendered)
+            )
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {pc.line(str(e))} "
                 + route + "\n"
