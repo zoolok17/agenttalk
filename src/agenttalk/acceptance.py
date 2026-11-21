@@ -321,6 +321,10 @@ def verify_project(repo, revision, *, live=True):
     # afresh; HEAD and dirty state are checked at EVERY original live boundary.
     key = ("project", str(repo), revision, tuple(sorted(env.items())))
     project = acceptance_git.read_once(key, metadata) if _SHA.fullmatch(revision) else metadata()
+    # Checkout identity is live even when fixed-commit metadata came from the cache.
+    checkout_root = git("rev-parse", "--show-toplevel")
+    if not checkout_root or Path(checkout_root).resolve() != repo:
+        _fail("project locator must name the checkout root", "acceptance_project_unverified")
     if live and (head if head is not None else git("rev-parse", "HEAD")) != project["revision"]:
         _fail("project HEAD must equal the verified SHA", "acceptance_project_unverified")
     dirty = git("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none") if live else ""
