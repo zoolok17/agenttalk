@@ -341,6 +341,9 @@ def test_782_real_relative_target_cannot_remove_an_unrelated_suffix_match(tmp_pa
     inspected = root / "abc"
     inspected.mkdir()
     _repo(inspected)  # a different clean repository, not a worktree registered with root
+    # `_repo` made a store in `inspected`; the store scan would refuse before Git is asked, and this test is about
+    # Git's own refusal of an unregistered folder, so the scan is switched off here.
+    monkeypatch.setattr(cli, "_lane_checkout_hazard", lambda folder: None)
     precious = registered / "src/core/a.py"
     original_bytes = precious.read_bytes()
     inspected_file = inspected / "src/core/a.py"

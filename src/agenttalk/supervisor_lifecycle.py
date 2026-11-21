@@ -85,7 +85,7 @@ def _read_selection_bytes(path: Path) -> object:
         )
     try:
         return json.loads(raw.decode("utf-8"))
-    except (UnicodeError, ValueError) as exc:
+    except (UnicodeError, ValueError, RecursionError) as exc:
         raise SupervisorLifecycleError(
             f"PowerShell host selection is malformed: {exc}; {psh.INSTALL_REMEDIATION}"
         ) from exc

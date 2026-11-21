@@ -3217,6 +3217,14 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
                 return 1, "", "could not verify worktree status; the worktree was not removed"
             if not clean:
                 return 1, "", "worktree has uncommitted changes or untracked files; the worktree was not removed"
+            # The adapter every removal ends in, the rollback of a failed `lane assign` included (a hook can make a
+            # store in the new checkout): nothing is removed that would take a store or a followed link with it.
+            try:
+                hazard = _lane_checkout_hazard(str(target))
+            except OSError:
+                return 1, "", "could not look inside the worktree for a store or a link; the worktree was not removed"
+            if hazard is not None:
+                return 1, "", _lane_checkout_hazard_text(hazard)
         # Git gets its own final untracked-file check; callers still submit only the narrow allowed shape.
         execution_argv = ["-c", "status.showUntrackedFiles=all", *argv[:3], str(target)]
     env = dict(os.environ)
@@ -4980,27 +4988,475 @@ def _cleanup_failed_provision(
     return "; ".join(notes) if notes else None
 
 
-def _verify_lane_worktree(store, lane: dict, *, expected_base: str | None = None) -> dict:
+def _lane_checkout_folder(saved: str) -> str:
+    """The one absolute folder a saved `worktree_path` names. A relative name is read from the folder the command runs
+    in, as the checks have always read it, and the result is what every later step is given: the check that a checkout
+    is the lane's and the removal that follows look at the same folder, because the removal is handed this full path
+    and never the original spelling (which Git's adapter would read from the store's folder instead). A name that
+    depends on a drive's current folder (`C:x`, `\\x`) has no single meaning and is refused."""
+    if lane_mod.path_is_absolute(saved):
+        return saved
+    path = Path(saved)
+    if path.drive or path.root:
+        raise lane_mod.LaneError(
+            f"the stored worktree path {saved!r} depends on a drive's current folder, so it names no single folder; "
+            "replace worktree_path in that lane's record in lanes.json with the checkout's real absolute folder")
+    return str(path.absolute())
+
+
+def _lane_checkout_owned_by_another(
+        store, lane_id: str, *folders: str, rows: dict | None = None) -> tuple[str, bool] | None:
+    """`(key, names)` for another lane whose saved checkout fields leave it possible that it owns one of `folders`, or
+    None when every other row is ruled out. `names` is True when a field names the folder (the same folder under
+    another spelling, a link or a junction included), and False when the row's `worktree_path` is not a full path (so
+    which folder it names depends on where it was written) and the row saves no full canonical path to settle it: that
+    row is never skipped, because it could be the owner. A blank, empty or non-text field names no folder.
+    The lane's retained claims (`occupancy_worktrees`, the checkouts of its earlier generations, which a forced
+    reassignment moves out of the two fields) name folders too, and a claim that cannot be read as a full path
+    cannot be ruled out either: the full canonical path of the current checkout says nothing about an earlier one.
+    `rows` is the registry snapshot to scan (the caller keeps it, so what it later vouches for is exactly what was
+    scanned); without it the saved registry is read now.
+    A scan that cannot be made (a saved folder cannot be followed, or `folders` cannot be resolved) raises OSError or
+    ValueError and returns no answer: "could not look" is kept apart from "owned by another" (`names` True) and from
+    "cannot be placed" (`names` False), and the caller decides what each one allows."""
+    if rows is None:
+        rows = lane_mod.load_lanes(store).get("lanes") or {}
+    folder_reals = [_strict_real(folder) for folder in folders]  # OSError when a folder cannot be resolved: refused
+    for key, row in rows.items():
+        if key == lane_id or not isinstance(row, dict):
+            continue
+        anchored = False  # the row saves a full canonical path, which settles what its path field means
+        placed = True  # False while its `worktree_path` is a spelling that needs a folder to be read against
+        claim_unplaced = False  # a retained claim that is not a full path (nothing settles it)
+        claims: list[tuple[str, str]] = []
+        for field in ("worktree_path", "worktree_toplevel_canonical"):
+            saved = row.get(field)
+            if isinstance(saved, str) and lane_mod.checkout_path_problem({field: saved}) is None:
+                claims.append((field, saved))
+        retained = row.get("occupancy_worktrees")
+        if retained is not None and not isinstance(retained, list):
+            return key, False  # the claims cannot be read at all
+        for claim in retained or []:
+            if not isinstance(claim, str) or not claim.strip() or "\x00" in claim:
+                return key, False  # a claim that cannot be read cannot be ruled out
+            claims.append(("occupancy_worktrees", claim))
+        for field, saved in claims:
+            saved = saved.replace("{ROOT}", str(store.root))
+            if lane_mod.path_is_absolute(saved):
+                named = [saved]
+                anchored = anchored or field == "worktree_toplevel_canonical"
+            else:
+                # Which folder it means cannot be recovered, so it names the checkout if any reading does: the
+                # folder the command runs in (a drive-relative `C:x` is read against that drive's current folder),
+                # or the store's folder.
+                named = [os.path.abspath(saved)]
+                if not (Path(saved).drive or Path(saved).root):
+                    named.append(str(Path(store.root).absolute() / saved))
+                if field == "worktree_path":
+                    placed = False
+                elif field == "occupancy_worktrees":
+                    claim_unplaced = True
+            for candidate in named:
+                try:
+                    candidate_real = _strict_real(candidate)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue  # nothing is there, so it cannot be any of these folders
+                # Any other failure to follow it (access denied, a sharing violation) is not an answer, so it is not
+                # caught here: the caller sees "could not be examined", which it judges apart from "owned by another"
+                # and from "not a full path" (a committed retry keeps its evidence, a terminal recheck may use its
+                # recorded proof, a removal or a fresh delivery refuses).
+                for folder, folder_real in zip(folders, folder_reals, strict=True):
+                    if candidate_real == folder_real:
+                        return key, True
+                    try:
+                        if os.path.samefile(candidate, folder):
+                            return key, True
+                    except (OSError, ValueError):
+                        pass  # the file-identity comparison could not be made; the resolved paths above differ
+        if claim_unplaced or (not placed and not anchored):
+            return key, False
+    return None
+
+
+def _is_store_folder_name(name: str) -> bool:
+    """True for the store folder's name in any case. On a case-insensitive disk (Windows, the macOS default)
+    `.AGENTTALK` is the very folder `Store` opens as `.agenttalk`, so a name compared as written would miss a real
+    store; the comparison ignores case on every system, because refusing a differently spelled folder on a
+    case-sensitive disk costs only the manual exit, which is the safe side."""
+    return name.casefold() == store_mod.DIRNAME.casefold()
+
+
+def _lane_dir_has_store_folder(directory: str) -> bool:
+    """Whether `directory` holds a store folder, however it is spelled (a link to a folder counts). An unreadable
+    `directory` raises OSError."""
+    with os.scandir(directory) as entries:
+        return any(_is_store_folder_name(entry.name) and entry.is_dir() for entry in entries)
+
+
+_EXTENDED_DRIVE_OR_UNC_RE = re.compile(
+    r"^[\\/]{2}\?[\\/](?:(?P<drive>[A-Za-z]:(?:[\\/].*)?)|UNC[\\/](?P<unc>[^\\/].*))$", re.IGNORECASE)
+
+
+def _without_extended_prefix(text: str, *, windows: bool | None = None) -> str:
+    """`text` with the Windows extended-path prefix removed where that names the same folder: `\\\\?\\C:\\x` is `C:\\x`
+    and `\\\\?\\UNC\\server\\share\\x` is `\\\\server\\share\\x`. `os.path.realpath` keeps the prefix when it was given
+    one, so the same folder written two ways would compare unequal (and a record Git wrote with the prefix would not
+    match the checkout's ordinary spelling). Anything else is left as it is, a volume-GUID or device spelling
+    included: it stays different from every ordinary spelling, which is the safe side. On other systems nothing
+    changes (`windows` is for the tests)."""
+    if not (os.name == "nt" if windows is None else windows):
+        return text
+    found = _EXTENDED_DRIVE_OR_UNC_RE.match(text)
+    if found is None:
+        return text
+    if found.group("drive") is not None:
+        return found.group("drive")
+    return "\\\\" + found.group("unc")
+
+
+def _strict_real(path, *, missing_tail_ok: bool = False) -> str:
+    """The case-folded real path of `path`, resolved completely. Plain `os.path.realpath` swallows some failures (on
+    Windows an access-denied or sharing-violation while following a junction) and returns a partial path that still
+    begins where the link is, so a check that asks "does this lie inside that folder?" would say yes for a path it
+    could not follow. Here any failure raises OSError, and every caller treats that as "not proven" and refuses.
+
+    With `missing_tail_ok`, a path whose last parts are simply not there (a registered checkout whose folder was
+    deleted) is judged by its nearest existing ancestor, resolved the same strict way, plus the missing names as
+    written: nothing that is not there can be a link. An entry that IS there but cannot be followed (a dangling link)
+    still raises.
+
+    The Windows extended-path prefix is removed from the answer (`_without_extended_prefix`), so every comparison of
+    two answers, the back-link of a checkout's Git record included, sees one folder spelled two ways as one."""
+    text = os.fspath(path)
+    try:
+        return os.path.normcase(_without_extended_prefix(os.path.realpath(text, strict=True)))
+    except FileNotFoundError:
+        if not missing_tail_ok or os.path.lexists(text):
+            raise
+        parent, name = os.path.split(text.rstrip("\\/"))
+        if not name or not parent or parent == text:
+            raise
+        return os.path.normcase(os.path.join(_strict_real(parent, missing_tail_ok=True), name))  # parent: already clean
+
+
+def _lane_checkout_place(store, *folders: str) -> tuple[str, str, str] | None:
+    """Where `folders` are, against this store's folder, as `(kind, folder, detail)`, or None when every one lies inside
+    this store's folder, where `lane assign` always makes a lane's checkout (a worktrees root outside the store folder
+    is refused), and under no other store of its own. This is the store's own evidence that a checkout is its own. A
+    row can name a checkout that belongs to ANOTHER store sharing the repository (a copied store folder, a restored
+    lanes.json), and every check on such a row passes, because every field in it is genuine: only where the folder is
+    tells. Paths are compared as they resolve (a link or junction into another store's folder counts as that folder),
+    and only when they resolve completely.
+
+    Two different answers are kept apart, because they call for different things:
+    - "outside": the folder resolved completely and it is not this store's (or another store lies between). Proven.
+    - "unknown": the folder (or the store's folder, or a folder between) could not be examined, so nothing is proven
+      either way (`detail` says what failed). A removal treats this as not inside; a delivery, which removes nothing,
+      does not refuse for it (see `_verify_lane_worktree`)."""
+    looking = None
+    try:
+        root = _strict_real(store.root)
+        for folder in folders:
+            looking = folder
+            real = _strict_real(folder, missing_tail_ok=True)
+            if not real.startswith(root.rstrip(os.sep) + os.sep):
+                return "outside", folder, ""
+            parent = os.path.dirname(real)
+            while parent.startswith(root.rstrip(os.sep) + os.sep):  # a store of its own between the two is not ours
+                if _lane_dir_has_store_folder(parent):
+                    return "outside", folder, ""
+                parent = os.path.dirname(parent)
+    except (OSError, ValueError) as exc:
+        return "unknown", looking if looking is not None else str(store.root), str(exc)
+    return None
+
+
+def _lane_checkout_outside_store(store, *folders: str) -> str | None:
+    """None when every one of `folders` is proven inside this store's folder; otherwise the first folder that is not
+    proven so (outside it, or one that could not be examined: for a removal both mean "not ours", see
+    `_lane_checkout_place` for the difference)."""
+    place = _lane_checkout_place(store, *folders)
+    return None if place is None else place[1]
+
+
+def _lane_checkout_hazard(folder: str) -> tuple[str, str] | None:
+    """What inside a checkout would make removing it delete something that is not the checkout's own, as
+    `(kind, path)`, or None. Two kinds, found in one walk (links are not descended into; only the checkout root's own
+    `.git` entry is skipped, by its exact place: any other folder named `.git`, such as a nested repository's, is
+    walked like every other folder, because it can hold anything, a store included, and the removal deletes it):
+
+    - "store": an `.agenttalk` folder (any letter case) at the checkout's root or anywhere below it. A store made inside
+      a lane checkout (agenttalk was initialised there, by hand or by a hook) is store data, which Git ignores, so the
+      clean checks never see it, and removing the checkout deletes it.
+    - "link": a directory link that the removal can follow out of the checkout. On every system a link or junction
+      named like a store folder is one, whatever it points at (it can only be a way into a store). On Windows, any
+      directory junction or directory symbolic link whose target does not lie inside this checkout is one too: some
+      Git versions (2.39.1 was seen) follow a junction while removing a worktree and delete what it points at, and an
+      ignored junction is invisible to `git status`. On other systems Git removes a symbolic link without following it,
+      so only the store-named link counts there.
+
+    A folder that cannot be read raises OSError: it is not known to be free of either."""
+    root_real = _strict_real(folder).rstrip(os.sep) + os.sep  # fails (OSError) when the checkout cannot be resolved
+    pending = [folder]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                if current == folder and os.path.normcase(entry.name) == os.path.normcase(".git"):
+                    continue  # the checkout's own Git metadata only (a file in a linked checkout), see the docstring
+                info = entry.stat(follow_symlinks=False)
+                attributes = getattr(info, "st_file_attributes", 0)
+                is_link = stat.S_ISLNK(info.st_mode) or bool(attributes & 0x400)  # 0x400: a reparse point
+                if is_link:
+                    if _is_store_folder_name(entry.name):
+                        return "link", entry.path
+                    if os.name == "nt" and attributes & 0x10:  # a directory junction or directory symbolic link
+                        try:
+                            target = _strict_real(entry.path)
+                        except (OSError, ValueError):
+                            return "link", entry.path  # a link that cannot be followed is not proven to stay inside
+                        if not (target + os.sep).startswith(root_real):
+                            return "link", entry.path
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                if _is_store_folder_name(entry.name):
+                    return "store", entry.path
+                pending.append(entry.path)
+    return None
+
+
+def _lane_checkout_holds_a_store(folder: str) -> str | None:
+    """The first `.agenttalk` folder (a real one, not a link) at the checkout's root or anywhere below it, or None."""
+    hazard = _lane_checkout_hazard(folder)
+    return hazard[1] if hazard is not None and hazard[0] == "store" else None
+
+
+def _lane_checkout_hazard_text(hazard: tuple[str, str]) -> str:
+    kind, found = hazard
+    if kind == "store":
+        return _lane_checkout_holds_a_store_text(found)
+    return (
+        f"this checkout holds a directory link, {pc.line(found)}, that points out of it (or cannot be followed) and "
+        "that removing the checkout can follow, deleting what it points at, so it was left alone. If the checkout is "
+        "no longer needed: inspect where the link leads, remove the link itself (not what it points at), remove the "
+        "checkout with `git worktree remove` (naming that folder), then retire the lane with "
+        "`lane abandon --acknowledge-missing-worktree`")
+
+
+def _lane_checkout_holds_a_store_text(found: str) -> str:
+    return (
+        f"this checkout holds a store of its own, {pc.line(found)}, which Git ignores and which would be deleted with "
+        "the checkout, so it was left alone. If the checkout is no longer needed: inspect that store, save what you "
+        "need, remove the store folder yourself, remove the checkout with `git worktree remove` (naming that "
+        "folder), then retire the lane with `lane abandon --acknowledge-missing-worktree`")
+
+
+def _lane_checkout_not_ours_text(store, folder: str) -> str:
+    return (
+        f"this checkout, {pc.line(folder)}, is not inside this store's folder {pc.line(str(store.root))}, so this "
+        "store cannot show that it made it (a lane checkout is always made inside its own store's folder; this one "
+        "may belong to another store that shares the repository), and it was left alone. If it really is this lane's: "
+        "inspect it, save any ignored files, remove it yourself with `git worktree remove` (naming that folder), then "
+        "retire the lane with `lane abandon --acknowledge-missing-worktree`")
+
+
+def _lane_checkout_unexamined_text(store, folder: str, detail: str) -> str:
+    return (
+        f"this checkout, {pc.line(folder)}, could not be examined ({pc.line(detail)}), so it is not known whether it "
+        f"lies inside this store's folder {pc.line(str(store.root))}, and it was left alone. Make the folder readable "
+        "and run the command again")
+
+
+def _lane_checkout_registration(folder: str, git_dir: str) -> tuple[str, str] | None:
+    """None when Git's own record of this checkout names THIS folder, else `("mismatch", where)` (it names another
+    folder: this one is a copy, or was moved without `git worktree repair`) or `("unknown", why)` (the record or a path
+    in it could not be read or resolved). A linked checkout's administrative folder (`git_dir`) holds a `gitdir` file
+    naming the checkout's `.git` file; the checkout's `.git` file names the administrative folder. A copy of a
+    checkout, `.git` file included, reaches the same administrative folder and passes every check made from the
+    checkout's side, but the record still names the ORIGINAL, so only this back-link tells the copy. The FOLDER the
+    record names (the parent of the `.git` file it names) is compared with this folder, both resolved completely
+    (`_strict_real`, which compares case as the disk does); the `.git` entry itself is never resolved, because a
+    checkout whose `.git` is a link to another checkout's `.git` file would then resolve to the very file the record
+    names. A `.git` entry that is itself a link is `("link", entry)`: it cannot show which checkout this is."""
+    entry = os.path.join(folder, ".git")
+    try:
+        if lane_mod._is_link(entry):  # `lstat`: the link is looked at, not followed
+            return "link", entry
+        with open(os.path.join(git_dir, "gitdir"), encoding="utf-8") as record:
+            named = record.read().strip()
+        if not os.path.isabs(named):  # a relative record is relative to the administrative folder
+            named = os.path.join(git_dir, named)
+        recorded_folder = _strict_real(os.path.dirname(named))
+        here = _strict_real(folder)
+    except (OSError, ValueError) as exc:
+        return "unknown", str(exc)
+    if os.path.basename(named).casefold() != ".git" or recorded_folder != here:
+        return "mismatch", named
+    return None
+
+
+# The step for a checkout moved by hand, as a person reads it. It is run from INSIDE the moved checkout, with nothing
+# after it, so the command holds no path to quote (`git worktree repair` run from the repository with no path mends
+# nothing). The folder is only shown, in the words around the command, through `pc.line`. The step is only for a
+# checkout whose old folder is GONE: run from a copy, Git rewrites its record to name the copy whether or not the
+# original is there (and, when the original cannot be examined, nothing here proves it is gone), so the warning goes
+# wherever the step does.
+_LANE_REPAIR_STEP = "open the moved folder {folder} and run `git worktree repair` there"
+_LANE_REPAIR_WARNING = ("if the old folder still exists or cannot be checked, leave this one alone: the repair would "
+                        "take Git's record away from the original")
+
+
+def _lane_checkout_registration_text(folder: str, found: tuple[str, str]) -> str:
+    kind, detail = found
+    if kind == "link":
+        return (
+            f"this checkout's own `.git` entry, {pc.line(detail)}, is a link, so Git's record cannot show that "
+            f"{pc.line(folder)} is the checkout Git registered (a link can lead to another checkout's `.git` file), "
+            "and it was left alone. Replace the link with this checkout's real `.git` file and try again; if you "
+            "cannot, copy any work in this folder somewhere else first and ask for help: do not delete this folder")
+    if kind == "mismatch":
+        return (
+            f"Git's own record of this checkout says it lives at {pc.line(detail)}, not at {pc.line(folder)}: this "
+            "folder looks like a copy of another checkout (another store's, perhaps), so it is not proven to be this "
+            "lane's and it was left alone. If it is in fact your checkout, moved by hand, and the old folder is gone, "
+            f"{_LANE_REPAIR_STEP.format(folder=pc.line(folder))}, then try again; if the old folder is still there, "
+            "leave this one alone: the repair would take Git's record away from the original")
+    return (
+        f"Git's own record of where this checkout lives could not be examined ({pc.line(detail)}), so it is not "
+        f"proven that {pc.line(folder)} is the checkout Git registered, and it was left alone. Make the record "
+        "readable and run the command again. If you moved the checkout by hand and the old folder is really gone, "
+        f"{_LANE_REPAIR_STEP.format(folder=pc.line(folder))}, then run the command again; {_LANE_REPAIR_WARNING}")
+
+
+def _lane_proof_identity(
+        store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str,
+        rows: dict | None = None) -> tuple[tuple, dict]:
+    """The key and the facts of one checkout's ownership proof: which lane instance, and what Git itself says the
+    checkout is (its toplevel and its own administrative folder, which no other checkout shares), plus every other
+    lane's saved row (the other-owner scan reads exactly those). `rows` is the registry snapshot the scan read, when
+    the proof is made: it is not read again then, so the proof never vouches for a row that was not scanned."""
+    if rows is None:
+        rows = lane_mod.load_lanes(store).get("lanes") or {}
+    facts = {
+        "folder": os.path.normcase(folder), "toplevel": toplevel_c, "git_dir": git_dir,
+        "other_rows": lane_mod.fingerprint({key: row for key, row in rows.items() if key != lane_id}),
+    }
+    return (lane_id, lane.get("instance_id"), lane.get("generation")), facts
+
+
+def _lane_record_proof(
+        store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str, rows: dict) -> None:
+    """Remember, for the rest of THIS command, that the fresh delivery evaluation proved this store owns the checkout
+    (it lies inside the store's folder, Git's record of it names this folder, and no other lane in `rows`, the very
+    snapshot that was scanned, claims it). Kept on the store object the command opened, so no other command, and no
+    later run, ever relies on it."""
+    key, facts = _lane_proof_identity(store, lane_id, lane, folder, toplevel_c, git_dir, rows)
+    proofs = store.__dict__.setdefault("_lane_delivery_proofs", {})
+    proofs[key] = facts
+
+
+def _lane_proof_holds(store, lane_id: str, lane: dict, folder: str, toplevel_c: str, git_dir: str) -> bool:
+    """Whether the proof this command made earlier still describes the checkout the terminal recheck is looking at:
+    the same lane instance, the same folder, and the same toplevel and administrative folder according to Git, with
+    every other lane's saved row unchanged. A checkout swapped in since (another store's, another lane's) has its own
+    administrative folder, so it does not match. False when no proof was made in this command."""
+    try:
+        key, facts = _lane_proof_identity(store, lane_id, lane, folder, toplevel_c, git_dir)
+    except (OSError, ValueError, lane_mod.LaneError):
+        return False
+    return store.__dict__.get("_lane_delivery_proofs", {}).get(key) == facts
+
+
+def _verify_lane_worktree(
+    store, lane: dict, *, lane_id: str, expected_base: str | None = None, check_paths: bool = True,
+    store_owned: bool = False, for_removal: bool = False, terminal: bool = False,
+) -> dict:
+    """`lane_id` is the registry key: it names the row in every refusal. The id written inside the row is a separate
+    fact (it picks the lane branch below, as before) and must never stand in for the key.
+
+    Whose checkout it is (`store_owned`) is proven or the call refuses, with one exception. Where the proof could not be
+    made (the checkout, or another lane's saved paths, could not be examined) a removal and a FRESH delivery
+    evaluation refuse: nothing was published yet. Only the terminal recheck of a delivery (`terminal=True`, run on the
+    row's saved snapshot after the first state save and before the evidence is published) may go on without it, and
+    only when this same command proved it earlier for the same checkout (`_lane_proof_holds`): that proof is bound to
+    what Git itself says the checkout is (its own admin folder and toplevel), so a checkout swapped in since is not
+    accepted. Without that earlier proof (a recovery run by another command) it refuses.
+
+    `check_paths=False` is for one caller only: the persisted snapshot of a delivery whose committed final is already
+    valid (see `_lane_candidate`). There a blank or relative saved canonical path is not read as a folder: a relative
+    one would be resolved against the cwd of whatever process retries, and the final was committed from another place.
+    The same goes for a `worktree_path` that is not a full absolute path (relative, or a Windows `C:x` / `\\x`): it is
+    NEVER read against any folder (from inside some other checkout it would succeed with the wrong one, and the folder
+    the delivery ran from cannot be recovered). The checkout is verified through the snapshot's ABSOLUTE canonical
+    path instead, with every identity, branch and cleanliness check run there, exactly as for an absolute worktree
+    path; with no absolute canonical nothing is read at all and the delivery is kept whole."""
+    if check_paths:
+        lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
     wt = lane.get("worktree_path")
+    if not check_paths and _lane_worktree_path_is_relative(lane):
+        wt = _lane_committed_checkout_folder(store, lane, lane_id)
     if not isinstance(wt, str) or not wt:
         raise lane_mod.LaneError("lane has no registered worktree")
-    lane_id = lane_mod.validate_lane_id(str(lane.get("lane_id")))
-    branch = lane_mod.lane_branch(lane_id)
+    embedded_id = lane_mod.validate_lane_id(str(lane.get("lane_id")))
+    if embedded_id != lane_id:
+        # The branch below is picked by the id inside the row, so a damaged row that holds another lane's id would
+        # have this check confirm THAT lane's clean checkout, and a cleanup would then remove it. Refuse before the
+        # Git checks and any removal: the row must name itself.
+        raise lane_mod.LaneError(
+            f"lane row {pc.line(lane_id)} holds the lane id {pc.line(embedded_id)}; the two must match before its "
+            f"checkout is checked or removed: repair lane_id in that row of lanes.json")
+    # One absolute folder, the same one the removal that follows is given (`_lane_checkout_folder`): a relative name was
+    # read from the folder the command ran in below, but from the store's folder by the removal, so one checkout could
+    # be verified and another removed.
+    wt = _lane_checkout_folder(wt)
+    branch = lane_mod.lane_branch(embedded_id)
     toplevel = _git_read_one(wt, ["rev-parse", "--show-toplevel"], "worktree toplevel")
     toplevel_c = lane_mod.canonical_host_path(toplevel)
     expected_c = lane_mod.canonical_host_path(wt)
     if toplevel_c != expected_c:
         raise lane_mod.LaneError(
             f"registered worktree path {expected_c!r} does not match git toplevel {toplevel_c!r}")
+    place = None
+    if store_owned:  # for a removal or a delivery: only a checkout this store can show it made (see the helper)
+        place = _lane_checkout_place(store, wt, toplevel)
+        if place is not None and place[0] == "outside":
+            raise lane_mod.LaneError(_lane_checkout_not_ours_text(store, place[1]))
+        if place is not None and (for_removal or not terminal):
+            # Nothing proves it is ours. A removal never goes on; a fresh delivery has written nothing yet, so it
+            # stops here, and the publication is never made on the strength of a checkout nobody could look at.
+            raise lane_mod.LaneError(_lane_checkout_unexamined_text(store, place[1], place[2]))
+        # What is left is the terminal recheck of a delivery, which is judged by `_lane_proof_holds` below.
+    if for_removal:  # a store inside the checkout, or a link the removal can follow out of it, is lost unseen by Git
+        try:
+            hazard = _lane_checkout_hazard(toplevel)
+        except OSError as exc:
+            raise lane_mod.LaneError(
+                f"the inside of this checkout could not be read ({pc.line(str(exc))}), so it is not known that it "
+                "holds no store of its own and no link out of it; it was left alone") from exc
+        if hazard is not None:
+            raise lane_mod.LaneError(_lane_checkout_hazard_text(hazard))
     stored_c = lane.get("worktree_toplevel_canonical")
-    if stored_c and lane_mod.canonical_host_path(stored_c) != toplevel_c:
+    ambiguous = not check_paths and (
+        not isinstance(stored_c, str) or not stored_c.strip()
+        or lane_mod.canonical_checkout_problem({"worktree_toplevel_canonical": stored_c}, root=store.root) is not None
+    )
+    if stored_c and not ambiguous and lane_mod.canonical_host_path(stored_c) != toplevel_c:
         raise lane_mod.LaneError("stored worktree canonical path no longer matches git")
     repo_common = _common_git_dir(store.root)
     wt_common = _common_git_dir(wt)
     if repo_common != wt_common:
         raise lane_mod.LaneError("worktree common git dir does not match the store repository")
-    if _git_dir(wt) == wt_common:
+    wt_git_dir = _git_dir(wt)
+    if wt_git_dir == wt_common:
         raise lane_mod.LaneError("registered worktree is the primary checkout")
+    registration = None
+    if store_owned:
+        # Git's own record of where this checkout lives must name THIS folder: a copy of another checkout (its `.git`
+        # pointer file included) shares that checkout's administrative folder and passes every check from this side.
+        registration = _lane_checkout_registration(wt, wt_git_dir)
+        if registration is not None and (registration[0] in ("mismatch", "link") or for_removal or not terminal):
+            raise lane_mod.LaneError(_lane_checkout_registration_text(wt, registration))
     head = _git_read_one(wt, ["rev-parse", "--verify", "HEAD^{commit}"], "worktree HEAD")
     if expected_base is not None and head != expected_base:
         raise lane_mod.LaneError(
@@ -5013,16 +5469,68 @@ def _verify_lane_worktree(store, lane: dict, *, expected_base: str | None = None
                 f"worktree branch {short_branch.strip()!r} does not match {branch!r}")
     else:
         branch_tip = _git_read_one(store.root, [
-            "rev-parse", "--verify", f"{lane_mod.lane_ref(lane_id)}^{{commit}}"],
+            "rev-parse", "--verify", f"{lane_mod.lane_ref(embedded_id)}^{{commit}}"],
             "lane branch tip")
         if head != branch_tip:
             raise lane_mod.LaneError("detached worktree HEAD is not at the lane branch tip")
+        # Sitting at the branch's commit says nothing about whose checkout it is: two lanes made from one base share
+        # that commit. So a detached checkout is this lane's only when the branch is not checked out anywhere else.
+        records = _worktree_records(store.root)
+        if records is None:
+            raise lane_mod.LaneError(
+                "this checkout is detached, and which worktrees are registered could not be established, so it is "
+                "not proven to be this lane's")
+        elsewhere = [str(record.get("worktree")) for record in records
+                     if record.get("branch") == lane_mod.lane_ref(embedded_id)
+                     and not _same_folder(str(record.get("worktree")), toplevel)]
+        if elsewhere:
+            raise lane_mod.LaneError(
+                f"this checkout is detached, and the lane branch {branch!r} is checked out in another worktree "
+                f"({', '.join(repr(path) for path in elsewhere)}), so this checkout is not proven to be this lane's")
         detached_at_lane_tip = True
+    # Whatever the branch says, a folder that another lane's row names is that lane's, never this one's.
+    owner = None
+    scan_failed: Exception | None = None
+    scanned: dict = {}
+    try:
+        scanned = lane_mod.load_lanes(store).get("lanes") or {}  # read once: a proof vouches for what was scanned
+        owner = _lane_checkout_owned_by_another(store, lane_id, wt, toplevel, rows=scanned)
+    except (OSError, ValueError) as exc:
+        if for_removal or not terminal:  # not removed, not published, not assigned on a scan nobody could make
+            raise lane_mod.LaneError(
+                f"whether another lane owns this checkout could not be established ({pc.line(str(exc))}); it was "
+                "left alone") from exc
+        scan_failed = exc  # the terminal recheck of a delivery: see `_lane_proof_holds` below
+    if store_owned and terminal and (place is not None or registration is not None or scan_failed is not None):
+        if not _lane_proof_holds(store, lane_id, lane, wt, toplevel_c, wt_git_dir):
+            if place is not None:
+                raise lane_mod.LaneError(
+                    _lane_checkout_unexamined_text(store, place[1], place[2])
+                    + ", and nothing earlier in this delivery proved it is this lane's")
+            if registration is not None:
+                raise lane_mod.LaneError(
+                    _lane_checkout_registration_text(wt, registration)
+                    + ", and nothing earlier in this delivery proved it is this lane's")
+            raise lane_mod.LaneError(
+                f"whether another lane owns this checkout could not be established ({pc.line(str(scan_failed))}), "
+                "and nothing earlier in this delivery proved that it does not; it was left alone")
+    if owner is not None and owner[1]:
+        raise lane_mod.LaneError(
+            f"this checkout is also the saved checkout of lane {pc.line(owner[0])}, so it is not proven to be lane "
+            f"{pc.line(lane_id)}'s alone: repair the saved checkout paths in lanes.json before anything is removed")
+    if owner is not None:
+        raise lane_mod.LaneError(
+            f"a saved checkout of lane {pc.line(owner[0])} (its worktree path, or an earlier checkout it still "
+            "claims) is not a full path and cannot be placed, so it is not known that this checkout is not that "
+            f"lane's: put the real absolute folder in that lane's record in lanes.json (or remove the entry if it "
+            "has none) before anything is removed")
     rc, status = _git(wt, ["status", "--porcelain", "--untracked-files=no"])
     if rc != 0:
         raise lane_mod.LaneError(f"could not verify worktree tracked status (git rc={rc})")
     if status.strip():
         raise lane_mod.LaneError("worktree has staged/unstaged tracked changes")
+    if store_owned and not terminal and not for_removal:  # a fresh delivery evaluation: ownership was just proven
+        _lane_record_proof(store, lane_id, lane, wt, toplevel_c, wt_git_dir, scanned)
     return {
         "head": head,
         "worktree_toplevel_canonical": toplevel_c,
@@ -5092,6 +5600,8 @@ def _lane_entry_present(path: Path) -> bool:
         return True
     except FileNotFoundError:
         return False
+    except ValueError as exc:  # an embedded NUL: not an OSError, but just as unreadable
+        raise OSError(str(exc)) from None
 
 
 def _lane_is_plain_file(path: Path) -> bool:
@@ -5214,20 +5724,62 @@ def _lane_marker_names_worktree(marker: dict, worktree: str, worktree_canonical:
         return None
 
 
-def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False) -> str | None:
+def _lane_relative_worktree_refusal(path: str, lane_id: str) -> str:
+    """Why a relative `worktree_path` is never acknowledged as missing, and what to do. The folder it names depends on
+    where the command that wrote it ran, which cannot be recovered: nothing is searched for and nothing is guessed."""
+    return (
+        f"the stored worktree path {path!r} is not absolute, so whether that folder is gone depends on where the "
+        f"command runs. Replace worktree_path in lanes.json lane {lane_id!r} with the checkout's real absolute "
+        "folder (if a folder with exactly that name exists where the lane ran, write its absolute path); if no such "
+        'folder exists anywhere, set worktree_path to empty text ("") instead. Then acknowledge again')
+
+
+def _lane_acknowledgement_path(store, lane: dict, *, lane_id: str) -> Path | None:
+    """The surviving checkout field to use for presence and launch checks, never a damaged spelling.
+
+    Everything is judged before anything is chosen: a relative `worktree_toplevel_canonical` raises (repair advice
+    naming `lane_id`), so a blank first field or an absent first path cannot hide it. After that, only a relative
+    `worktree_path` keeps its repository-relative meaning; the canonical field is absolute or absent here."""
+    lane_mod.require_canonical_checkout(lane, lane_id=lane_id, root=store.root)
+    for field in ("worktree_path", "worktree_toplevel_canonical"):
+        candidate = lane.get(field)
+        # One shared damage check (blank, whitespace only, embedded NUL, not text) decides what is skipped: a damaged
+        # candidate is never chosen ahead of a healthy one, and never reaches a folder lookup.
+        if not isinstance(candidate, str) or lane_mod.checkout_path_problem({field: candidate}) is not None:
+            continue
+        if field == "worktree_toplevel_canonical":
+            candidate = candidate.replace("{ROOT}", str(store.root))
+        path = Path(candidate)
+        if field == "worktree_path" and not lane_mod.path_is_absolute(candidate):
+            # Every non-absolute spelling (relative, drive-relative `C:x`, rooted `\\x`) before any fallback.
+            raise lane_mod.LaneError(_lane_relative_worktree_refusal(candidate, lane_id))
+        if not path.is_absolute():
+            if path.drive or path.root:
+                continue  # ambiguous Windows spellings have no repository-relative meaning
+            path = store.root / path
+        return path
+    return None
+
+
+def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False,
+                             pathless: bool = False) -> str | None:
     """None when no launch uses the lane's worktree; otherwise the reason it must be treated as in use. A record that
     cannot be read or has the wrong shape is "could not be established" (naming what to inspect), never "idle" and
     never reported as a launch that was actually found. A launch that is found wins over one that cannot be read.
     With `queued_ok`, a launch that has not started yet (a marker not yet `launched`) is left out: what is left is
-    running or unknown evidence, and a queued record never wins over it by returning first."""
+    running or unknown evidence, and a queued record never wins over it by returning first.
+    With `pathless`, record-only acknowledgement found no usable checkout field (the acknowledgement owner chooses
+    the surviving path once and passes it as `worktree_path`): lane bindings are checked and uncomparable folder
+    evidence still prevents acknowledgement.
+    """
     wt = lane.get("worktree_path")
-    if not wt:
+    if not wt and not pathless:
         return None
     lane_id = lane.get("lane_id")
     unknown: str | None = None
     over: dict[str, str] = {}  # request id -> file name, of markers that say "over" but may belong to this lane
     try:
-        wt_c = lane_mod.canonical_host_path_checked(wt)
+        wt_c = None if pathless else lane_mod.canonical_host_path_checked(wt)
     except (OSError, ValueError):
         return _lane_unknown("the lane's own worktree path cannot be resolved, so it cannot be compared with the "
                              "launch records")
@@ -5242,7 +5794,10 @@ def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False) -> 
                 unknown = unknown or f"the launch request file {request + '.json'!r} has a state that cannot be read"
                 continue
             scope = marker.get("scope")
-            names_folder = _lane_marker_names_worktree(marker, wt, wt_c)
+            if pathless:
+                names_folder = None if marker.get("workspace_path") else False
+            else:
+                names_folder = _lane_marker_names_worktree(marker, wt, wt_c)
             if state in {"archived", "failed"}:
                 # Skipped, unless it may belong to this lane and the supervisor still lists its request as active
                 # (below): a launch that is still running can have its marker damaged into a finished-looking one.
@@ -5314,6 +5869,11 @@ def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False) -> 
                     if not isinstance(cwd, str):
                         unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} is not text"
                     else:
+                        if pathless:
+                            unknown = unknown or (
+                                f"{where}, record {str(name)!r}, field {key!r} cannot be compared "
+                                "with the damaged lane path")
+                            continue
                         try:
                             same = _lane_same_folder(cwd, lane_mod.canonical_host_path_checked(cwd), wt, wt_c)
                         except (OSError, ValueError):
@@ -5323,6 +5883,8 @@ def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False) -> 
                             return _lane_busy(f"{where}, record {str(name)!r}")
     except Exception:  # noqa: BLE001
         return _lane_unknown("the supervisor-state.json file in the store has an unexpected shape")
+    if unknown and pathless:
+        unknown += "; no usable checkout path remains, so stop the supervised seats first"
     return _lane_unknown(unknown) if unknown else None
 
 
@@ -5493,7 +6055,7 @@ def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
     if in_use is not None:
         return False, in_use
     try:
-        _verify_lane_worktree(store, probe)
+        _verify_lane_worktree(store, probe, lane_id=lane_id, store_owned=True, for_removal=True)
     except lane_mod.LaneError as e:
         return False, f"worktree is not clean/verifiable: {e}"
     return True, "worktree is clean and idle"
@@ -5648,10 +6210,84 @@ def _print_lane_verdict(lane_id: str, verdict: dict, ctx: dict) -> None:
         print(f"  HOLD[{h['code']}]: {h['detail']}")
 
 
-def _lane_candidate(store, lane: dict, requested_head: str | None, *, delivery: bool):
+class _LaneRetryFromDeliveryFolder(lane_mod.LaneError):
+    """A refusal because the checkout cannot be located at all (not a failure found in it): nothing is quarantined or
+    undone, and the committed final, the pending delivery and the row are kept."""
+
+
+def _lane_worktree_path_is_relative(lane: dict) -> bool:
+    """A hand-written row can name its checkout relative to the folder a delivery ran from. That folder cannot be
+    recovered, so such a path is never resolved here. This is the one shared rule, judged exactly as stored
+    (`lanes.worktree_path_is_relative`: " " is non-absolute), so a committed delivery sends it through the canonical
+    path (or the keep-whole report) instead of handing it to Git relative to the retrying folder."""
+    return lane_mod.worktree_path_is_relative(lane)
+
+
+def _lane_absolute_canonical(store, lane: dict) -> str | None:
+    """The saved absolute `worktree_toplevel_canonical` (its `{ROOT}` placeholder expanded), or None when there is none:
+    blank, not text, relative, or damaged. The one place that decides it."""
+    stored = lane.get("worktree_toplevel_canonical")
+    if (isinstance(stored, str) and stored.strip()
+            and lane_mod.checkout_issue({"worktree_toplevel_canonical": stored}, root=store.root) is None):
+        return stored.replace("{ROOT}", str(store.root))
+    return None
+
+
+_LANE_CANNOT_COMPLETE_REPORT = "this version cannot complete this delivery; the evidence is kept; report it"
+
+
+def _lane_row_delivery_unlocatable(store, row) -> bool:
+    """True when the row's pending delivery has a saved copy whose checkout cannot be located: a worktree path that is
+    not a full absolute path and no absolute canonical path. The one rule `lane deliver`, `lane recover` and
+    `lane status` share (the first two raise or print the report, the last prints it instead of a step)."""
+    pending = row.get("publish_pending") if isinstance(row, dict) else None
+    snapshot = pending.get("lane_snapshot") if isinstance(pending, dict) else None
+    return (isinstance(snapshot, dict) and _lane_worktree_path_is_relative(snapshot)
+            and _lane_absolute_canonical(store, snapshot) is None)
+
+
+def _lane_committed_delivery_unlocatable(store, lane_id: str) -> bool:
+    """`_lane_row_delivery_unlocatable` for the saved row of `lane_id`. A read, no lock (as `lane status` reads the
+    registry)."""
+    return _lane_row_delivery_unlocatable(store, (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id))
+
+
+def _lane_committed_checkout_folder(store, lane: dict, lane_id: str) -> str:
+    """The absolute folder to verify a committed snapshot's checkout in, when its `worktree_path` is not a full absolute
+    path: the snapshot's own absolute `worktree_toplevel_canonical` (its `{ROOT}` placeholder expanded). With none,
+    nothing can be located from any folder, the original one included: the delivery is kept whole and the message says
+    so. It makes no promise that a repair finishes the delivery: the signed saved copy of the lane inside the pending
+    delivery is what is checked, so putting the real folder into the lane row changes nothing."""
+    folder = _lane_absolute_canonical(store, lane)
+    if folder is not None:
+        return folder
+    raise _LaneRetryFromDeliveryFolder(
+        f"the delivery was committed with a relative worktree path ({lane.get('worktree_path')!r}) and its saved copy "
+        "of the lane has no absolute canonical path, so its checkout cannot be located from any folder. Nothing was "
+        "changed: the committed final, the pending delivery and the row are kept. This version cannot complete this "
+        "delivery; the evidence is kept; report it. Putting the real absolute folder into worktree_path in "
+        f"lanes.json lane {lane_id!r} does not help, because the check reads the saved copy of the lane inside the "
+        "pending delivery, not the row")
+
+
+def _lane_candidate(
+    store, lane: dict, requested_head: str | None, *, lane_id: str, delivery: bool, check_paths: bool = True,
+    terminal: bool = False,
+):
+    """`check_paths=False` carries the committed-publication exception to the signed snapshot: a delivery an older
+    version prepared with a blank or relative canonical path already in the row has that damage inside its snapshot
+    and in the committed final's lane fingerprint, both integrity-valid. Once that final is valid, publishing it must
+    not be refused for a field the final already vouches for. The snapshot is still checked against Git."""
+    if check_paths:
+        lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
     provenance = None
     if lane.get("worktree_path") and (delivery or not requested_head):
-        provenance = _verify_lane_worktree(store, lane)
+        # A delivery is judged only for a checkout this store can show it made, so a row that names another store's
+        # checkout is refused here, before anything is written; the retry of an already committed delivery
+        # (`check_paths=False`) is not judged again, and its cleanup is.
+        provenance = _verify_lane_worktree(
+            store, lane, lane_id=lane_id, check_paths=check_paths, store_owned=delivery and check_paths,
+            terminal=terminal)
         head = provenance["head"]
         if requested_head:
             requested = _lane_resolve(store, requested_head)
@@ -5777,12 +6413,45 @@ def _lane_checkpoint_cleanup(store, lane_id: str, pending: dict, *,
         lane_mod.save_lanes(store, data)
 
 
-def _lane_remove_prepared(pending: dict) -> None:
+def _lane_remove_prepared(store, pending: dict) -> None:
+    """Remove the delivery's own prepared copy, and nothing else. The path in a saved record can be damaged, and the
+    check that publication makes of it is skipped when the final already exists (a retry), so the path is judged here,
+    at the one place that deletes: only the file this delivery's own identity names is removed. A record naming any
+    other path leaves that file alone and says so."""
     raw = pending.get("prepared_artifact")
     if not isinstance(raw, str):
         return
     try:
-        Path(raw).unlink(missing_ok=True)
+        own = lane_mod.prepared_delivery_artifact_path(
+            store, str(pending.get("lane_id")), str(pending.get("transaction_id")))
+        named = Path(raw) if Path(raw).is_absolute() else store.root / raw
+        mine = lane_mod.canonical_host_path(named) == lane_mod.canonical_host_path(own)
+    except (lane_mod.LaneError, OSError, ValueError):
+        mine = False
+    if not mine:
+        if raw:
+            sys.stderr.write(
+                "agenttalk lane deliver: the prepared copy named in the saved delivery record is not this delivery's "
+                "own prepared file, so it was left in place; check that record in lanes.json.\n")
+        return
+    # The right name is not enough: if a folder on the way to it is a link or a junction, the path resolves into some
+    # other folder and the file there is not the delivery's (its canonical path matches because both spellings resolve
+    # through the link). The delivery's managed folders must be real folders, or nothing is removed.
+    deliveries = lane_mod.deliveries_dir(store)
+    for folder in (deliveries, own.parent):
+        try:
+            linked = lane_mod._is_link(os.fspath(folder))
+        except FileNotFoundError:
+            return  # nothing is there to remove
+        except OSError:
+            linked = True  # it cannot be looked at, so it is not shown to be a real folder
+        if linked:
+            sys.stderr.write(
+                "agenttalk lane deliver: the delivery's prepared-copy folder is a link (or cannot be checked), so "
+                "the prepared copy was left in place; check the folders under the store's lane-deliveries folder.\n")
+            return
+    try:
+        own.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -5815,8 +6484,7 @@ def _lane_rebind_pending_delivery(
         active_changed = (
             lane_mod.active_lane_fingerprints(data, exclude=lane_id) != expected_active
         )
-        others = [item for item in lane_mod.reservation_lanes(data)
-                  if item.get("lane_id") != lane_id]
+        others = [row for _key, row in lane_mod.reservation_lane_items(data, exclude=lane_id)]
 
     lane_snapshot = pending.get("lane_snapshot")
     if not isinstance(lane_snapshot, dict):
@@ -5840,6 +6508,18 @@ def _lane_rebind_pending_delivery(
             lane_instance_id=str(pending.get("lane_instance_id")),
             lane_generation=pending.get("lane_generation"),
         )
+    if committed is not None:
+        # A valid committed final whose saved copy of the lane cannot be located (a relative worktree path and no
+        # absolute canonical path) is kept and reported BEFORE any terminal rollback below: a changed active-lane set,
+        # a new release barrier or any other change of the world must not set the final aside or touch the delivery
+        # and the row for a delivery this version cannot complete. Only a final that passes its integrity check above
+        # and vouches for this very snapshot counts; anything else is judged as before.
+        vouched = transaction_evidence.get("evaluation_snapshot")
+        if (isinstance(vouched, dict)
+                and lane_mod.fingerprint(vouched) == pending.get("evaluation_fingerprint")
+                and lane_mod.fingerprint(lane_snapshot) == vouched.get("lane_fingerprint")
+                and _lane_worktree_path_is_relative(lane_snapshot)):
+            _lane_committed_checkout_folder(store, lane_snapshot, lane_id)  # raises when no absolute path is saved
     if active_changed:
         return pending, "active-lane set changed across the delivery state save", committed
     expected_snapshot = transaction_evidence.get("evaluation_snapshot")
@@ -5870,17 +6550,22 @@ def _lane_rebind_pending_delivery(
             committed,
         )
     try:
+        # A valid committed final is the publication exception: the snapshot it vouches for is not refused for its
+        # saved checkout paths (a non-committed delivery is, as before).
+        paths_matter = committed is None
         rebound_head, provenance = _lane_candidate(
-            store, lane_snapshot, head, delivery=True,
+            store, lane_snapshot, head, lane_id=lane_id, delivery=True, check_paths=paths_matter, terminal=True,
         )
         verdict, ctx = _lane_eval(
             store, lane_snapshot, others, rebound_head,
             str(expected_snapshot.get("gate_scope")),
         )
         final_head, final_provenance = _lane_candidate(
-            store, lane_snapshot, head, delivery=True,
+            store, lane_snapshot, head, lane_id=lane_id, delivery=True, check_paths=paths_matter, terminal=True,
         )
         final_target = _lane_resolve(store, str(lane_snapshot.get("target_ref")))
+    except _LaneRetryFromDeliveryFolder:
+        raise  # only the checkout could not be reached from this folder: keep the final, the delivery and the row
     except lane_mod.LaneError as exc:
         return pending, f"terminal Git/worktree recheck failed ({exc})", committed
     cooperating_after = lane_mod.cooperating_input_fingerprint(store)
@@ -5983,7 +6668,7 @@ def _lane_abort_terminal_binding(
         _lane_quarantine_rejected_final(store, artifact)
     rollback, conflicts = _lane_rollback_pending_delivery(store, lane_id, pending)
     if rollback == "restored":
-        _lane_remove_prepared(pending)
+        _lane_remove_prepared(store, pending)
     elif rollback == "bound":
         raise lane_mod.LaneError(
             "lane terminal binding changed before the stale transaction could be rolled back"
@@ -6251,7 +6936,7 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
             raise _LaneTerminalBoundaryChanged(error, conflicts)
         artifact = Path(lane_mod.publish_delivery_artifact(store, pending))
         _lane_checkpoint_publication(store, lane_id, pending, artifact)
-        _lane_remove_prepared(pending)
+        _lane_remove_prepared(store, pending)
     else:
         artifact_raw = pending.get("committed_artifact")
         if not isinstance(artifact_raw, str):
@@ -6263,6 +6948,21 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
         require_live_marker=True,
     )
     delivered_head = str(committed["delivered_head"])
+
+    # The advice is about the row as it is SAVED now, after publication (publish_pending False). `lane_snapshot` is
+    # the row as it was before publication, with its delivery still unfinished, so advice built from it would send the
+    # person to `lane recover`, which refuses a lane whose delivery is complete.
+    with store._config_lock():
+        saved = (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id)
+    try:
+        lane_mod.require_checkout_paths(
+            saved if isinstance(saved, dict) else lane_snapshot, lane_id=lane_id, root=store.root,
+        )
+    except lane_mod.LaneError as exc:
+        sys.stderr.write(
+            f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {exc}.\n"
+        )
+        return artifact, True, delivered_head
 
     cleanup_lock = store.dir / "state" / f"lane-{lane_id}.cleanup.lock"
     with store._exclusive_lock(cleanup_lock, what=f"lane {lane_id} cleanup lock"):
@@ -6288,10 +6988,28 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
 def _lane_deliver_cleanup(store, lane_id: str, pending: dict, cleanup_lane: dict, artifact: Path,
                           delivered_head: str) -> tuple[Path, bool, str]:
     """The worktree teardown that ends a delivery, run while the lane's cleanup lock and occupancy claim are held."""
+    try:
+        # The row read under the lock, not the snapshot checked before: a field damaged since then must not look like
+        # "no folder" and end the cleanup as complete.
+        lane_mod.require_checkout_paths(cleanup_lane, lane_id=lane_id, root=store.root)
+    except lane_mod.LaneError as exc:
+        sys.stderr.write(
+            f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {exc}.\n"
+        )
+        return artifact, True, delivered_head
     wt_raw = cleanup_lane.get("worktree_path")
     if not isinstance(wt_raw, str) or not wt_raw:
         _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
         return artifact, False, delivered_head
+    try:
+        # One absolute folder for the look, the verification and the removal below: the original spelling is never
+        # read again against another folder.
+        wt_raw = _lane_checkout_folder(wt_raw)
+    except lane_mod.LaneError as exc:
+        sys.stderr.write(
+            f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {exc}.\n"
+        )
+        return artifact, True, delivered_head
     wt = Path(wt_raw)
     try:
         wt_there = _lane_entry_present(wt)
@@ -6310,7 +7028,7 @@ def _lane_deliver_cleanup(store, lane_id: str, pending: dict, cleanup_lane: dict
             f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {in_use}.\n")
         return artifact, True, delivered_head
     try:
-        provenance = _verify_lane_worktree(store, cleanup_lane)
+        provenance = _verify_lane_worktree(store, cleanup_lane, lane_id=lane_id, store_owned=True, for_removal=True)
         if provenance.get("head") != pending.get("head_sha"):
             raise lane_mod.LaneError("worktree HEAD changed before teardown")
         with store._config_lock():  # every lane writer takes this lock: none gets in between the look and the removal
@@ -6371,6 +7089,19 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 "Use --advisory only for non-release coordination.\n"
             )
             return 2
+        if args.force:
+            try:
+                previous = (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id)
+            except lane_mod.LaneError as exc:
+                sys.stderr.write(f"agenttalk lane assign: {exc}\n")
+                return 2
+            issue = (lane_mod.checkout_issue_advice(previous, lane_id=lane_id, root=store.root)
+                     if isinstance(previous, dict) else None)
+            if issue is not None:
+                sys.stderr.write(
+                    f"agenttalk lane assign: lanes.json lane {lane_id}: "
+                    f"could not read current checkout path {issue[0]}; {issue[2]}\n")
+                return 2
         reg = _load_domain_registry(store)
         if args.domain not in (reg.data.get("domains") or {}):
             sys.stderr.write(
@@ -6416,9 +7147,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         "before force reassignment.\n"
                     )
                     return 2
-                for other in lane_mod.reservation_lanes(data):
-                    if other.get("lane_id") == lane_id:
-                        continue
+                for other_key, other in lane_mod.reservation_lane_items(data, exclude=lane_id):
                     # Disjointness is checked WITHIN a domain (an empty subset = the whole
                     # domain, so it conflicts with any same-domain lane). Different-domain
                     # lanes are allowed at assign; the per-path domain classification +
@@ -6431,20 +7160,18 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                                                       casefold=casefold):
                         sys.stderr.write(
                             f"agenttalk lane assign: path subset {prefixes or '[whole domain]'} "
-                            f"overlaps active lane {other.get('lane_id')!r} "
+                            f"overlaps active lane {other_key!r} "
                             f"{other.get('path_subset') or '[whole domain]'} in domain "
                             f"{args.domain!r} - refusing (fail closed on overlap).\n")
                         return 2
                 retained = previous.get("occupancy_worktrees", []) if isinstance(previous, dict) else []
                 if not isinstance(retained, list):
                     raise lane_mod.LaneError("could not read retained occupancy worktrees")
-                field = "worktree_path"
-                if isinstance(previous, dict) and previous.get("worktree_toplevel_canonical"):
-                    field = "worktree_toplevel_canonical"
-                current = previous.get(field) if isinstance(previous, dict) else None
-                if current and (not isinstance(current, str) or not current.strip()):
+                issue = (lane_mod.checkout_issue_advice(previous, lane_id=lane_id, root=store.root)
+                         if isinstance(previous, dict) else None)
+                if issue is not None:
                     raise lane_mod.LaneError(
-                        f"lanes.json lane {lane_id}: could not read current checkout path {field}")
+                        f"lanes.json lane {lane_id}: could not read current checkout path {issue[0]}; {issue[2]}")
                 old_checkout = (previous.get("worktree_toplevel_canonical") or previous.get("worktree_path")) \
                     if isinstance(previous, dict) else None
                 retained = [*retained, *([old_checkout] if old_checkout else [])]
@@ -6513,7 +7240,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 if retained:  # A prior child can still hold this lane token after reassignment.
                     lane["occupancy_worktrees"] = list(dict.fromkeys(retained))
                 if provision_worktree:
-                    prov = _verify_lane_worktree(store, lane, expected_base=base)
+                    prov = _verify_lane_worktree(store, lane, lane_id=lane_id, expected_base=base)
                     lane["worktree_toplevel_canonical"] = prov["worktree_toplevel_canonical"]
                     lane["worktree_common_git_dir_canonical"] = prov["common_git_dir_canonical"]
                 data.setdefault("lanes", {})[lane_id] = lane
@@ -6605,14 +7332,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             return 2
         try:
             head, _provenance = _lane_candidate(
-                store, lane, getattr(args, "head", None), delivery=False)
+                store, lane, getattr(args, "head", None), lane_id=args.id, delivery=False)
         except lane_mod.LaneError as e:
             sys.stderr.write(f"agenttalk lane check: {e}\n")
             return 2
-        others = [
-            lane for lane in lane_mod.reservation_lanes(data)
-            if lane.get("lane_id") != args.id
-        ]
+        others = [row for _key, row in lane_mod.reservation_lane_items(data, exclude=args.id)]
         verdict, ctx = _lane_eval(store, lane, others, head, getattr(args, "gate_scope", None))
         if getattr(args, "json", False):
             print(json.dumps({**verdict, "target_moved": ctx["target_moved"],
@@ -6630,6 +7354,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 if not isinstance(current, dict):
                     sys.stderr.write(f"agenttalk lane deliver: no lane {args.id!r}.\n")
                     return 2
+                if current.get("status") != lane_mod.STATUS_DELIVERED:
+                    lane_mod.require_checkout_paths(current, lane_id=args.id, root=store.root)
                 if current.get("status") == lane_mod.STATUS_DELIVERED:
                     resume = True
                     lane_snapshot = dict(current)
@@ -6683,6 +7409,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 with store._exclusive_lock(
                         _lane_transaction_lock_path(store, args.id),
                         what=f"lane {args.id} delivery transaction lock"):
+                    if lane_mod.checkout_issue(lane_snapshot, root=store.root):
+                        pending = lane_snapshot.get("publish_pending")
+                        if (not isinstance(pending, dict)
+                                or lane_mod.existing_committed_delivery_artifact(store, pending) is None):
+                            lane_mod.require_checkout_paths(lane_snapshot, lane_id=args.id, root=store.root)
                     if isinstance(lane_snapshot.get("publish_pending"), dict):
                         try:
                             terminal_error, terminal_conflicts = _lane_prepare_publication(
@@ -6730,7 +7461,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         cooperating_before = lane_mod.cooperating_input_fingerprint(store)
         try:
             head, provenance = _lane_candidate(
-                store, current, getattr(args, "head", None), delivery=True,
+                store, current, getattr(args, "head", None), lane_id=args.id, delivery=True,
             )
         except lane_mod.LaneError as exc:
             sys.stderr.write(f"agenttalk lane deliver: {exc}\n")
@@ -6755,10 +7486,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     "retry.\n"
                 )
                 return 3
-            others = [
-                lane for lane in lane_mod.reservation_lanes(data)
-                if lane.get("lane_id") != args.id
-            ]
+            others = [row for _key, row in lane_mod.reservation_lane_items(data, exclude=args.id)]
         verdict, ctx = _lane_eval(
             store, current, others, head, getattr(args, "gate_scope", None),
         )
@@ -6768,7 +7496,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             return 3
         try:
             final_head, final_provenance = _lane_candidate(
-                store, current, getattr(args, "head", None), delivery=True,
+                store, current, getattr(args, "head", None), lane_id=args.id, delivery=True,
             )
             final_target = _lane_resolve(store, current.get("target_ref"))
         except lane_mod.LaneError as exc:
@@ -6879,7 +7607,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             except (OSError, lane_mod.LaneError, TimeoutError):
                 pass
             if not persisted:
-                _lane_remove_prepared(pending)
+                _lane_remove_prepared(store, pending)
             sys.stderr.write(
                 f"agenttalk lane deliver: first delivery state save failed ({exc}); "
                 "no consumable artifact was published.\n"
@@ -6887,9 +7615,9 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             return 2
 
         if competing_delivery:
-            _lane_remove_prepared(pending)
+            _lane_remove_prepared(store, pending)
         elif cas_error:
-            _lane_remove_prepared(pending)
+            _lane_remove_prepared(store, pending)
             sys.stderr.write(
                 f"agenttalk lane deliver: CAS refused ({cas_error}); lane was not "
                 "committed.\n"
@@ -6923,6 +7651,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 exc.error, exc.conflicts,
             ))
             return 3
+        except _LaneRetryFromDeliveryFolder as exc:
+            # No command finishes this delivery, so "retry the same command" would send the person in a circle: the
+            # report is all that is printed (the committed final, the pending delivery and the row are kept).
+            sys.stderr.write(f"agenttalk lane deliver: {exc}.\n")
+            return 2
         except (OSError, TimeoutError, lane_mod.LaneError, GitWriteError) as exc:
             sys.stderr.write(
                 f"agenttalk lane deliver: delivery is checkpointed but pending recovery "
@@ -6948,6 +7681,14 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             sys.stderr.write(f"agenttalk lane recover: {exc}\n")
             return 2
         if outcome == "committed":
+            if _lane_committed_delivery_unlocatable(store, lane_id):
+                sys.stderr.write(
+                    "agenttalk lane recover: an authoritative committed final exists, but its saved copy of the lane "
+                    "has a relative worktree path and no absolute canonical path, so its checkout cannot be located "
+                    "from any folder. Nothing was changed. This version cannot complete this delivery; the evidence "
+                    "is kept; report it.\n"
+                )
+                return 3
             sys.stderr.write(
                 "agenttalk lane recover: an authoritative committed final exists; "
                 "run `lane deliver` to complete its publication marker.\n"
@@ -6971,6 +7712,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         if not isinstance(lane, dict):
             sys.stderr.write(f"agenttalk lane workspace: no lane {args.id!r}.\n")
             return 2
+        lane_mod.require_checkout_paths(lane, lane_id=args.id, root=store.root)
         path = lane.get("worktree_path")
         payload = {
             "lane_id": args.id,
@@ -7000,6 +7742,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             lane = (data.get("lanes") or {}).get(lane_id)
             if lane is None:
                 raise lane_mod.LaneError(f"no lane {lane_id!r}")
+            lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
             history = lane_mod.restamp_history(lane)
             if (
                 lane["status"] != lane_mod.STATUS_ACTIVE
@@ -7015,7 +7758,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 return 3
             if lane["domain_id"] not in reg.data["domains"]:
                 raise lane_mod.LaneError(f"domain {lane['domain_id']!r} no longer exists")
-            for other in lane_mod.reservation_lanes(data):
+            for _key, other in lane_mod.reservation_lane_items(data):
                 if other.get("domain_id") == lane["domain_id"]:
                     lane_mod.validate_stored_prefixes(other.get("path_subset"))
             conflicts = lane_mod.reservation_conflicts(data, lane, exclude=lane_id)
@@ -7072,6 +7815,19 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if isinstance(lane, dict):
+                # Before any acknowledgement or retired-state shortcut: it cannot be cleared by retiring the lane.
+                lane_mod.require_canonical_checkout(lane, lane_id=lane_id, root=store.root)
+                lane_mod.require_writable_checkout(lane, lane_id=lane_id)  # the save below would fail with it
+                damaged_path = lane_mod.checkout_path_problem(lane) is not None
+                if not acknowledge:
+                    try:
+                        lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
+                    except lane_mod.LaneError as exc:
+                        if lane_mod.checkout_damage_acknowledged(lane):
+                            raise
+                        raise lane_mod.LaneError(
+                            f"{exc}; inspect the checkout and repair the damaged field in lanes.json "
+                            "before retrying plain `lane abandon`") from exc
                 # Taken after the read that found the lane and never waiting, so a lane found here is never changed
                 # without it; held until the command ends (branch delete included). A mistyped id makes no token.
                 busy = args._lane_claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
@@ -7092,21 +7848,26 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         sys.stderr.write(f"agenttalk lane abandon: {running}; nothing was changed.\n")
                         return 3
                 if acknowledge:
-                    # A person's word that the worktree is gone: bookkeeping only. Nothing is removed or deleted, and
-                    # nothing here checks that the worktree really is gone (it is refused while the folder is there).
+                    # Bookkeeping only: a damaged path is never used. For a usable
+                    # path, keep the existing refusal while its folder is there.
                     wt = lane.get("worktree_path")
-                    if not isinstance(wt, str) or not wt:
+                    if not damaged_path and (not isinstance(wt, str) or not wt):
                         sys.stderr.write(
                             f"agenttalk lane abandon: lane {lane_id!r} has no worktree to acknowledge; "
                             "nothing was changed.\n")
                         return 2
-                    if not (lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt)):
+                    if _lane_worktree_path_is_relative(lane):  # the shared as-stored rule: " " is refused too
                         sys.stderr.write(
-                            f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
-                            "that folder is gone depends on where the command runs; nothing was changed.\n")
+                            f"agenttalk lane abandon: {_lane_relative_worktree_refusal(wt, lane_id)}; "
+                            "nothing was changed.\n")
                         return 2
+                    if damaged_path:
+                        surviving = _lane_acknowledgement_path(store, lane, lane_id=lane_id)
+                        wt = str(surviving) if surviving is not None else None
                     try:
-                        wt_there = _lane_entry_present(Path(wt))
+                        # Never look up a damaged spelling. A surviving folder must
+                        # be absent even though this exit cannot remove a checkout.
+                        wt_there = wt is not None and _lane_entry_present(Path(wt))
                     except OSError:
                         sys.stderr.write(
                             f"agenttalk lane abandon: whether the worktree folder {wt!r} is there could not be "
@@ -7119,13 +7880,25 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                                 f"agenttalk lane abandon: the worktree folder {wt!r} exists again, although this "
                                 "lane's missing worktree was acknowledged earlier. Nothing was changed; inspect the "
                                 "folder by hand before doing anything with it.\n")
+                        elif damaged_path:
+                            field, _ = lane_mod.checkout_path_problem(lane)
+                            sys.stderr.write(
+                                f"agenttalk lane abandon: the surviving worktree folder {wt!r} still exists; "
+                                f"inspect it and repair lanes.json lane {lane_id!r} field {field} "
+                                "before retrying plain `lane abandon`. Nothing was changed.\n")
                         else:
                             sys.stderr.write(
                                 f"agenttalk lane abandon: the worktree folder {wt!r} still exists, so there is "
                                 "nothing to acknowledge; `lane abandon` without the option removes a worktree "
                                 "normally. Nothing was changed.\n")
                         return 2
-                    in_use = _lane_worktree_launch_use(store, lane)
+                    # Launches are matched by the registry key just validated, never by a `lane_id` written inside
+                    # the (possibly damaged) record, which can name another lane or none.
+                    keyed = {**lane, "lane_id": lane_id}
+                    if damaged_path and wt is not None:
+                        keyed["worktree_path"] = wt  # the surviving path chosen above, so launch-use never picks one
+                    in_use = (_lane_worktree_launch_use(store, keyed, pathless=True) if damaged_path and wt is None
+                              else _lane_worktree_launch_use(store, keyed))
                     if in_use is not None:
                         sys.stderr.write(f"agenttalk lane abandon: {in_use}; nothing was changed.\n")
                         return 2
@@ -7136,7 +7909,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     lane["worktree_state"] = lane_mod.STATUS_CLEANUP_ACKNOWLEDGED
                     lane.pop("worktree_cleanup_error", None)
                     lane_mod.save_lanes(store, data)
-                    print(f"abandoned lane {lane_id}; its missing worktree is recorded as acknowledged, not verified. "
+                    acknowledged = "damaged checkout path" if damaged_path else "missing worktree"
+                    print(f"abandoned lane {lane_id}; its {acknowledged} is recorded as acknowledged, not verified. "
                           f"{_LANE_WRAP_NOT_DETECTED}")
                     return 0
                 lane["status"] = lane_mod.STATUS_ABANDONED
@@ -7151,9 +7925,10 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     in_use = _lane_worktree_launch_use(store, lane)
                     if in_use is None:
                         try:
-                            _verify_lane_worktree(store, lane)
-                            rc, _out, err = _git_write(
-                                store.root, ["worktree", "remove", "--", str(lane["worktree_path"])])
+                            _verify_lane_worktree(store, lane, lane_id=lane_id, store_owned=True, for_removal=True)
+                            rc, _out, err = _git_write(  # the folder the check above read: one absolute target
+                                store.root,
+                                ["worktree", "remove", "--", _lane_checkout_folder(lane["worktree_path"])])
                             lane["worktree_state"] = (
                                 lane_mod.STATUS_ABANDONED if rc == 0
                                 else lane_mod.STATUS_CLEANUP_FAILED)
@@ -7239,7 +8014,16 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             name = rec.get("branch")
             if isinstance(name, str) and name.startswith("refs/heads/lane/"):
                 regs_by_branch.setdefault(name.removeprefix("refs/heads/"), []).append(rec)
-        wt_by_branch = {branch: recs[-1] for branch, recs in regs_by_branch.items()}
+        # gc may take a checkout from Git's repository-wide list only when it lies inside THIS store's folder. Git lists
+        # every store's checkouts, and lane branches belong to the whole repository, so a `lane/x` checked out by
+        # another store is not this store's to remove (nor is its branch to delete): it stays in `regs_by_branch`, so it
+        # keeps the branch, but it is never a target.
+        wt_by_branch = {
+            branch: ours[-1] for branch, recs in regs_by_branch.items()
+            if (ours := [r for r in recs
+                         if isinstance(r.get("worktree"), str)
+                         and _lane_checkout_outside_store(store, r["worktree"]) is None])
+        }
         managed_wt_by_branch = _managed_worktree_paths(store)
         rc, refs_out = _git(store.root, ["for-each-ref", "--format=%(refname:short)", "refs/heads/lane/"])
         branches = [b.strip() for b in refs_out.splitlines() if rc == 0 and b.strip()]
@@ -7283,6 +8067,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 reason = branch_allowed_reason if reason.startswith("branch tip is") else reason
             wt_safe, wt_reason = _lane_worktree_remove_safe(
                 store, lane_id, lane if isinstance(lane, dict) else None, wt_path, safe)
+            if not wt_path and others:  # Git lists it, but not inside this store's folder: say that, remove nothing
+                wt_reason = (
+                    "no checkout of this branch lies inside this store's folder; it is checked out at "
+                    f"{', '.join(pc.line(path) for path in others)}, which this store did not make, so it is left "
+                    "alone (and so is the branch)")
             if in_use is not None:  # a session is on the lane (or that could not be established): nothing of it goes
                 wt_safe, wt_reason = False, lane_occupancy.refusal(lane_id, in_use)
                 safe, reason = False, wt_reason
@@ -7410,18 +8199,72 @@ def _cmd_lane(args: argparse.Namespace) -> int:
 
     if action == "status":
         data = lane_mod.load_lanes(store)
-        active = lane_mod.active_lanes(data)
-        recovery = []
+        # What THIS run found, by row. The annotation goes on the copies that are printed, never on a stored row, and
+        # a `checkout_path_error` key a row already carries (`load_lanes` keeps extra fields, so a hand edit can leave
+        # one) is just data: it is never read back as a finding, so it cannot relabel a healthy row or hide its real
+        # diagnosis.
+        found: dict[int, str] = {}
+        damaged = []
+        for lane_id, row in (data.get("lanes") or {}).items():
+            if isinstance(row, dict) and (
+                    lane_mod.canonical_checkout_problem(row, root=store.root) is not None
+                    or not lane_mod.checkout_damage_acknowledged(row)
+                    or lane_mod.acknowledged_damage_remains(row)):
+                try:
+                    lane_mod.require_checkout_paths(row, lane_id=lane_id, root=store.root)
+                except lane_mod.LaneError as exc:
+                    found[id(row)] = str(exc)
+                    damaged.append(row)
+
+        # Decided on the record BEFORE text or JSON is chosen, so both say the same thing. A valid committed final
+        # that no command can complete (the rule `lane deliver` and `lane recover` share) is reported as exactly
+        # that, whether or not its current row is also damaged or was repaired since (the signed saved copy is what
+        # cannot be located): its only line is the report. Every other step (recover, repair, abandon) names
+        # something that cannot finish it, so the damage annotation, which carries those steps, is not shown for it.
+        unfinishable = {}  # id(row) -> its recovery diagnosis (state, detail)
         for lane in lane_mod.recovery_lanes(data):
-            diagnosis, detail = _lane_recovery_diagnosis(store, lane)
+            if _lane_row_delivery_unlocatable(store, lane):
+                state, state_detail = _lane_recovery_diagnosis(store, lane)
+                if state == "final_pending_marker":
+                    unfinishable[id(lane)] = (state, f"{state_detail} ({_LANE_CANNOT_COMPLETE_REPORT})")
+
+        def shown(row: dict) -> dict:
+            if id(row) in found and id(row) not in unfinishable:
+                return {**row, "checkout_path_error": found[id(row)]}
+            return row
+
+        active = [shown(row) for row in lane_mod.active_lanes(data)]
+        recovery = []
+        recovery_keys = []  # the registry key of each recovery row, for advice that names a record in lanes.json
+        recovery_found = {}  # key -> True for a row the shared damage check found damaged (and has its own step)
+        key_of = {id(row): key for key, row in (data.get("lanes") or {}).items()}
+        for lane in lane_mod.recovery_lanes(data):
+            recovery_keys.append(key_of.get(id(lane)))
+            recovery_found[key_of.get(id(lane))] = id(lane) in found or id(lane) in unfinishable
+            if id(lane) in unfinishable:
+                diagnosis, detail = unfinishable[id(lane)]
+            elif id(lane) in found:
+                diagnosis, detail = "damaged checkout", found[id(lane)]
+            else:
+                diagnosis, detail = _lane_recovery_diagnosis(store, lane)
             recovery.append({
-                **lane,
+                **shown(lane),
                 "recovery_state": diagnosis,
                 "recovery_detail": detail,
             })
         if getattr(args, "json", False):
-            print(json.dumps([*active, *recovery], indent=2))
+            extra = [
+                shown(lane)
+                for lane in damaged
+                if lane.get("status") != lane_mod.STATUS_ACTIVE
+                and not lane_mod.delivery_recovery_required(lane)
+                and not lane_mod.cleanup_recovery_required(lane)
+            ]
+            print(json.dumps([*active, *recovery, *extra], indent=2))
             return 0
+        for lane in damaged:
+            if id(lane) not in unfinishable:  # that row's only line is the report, in its recovery line below
+                print(f"damaged checkout: {found[id(lane)]}")
         unfinished = sorted(
             (lane_id, lane) for lane_id, lane in (data.get("lanes") or {}).items()
             if isinstance(lane, dict) and lane.get("status") == lane_mod.STATUS_ABANDONED
@@ -7448,7 +8291,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 else:
                     wt = " worktree=missing"
                 print(
-                    f"  {lane['lane_id']}: {lane.get('assignee')} @ {lane.get('domain_id')} "
+                    f"  {lane.get('lane_id', '?')}: {lane.get('assignee')} @ {lane.get('domain_id')} "
                     f"{lane.get('path_subset') or '[whole domain]'} -> "
                     f"{lane.get('target_ref')}{tag}{wt}"
                 )
@@ -7456,19 +8299,39 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             print("active lanes: none")
         if recovery:
             print(f"recovery lanes ({len(recovery)}):")
-            for lane in recovery:
-                print(
-                    f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - "
-                    f"{lane['recovery_detail']} (run `lane deliver` or `lane recover`)"
-                )
+            for lane, key in zip(recovery, recovery_keys, strict=True):
+                # `lane recover` refuses a lane whose publication is complete (only its cleanup is pending), so the
+                # step named there is `lane deliver` alone. If the cleanup marker is not an explicit true or false
+                # (null, missing, 0, ""), `lane deliver` reads it as "nothing pending", exits 0 and leaves it as it
+                # is, and no other command changes it: the only step that works is to set the field in the lane's
+                # record, so that is what is printed.
+                if recovery_found.get(key):
+                    # `lane deliver` refuses on a damaged row: its damage message carries the step. A committed final
+                    # that cannot be completed has no step at all: its recovery detail is the report.
+                    step = None
+                elif lane_mod.delivery_recovery_required(lane):
+                    step = "run `lane deliver` or `lane recover`"
+                elif lane.get("cleanup_pending") is not True and lane.get("cleanup_pending") is not False:
+                    step = (
+                        f"no command repairs this: edit lanes.json lane {key!r} and set cleanup_pending to `true` if "
+                        "the checkout still needs removing, or to `false` if the cleanup is already done"
+                    )
+                else:
+                    step = "run `lane deliver` to retry the cleanup"
+                shown_step = f" ({step})" if step is not None else ""
+                print(f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - {lane['recovery_detail']}{shown_step}")
         if unfinished:
             print(f"abandoned lanes with the worktree cleanup still pending ({len(unfinished)}):")
             for lane_id, lane in unfinished:
                 state = str(lane.get("worktree_state")).replace("_", " ")
-                print(
-                    f"  {lane_id}: {state} - {lane.get('worktree_cleanup_error') or 'no reason saved'} "
-                    f"(if the worktree is gone: `lane abandon --id {lane_id} --acknowledge-missing-worktree`)"
+                # A damaged row is listed above under "damaged checkout:" with its own step; the generic hint is only
+                # for a row the shared damage check does not find damaged.
+                hint = (
+                    ""
+                    if id(lane) in found
+                    else f" (if the worktree is gone: `lane abandon --id {lane_id} --acknowledge-missing-worktree`)"
                 )
+                print(f"  {lane_id}: {state} - {lane.get('worktree_cleanup_error') or 'no reason saved'}{hint}")
         return 0
 
     sys.stderr.write(
@@ -12859,8 +13722,8 @@ def cmd_reset(args: argparse.Namespace) -> int:
             lane_ids = ", ".join(str(lane.get("lane_id") or "?") for lane in recovery)
             sys.stderr.write(
                 "agenttalk reset: refusing to erase incomplete lane delivery journal(s) "
-                f"({lane_ids}) while artifacts/worktrees survive; run `lane status`, then "
-                "`lane deliver` or `lane recover` first.\n"
+                f"({lane_ids}) while artifacts/worktrees survive; run `lane status` and follow the step it prints "
+                "for each lane first.\n"
             )
             return 2
         active = lane_mod.active_lanes(lane_data)
@@ -14941,13 +15804,17 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
     if getattr(args, "lane_id", None):
         try:
             lane_id = lane_mod.validate_lane_id(args.lane_id)
-            # The occupancy token first, then the lane: a cleanup that holds the lane is refused here with no child and
-            # no chdir; one that arrives later finds a session on it. Held until this process ends.
+            # Refuse damaged paths before acquiring a token, then read again under it. A cleanup holding the lane
+            # refuses this launch; one that arrives later finds a session on it. Held until this process ends.
+            preflight = (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id)
+            if isinstance(preflight, dict):
+                lane_mod.require_checkout_paths(preflight, lane_id=lane_id, root=store.root)
             lane_occupancy.hold(store, lane_id)
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if not isinstance(lane, dict):
                 raise lane_mod.LaneError(f"lane {lane_id!r} has no active provisioned worktree")
+            lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
             if lane.get("status") != lane_mod.STATUS_ACTIVE:
                 raise lane_mod.LaneError(f"lane {lane_id!r} is not active for launch")
             if not lane.get("worktree_path"):
@@ -18398,7 +19265,8 @@ def build_parser() -> argparse.ArgumentParser:
     labandon.add_argument("--delete-branch", action="store_true",
                           help="Delete lane branch only when merge-base --is-ancestor proves it safe.")
     labandon.add_argument("--acknowledge-missing-worktree", action="store_true",
-                          help="Finish the bookkeeping for a lane whose worktree is already gone: records your "
+                          help="Finish the bookkeeping for a lane with a missing worktree or damaged checkout path: "
+                               "records your "
                                "acknowledgement, not a check. Never removes a checkout or deletes a branch. "
                                + _LANE_WRAP_NOT_DETECTED)
     labandon.set_defaults(func=cmd_lane)
