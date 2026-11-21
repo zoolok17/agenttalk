@@ -2601,20 +2601,19 @@ def test_a_saved_unc_share_root_does_not_stop_a_lane_command(keyed, capsys, cano
 
 @pytest.mark.skipif(os.name != "nt", reason="a UNC path is only absolute on Windows")
 def test_worktree_release_accepts_a_unc_share_root_as_absolute_too(tmp_path, monkeypatch):
-    """Release must not call a share root ambiguous. Its physical matching (`Path.resolve`) is kept in production but
-    replaced here by a stand-in that looks at nothing, so this test never touches a share or the network; it records
-    what release asked to resolve, which shows that release got past the classification and reached the matching."""
-    import pathlib
-
+    """Release must not call a share root ambiguous. Its physical matching (`worktree_release._placed`) is kept in
+    production but replaced here by a stand-in that looks at nothing, so this test never touches a share or the
+    network; it records what release asked to place, which shows that release got past the classification and
+    reached the matching."""
     from agenttalk import worktree_release
 
     asked = []
 
-    def resolve_nothing(self, strict=False):
-        asked.append(str(self))
-        return self
+    def place_nothing(path):
+        asked.append(str(path))
+        return "//server/share" if str(path).rstrip("\\") == r"\\server\share" else "c:/elsewhere"
 
-    monkeypatch.setattr(pathlib.Path, "resolve", resolve_nothing)
+    monkeypatch.setattr(worktree_release, "_placed", place_nothing)
     row = {"lane_id": OTHER, "worktree_toplevel_canonical": r"\\server\share"}
     assert not worktree_release._names_checkout(
         row, tmp_path / "elsewhere", tmp_path, lane_id=BAD, source="lanes.json lane bad", lane=True

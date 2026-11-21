@@ -80,6 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The janitor's release no longer removes a checkout that a launch or lane record names through a link it cannot follow (#853).** `janitor --release` compares every path in the lane, supervisor and launch records with the checkout. On Windows a folder link (a junction) that is locked or not allowed to be read used to give a half answer that still looked like an unrelated folder, so a record naming the checkout through such a link did not stop the removal. Now the paths are resolved strictly: one that cannot be placed keeps the checkout, says which record and which field could not be checked, and does the same in the preview. A folder that is really gone, however deep, an unrelated folder and a record of a retired lane behave as before; a link whose target is gone, or a file where a folder should be, is not taken as proof that a path is absent. Technical: `_names_checkout` uses `lanes.canonical_host_path_checked` through a new `_placed` that also places a path with more than one missing part.
+
 - **Three first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
   line for every seat; now it names the seat and the change, for example "roster: worker model vendor
   set to openai (operator-configured, not provider attestation)." or "... cleared ...", so a script

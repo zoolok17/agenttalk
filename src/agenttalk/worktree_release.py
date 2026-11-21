@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import ctypes
+import errno
 import json
 import os
 import re
@@ -350,6 +351,46 @@ def _read_record(cfg: janitor.JanitorConfig, path: Path) -> dict:
         raise Refused(f"could not read activity record {path.name}") from exc
 
 
+def _why(exc: BaseException) -> str:
+    """A short reason for a refusal: what the system said, never a path."""
+    return str(getattr(exc, "strerror", None) or type(exc).__name__)
+
+
+def _placed(path: Path) -> str:
+    """Where `path` is, as a canonical token (`lanes.canonical_host_path_checked`), resolved strictly: any failure to
+    follow it (access denied, a sharing violation, a loop, a dangling link or junction, a file where a folder should
+    be, an unsupported spelling) raises OSError, which the caller turns into a refusal. The tolerant `Path.resolve()`
+    hands back a partial answer that still names a link when Windows cannot follow it, so a record that names the
+    checkout through that link read as an unrelated path (#853).
+
+    A path that is not there is accepted only when its absence is proved. Starting from the nearest part that exists
+    (its `lstat` answers, so a link is looked at, not followed), which must resolve strictly and be a folder, the
+    missing names are added to its resolved place as written: nothing that is not there can be a link. One, two or
+    more missing parts are placed this way, so a record of a folder that is long gone does not hold a checkout. A
+    missing name that is `.` or `..` cannot be placed and raises."""
+    current = os.fspath(path)
+    missing: list[str] = []
+    while True:
+        try:
+            os.lstat(current)
+            break
+        except FileNotFoundError:
+            parent, name = os.path.split(current.rstrip("\\/"))
+            if not name or not parent or parent == current:
+                raise
+            if name in (".", "..") or (os.name == "nt" and ":" in name):
+                message = "cannot be placed: a missing part that is not a plain name"
+                raise OSError(errno.EINVAL, message, current) from None
+            missing.append(name)
+            current = parent
+    token = lanes.canonical_host_path_checked(current)
+    if missing:
+        if not stat.S_ISDIR(os.stat(current).st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "cannot be placed: the part that exists is not a folder", current)
+        token = token.rstrip("/") + "/" + "/".join(os.path.normcase(name) for name in reversed(missing))
+    return token
+
+
 def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | None,
                     source: str = "activity record", lane: bool = False, owner: dict | None = None) -> bool:
     """True when `value` names the checkout `target`. `lane_id` is the registry key of the lane row being read (None
@@ -412,8 +453,20 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
                         raise Refused(f"{source}: relative activity path {key} is ambiguous; "
                                       "record an absolute path first")
                 for candidate in paths:
-                    physical = candidate.resolve()
-                    if target.resolve() in (physical, *physical.parents):
+                    try:
+                        where = _placed(candidate)
+                    except (OSError, ValueError) as exc:
+                        raise Refused(
+                            f"{source}: could not establish where activity path {key} leads "
+                            f"({_why(exc)}); the checkout was kept"
+                        ) from exc
+                    try:
+                        mine = _placed(target)
+                    except (OSError, ValueError) as exc:
+                        raise Refused(
+                            f"{source}: could not establish where the checkout is ({_why(exc)}); the checkout was kept"
+                        ) from exc
+                    if where == mine or where.startswith(mine + "/"):
                         return True
             elif key in fields and item is not None:
                 if not isinstance(item, str):

@@ -2375,3 +2375,267 @@ def test_status_shows_an_acknowledged_row_that_still_blocks_a_release_and_its_ad
     assert capsys.readouterr().out.strip() == "active lanes: none"
     code, text = run(cfg, wt)
     assert code == 0 and "REMOVED" in text, text
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# #853: a recorded path that cannot be looked at is not "a different path". The activity check named the checkout with a
+# tolerant `Path.resolve()`, which on Windows hands back a partial answer (still naming the link) when following a
+# junction is denied or shared, so a record that names the checkout through that junction was read as unrelated and the
+# checkout was removed. The paths that name activity are now resolved strictly; one that cannot be placed keeps the
+# checkout, and says which record could not be checked.
+
+_RECORD_KINDS = [
+    "active-lane",
+    "pending-lane",
+    "retained-lane",
+    "supervisor-state",
+    "store-supervisor",
+    "launch-request",
+]
+
+
+def _write_record(repo, kind, path):
+    """A record of `kind` that names `path`, in the place the release check reads it from."""
+    store = repo / ".agenttalk"
+    state = store / "state"
+    state.mkdir(exist_ok=True)
+    text = str(path)
+    if kind == "active-lane":
+        row = {"status": "active", "worktree_path": text}
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}))
+    elif kind == "pending-lane":
+        row = {"status": "delivered", "publish_pending": {"x": 1}, "worktree_path": text}
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}))
+    elif kind == "retained-lane":
+        row = {"status": "abandoned", "occupancy_worktrees": [text]}
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}))
+    elif kind == "supervisor-state":
+        (state / "supervisor-state.json").write_text(json.dumps({"agents": {"seat": {"cwd": text}}}))
+    elif kind == "store-supervisor":
+        (store / "supervisor.json").write_text(json.dumps({"agents": {"seat": {"launch_cwd": text}}}))
+    elif kind == "launch-request":
+        (state / "launch-requests").mkdir(exist_ok=True)
+        (state / "launch-requests" / "r.json").write_text(json.dumps({"state": "pending", "cwd": text}))
+    else:
+        raise AssertionError(kind)
+
+
+def _resolver_cannot_follow(monkeypatch, alias, error, *, armed=lambda: True):
+    """Make resolving `alias` fail the way Windows does: a plain call hands back the unresolved path, a strict one
+    raises `error`. Everything else resolves as usual. Returns what each call asked for: True for strict, False for
+    plain."""
+    real = os.path.realpath
+    wanted = os.path.normcase(os.path.normpath(os.fspath(alias)))
+    asked: list[bool] = []
+
+    def realpath(path, *args, strict=False, **kwargs):
+        if armed() and os.path.normcase(os.path.normpath(os.fspath(path))) == wanted:
+            asked.append(bool(strict))
+            if strict:
+                raise error
+            return os.fspath(path)
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    return asked
+
+
+@pytest.fixture
+def alias_to_the_checkout(estate):
+    """A real junction (a symbolic link where there are none) that leads to the checkout, outside the folders
+    the release looks at."""
+    repo, wt, _cfg = estate
+    alias = repo.parent / "alias-to-the-checkout"
+    directory_link(alias, wt)
+    yield alias
+    with contextlib.suppress(OSError):
+        alias.rmdir() if os.name == "nt" else alias.unlink()
+
+
+_DENIED = [PermissionError(13, "access denied", None, 5), OSError(32, "sharing violation"), OSError(5, "I/O error")]
+
+
+@pytest.mark.parametrize("error", _DENIED, ids=["winerror-5", "winerror-32", "other-os-error"])
+@pytest.mark.parametrize("kind", _RECORD_KINDS)
+def test_a_recorded_path_that_cannot_be_followed_keeps_the_checkout(
+    estate, alias_to_the_checkout, monkeypatch, kind, error
+):
+    repo, wt, cfg = estate
+    alias = alias_to_the_checkout
+    _write_record(repo, kind, alias)
+    asked = _resolver_cannot_follow(monkeypatch, alias, error)
+    before = git(repo, "rev-parse", "refs/heads/finished")
+
+    code, text = run(cfg, wt)
+
+    assert True in asked, "the recorded path was never looked up strictly"
+    assert code != 0 and "KEPT" in text, text
+    assert wt.is_dir() and (wt / "source.txt").exists()
+    assert git(repo, "rev-parse", "refs/heads/finished") == before
+    assert "could not establish where activity path" in text and "the checkout was kept" in text, text
+
+
+@pytest.mark.parametrize("kind", _RECORD_KINDS)
+def test_the_report_does_not_offer_a_checkout_when_a_recorded_path_cannot_be_followed(
+    estate, alias_to_the_checkout, monkeypatch, kind
+):
+    repo, wt, cfg = estate
+    alias = alias_to_the_checkout
+    _write_record(repo, kind, alias)
+    asked = _resolver_cannot_follow(monkeypatch, alias, PermissionError(13, "access denied", None, 5))
+
+    code, text = run_report(cfg)
+
+    assert True in asked
+    assert "WOULD RELEASE" not in text and f"KEPT {wt}" in text, text
+    assert wt.is_dir()
+
+
+def run_report(cfg):
+    from agenttalk.worktree_release import release
+
+    return release(cfg, None)
+
+
+def test_the_activity_check_names_the_reason_and_the_record(estate, alias_to_the_checkout, monkeypatch):
+    repo, wt, cfg = estate
+    alias = alias_to_the_checkout
+    _write_record(repo, "active-lane", alias)
+    _resolver_cannot_follow(monkeypatch, alias, PermissionError(13, "access denied", None, 5))
+
+    _code, text = run(cfg, wt)
+
+    assert "lanes.json lane one: could not establish where activity path worktree_path leads" in text, text
+
+
+@pytest.mark.parametrize("kind", [k for k in _RECORD_KINDS if k != "retained-lane"])
+def test_a_junction_to_the_checkout_still_names_it(estate, kind):
+    """The control without a fault: the alias resolves into the checkout, so the record names it. (A retired lane that
+    retains the checkout does not block: it is named, its occupancy token is claimed, and the removal goes on.)"""
+    repo, wt, cfg = estate
+    alias = repo.parent / "alias-to-the-checkout"
+    directory_link(alias, wt)
+    _write_record(repo, kind, alias)
+    try:
+        code, text = run(cfg, wt)
+        assert code != 0 and "KEPT" in text, text
+        assert wt.is_dir()
+    finally:
+        alias.rmdir() if os.name == "nt" else alias.unlink()
+
+
+def test_an_unrelated_existing_path_does_not_block_release(estate):
+    repo, wt, cfg = estate
+    other = repo.parent / "somewhere-else"
+    other.mkdir()
+    _write_record(repo, "active-lane", other)
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+@pytest.mark.parametrize("parts", [1, 2, 3])
+@pytest.mark.parametrize("kind", ["active-lane", "supervisor-state", "retained-lane"])
+def test_a_path_that_is_provably_absent_and_unrelated_does_not_block_release(estate, kind, parts):
+    """One, two or three missing parts: an old record of a folder that is long gone must not hold the checkout."""
+    repo, wt, cfg = estate
+    gone = repo.parent / "long-gone"
+    for number in range(1, parts):
+        gone = gone / f"deeper{number}"
+    _write_record(repo, kind, gone)
+    assert not os.path.lexists(repo.parent / "long-gone")
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+@pytest.mark.parametrize("parts", [1, 2, 3])
+def test_a_missing_path_inside_the_checkout_still_names_it(estate, parts):
+    repo, wt, cfg = estate
+    inside = wt
+    for number in range(parts):
+        inside = inside / f"not-there{number}"
+    _write_record(repo, "active-lane", inside)
+    code, text = run(cfg, wt)
+    assert code != 0 and "KEPT" in text, text
+    assert wt.is_dir()
+
+
+def test_a_missing_path_below_a_junction_into_the_checkout_still_names_it(estate):
+    repo, wt, cfg = estate
+    alias = repo.parent / "alias-to-the-checkout"
+    directory_link(alias, wt)
+    _write_record(repo, "active-lane", alias / "not-there" / "deeper")
+    try:
+        code, text = run(cfg, wt)
+        assert code != 0 and "KEPT" in text, text
+    finally:
+        alias.rmdir() if os.name == "nt" else alias.unlink()
+
+
+def test_a_dangling_link_is_not_proof_that_the_path_is_absent(estate, tmp_path):
+    """A link whose target is gone cannot be placed: it might have led to the checkout, so the checkout is kept."""
+    repo, wt, cfg = estate
+    gone = tmp_path / "gone-target"
+    gone.mkdir()
+    alias = repo.parent / "dangling"
+    directory_link(alias, gone)
+    gone.rmdir()
+    _write_record(repo, "active-lane", alias)
+    try:
+        code, text = run(cfg, wt)
+        assert code != 0 and "KEPT" in text, text
+        assert wt.is_dir()
+    finally:
+        with contextlib.suppress(OSError):
+            alias.rmdir() if os.name == "nt" else alias.unlink()
+
+
+def test_a_file_in_the_way_of_a_recorded_path_is_not_proof_that_the_path_is_absent(estate):
+    repo, wt, cfg = estate
+    blocker = repo.parent / "a-file"
+    blocker.write_text("x")
+    _write_record(repo, "active-lane", blocker / "child")
+    code, text = run(cfg, wt)
+    assert code != 0 and "KEPT" in text, text
+
+
+@pytest.mark.parametrize("kind", ["active-lane", "supervisor-state"])
+def test_a_failure_to_follow_a_recorded_path_at_the_final_reread_keeps_the_checkout(estate, monkeypatch, kind):
+    """The first reads are clean; at the read made under the locks, just before Git removes the checkout, the record
+    cannot be followed. The removal must not go ahead on a tolerant second look."""
+    repo, wt, cfg = estate
+    other = repo.parent / "recorded-but-unrelated"
+    other.mkdir()
+    _write_record(repo, kind, other)
+    calls = []
+    real_activity = worktree_release._activity
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real_activity(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_activity", counting)
+    asked = _resolver_cannot_follow(
+        monkeypatch, other, PermissionError(13, "access denied", None, 5), armed=lambda: len(calls) >= 4
+    )
+
+    code, text = run(cfg, wt)
+
+    assert len(calls) >= 4 and True in asked, (len(calls), asked)
+    assert code != 0 and "KEPT" in text, text
+    assert wt.is_dir()
+
+
+@pytest.mark.parametrize("field", ["cwd", "launch_cwd", "workspace_path", "worktree_path"])
+def test_every_activity_field_is_resolved_strictly_and_a_nested_one_too(
+    estate, alias_to_the_checkout, monkeypatch, field
+):
+    repo, wt, cfg = estate
+    alias = alias_to_the_checkout
+    state = repo / ".agenttalk" / "state"
+    state.mkdir()
+    record = {"agents": {"seat": {"nested": [{"deep": {field: str(alias)}}]}}}
+    (state / "supervisor-state.json").write_text(json.dumps(record))
+    asked = _resolver_cannot_follow(monkeypatch, alias, PermissionError(13, "access denied", None, 5))
+    code, text = run(cfg, wt)
+    assert True in asked and code != 0 and "KEPT" in text, text
+    assert wt.is_dir()
