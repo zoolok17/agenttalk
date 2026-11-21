@@ -1814,6 +1814,8 @@ def _status_redact_home(value, *, root=None, project_id=None):
             for char in part:
                 escaped = pc.shown(char, limit=1)[1:-1]
                 choices = {re.escape(char), re.escape(escaped)}
+                if escaped != char:
+                    choices.add(re.escape(escaped[:2] + escaped[2:].upper()))
                 if os.name == "nt" and escaped != char:
                     for variant in (char.lower(), char.upper()):
                         if len(variant) == 1:
@@ -1821,9 +1823,14 @@ def _status_redact_home(value, *, root=None, project_id=None):
                 pieces.append(next(iter(choices)) if len(choices) == 1 else f"(?:{'|'.join(sorted(choices))})")
             return "".join(pieces)
 
-        pattern = r"(?:[\\/]|\\u005[cC])+".join(shown_or_raw(part) for part in parts)
+        def normalized_part(part):
+            forms = {unicodedata.normalize(form, part) for form in ("NFC", "NFD")}
+            options = sorted(shown_or_raw(form) for form in forms)
+            return options[0] if len(options) == 1 else f"(?:{'|'.join(options)})"
+
+        pattern = r"(?:[\\/]|\\u005[cC])+".join(normalized_part(part) for part in parts)
         name = f"path{len(patterns)}"
-        patterns.append(fr"(?P<{name}>{pattern})(?![\w-]|\.[\w-])")
+        patterns.append(fr"(?P<{name}>{pattern})(?![\w-]|\.[\w-]|\\[uU](?!005[cC]))")
         replacements[name] = replacement
     if isinstance(project_id, str) and project_id:
         patterns.append(fr"(?P<project_id>{re.escape(project_id)})")
