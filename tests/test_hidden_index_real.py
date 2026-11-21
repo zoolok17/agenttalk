@@ -197,6 +197,10 @@ def test_real_sparse_absence_is_not_hidden_work(tmp_path, mode, record_property,
         == 0
     )
     assert close.load_close(store, "sparse")["revision_clean"] is True
+    # The store made above lives inside the checkout, and a removal now refuses a checkout that holds a store (Git
+    # ignores it, so it would be deleted unseen). This test is about sparse absence, so the store goes first.
+    assert cli._git_write(root, ["worktree", "remove", "--", str(wt)])[0] == 1
+    shutil.rmtree(wt / ".agenttalk")
     assert cli._git_write(root, ["worktree", "remove", "--", str(wt)])[0] == 0
 
 
