@@ -55,7 +55,7 @@ def test_vanished_requeue_advice_preserves_the_right_route(tmp_path, monkeypatch
     assert store.read_dead_letter_payload("beta", original.id) == payload
 
     command = f"agenttalk dead-letter requeue --agent beta --id {original.id}"
-    assert command in output.err
+    assert f"--agent beta --id {original.id}" in output.err
     assert "after the reset" in output.err.lower()
     assert "new request id" not in output.err
     assert "--meta request_id=" not in output.err
@@ -113,7 +113,7 @@ def test_vanished_resolved_reply_keeps_the_original_reopen_options(tmp_path, mon
     command = (
         f"agenttalk dead-letter requeue --agent beta --id {original.id} --force-resolved --from lead --reason retry"
     )
-    assert command in error
+    assert f"--agent beta --id {original.id} --force-resolved --from lead --reason retry" in error
     assert "new request id" not in error
     store.reset()
     assert cli.main(["--root", str(store.root), *shlex.split(command)[1:]]) == 0
@@ -121,3 +121,203 @@ def test_vanished_resolved_reply_keeps_the_original_reopen_options(tmp_path, mon
     assert len(messages) == 1
     assert messages[0].meta == {**original.meta, "requeued_from": original.id}
     assert cli._dead_letter_resolution_state(store)[("beta", original.id)] == "requeued"
+
+
+@pytest.mark.parametrize("kind,resolved", [("task", False), ("review-request", False), ("review-result", True)])
+def test_actual_retry_line_targets_selected_store(tmp_path, monkeypatch, capsys, kind, resolved):
+    selected = tmp_path / "selected folder"
+    selected.mkdir()
+    store = _requeue_store(selected, monkeypatch, False)
+    original = dead_letter(store, kind)
+    if resolved:
+        assert (
+            cli.main(
+                [
+                    "--root",
+                    str(store.root),
+                    "dead-letter",
+                    "resolve",
+                    "--from",
+                    "lead",
+                    "--agent",
+                    "beta",
+                    "--id",
+                    original.id,
+                    "--reason",
+                    "handled",
+                ]
+            )
+            == 0
+        )
+    flags = ["--force-resolved", "--from", "lead", "--reason", "try again"] if resolved else []
+    other = tmp_path / "different store"
+    other.mkdir()
+    wrong = storage.Store(other)
+    wrong.init(["lead", "beta"])
+    monkeypatch.setenv("AGENTTALK_ROOT", str(other))
+    capsys.readouterr()
+    refuse_lost_preparation(monkeypatch, lambda: _requeue(store, original, *flags))
+    error = capsys.readouterr().err
+    line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
+    argv = shlex.split(line)
+    assert argv[0] == "agenttalk"
+    assert "--root" in argv and argv[argv.index("--root") + 1] == str(store.root)
+    store.reset()
+    assert cli.main(argv[1:]) == 0
+    assert len(store.valid_messages()) == 1
+    assert not wrong.valid_messages()
+    if resolved:
+        assert cli._dead_letter_resolution_state(store)[("beta", original.id)] == "requeued"
+
+
+@pytest.mark.parametrize("kind,resolved", [("task", False), ("review-request", False), ("review-result", True)])
+def test_actual_retry_line_has_exact_arguments(tmp_path, monkeypatch, capsys, kind, resolved):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = dead_letter(store, kind)
+    if resolved:
+        assert (
+            cli.main(
+                [
+                    "--root",
+                    str(store.root),
+                    "dead-letter",
+                    "resolve",
+                    "--from",
+                    "lead",
+                    "--agent",
+                    "beta",
+                    "--id",
+                    original.id,
+                    "--reason",
+                    "handled",
+                ]
+            )
+            == 0
+        )
+    flags = ["--force-resolved", "--from", "lead", "--reason", "try again"] if resolved else []
+    monkeypatch.setenv("AGENTTALK_ROOT", str(store.root))
+    args = ["dead-letter", "requeue", "--agent", "beta", "--id", original.id, *flags]
+    capsys.readouterr()
+    refuse_lost_preparation(monkeypatch, lambda: cli.main(args))
+    error = capsys.readouterr().err
+    line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
+    argv = shlex.split(line)
+    assert argv[0] == "agenttalk"
+    assert argv[argv.index("--id") + 1] == original.id
+    if resolved:
+        assert argv[argv.index("--reason") + 1] == "try again"
+    store.reset()
+    assert cli.main(argv[1:]) == 0
+    assert len(store.valid_messages()) == 1
+
+
+def test_retry_advice_unsafe_reason_uses_placeholder(tmp_path, monkeypatch, capsys):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = dead_letter(store, "review-result")
+    assert (
+        cli.main(
+            [
+                "--root",
+                str(store.root),
+                "dead-letter",
+                "resolve",
+                "--from",
+                "lead",
+                "--agent",
+                "beta",
+                "--id",
+                original.id,
+                "--reason",
+                "handled",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    refuse_lost_preparation(
+        monkeypatch,
+        lambda: _requeue(store, original, "--force-resolved", "--from", "lead", "--reason", "unsafe; command"),
+    )
+    error = capsys.readouterr().err
+    line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
+    assert "<reason>" in line and "unsafe; command" not in error
+    assert "Not a ready command:" in error
+
+
+def test_retry_advice_dash_reason_replays(tmp_path, monkeypatch, capsys):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = dead_letter(store, "review-result")
+    assert (
+        cli.main(
+            [
+                "--root",
+                str(store.root),
+                "dead-letter",
+                "resolve",
+                "--from",
+                "lead",
+                "--agent",
+                "beta",
+                "--id",
+                original.id,
+                "--reason",
+                "handled",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    refuse_lost_preparation(
+        monkeypatch, lambda: _requeue(store, original, "--force-resolved", "--from", "lead", "--reason=-later")
+    )
+    error = capsys.readouterr().err
+    line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
+    argv = shlex.split(line)
+    assert "--reason=-later" in argv
+    store.reset()
+    assert cli.main(argv[1:]) == 0
+
+
+def test_retry_advice_uses_current_folder_when_root_is_implicit(tmp_path, monkeypatch, capsys):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = dead_letter(store, "task")
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    monkeypatch.chdir(store.root)
+    capsys.readouterr()
+    refuse_lost_preparation(
+        monkeypatch, lambda: cli.main(["dead-letter", "requeue", "--agent", "beta", "--id", original.id])
+    )
+    error = capsys.readouterr().err
+    line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
+    argv = shlex.split(line)
+    assert "--root" not in argv
+    store.reset()
+    assert cli.main(argv[1:]) == 0
+
+
+def test_retry_advice_unsafe_root_uses_placeholder(tmp_path, monkeypatch, capsys):
+    parent = tmp_path / "unsafe & folder"
+    parent.mkdir()
+    store = _requeue_store(parent, monkeypatch, False)
+    original = dead_letter(store, "task")
+    capsys.readouterr()
+    refuse_lost_preparation(monkeypatch, lambda: _requeue(store, original))
+    error = capsys.readouterr().err
+    line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
+    assert "--root <root>" in line and "&" not in line
+    assert "Not a ready command:" in error
+
+
+def test_empty_explicit_root_names_selected_store(tmp_path, monkeypatch, capsys):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = dead_letter(store, "task")
+    monkeypatch.setenv("AGENTTALK_ROOT", str(store.root))
+    capsys.readouterr()
+    refuse_lost_preparation(
+        monkeypatch, lambda: cli.main(["--root", "", "dead-letter", "requeue", "--agent", "beta", "--id", original.id])
+    )
+    line = next(line.strip() for line in capsys.readouterr().err.splitlines() if line.startswith("  agenttalk "))
+    argv = shlex.split(line)
+    assert argv[argv.index("--root") + 1] == str(store.root)
+    store.reset()
+    assert cli.main(argv[1:]) == 0
