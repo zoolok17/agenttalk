@@ -1374,22 +1374,19 @@ def _remove_held_posix(deliveries: str, prepared_name: str, name: str) -> str:
         return "refused"
     mode = os.O_RDONLY | flags[0] | flags[1] | getattr(os, "O_CLOEXEC", 0)
     held: list[int] = []
-    try:
+    opening = True
+    try:  # every descriptor opened is closed on every way out, the early returns included
         held.append(os.open(deliveries, mode))
         held.append(os.open(prepared_name, mode, dir_fd=held[0]))
-    except FileNotFoundError:
-        return "absent"
-    except OSError:  # a link (ELOOP), not a folder (ENOTDIR), no permission: not shown to be a real folder
-        for fd in held:
-            os.close(fd)
-        return "refused"
-    try:
+        opening = False
         os.unlink(name, dir_fd=held[1])
         return "removed"
     except FileNotFoundError:
-        return "absent"
+        return "absent"  # a missing folder or file
     except OSError:
-        return "absent"  # as before: a delete that fails is not reported
+        # while opening: a link (ELOOP), not a folder (ENOTDIR), no permission, so not shown to be a real folder;
+        # after that: as before, a delete that fails is not reported
+        return "refused" if opening else "absent"
     finally:
         for fd in held:
             os.close(fd)

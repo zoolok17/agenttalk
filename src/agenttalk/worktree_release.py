@@ -6,6 +6,7 @@ preservation commit, recursive-delete fallback or branch deletion is used.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import ctypes
 import errno
@@ -351,6 +352,43 @@ def _read_record(cfg: janitor.JanitorConfig, path: Path) -> dict:
         raise Refused(f"could not read activity record {path.name}") from exc
 
 
+# The names that `_placed` accepted as absent while one `_activity` read ran, kept so that they can be looked at again
+# at the removal decision (`_still_absent`). A lookup that said "absent" is true only for that instant.
+_absent_seen: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("absent_seen", default=None)
+
+
+@contextlib.contextmanager
+def _watching_absent():
+    seen: list[str] = []
+    token = _absent_seen.set(seen)
+    try:
+        yield seen
+    finally:
+        _absent_seen.reset(token)
+
+
+def _still_absent(seen: list[str]) -> None:
+    """Refuse when any name that was read as absent exists now. A record that named a path that was not there was
+    judged unrelated from one lookup; the name can be created, as a link to the checkout, right after that lookup. So
+    the read under the locks is followed by a second look at each of those names, immediately before Git removes the
+    checkout. This narrows the window; it cannot close it (no check by path can: see the notes on the concurrent
+    rename race), and the same window exists in `lanes._resolve_absent` for a path with one missing part."""
+    for entry in seen:
+        try:
+            os.lstat(entry)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise Refused(
+                f"a path that a record names could not be looked at again before the removal ({_why(exc)}); "
+                "the checkout was kept"
+            ) from exc
+        raise Refused(
+            "a path that a record names, and that was absent when the records were read, exists now; "
+            "the checkout was kept"
+        )
+
+
 def _why(exc: BaseException) -> str:
     """A short reason for a refusal: what the system said, never a path."""
     return str(getattr(exc, "strerror", None) or type(exc).__name__)
@@ -388,6 +426,9 @@ def _placed(path: Path) -> str:
         if not stat.S_ISDIR(os.stat(current).st_mode):
             raise NotADirectoryError(errno.ENOTDIR, "cannot be placed: the part that exists is not a folder", current)
         token = token.rstrip("/") + "/" + "/".join(os.path.normcase(name) for name in reversed(missing))
+        seen = _absent_seen.get()
+        if seen is not None:
+            seen.append(os.path.join(current, missing[-1]))  # the name directly below the part that exists
     return token
 
 
@@ -761,7 +802,9 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                     # The token does not stop a lane writer; this lock, which every one of them takes, does. Only
                     # here, not around the checks above: they hash every file, and lane writers wait 10 seconds.
                     with store_mod.Store(cfg.repo)._config_lock() if named else contextlib.nullcontext():
-                        _activity(cfg, path)
+                        with _watching_absent() as seen:
+                            _activity(cfg, path)
+                        _still_absent(seen)
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:

@@ -5758,3 +5758,66 @@ def test_the_prepared_copy_remover_no_longer_deletes_by_name():
     source = inspect.getsource(cli._lane_remove_prepared)
     assert "own.unlink" not in source and ".unlink(" not in source
     assert "_remove_in_managed_folders" in source
+
+
+@pytest.mark.parametrize("missing", ["prepared-folder", "file"])
+def test_the_posix_helper_closes_every_descriptor_it_opened_on_an_early_return(tmp_path, monkeypatch, missing):
+    """A missing `.prepared` folder (or a missing file in it) is "absent", and every descriptor opened by then is
+    closed. The helper is exercised through stand-ins for the folder-relative calls, so this runs on every system."""
+    opened, closed = [], []
+    real_close = os.close
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and missing == "prepared-folder":
+            raise FileNotFoundError(2, "no .prepared", path)
+        descriptor = 1000 + len(opened)
+        opened.append(descriptor)
+        return descriptor
+
+    def fake_close(descriptor):
+        if descriptor in opened:
+            closed.append(descriptor)
+            return None
+        return real_close(descriptor)
+
+    def fake_unlink(name, *, dir_fd=None):
+        raise FileNotFoundError(2, "no file", name)
+
+    monkeypatch.setattr(os, "O_DIRECTORY", 0o200000, raising=False)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0o400000, raising=False)
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "unlink", fake_unlink)
+    monkeypatch.setattr(os, "close", fake_close)
+    monkeypatch.setattr(os, "supports_dir_fd", {fake_open, fake_unlink})
+
+    answer = lanes._remove_held_posix(str(tmp_path / "lane-deliveries"), ".prepared", "x.prepared.json")
+
+    assert answer == "absent"
+    assert opened and sorted(closed) == sorted(opened), (opened, closed)
+
+
+def test_the_posix_helper_closes_a_descriptor_when_the_second_open_is_refused(tmp_path, monkeypatch):
+    """The refusal branch (a link, or not a folder) closes what was opened too."""
+    opened, closed = [], []
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None:
+            raise OSError(40, "too many levels of symbolic links", path)
+        opened.append(1000 + len(opened))
+        return opened[-1]
+
+    def fake_close(descriptor):
+        closed.append(descriptor)
+
+    def fake_unlink(name, *, dir_fd=None):
+        raise AssertionError("nothing may be deleted")
+
+    monkeypatch.setattr(os, "O_DIRECTORY", 0o200000, raising=False)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0o400000, raising=False)
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "unlink", fake_unlink)
+    monkeypatch.setattr(os, "close", fake_close)
+    monkeypatch.setattr(os, "supports_dir_fd", {fake_open, fake_unlink})
+
+    assert lanes._remove_held_posix(str(tmp_path / "lane-deliveries"), ".prepared", "x.prepared.json") == "refused"
+    assert opened and sorted(closed) == sorted(opened)

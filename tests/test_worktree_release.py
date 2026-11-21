@@ -2639,3 +2639,55 @@ def test_every_activity_field_is_resolved_strictly_and_a_nested_one_too(
     code, text = run(cfg, wt)
     assert True in asked and code != 0 and "KEPT" in text, text
     assert wt.is_dir()
+
+
+@pytest.mark.parametrize("parts", [1, 2])
+@pytest.mark.parametrize("kind", ["active-lane", "supervisor-state"])
+def test_a_missing_recorded_path_that_becomes_a_link_at_the_final_reread_keeps_the_checkout(
+    estate, monkeypatch, kind, parts
+):
+    """The race: at the read made under the locks, the lookup says the recorded name is absent, and the name is created
+    as a junction to the checkout right after that answer. A placement made from the answer alone would call the path
+    unrelated and release would remove a checkout the record now names. The names that were read as absent are looked at
+    again just before Git removes the checkout, and anything that exists by then refuses."""
+    repo, wt, cfg = estate
+    gone = repo.parent / "long-gone"
+    recorded = gone / "deeper" if parts == 2 else gone
+    _write_record(repo, kind, recorded)
+    calls = []
+    real_activity = worktree_release._activity
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real_activity(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_activity", counting)
+    real_lstat = os.lstat
+    fired = []
+    wanted = os.path.normcase(os.fspath(gone))
+
+    def lstat(path, *args, **kwargs):
+        if len(calls) >= 4 and not fired and os.path.normcase(os.fspath(path)) == wanted:
+            fired.append(1)
+            directory_link(gone, wt)  # it appears now, and this lookup has already answered "absent"
+            raise FileNotFoundError(2, "absent", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    try:
+        code, text = run(cfg, wt)
+        assert fired, "the race seam never ran"
+        assert code != 0 and "KEPT" in text, text
+        assert wt.is_dir() and (wt / "source.txt").exists()
+    finally:
+        monkeypatch.undo()
+        if os.path.lexists(gone):
+            gone.rmdir() if os.name == "nt" else gone.unlink()
+
+
+def test_a_recorded_path_that_stays_absent_through_the_final_check_still_lets_release_go_on(estate):
+    """The control for the race test: the same record, nothing created, so the checkout is removed as before."""
+    repo, wt, cfg = estate
+    _write_record(repo, "active-lane", repo.parent / "long-gone" / "deeper")
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
