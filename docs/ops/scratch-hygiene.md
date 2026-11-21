@@ -214,6 +214,20 @@ agenttalk janitor --apply                  # clean up
 agenttalk janitor --apply --keep-days 7    # override the scratch-root staleness window
 ```
 
+Both the report and `--apply` keep a registered checkout that a lane, a launch or a
+supervisor record still names, and a checkout whose lane session is running. They apply the
+same activity rules as `janitor --release` (the eligibility rules differ: `--release` also
+needs a merged branch). The line reads `REFUSED (kept) <path>: <reason>`. A kept checkout is
+not a failure and does not change the exit code; a record that cannot be read is also kept,
+and the reason says it could not be checked. A folder that holds several checkouts is kept
+whole when any one is in use, and no work-in-progress commit is made on any of them. The
+report is a preview: `--apply` reads the records again, takes the lanes' non-waiting
+occupancy claims, and looks at the records and the checkouts under the folder once more just
+before the delete. Limits: a record is evidence that something may be using the checkout, not
+proof that a process is; a checkout that Git does not list is not looked up; and a folder that
+is renamed by another program in the instant between the last look and the delete cannot be
+stopped by any check made by path.
+
 In order:
 
 1. **Report mode** (default): lists scratch candidates under the

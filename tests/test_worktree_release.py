@@ -2130,6 +2130,27 @@ def test_real_git_success_report_escapes_checkout_path(estate, branch, name):
     assert "\x1b" not in message
 
 
+@contextlib.contextmanager
+def _no_use_check():
+    yield
+
+
+class _NoGuard:
+    """The activity check (#858) reads a real config; this test uses a stand-in one and tests the report lines. The
+    check has its own tests (test_janitor_active_lanes.py)."""
+
+    def __init__(self, cfg, targets):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return None
+
+    final_window = staticmethod(_no_use_check)
+
+
 def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
     from agenttalk import store as store_mod
 
@@ -2186,6 +2207,7 @@ def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
         cfg.default_branches = ["main"]
         report.candidates = [candidates[0]]
         report.registered_worktrees = [path]
+        patch.setattr(worktree_release, "RemovalGuard", _NoGuard)  # a stand-in config: see _NoGuard
         patch.setattr(Path, "exists", lambda *args: True)
         patch.setattr(janitor, "_ancestor_change_reason", lambda *args: None)
         patch.setattr(janitor, "_path_change_reason", lambda *args: None)

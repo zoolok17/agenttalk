@@ -37,6 +37,7 @@ would over-match in the shared temp root - fnmatchcase is used instead).
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import fnmatch
@@ -148,6 +149,9 @@ class JanitorReport:
     access_errors: list[tuple[Path, str]]
     ancestor_ids: dict[Path, tuple[int, int] | None] | None = None
     apply_failed: bool = False
+    # Candidates that a lane, launch or supervisor record still names (or whose use could not be checked), with the
+    # reason. A preview only: `apply` reads the records again (#858).
+    in_use: dict[Path, str] = dataclasses.field(default_factory=dict)
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -742,11 +746,48 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
         if not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
     ]
     foreign = find_foreign_kept(cfg)
+    in_use = {}
+    for c in candidates:
+        targets = [] if c.link else _checkouts_under(c, registered, cfg)
+        if targets:
+            reason = _in_use_reason(cfg, targets)
+            if reason is not None:
+                in_use[c.path] = reason
     return JanitorReport(
         candidates=candidates, registered_worktrees=registered,
         dirty_worktrees=dirty, foreign_kept=foreign, access_errors=access_errors,
         ancestor_ids=ancestor_ids,
+        in_use=in_use,
     )
+
+
+class _UseCheckFailed(Exception):
+    """Whether anything is using a checkout could not be established (as opposed to: something is)."""
+
+
+def _checkouts_under(c: Candidate, registered: list[Path], cfg: JanitorConfig) -> list[Path]:
+    """The registered checkouts that removing `c` would remove, the main repository left out (it is never removed)."""
+    return [w for w in registered if w.exists() and _contains_worktree(c.path, w) and not _same_worktree(w, cfg.repo)]
+
+
+def _in_use_reason(cfg: JanitorConfig, targets: list[Path]) -> str | None:
+    """Why these checkouts must be kept because something uses them, or None. The same rules a release applies
+    (`worktree_release`: active, pending and launch records, retained occupancy) and the same strict reading of the
+    paths those records name; nothing is changed. A record that cannot be read or placed keeps them too (the reason says
+    so), never read as idle. A listing: it takes no claim, so `apply` checks again."""
+    from . import worktree_release  # imported here: that module imports this one
+
+    try:
+        worktree_release.check_unused(cfg, targets)
+    except worktree_release.Refused as exc:
+        return str(exc)
+    except (OSError, ValueError, TypeError) as exc:
+        return _use_check_failure(exc)
+    return None
+
+
+def _use_check_failure(exc: Exception) -> str:
+    return f"could not check whether anything is using it: {_os_error_text(exc) if isinstance(exc, OSError) else exc}"
 
 
 def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> str:
@@ -773,7 +814,10 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
         oldest = sorted(report.candidates, key=lambda c: c.mtime)[:15]
         for c in oldest:
             when = datetime.datetime.fromtimestamp(c.mtime).strftime("%Y-%m-%d")
-            lines.append(f"  {when} {c.path}")
+            if c.path in report.in_use:
+                lines.append(f"  REFUSED (kept) {c.path}: {report.in_use[c.path]}")
+            else:
+                lines.append(f"  {when} {c.path}")
         if len(report.candidates) > 15:
             lines.append(f"  ... and {len(report.candidates) - 15} more")
         lines.append("re-run with --apply to preserve dirty removal candidates as WIP commits, "
@@ -1088,96 +1132,137 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         return refuse_ancestry(reason)
     summary: dict[str, int] = {}
     failed: list[tuple[Path, str]] = []
-    for c in report.candidates:
-        reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
-        if reason is not None:
-            result = "FAILED"
-        else:
-            # Complete all keep checks for this candidate before any WIP commit.
-            # Link candidates are only unlinked, never entered or committed.
-            worktrees = []
-            try:
-                if not c.link:
-                    worktrees = [w for w in report.registered_worktrees
-                                 if w.exists() and _contains_worktree(c.path, w)]
-                keep = None
-                for w in report.registered_worktrees:
-                    if (not c.link and w.exists() and not _same_worktree(w, cfg.repo)
-                            and not _same_worktree(w, c.path) and _contains_worktree(w, c.path)):
-                        keep = "candidate is inside a registered worktree; keep it until the whole worktree is removed"
-                        break
-                for w in worktrees:
-                    if keep:
-                        break
-                    if _same_worktree(w, cfg.repo):
-                        keep = "the main repository is never committed or removed"
-                        break
-                    keep = index_safety.keep_reason(w) or ignored_worktree_keep_reason(w)
-                    if keep:
-                        break
-                    branch = worktree_branch(w)
-                    unsafe_branch = (branch in cfg.default_branches
-                                     or branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS)
-                    if unsafe_branch and is_dirty_worktree(w):
-                        keep = "dirty worktree on a default branch or detached HEAD"
-                        break
-                    if (branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS
-                            and not worktree_head_reachable(w)):
-                        keep = "detached worktree with unreachable HEAD (would be lost on prune)"
-                        break
-                if keep:
-                    lines.append(f"  REFUSED (kept) {c.path}: {keep}")
-                    guidance = _visibility_guidance(w, keep)
-                    if guidance:
-                        lines.append(guidance)
-                    summary["refused"] = summary.get("refused", 0) + 1
-                    continue
-            except (OSError, RuntimeError) as exc:
-                reason = f"could not check worktree identity: {exc}"
+    from . import worktree_release  # imported here: that module imports this one
 
-            refused = False
-            for w in worktrees:
-                if reason:
-                    break
-                reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
-                if reason:
-                    break
-                if is_dirty_worktree(w):
-                    commit = wip_commit_dirty_worktree(w, default_branches=cfg.default_branches)
-                    lines.append(commit.message)
-                    if commit.refused:
-                        refused = True
-                        break
-            if refused:
-                summary["refused"] = summary.get("refused", 0) + 1
-                continue
-            if reason is None:
-                reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
-            if reason is None:
-                keep = None
-                for w in worktrees:
-                    keep = index_safety.keep_reason(w)
-                    if keep:
-                        break
-                if keep:
-                    lines.append(f"  REFUSED (kept) {c.path}: {keep}")
-                    guidance = _visibility_guidance(w, keep)
-                    if guidance:
-                        lines.append(guidance)
-                    summary["refused"] = summary.get("refused", 0) + 1
-                    continue
-            if reason is None:
-                # The read-only Git probes above may take time; retain the identity
-                # check immediately before the existing filesystem removal.
-                reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+    held = contextlib.ExitStack()  # the occupancy claims of the candidate being processed
+    try:
+        for c in report.candidates:
+            held.close()  # the previous candidate's claims
+            guard = None
+            reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
             if reason is not None:
                 result = "FAILED"
             else:
-                result, reason = remove_plainly(c.path)
-        summary[result] = summary.get(result, 0) + 1
-        if result == "FAILED":
-            report.apply_failed = True
-            failed.append((c.path, reason or "unknown"))
+                # Complete all keep checks for this candidate before any WIP commit.
+                # Link candidates are only unlinked, never entered or committed.
+                worktrees = []
+                try:
+                    if not c.link:
+                        worktrees = [w for w in report.registered_worktrees
+                                     if w.exists() and _contains_worktree(c.path, w)]
+                    keep = None
+                    for w in report.registered_worktrees:
+                        if (not c.link and w.exists() and not _same_worktree(w, cfg.repo)
+                                and not _same_worktree(w, c.path) and _contains_worktree(w, c.path)):
+                            keep = (
+                                "candidate is inside a registered worktree; keep it until the whole worktree is removed"
+                            )
+                            break
+                    # Before any work-in-progress commit: is something using a checkout that removing this would
+                    # remove? The same rules a release applies, with the lanes' occupancy claims kept until the
+                    # candidate is done (#858). All of them are resolved first, so a parent of several checkouts is
+                    # kept whole when any one is in use or cannot be checked.
+                    in_use = [w for w in worktrees if not _same_worktree(w, cfg.repo)]
+                    if in_use and not keep:
+                        try:
+                            guard = worktree_release.RemovalGuard(cfg, in_use)
+                            held.enter_context(guard)
+                        except worktree_release.Refused as exc:
+                            keep = str(exc)
+                        except (OSError, ValueError, TypeError) as exc:
+                            raise _UseCheckFailed(_use_check_failure(exc)) from exc
+                    for w in worktrees:
+                        if keep:
+                            break
+                        if _same_worktree(w, cfg.repo):
+                            keep = "the main repository is never committed or removed"
+                            break
+                        keep = index_safety.keep_reason(w) or ignored_worktree_keep_reason(w)
+                        if keep:
+                            break
+                        branch = worktree_branch(w)
+                        unsafe_branch = (branch in cfg.default_branches
+                                         or branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS)
+                        if unsafe_branch and is_dirty_worktree(w):
+                            keep = "dirty worktree on a default branch or detached HEAD"
+                            break
+                        if (branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS
+                                and not worktree_head_reachable(w)):
+                            keep = "detached worktree with unreachable HEAD (would be lost on prune)"
+                            break
+                    if keep:
+                        lines.append(f"  REFUSED (kept) {c.path}: {keep}")
+                        guidance = _visibility_guidance(w, keep)
+                        if guidance:
+                            lines.append(guidance)
+                        summary["refused"] = summary.get("refused", 0) + 1
+                        continue
+                except _UseCheckFailed as exc:
+                    reason = str(exc)
+                except (OSError, RuntimeError) as exc:
+                    reason = f"could not check worktree identity: {exc}"
+
+                refused = False
+                for w in worktrees:
+                    if reason:
+                        break
+                    reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+                    if reason:
+                        break
+                    if is_dirty_worktree(w):
+                        commit = wip_commit_dirty_worktree(w, default_branches=cfg.default_branches)
+                        lines.append(commit.message)
+                        if commit.refused:
+                            refused = True
+                            break
+                if refused:
+                    summary["refused"] = summary.get("refused", 0) + 1
+                    continue
+                if reason is None:
+                    reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+                if reason is None:
+                    keep = None
+                    for w in worktrees:
+                        keep = index_safety.keep_reason(w)
+                        if keep:
+                            break
+                    if keep:
+                        lines.append(f"  REFUSED (kept) {c.path}: {keep}")
+                        guidance = _visibility_guidance(w, keep)
+                        if guidance:
+                            lines.append(guidance)
+                        summary["refused"] = summary.get("refused", 0) + 1
+                        continue
+                if reason is None:
+                    # The read-only Git probes above may take time; retain the identity
+                    # check immediately before the existing filesystem removal.
+                    reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+                if reason is not None:
+                    result = "FAILED"
+                else:
+                    keep = None
+                    try:
+                        # The last look, made at the removal: every record again under the lane writers' lock, and
+                        # the set of checkouts that this removal takes with it.
+                        with guard.final_window() if guard else contextlib.nullcontext():
+                            keep = _checkouts_changed(c, worktrees, cfg)
+                            if keep is None:
+                                result, reason = remove_plainly(c.path)
+                    except worktree_release.Refused as exc:
+                        keep = str(exc)
+                    except (OSError, ValueError, TypeError) as exc:
+                        result, reason = "FAILED", _use_check_failure(exc)
+                    if keep:
+                        lines.append(f"  REFUSED (kept) {c.path}: {keep}")
+                        summary["refused"] = summary.get("refused", 0) + 1
+                        continue
+            summary[result] = summary.get(result, 0) + 1
+            if result == "FAILED":
+                report.apply_failed = True
+                failed.append((c.path, reason or "unknown"))
+
+    finally:
+        held.close()
 
     reason = _ancestor_change_reason(report.ancestor_ids)
     if reason is None:
@@ -1196,3 +1281,15 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         for path, reason in failed:
             lines.append(f"  {_scanned_root_relative(path, cfg)}: {reason}")
     return "\n".join(store_mod.report_line(line) for line in lines)
+
+
+def _checkouts_changed(c: Candidate, worktrees: list[Path], cfg: JanitorConfig) -> str | None:
+    """Why `c` must be kept because the registered checkouts under it are no longer the ones that were checked (one
+    was added, or one is gone), or None. Only a candidate that held checkouts is looked at again: a plain folder pays
+    nothing."""
+    if not worktrees:
+        return None
+    now = [w for w in get_registered_worktrees(cfg.repo) if w.exists() and _contains_worktree(c.path, w)]
+    if len(now) != len(worktrees) or not all(any(_same_worktree(w, x) for x in worktrees) for w in now):
+        return "the registered checkouts under it changed while it was being checked; run the sweep again"
+    return None

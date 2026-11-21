@@ -595,6 +595,70 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> dict | None:
     return lanes
 
 
+def check_unused(cfg: janitor.JanitorConfig, targets: list[Path]) -> None:
+    """A look that changes nothing, for a listing: refuses (`Refused`, or an OSError, ValueError or TypeError for a
+    record that cannot be read) when any of these registered checkouts is in use, by the same rules a release applies:
+    an active, pending or launch record that names it, or a lane that names it whose occupancy token is held or cannot
+    be checked."""
+    for target in _in_claim_order(targets):
+        _free_lanes(cfg, target, lane_occupancy.peek)  # reads the records first (`_activity`), then looks at tokens
+
+
+def _in_claim_order(targets: list[Path]) -> list[Path]:
+    return sorted(targets, key=lambda path: os.path.normcase(os.fspath(path)))
+
+
+class RemovalGuard:
+    """What a removal of registered checkouts holds, shared by a release and the ordinary sweep.
+
+    Entering it takes a non-waiting cleanup claim on every lane that names one of the checkouts (checkouts in a fixed
+    order, one claim per lane even when two checkouts name it) and refuses, releasing every claim taken, when a record
+    makes any of them in use or a claim is not free. The claims are kept until the block ends, so no session can start
+    on those lanes through everything that follows (a work-in-progress commit, the removal). `final_window()` is the
+    last look, made at the removal itself."""
+
+    def __init__(self, cfg: janitor.JanitorConfig, targets: list[Path]):
+        self.cfg = cfg
+        self.targets = _in_claim_order(targets)
+        self.named: list[str] = []
+        self._claims = contextlib.ExitStack()
+
+    def __enter__(self) -> "RemovalGuard":
+        claimed: set[str] = set()
+
+        def claim(store, lane_id):
+            if lane_id in claimed:
+                return None
+            busy = self._claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
+            if busy is None:
+                claimed.add(lane_id)
+            return busy
+
+        try:
+            for target in self.targets:
+                self.named += [lane for lane in _free_lanes(self.cfg, target, claim) if lane not in self.named]
+        except BaseException:
+            self._claims.close()
+            raise
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._claims.close()
+
+    @contextlib.contextmanager
+    def final_window(self):
+        """Re-reads every record under the lock that every lane writer takes, then lets the caller remove. The token
+        does not stop a lane writer; this lock, which every one of them takes, does. It is taken only here, not around
+        the checks that hash every file: lane writers wait 10 seconds for it. Names read as absent are looked at once
+        more before the caller goes on (`_still_absent`)."""
+        with store_mod.Store(self.cfg.repo)._config_lock() if self.named else contextlib.nullcontext():
+            with _watching_absent() as seen:
+                for target in self.targets:
+                    _activity(self.cfg, target)
+            _still_absent(seen)
+            yield
+
+
 # One Git call hashes at most this many files and bytes (a file over the byte limit goes alone), and a file with a
 # clean filter goes alone in the converted pass: each call keeps its own minute (`_git`'s timeout), so the check as a
 # whole has no fixed limit, but no call is asked to do more than a minute's worth.
@@ -784,14 +848,12 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                 _unchanged(ids)
                 size, head = _check_worktree(cfg, path, default)
                 if target is None:
-                    _free_lanes(cfg, path, lane_occupancy.peek)
+                    check_unused(cfg, [path])
                     _unchanged(candidate_ids)
                     lines.append(f"WOULD RELEASE {path}: {size} bytes")
                     continue
                 _unchanged(candidate_ids)
-                with contextlib.ExitStack() as claims:  # kept through the removal: no session can start on these lanes
-                    named = _free_lanes(cfg, path, lambda store, lane: claims.enter_context(
-                        lane_occupancy.cleanup_claim(store, lane)))
+                with RemovalGuard(cfg, [path]) as guard:  # claims kept through the removal: no session can start
                     # Re-read mutable eligibility, then recheck identities at the
                     # deletion boundary. No stale report can authorize a removal.
                     _, current_head = _check_worktree(cfg, path, default)
@@ -799,12 +861,7 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                         raise Refused("checkout HEAD changed during the checks")
                     _unchanged(candidate_ids)
                     _unchanged(ids)
-                    # The token does not stop a lane writer; this lock, which every one of them takes, does. Only
-                    # here, not around the checks above: they hash every file, and lane writers wait 10 seconds.
-                    with store_mod.Store(cfg.repo)._config_lock() if named else contextlib.nullcontext():
-                        with _watching_absent() as seen:
-                            _activity(cfg, path)
-                        _still_absent(seen)
+                    with guard.final_window():
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:

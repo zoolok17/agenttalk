@@ -1,12 +1,35 @@
 """Preservation must never stage around hidden files or nested work."""
 
-from agenttalk import janitor
+import contextlib
+
+from agenttalk import janitor, worktree_release
 from test_git_index_safety import git_reads
 from types import SimpleNamespace
 import subprocess
 import os
 
 import pytest
+
+
+@contextlib.contextmanager
+def _no_use_check():
+    """The activity check (#858) reads a real config; these tests use a stand-in one and test something else."""
+    yield
+
+
+class _NoGuard:
+    """A guard that finds nothing in use: the activity check has its own tests (test_janitor_active_lanes.py)."""
+
+    def __init__(self, cfg, targets):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return None
+
+    final_window = staticmethod(_no_use_check)
 
 
 def test_janitor_clean_status_cannot_certify_hidden_files(tmp_path, monkeypatch):
@@ -34,6 +57,7 @@ def test_apply_keeps_entire_candidate_before_any_destructive_step(tmp_path, monk
         path.mkdir()
         (path / "precious").write_bytes(b"keep all work")
     cfg = SimpleNamespace(repo=repo, tmp_root=tmp_path, scratch_root=tmp_path, default_branches=["main"])
+    monkeypatch.setattr(worktree_release, "RemovalGuard", _NoGuard)
     report = janitor.JanitorReport([janitor.Candidate(candidate, 0, "tmp")], worktrees, [], [], [])
     info = tmp_path.stat()
     report.ancestor_ids = {tmp_path: (info.st_dev, info.st_ino)}

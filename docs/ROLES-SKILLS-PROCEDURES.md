@@ -598,7 +598,7 @@ Temporary work goes in one place per seat and task, and is cleaned up as part of
    - **It keeps the branch and commits,** and refuses a checkout with changes, untracked files or a squash merge.
    - **On Linux or macOS the only in-use check is a lane's token,** held by a running `wrap --lane-id` session: confirm yourself that every other user has stopped.
 5. **Clean up at every batch close.** `agenttalk janitor` reports only; read that report first. A batch is done only when the report is empty, or its leftovers are named in the close-out.
-   - **What `--apply` does:** `agenttalk janitor --apply` removes the scratch paths it allows and prunes stale worktree registrations.
+   - **What `--apply` does:** `agenttalk janitor --apply` removes the scratch paths it allows and prunes stale worktree registrations. It keeps a registered checkout that an active lane, a launch or supervisor record, or a running lane session still names (`REFUSED (kept)` with the reason).
    - **Before running it:** it first commits any unsaved changes in a registered worktree it is about to remove as a work-in-progress commit on that worktree's own branch (never the default branch). Commit or move your own work first if you do not want that.
 6. **Say what you kept:** a reply that created scratch work says "scratch removed", or names what is kept and why.
 
