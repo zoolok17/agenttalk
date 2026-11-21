@@ -1830,15 +1830,26 @@ def _status_redact_home(value, *, root=None, project_id=None):
 
         pattern = r"(?:[\\/]|\\u005[cC])+".join(normalized_part(part) for part in parts)
         name = f"path{len(patterns)}"
-        patterns.append(fr"(?P<{name}>{pattern})(?![\w-]|\.[\w-]|\\[uU](?!005[cC]))")
+        patterns.append(fr"(?P<{name}>{pattern})(?![\w-]|\.[\w-]|\\u(?:005[fF]|007[eE]))")
         replacements[name] = replacement
     if isinstance(project_id, str) and project_id:
         patterns.append(fr"(?P<project_id>{re.escape(project_id)})")
         replacements["project_id"] = "<project_id>"
     if not patterns:
         return value
-    return re.sub("|".join(patterns), lambda match: replacements[match.lastgroup], value,
-                  flags=re.IGNORECASE if os.name == "nt" else 0)
+    def replace(match):
+        # Encoded letters, digits and combining marks can continue a sibling folder name;
+        # punctuation and symbols can also end a path, so hide the ambiguous prefix.
+        if match.lastgroup != "project_id":
+            tail = value[match.end():match.end() + 10]
+            escaped = re.match(r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))", tail)
+            if escaped:
+                code = int(escaped.group(1) or escaped.group(2), 16)
+                if 0x80 <= code <= 0x10ffff and unicodedata.category(chr(code))[0] in "LMN":
+                    return match.group()
+        return replacements[match.lastgroup]
+
+    return re.sub("|".join(patterns), replace, value, flags=re.IGNORECASE if os.name == "nt" else 0)
 
 
 def cmd_status(args: argparse.Namespace) -> int:

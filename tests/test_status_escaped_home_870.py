@@ -139,3 +139,43 @@ def test_escaped_other_user_is_not_redacted(monkeypatch, home, other):
     monkeypatch.setattr(cli.os.path, "expanduser", lambda _: home)
     monkeypatch.setenv("LOCALAPPDATA", home + r"\AppData\Local")
     assert cli._status_redact_home(text) == text
+
+
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+@pytest.mark.parametrize("shown", [False, True])
+@pytest.mark.parametrize("sibling", [False, True])
+@pytest.mark.parametrize("example", ["error", "parentheses", "semicolon", "quotes", "exclamation"])
+def test_punctuation_after_home_or_ambiguous_sibling_is_hidden(monkeypatch, platform, shown, sibling, example):
+    home = r"C:\Users\ann-x"
+    sibling_mark = {"error": "'", "parentheses": ")", "semicolon": ";", "quotes": "'", "exclamation": "!"}[example]
+    path = home + (sibling_mark + "2" if sibling else "")
+    examples = {
+        "error": str(PermissionError(13, "Permission denied", path)),
+        "parentheses": f"({path})",
+        "semicolon": path + r";D:\Tools",
+        "quotes": f'"{path}"',
+        "exclamation": path + "!",
+    }
+    text = printed_commands.shown(examples[example], limit=260) if shown else examples[example]
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os.path, "expanduser", lambda _: home)
+        patch.setenv("LOCALAPPDATA", home + r"\AppData\Local")
+        patch.setattr(cli.os, "name", platform)
+        result = cli._status_redact_home(text)
+    assert "ann-x" not in result
+    assert "<home>" in result
+
+
+@pytest.mark.parametrize("shown", [False, True])
+@pytest.mark.parametrize("suffix", list("$@#%+=,[]{}' !);”–😀"))
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+def test_ambiguous_punctuation_prefers_hiding(monkeypatch, shown, suffix, platform):
+    home = r"C:\Users\ann-x"
+    path = home + suffix + "2"
+    text = printed_commands.shown(path, limit=260) if shown else path
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os.path, "expanduser", lambda _: home)
+        patch.setenv("LOCALAPPDATA", home + r"\AppData\Local")
+        patch.setattr(cli.os, "name", platform)
+        result = cli._status_redact_home(text)
+    assert "ann-x" not in result
