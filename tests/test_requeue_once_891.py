@@ -60,11 +60,12 @@ def test_old_non_opener_copy_is_accepted_once(tmp_path, monkeypatch):
     assert len(store.messages_for("beta")) == 2
 
 
-def test_damaged_record_needs_explicit_again(tmp_path, monkeypatch):
+@pytest.mark.parametrize("damaged", [b"{}", b"{", b"\xff"])
+def test_damaged_record_needs_explicit_again(tmp_path, monkeypatch, damaged):
     store = _requeue_store(tmp_path, monkeypatch, False)
     original = _send(store, "body")
     _dead_payload(store, original)
-    store._requeue_state_path("beta", original.id).write_text("{}", encoding="utf-8")
+    store._requeue_state_path("beta", original.id).write_bytes(damaged)
     assert _requeue(store, original) == 2
     assert _requeue(store, original, "--again", "--reason", "repair") == 0
     assert store.messages_for("beta")[-1].meta["requeued_again_after"] == "unreadable"
@@ -296,3 +297,35 @@ def test_again_does_not_ignore_error_checking_previous_copy(tmp_path, monkeypatc
     monkeypatch.setattr(Store, "_find_message", unavailable)
     assert _requeue(store, original, "--again", "--reason", "retry") == 2
     assert len(store.messages_for("beta")) == 1
+
+
+@pytest.mark.parametrize("failure_call", [1, 2, 3])
+def test_again_cannot_waive_requeue_record_read_error(tmp_path, monkeypatch, capsys, failure_call):
+    from pathlib import Path
+
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body")
+    _dead_payload(store, original)
+    assert _requeue(store, original) == 0
+    record = store._requeue_state_path("beta", original.id)
+    previous = record.read_bytes()
+    before = {message.id for message in store.valid_messages()}
+    read_text = Path.read_text
+    reads = 0
+
+    def unreadable(path, *args, **kwargs):
+        nonlocal reads
+        if path == record:
+            reads += 1
+            if reads == failure_call:
+                raise PermissionError("synthetic read failure")
+        return read_text(path, *args, **kwargs)
+
+    capsys.readouterr()
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    assert _requeue(store, original, "--again", "--reason", "retry") == 2
+    output = capsys.readouterr()
+    assert "cannot be read" in output.err
+    assert "--again" not in output.err
+    assert record.read_bytes() == previous
+    assert {message.id for message in store.valid_messages()} == before

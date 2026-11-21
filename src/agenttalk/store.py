@@ -1048,6 +1048,14 @@ class RequeueRefused(ValueError):
         self.retry = retry
 
 
+class RequeueStateDamaged(RequeueRefused):
+    """A malformed or unsupported requeue record that an explicit replay can replace."""
+
+
+class RequeueStateReadError(RequeueRefused):
+    """The requeue record or an earlier copy could not be accessed."""
+
+
 # Names that the product writes under itself. An older roster may already contain one (it was valid), so
 # only NEW rosters and new members refuse it; it never makes an existing store unreadable.
 RESERVED_NEW_AGENT_NAMES = frozenset({"agenttalk-pack"})
@@ -5224,8 +5232,12 @@ class Store:
             state = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
-        except (OSError, ValueError) as exc:
-            raise RequeueRefused(
+        except OSError as exc:
+            raise RequeueStateReadError(
+                f"{escape_controls(path)} cannot be read ({escape_controls(exc)}); nothing was published."
+            ) from exc
+        except ValueError as exc:
+            raise RequeueStateDamaged(
                 f"{escape_controls(path)} cannot be read ({escape_controls(exc)}); nothing was published."
             ) from exc
         if not (
@@ -5238,7 +5250,7 @@ class Store:
             and isinstance(state.get("session_id"), str)
             and _SESSION_ID_RE.match(state["session_id"])
         ):
-            raise RequeueRefused(
+            raise RequeueStateDamaged(
                 f"{escape_controls(path)} is damaged or not supported by this version; nothing was published."
             )
         return state
@@ -5329,7 +5341,7 @@ class Store:
     def _requeue_previous(self, agent: str, dead_letter_id: str) -> str:
         try:
             state = self._read_requeue_state(agent, dead_letter_id)
-        except RequeueRefused:
+        except RequeueStateDamaged:
             return "unreadable"
         return state["requeued_as"] if state else "none"
 
@@ -5343,7 +5355,7 @@ class Store:
                 raise RequeueRefused("the earlier requeue changed while preparing; retry; nothing was published.")
             try:
                 block = self._requeue_block(agent, dead_letter_id, session_id)
-            except RequeueRefused:
+            except RequeueStateDamaged:
                 if again_after is None:
                     raise
             else:
@@ -5358,7 +5370,7 @@ class Store:
                 if isinstance(exc, PermissionError)
                 else ""
             )
-            raise RequeueRefused(
+            raise RequeueStateReadError(
                 f"could not check the earlier copy or update its record ({escape_controls(exc)}); nothing was "
                 f"published and no record was changed.{hint}"
             ) from exc

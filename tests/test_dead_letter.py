@@ -1843,6 +1843,31 @@ def test_requeue_fanout_lookup_and_board(tmp_path, monkeypatch, kind, signed, re
 
 @_DL_KINDS
 @_DL_SIGNED
+def test_requeue_again_fanout_lookup_and_board(tmp_path, monkeypatch, kind, signed):
+    from agenttalk import work_tags
+
+    store = _requeue_store(tmp_path, monkeypatch, signed)
+    original, other = _dispatch_copies(store, kind)
+    _dead_payload(store, original)
+    assert _requeue(store, original) == 0
+    first = store.messages_for("beta")[-1]
+    _dead_payload(store, first)
+    assert _requeue(store, original, "--again", "--reason", "retry") == 0
+    assert len(work_tags._opener(store.valid_messages(), "tk-fan")) == 2
+    assert not _board_request(store)["issues"]
+    store.send(
+        sender="gamma",
+        recipient="lead",
+        kind="task-response" if kind == "task" else "review-result",
+        body="ok",
+        meta={"request_id": "tk-fan", "in_reply_to": other.id,
+              "status": "done" if kind == "task" else "approved", "verdict": "GO"},
+    )
+    assert not _board_request(store)["issues"]
+
+
+@_DL_KINDS
+@_DL_SIGNED
 @pytest.mark.parametrize("field", ["work_head", "key_id", "body", "signature", "signed_at"])
 def test_requeue_comparison_boundary(tmp_path, monkeypatch, kind, signed, field):
     from agenttalk import work_tags
@@ -2216,7 +2241,13 @@ def test_requeue_plain_message_refuses_repeat(tmp_path, monkeypatch, signed):
 def test_requeue_copy_only_metadata_is_exact():
     from agenttalk import work_tags
 
-    assert work_tags.COPY_ONLY_META == {"requeued_from", "signature", "signed_at"}
+    assert work_tags.COPY_ONLY_META == {
+        "requeued_from",
+        "signature",
+        "signed_at",
+        "requeued_again",
+        "requeued_again_after",
+    }
 
 
 @_DL_ALL_KINDS
