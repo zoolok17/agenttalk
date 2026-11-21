@@ -76,9 +76,21 @@ def test_a_posix_path_with_a_star_keeps_the_old_form(monkeypatch) -> None:
     assert prompt.strict_reply_invocation("claude", STRICT, "/opt/pinned*/bin/python") is None
 
 
-@pytest.mark.parametrize("folder", ["open(paren", "close)paren"])
-def test_a_path_with_a_parenthesis_of_the_rule_keeps_the_old_form(tmp_path, folder) -> None:
-    assert prompt.strict_reply_invocation("claude", STRICT, _python(tmp_path, folder)) is None
+@pytest.mark.parametrize("folder", ["Program Files (x86)", "open(paren", "close)paren"])
+def test_a_path_with_a_parenthesis_gets_the_written_out_form_and_its_exact_rule(tmp_path, folder) -> None:
+    # #860: a live Claude Code in dontAsk mode matched a rule for a path holding `Program Files (x86)` only to
+    # that path, exactly as for a path without brackets, so the brackets no longer force the old form.
+    py = _python(tmp_path, folder)
+    assert os.path.isfile(py) and folder in py                      # a real folder, named like the case in question
+    invocation = prompt.strict_reply_invocation("claude", STRICT, py)
+    assert invocation == _written(py) and folder in invocation
+    rule = f"Bash({invocation} *)"                                   # what the wrapper prints for the team to allow
+    assert rule == 'Bash("' + (py.replace(chr(92), "/") if os.name == "nt" else py) + '" -m agenttalk *)'
+    assert rule.count("*") == 1
+
+    text = prompt.assemble_turn_prompt(TASK, reply_shell="bash", reply_invocation=invocation, seat="beta")
+    assert f"  {invocation} reply --from beta --to-request tk-1 --kind task-response" in text
+    assert "AGENTTALK_PY" not in text and '& "' not in text         # the old form is not used
 
 
 @pytest.mark.parametrize("cli_name,argv", [

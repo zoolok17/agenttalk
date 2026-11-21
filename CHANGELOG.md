@@ -106,6 +106,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Opening a close no longer records a checkout as clean when Git cannot check it (#862).**
   Teams whose store is outside a Git checkout will see ordinary closes hold until they record a diff artifact.
+
+- **Three first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
+  line for every seat; now it names the seat and the change, for example "roster: worker model vendor
+  set to openai (operator-configured, not provider attestation)." or "... cleared ...", so a script
+  that sets several seats can tell them apart. `install-skills --claude-only` and `--codex-only`
+  installed the dev-discipline pack into both the Claude and the Codex skills folders without saying
+  so; now their output adds one line that says this and that `--no-devkit` leaves the pack out, and
+  their help says the same. With `--devkit-only` the line says instead that the flag has no effect.
+  What gets installed is unchanged, with one exception: `--devkit-only` together with `--no-devkit`
+  used to install the pack anyway, and is now refused before anything is written, because the two
+  contradict each other. A Claude seat with no capacity reading
+  yet read like a fault: `status` showed `capacity=unknown(claude_source_not_configured)` and
+  `capacity` said "Claude capacity source not configured", even for a seat that had simply not had its
+  first turn. Now `status` shows `capacity=unknown(no reading yet)`, and `capacity` explains that a
+  new seat usually gets a reading after its first turn and when to set up a status line. The reason
+  code `claude_source_not_configured` is unchanged wherever programs read it (`status --json`, the
+  capacity file, the dashboard data), and the dashboard page still shows the code as it is (issue
+  #824, items 1 to 3).
+
+- **A strict-mode Claude seat whose Python sits in a folder with brackets now gets the full-path form too.**
+  Since #828, a Claude seat in a stricter permission mode is told to run agenttalk through the full path
+  of its Python, but a path with `(` or `)`, such as one under `Program Files (x86)`, fell back to the old
+  form, which such a seat cannot run. A live Claude Code in `dontAsk` mode was tried with the rule for a
+  path holding `Program Files (x86)`: it allowed only that exact command, the same as for a path without
+  brackets. So the wrapper no longer refuses brackets. It still refuses a `*` (a rule reads it as "any
+  text"), characters that are unsafe inside double quotes, and a path that is not an existing full path
+  (#860).
 - **`agenttalk doctor` no longer calls the PowerShell host check "not needed" while a seat that left the
   team list may still run a continuous Codex wrapper.** Retiring, renaming or removing a seat leaves its
   health marker behind, and its wrapper may still be running. Doctor now reads those markers too: a

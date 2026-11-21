@@ -1873,9 +1873,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         cap = a.get("capacity")
         if isinstance(cap, dict):
             age = capmod.age_seconds(cap.get("observed_at") or "")
+            reason = cap.get("reason") or "no signal"
+            if reason == "claude_source_not_configured":  # #824: usually a new seat, not a fault; --json keeps the code
+                reason = "no reading yet"
             seen += {"observed": " capacity=current",
                      "stale": f" capacity=stale(last reading {_format_age(age or 0)})"
-                     }.get(cap["state"], f" capacity=unknown({cap.get('reason') or 'no signal'})")
+                     }.get(cap["state"], f" capacity=unknown({pc.line(str(reason))})")
         if isinstance(a.get("conversation_size"), dict):
             seen += " " + convsize.format_size(a["conversation_size"])
         role = f" role={a['role']}" if a.get("role") else ""
@@ -11336,7 +11339,8 @@ def cmd_roster(args: argparse.Namespace) -> int:
         if bool(args.clear) == bool(args.vendor):
             raise ValueError("provide a model vendor or --clear")
         store.set_model_vendor(args.name, None if args.clear else args.vendor)
-        print("roster: updated operator-configured model vendor (not provider attestation).")
+        change = "cleared" if args.clear else f"set to {args.vendor}"
+        print(f"roster: {args.name} model vendor {change} (operator-configured, not provider attestation).")
         return 0
     if action == "set-role":
         demoted = store.set_role(args.name, args.role)
@@ -12977,8 +12981,9 @@ def _fmt_pct(used: object) -> str:
 
 
 _CAPACITY_REASONS = {
-    "claude_source_not_configured": "Claude capacity source not configured: no status-line "
-                                    "dump and no rate-limit event from the seat yet",
+    "claude_source_not_configured": "no Claude reading yet: no rate-limit event from the seat's turns so far "
+                                    "and no status-line dump. A new seat usually gets one after its first "
+                                    "turn. If it stays this way after turns, set up a status line",
     "codex_no_thread_yet": "no Codex session of its own yet in the shared Codex home",
     "codex_no_reading": "no readable Codex session file",
     "claude_seat_source_unknown": "this shell cannot see another seat's Claude folder, and the "
@@ -13074,7 +13079,9 @@ def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
     snap = capmod.current_view(snap)
     conf = snap["confidence"]
     if conf == "unknown":
-        return f"budget unknown ({_CAPACITY_REASONS.get(snap.get('reason'), 'no readable signal on its side')})"
+        reason = snap.get("reason")  # read from a file anyone can edit: a list or an object must not crash the table
+        text = _CAPACITY_REASONS.get(reason) if isinstance(reason, str) else None
+        return f"budget unknown ({text or 'no readable signal on its side'})"
     if conf == "stale":
         last_known = f"; last known: {'; '.join(older.values())}" if older else ""
         return f"stale: last reading {age} ({source}); no current figures{last_known}"
@@ -13333,6 +13340,13 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
     counts = res.counts()
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     print(f"\nagenttalk install-skills: {summary or 'no actions'}")
+    flag = "--claude-only" if args.claude_only else "--codex-only" if args.codex_only else None
+    if flag and args.devkit_only:
+        print(f"{flag} has no effect with --devkit-only: the dev-discipline pack goes to both the Claude "
+              "and the Codex skills folders.")
+    elif flag and devkit:
+        print(f"{flag} covers only the agenttalk bus skills: the dev-discipline pack still goes to both "
+              "the Claude and the Codex skills folders. Add --no-devkit to leave it out.")
 
     if res.retired:
         print(
@@ -21139,13 +21153,21 @@ def build_parser() -> argparse.ArgumentParser:
              "~/.codex/skills/, and the dev-discipline pack to ~/.claude/skills/ + "
              "~/.codex/skills/ (skip with --no-devkit).",
     )
-    pis.add_argument("--claude-only", action="store_true", help="Install only Claude-side bus skills")
-    pis.add_argument("--codex-only", action="store_true", help="Install only Codex-side bus skills")
-    pis.add_argument("--no-devkit", action="store_true",
-                     help="Skip the dev-discipline pack; install only the agenttalk bus skills")
-    pis.add_argument("--devkit-only", action="store_true",
-                     help="Install ONLY the dev-discipline pack (to the Agent-Skills dirs), "
-                          "not the agenttalk bus skills")
+    pis.add_argument("--claude-only", action="store_true",
+                     help="Install only Claude-side bus skills (the dev-discipline pack still goes to both "
+                          "the Claude and the Codex skills folders unless --no-devkit; no effect with "
+                          "--devkit-only)")
+    pis.add_argument("--codex-only", action="store_true",
+                     help="Install only Codex-side bus skills (the dev-discipline pack still goes to both "
+                          "the Claude and the Codex skills folders unless --no-devkit; no effect with "
+                          "--devkit-only)")
+    # #829: the two contradict each other, and --devkit-only used to win silently.
+    devkit_choice = pis.add_mutually_exclusive_group()
+    devkit_choice.add_argument("--no-devkit", action="store_true",
+                               help="Skip the dev-discipline pack; install only the agenttalk bus skills")
+    devkit_choice.add_argument("--devkit-only", action="store_true",
+                               help="Install ONLY the dev-discipline pack (to the Agent-Skills dirs), "
+                                    "not the agenttalk bus skills")
     pis.add_argument("--claude-dir", help="Override Claude bus-command dir (default: ~/.claude/commands)")
     pis.add_argument("--codex-dir", help="Override Codex bus-skills dir (default: ~/.codex/skills)")
     pis.add_argument("--claude-skills-dir",
