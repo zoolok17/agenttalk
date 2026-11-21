@@ -743,6 +743,9 @@ def test_assignment_add_timeout_keeps_checkout_and_branch(tmp_path, monkeypatch,
         return (0, "a" * 40) if state["branch"] else (1, "")
 
     class TimedOutGit:
+        def poll(self):
+            return 0
+
         calls = 0
 
         def communicate(self, timeout=None):

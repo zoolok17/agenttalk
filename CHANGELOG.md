@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Windows Git write timeouts attempt to stop the process tree (#791).** If the stop cannot be
+  confirmed, Git or a child may still be running; wait before retrying or cleaning up. A partial
+  checkout or lock may still need recovery.
+
 - **The release checklist now names the README as the only install pin.** Since the user manuals
   stopped carrying their own install line (#835), step 1 of the release ritual in
   `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
