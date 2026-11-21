@@ -1344,6 +1344,134 @@ def delivery_artifact_path(store, lane_id: str, head_sha: str,
     return deliveries_dir(store) / f"{validate_lane_id(lane_id)}-{safe_head}{suffix}.json"
 
 
+def _remove_in_managed_folders(deliveries, own) -> str:
+    """Delete the prepared copy `own` through the two folders it lives in, held open after they were checked, and not
+    through their names again: a program of the same user that swaps `.prepared` for a link between a check by name
+    and a delete by name would otherwise have the delete follow the link (#843). Returns:
+
+    - "removed": the file was deleted from the folder that was opened;
+    - "absent": there was nothing to delete (a missing folder or file), or the delete itself failed as it always has
+      without a word;
+    - "refused": a managed folder is a link or not a folder, the held-folder delete is not available here, or anything
+      else stopped the folders from being held. The file is left in place; it is never deleted by name instead.
+
+    Linux and macOS open the two folders without following a link and delete relative to the second one. Windows has
+    no folder-relative delete, so it holds both folders open (with list access and without delete sharing, which keeps
+    them and every folder above them from being renamed or removed while they are held, on local NTFS) and deletes
+    through the real path of the held `.prepared` folder."""
+    deliveries, own = os.fspath(deliveries), os.fspath(own)
+    prepared_name, name = os.path.basename(os.path.dirname(own)), os.path.basename(own)
+    if prepared_name != PREPARED_DIRNAME or os.path.dirname(os.path.dirname(own)) != deliveries or not name:
+        return "refused"
+    if os.name == "nt":
+        return _remove_held_windows(deliveries, prepared_name, name)
+    return _remove_held_posix(deliveries, prepared_name, name)
+
+
+def _remove_held_posix(deliveries: str, prepared_name: str, name: str) -> str:
+    flags = getattr(os, "O_DIRECTORY", None), getattr(os, "O_NOFOLLOW", None)
+    if None in flags or os.open not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd:
+        return "refused"
+    mode = os.O_RDONLY | flags[0] | flags[1] | getattr(os, "O_CLOEXEC", 0)
+    held: list[int] = []
+    try:
+        held.append(os.open(deliveries, mode))
+        held.append(os.open(prepared_name, mode, dir_fd=held[0]))
+    except FileNotFoundError:
+        return "absent"
+    except OSError:  # a link (ELOOP), not a folder (ENOTDIR), no permission: not shown to be a real folder
+        for fd in held:
+            os.close(fd)
+        return "refused"
+    try:
+        os.unlink(name, dir_fd=held[1])
+        return "removed"
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "absent"  # as before: a delete that fails is not reported
+    finally:
+        for fd in held:
+            os.close(fd)
+
+
+def _remove_held_windows(deliveries: str, prepared_name: str, name: str) -> str:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _FileInformation(ctypes.Structure):
+            _fields_ = [
+                ("attributes", wintypes.DWORD),
+                ("created", wintypes.FILETIME),
+                ("accessed", wintypes.FILETIME),
+                ("written", wintypes.FILETIME),
+                ("volume", wintypes.DWORD),
+                ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD),
+                ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD),
+                ("index_low", wintypes.DWORD),
+            ]
+
+        create = kernel.CreateFileW
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                           wintypes.DWORD, ctypes.c_void_p]
+        create.restype = ctypes.c_void_p
+        close = kernel.CloseHandle
+        close.argtypes = [ctypes.c_void_p]
+        close.restype = wintypes.BOOL
+        information = kernel.GetFileInformationByHandle
+        information.argtypes = [ctypes.c_void_p, ctypes.POINTER(_FileInformation)]
+        information.restype = wintypes.BOOL
+        final_path = kernel.GetFinalPathNameByHandleW
+        final_path.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+        final_path.restype = wintypes.DWORD
+    except (OSError, AttributeError, ImportError):
+        return "refused"
+    held: list[int] = []
+
+    def hold(folder: str) -> tuple[str, int]:
+        # LIST access (an attribute-only handle takes no part in sharing checks and would not stop a rename), sharing
+        # read and write but not delete, opened as the folder itself (BACKUP_SEMANTICS | OPEN_REPARSE_POINT) so that
+        # a link is opened as a link and seen, not followed. 0x1 FILE_LIST_DIRECTORY | 0x80 FILE_READ_ATTRIBUTES.
+        handle = create(folder, 0x1 | 0x80, 0x1 | 0x2, None, 3, 0x02000000 | 0x00200000, None)
+        if handle in (None, ctypes.c_void_p(-1).value):
+            error = ctypes.get_last_error()
+            raise FileNotFoundError(error, "folder not found") if error in (2, 3) else OSError(error, "cannot open")
+        held.append(handle)
+        info = _FileInformation()
+        if not information(handle, ctypes.byref(info)):
+            raise OSError(ctypes.get_last_error(), "cannot read the folder's attributes")
+        if not info.attributes & 0x10 or info.attributes & 0x400:  # must be a folder and not a reparse point
+            raise OSError(0, "not a real folder")
+        buffer = ctypes.create_unicode_buffer(32768)
+        if not final_path(handle, buffer, len(buffer), 0):
+            raise OSError(ctypes.get_last_error(), "cannot read the folder's real path")
+        return buffer.value, handle
+
+    try:
+        first, _ = hold(deliveries)
+        second, _ = hold(os.path.join(deliveries, prepared_name))
+        if os.path.normcase(second) != os.path.normcase(first.rstrip("\\") + "\\" + prepared_name):
+            return "refused"  # the second folder is not the one directly below the first
+        target = second.rstrip("\\") + "\\" + name
+        try:
+            os.unlink(target)
+            return "removed"
+        except OSError:
+            return "absent"  # as before: a delete that fails, or a file that is not there, is not reported
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "refused"
+    finally:
+        for handle in held:
+            close(handle)
+
+
 def prepared_delivery_artifact_path(store, lane_id: str, transaction_id: str):
     validate_lane_id(lane_id)
     if not re.fullmatch(r"[0-9a-f]{32}", transaction_id):

@@ -5565,3 +5565,196 @@ def test_a_delivery_is_still_refused_when_the_prefixed_record_names_another_fold
 
     assert rc == 3 and "Git's own record of this checkout says it lives at" in capsys.readouterr().err
     _nothing_was_published(Store(root), "mine")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# #843: the prepared copy is deleted through the folders that were checked, not through their names again. The removal
+# checked that `lane-deliveries` and `.prepared` were real folders and then deleted by name, so another program of the
+# same user could swap `.prepared` for a link in between and the delete followed it. The seams below make the swap
+# happen at an exact step instead of relying on timing.
+
+
+def _prepared_copy_with_a_swap_ready(tmp_path, monkeypatch, seam):
+    """A committed delivery whose own prepared copy exists, an unrelated file with the same name in another folder,
+    and a `swap()` that moves the real `.prepared` folder aside and puts a link to the other folder in its place at
+    `seam`: "after-the-last-folder-check" (right after the check of the `.prepared` folder says it is a real folder) or
+    "inside-the-delete-call" (just before the real delete runs, whether by `os.unlink` or `Path.unlink`)."""
+    store, lane_id, _checkout, _head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    pending = lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]
+    own = lanes.prepared_delivery_artifact_path(store, pending["lane_id"], pending["transaction_id"])
+    assert own.exists()
+    independent = tmp_path.parent / f"{tmp_path.name}-independent-843"
+    independent.mkdir()
+    victim = independent / own.name
+    victim.write_text("not part of any delivery\n", encoding="utf-8")
+    moved = own.parent.with_name(".prepared-original")
+    state = {"swapped": False, "refused": None, "calls": 0}
+
+    def swap():
+        state["calls"] += 1
+        if state["swapped"] or state["refused"] is not None:
+            return
+        try:
+            own.parent.rename(moved)
+        except OSError as exc:  # a held folder cannot be renamed on Windows
+            state["refused"] = exc
+            return
+        _link_directory(own.parent, independent)
+        state["swapped"] = True
+
+    if seam == "inside-the-delete-call":
+        real_unlink, real_path_unlink = os.unlink, Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)) == own.name:
+                swap()
+            return real_unlink(path, *args, **kwargs)
+
+        def path_unlink(self, *args, **kwargs):
+            if self.name == own.name:
+                swap()
+            return real_path_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(os, "unlink", unlink)
+        monkeypatch.setattr(Path, "unlink", path_unlink)
+    else:
+        real_is_link = lanes._is_link
+        wanted = os.path.normcase(os.fspath(own.parent))
+
+        def is_link(path):
+            answer = real_is_link(path)
+            if not answer and os.path.normcase(os.fspath(path)) == wanted:
+                swap()
+            return answer
+
+        monkeypatch.setattr(lanes, "_is_link", is_link)
+    return store, lane_id, pending, own, victim, moved, state, artifact
+
+
+@pytest.mark.parametrize("seam", ["inside-the-delete-call", "after-the-last-folder-check"])
+def test_a_swapped_prepared_folder_cannot_redirect_the_delete_of_a_committed_retry(tmp_path, monkeypatch, capsys, seam):
+    store, lane_id, _pending, own, victim, moved, state, artifact = _prepared_copy_with_a_swap_ready(
+        tmp_path, monkeypatch, seam
+    )
+    signed = artifact.read_bytes()
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+
+    assert state["calls"] >= 1, "the swap seam never ran"
+    assert victim.read_text(encoding="utf-8") == "not part of any delivery\n"
+    assert artifact.read_bytes() == signed
+    if seam == "after-the-last-folder-check":
+        # the link is found when the folders are opened: nothing is deleted and the existing message says so
+        assert state["swapped"] and (moved / own.name).exists()
+        assert "left in place" in capsys.readouterr().err
+    elif os.name == "nt":
+        # the checked folders are held open: the swap itself is refused and the real copy goes
+        assert state["refused"] is not None and not state["swapped"] and not own.exists()
+    else:
+        # the swap goes through, but the delete is made in the folder that was opened: the real copy goes
+        assert state["swapped"] and not (moved / own.name).exists()
+
+
+@pytest.mark.parametrize("seam", ["inside-the-delete-call", "after-the-last-folder-check"])
+def test_a_swapped_prepared_folder_cannot_redirect_the_direct_removal(tmp_path, monkeypatch, capsys, seam):
+    """The other callers (rollback, a failed save, a competing delivery, a refused final check) ask the same remover."""
+    store, _lane_id, pending, own, victim, moved, state, _artifact = _prepared_copy_with_a_swap_ready(
+        tmp_path, monkeypatch, seam
+    )
+    capsys.readouterr()
+
+    cli._lane_remove_prepared(store, pending)
+
+    assert state["calls"] >= 1
+    assert victim.read_text(encoding="utf-8") == "not part of any delivery\n"
+    if seam == "after-the-last-folder-check":
+        assert "left in place" in capsys.readouterr().err
+    elif os.name == "nt":
+        assert state["refused"] is not None and not own.exists()
+    else:
+        assert state["swapped"] and not (moved / own.name).exists()
+
+
+def _managed_folders(tmp_path):
+    from test_lanes import _repo
+
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    own = lanes.prepared_delivery_artifact_path(store, "lane-a", "cd" * 16)
+    own.parent.mkdir(parents=True)
+    own.write_text("{}", encoding="utf-8")
+    return store, lanes.deliveries_dir(store), own
+
+
+def test_the_helper_removes_the_copy_and_reports_what_it_did(tmp_path):
+    _store, deliveries, own = _managed_folders(tmp_path)
+    assert lanes._remove_in_managed_folders(deliveries, own) == "removed"
+    assert not own.exists() and own.parent.is_dir()
+    assert lanes._remove_in_managed_folders(deliveries, own) == "absent"  # the file is already gone
+    own.parent.rmdir()
+    assert lanes._remove_in_managed_folders(deliveries, own) == "absent"  # so is the folder
+
+
+@pytest.mark.parametrize("which", ["prepared-folder", "deliveries-folder"])
+def test_the_helper_refuses_a_linked_managed_folder(tmp_path, which):
+    _store, deliveries, own = _managed_folders(tmp_path)
+    independent = tmp_path.parent / f"{tmp_path.name}-linked-843"
+    independent.mkdir()
+    if which == "prepared-folder":
+        (independent / own.name).write_text("not part of any delivery\n", encoding="utf-8")
+        original = own.parent.rename(own.parent.with_name(".prepared-original"))
+        _link_directory(own.parent, independent)
+        victim = independent / own.name
+    else:
+        (independent / ".prepared").mkdir()
+        victim = independent / ".prepared" / own.name
+        victim.write_text("not part of any delivery\n", encoding="utf-8")
+        original = deliveries.rename(deliveries.with_name("lane-deliveries-original"))
+        _link_directory(deliveries, independent)
+
+    assert lanes._remove_in_managed_folders(deliveries, own) == "refused"
+
+    assert victim.read_text(encoding="utf-8") == "not part of any delivery\n"
+    assert any(original.rglob(own.name))  # the real copy was not touched either
+
+
+def test_the_helper_refuses_a_file_that_is_not_in_the_prepared_folder(tmp_path):
+    _store, deliveries, own = _managed_folders(tmp_path)
+    stray = deliveries / own.name
+    stray.write_text("{}", encoding="utf-8")
+    assert lanes._remove_in_managed_folders(deliveries, stray) == "refused"
+    assert stray.exists() and own.exists()
+
+
+def test_the_prepared_copy_is_left_in_place_when_the_held_folder_delete_is_not_available(
+    tmp_path, monkeypatch, capsys
+):
+    """No folder-relative delete (POSIX) or no way to hold the folders (Windows): the copy stays and the existing
+    message is printed. It is never deleted by name instead: a leftover prepared copy is never accepted as a
+    delivery."""
+    store, deliveries, own = _managed_folders(tmp_path)
+    pending = {"lane_id": "lane-a", "transaction_id": "cd" * 16, "prepared_artifact": str(own)}
+    if os.name == "nt":
+        import ctypes
+
+        def unavailable(*_args, **_kwargs):
+            raise OSError("no kernel32 here")
+
+        monkeypatch.setattr(ctypes, "WinDLL", unavailable)
+    else:
+        monkeypatch.setattr(os, "supports_dir_fd", set())
+    capsys.readouterr()
+
+    cli._lane_remove_prepared(store, pending)
+
+    assert own.exists()
+    assert "left in place" in capsys.readouterr().err
+
+
+def test_the_prepared_copy_remover_no_longer_deletes_by_name():
+    import inspect
+
+    source = inspect.getsource(cli._lane_remove_prepared)
+    assert "own.unlink" not in source and ".unlink(" not in source
+    assert "_remove_in_managed_folders" in source

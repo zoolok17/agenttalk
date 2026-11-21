@@ -6438,6 +6438,10 @@ def _lane_remove_prepared(store, pending: dict) -> None:
     # other folder and the file there is not the delivery's (its canonical path matches because both spellings resolve
     # through the link). The delivery's managed folders must be real folders, or nothing is removed.
     deliveries = lane_mod.deliveries_dir(store)
+    refusal = (
+        "agenttalk lane deliver: the delivery's prepared-copy folder is a link (or cannot be checked), so "
+        "the prepared copy was left in place; check the folders under the store's lane-deliveries folder.\n"
+    )
     for folder in (deliveries, own.parent):
         try:
             linked = lane_mod._is_link(os.fspath(folder))
@@ -6446,14 +6450,12 @@ def _lane_remove_prepared(store, pending: dict) -> None:
         except OSError:
             linked = True  # it cannot be looked at, so it is not shown to be a real folder
         if linked:
-            sys.stderr.write(
-                "agenttalk lane deliver: the delivery's prepared-copy folder is a link (or cannot be checked), so "
-                "the prepared copy was left in place; check the folders under the store's lane-deliveries folder.\n")
+            sys.stderr.write(refusal)
             return
-    try:
-        own.unlink(missing_ok=True)
-    except OSError:
-        pass
+    # The folders were checked by name; a swap between that and a delete by name would redirect the delete. So the
+    # delete is made through the two folders held open (#843), and where that cannot be done the copy stays.
+    if lane_mod._remove_in_managed_folders(deliveries, own) == "refused":
+        sys.stderr.write(refusal)
 
 
 def _lane_rebind_pending_delivery(
