@@ -204,7 +204,11 @@ def test_close_index_refusal_never_enters_unknown_status_fallback(tmp_path, monk
     store.init(["lead"])
     store.set_role("lead", "lead")
     sha = "a" * 40
-    monkeypatch.setattr(cli, "_git", lambda root, argv: (0, "" if "status" in argv else sha))
+    monkeypatch.setattr(
+        cli,
+        "_git",
+        lambda root, argv: (0, "true" if "--is-inside-work-tree" in argv else "" if "status" in argv else sha),
+    )
     git_reads(monkeypatch, b"")
     if action == "reopen":
         assert (
@@ -235,6 +239,44 @@ def test_close_index_refusal_never_enters_unknown_status_fallback(tmp_path, monk
     error = capsys.readouterr().err
     assert "this checkout is not recorded as clean" in error
     assert "worktree is dirty and no" not in error
+
+
+@pytest.mark.parametrize("action", ["open", "reopen"])
+@pytest.mark.parametrize("reason_name", ["HIDDEN", "SUBMODULE_NOT_CLEAN"])
+def test_close_reports_hold_for_hidden_index_or_submodule(tmp_path, monkeypatch, capsys, action, reason_name):
+    store = Store(tmp_path)
+    store.init(["lead"])
+    store.set_role("lead", "lead")
+    sha = "a" * 40
+    monkeypatch.setattr(cli, "_git", lambda root, argv: (0, "true" if "--is-inside-work-tree" in argv else sha))
+    reason = getattr(safety(), reason_name)
+    monkeypatch.setattr(cli, "_close_clean_detail", lambda root: (False, reason))
+    args = [
+        "--root",
+        str(tmp_path),
+        "close",
+        "open",
+        "--id",
+        "sub",
+        "--from",
+        "lead",
+        "--scope",
+        "docs",
+        "--revision",
+        sha,
+    ]
+    assert cli.main(args) == 0
+    if action == "reopen":
+        capsys.readouterr()
+        assert (
+            cli.main(["--root", str(tmp_path), "close", "reopen", "--id", "sub", "--from", "lead", "--revision", sha])
+            == 0
+        )
+    error = capsys.readouterr().err
+    assert reason in error
+    assert "Close will HOLD without a dirty artifact until" in error
+    if reason_name == "HIDDEN":
+        assert "these files are inspected and the relevant flags are cleared." in error
 
 
 def test_materialized_gitlink_refuses_the_final_cli_removal(tmp_path, monkeypatch):

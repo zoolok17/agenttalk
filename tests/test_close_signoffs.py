@@ -11,6 +11,7 @@ hermetic, plus a recorded --dirty-artifact so the revision never HOLDs.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -458,8 +459,18 @@ def test_cli_signoff_reopen_to_new_revision_holds_until_reapply(tmp_path: Path) 
     assert _run(["close", "check", "--id", "rel"], root) == 0     # GO at original rev
     # publish GO then reopen to a new revision (simulates re-review of new code)
     _run(["close", "publish", "--id", "rel", "--from", "lead", "--verdict", "go"], root)
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    (root / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    git("add", ".gitignore")
+    git("-c", "commit.gpgsign=false", "commit", "-qm", "new revision")
+    revision = git("rev-parse", "HEAD")
     assert _run(["close", "reopen", "--id", "rel", "--from", "lead",
-                 "--revision", OTHER_SHA], root) == 0
+                 "--revision", revision], root) == 0
     # route still pinned to the old revision -> stale until re-apply, even though the
     # prior acks would otherwise be re-collected
     assert _run(["close", "check", "--id", "rel"], root) == 3
