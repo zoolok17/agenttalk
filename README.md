@@ -1383,7 +1383,10 @@ in agenttalk waits for it or is held back by it.
   Below it, each seat shows its own reading, newest first, with how long ago it was seen. Readings
   are never merged across seats: to judge the account, read the newest seat's row.
 - `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or
-  `capacity=unknown(<reason>)` to each seat that has written a reading.
+  `capacity=unknown(<reason>)` to each seat that has written a reading; a seat that has written
+  none, such as a newly set-up seat, shows no `capacity=` field. When a Claude seat's reading has
+  no figures yet (reason `claude_source_not_configured`), the field reads
+  `capacity=unknown(no reading yet)`; `status --json` keeps the reason code.
 - The web console and `agenttalk attention` show and warn only on figures that are still current.
 
 **Where the figures come from**
@@ -1408,7 +1411,8 @@ in agenttalk waits for it or is held back by it.
     reason is `claude_seat_source_unknown`.
   - For a seat whose supervisor entry gives it its own `CLAUDE_CONFIG_DIR`, pass that folder's
     `statusline-last-input.json` with `--statusline-path`, or let the seat's wrapper refresh it.
-  - With neither source, the reason is `claude_source_not_configured`.
+  - With neither source, the reason is `claude_source_not_configured`. A new seat usually has a
+    reading after its first turn; if a seat still has none after some turns, set up a status line.
 - **Codex seats:** the seat's own session file under its `CODEX_HOME`. A seat without a Codex home
   of its own reads the shared `~/.codex` (also when `CODEX_HOME` names that same folder, directly or
   through a link). There it

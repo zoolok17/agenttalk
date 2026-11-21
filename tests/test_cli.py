@@ -2136,6 +2136,31 @@ def test_status_a_seat_with_only_a_capacity_snapshot_is_told_why_it_still_counts
     assert "capacity=unknown(claude_seat_source_unknown)" in out  # the row still shows the snapshot it names
 
 
+@pytest.mark.parametrize("reason,shown", [
+    ("claude_source_not_configured", "no reading yet"),
+    ("claude_seat_source_unknown", "claude_seat_source_unknown"),
+    (None, "no signal"),
+    (["not", "text"], "['not', 'text']"),
+    ("line" + chr(10) + "break", "line" + chr(92) + "u000abreak"),  # a stored line break never starts a line
+])
+def test_status_shows_a_claude_seat_with_no_reading_yet_in_plain_words(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, reason, shown
+) -> None:
+    """#824: a new Claude seat has no reading until its first turn, so the plain line says so instead of naming a
+    fault; every other reason is shown as it is, and `status --json` keeps the stored reason that programs read."""
+    store.write_capacity("beta", dict(_SNAPSHOT, reason=reason))
+    capsys.readouterr()
+
+    assert _run(["status", "--json"], store_root) == 0
+    beta = next(a for a in json.loads(capsys.readouterr().out)["agents"] if a["name"] == "beta")
+    assert _run(["status"], store_root) == 0
+    out = capsys.readouterr().out
+
+    assert beta["capacity"]["reason"] == reason
+    assert f"capacity=unknown({shown})" in out
+    assert reason != "claude_source_not_configured" or "claude_source_not_configured" not in out
+
+
 def test_status_a_seat_without_a_capacity_snapshot_gets_no_capacity_note(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -4087,10 +4112,27 @@ def test_301_capacity_says_when_the_claude_source_is_not_configured(
     rc = cli.main(["--root", str(tmp_path), "capacity", "refresh", "--for", "alpha",
                    "--source", "claude", "--statusline-path", str(tmp_path / "nope.json")])
     assert rc == 0
-    assert "Claude capacity source not configured" in capsys.readouterr().out
+    no_reading_yet = ("no Claude reading yet: no rate-limit event from the seat's turns so far and no status-line "
+                      "dump. A new seat usually gets one after its first turn. If it stays this way after turns, "
+                      "set up a status line")
+    assert no_reading_yet in capsys.readouterr().out  # #824: worded as "not yet", not as a fault
     assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
-    assert "Claude capacity source not configured" in capsys.readouterr().out
+    assert f"budget unknown ({no_reading_yet})" in capsys.readouterr().out
+    assert Store(tmp_path).read_capacity("alpha")["reason"] == "claude_source_not_configured"
 
+
+
+@pytest.mark.parametrize("reason", [["not", "text"], {"a": 1}, "line" + chr(10) + "break", None])
+def test_capacity_table_survives_a_stored_reason_it_does_not_know(
+    tmp_path: Path, capsys: pytest.CaptureFixture, reason,
+) -> None:
+    """#824: the reason comes from a file anyone can edit; a list or an object used to crash `agenttalk capacity`."""
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    Store(tmp_path).write_capacity("beta", dict(_SNAPSHOT, reason=reason))
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    assert "budget unknown (no readable signal on its side)" in capsys.readouterr().out
 
 # --------------------------------------- roster set-operator-facing (T012)
 
