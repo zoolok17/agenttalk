@@ -20,6 +20,16 @@ def test_operator_vendor_config_and_single_dispatch(bus, vendor):
     assert bus.valid_messages()[0].meta["assignee_model_vendors"] == {"worker": vendor}
 
 
+def test_set_model_vendor_names_the_seat_and_the_change(bus, capsys):
+    """#824: a script that sets several seats can tell from the output which one changed."""
+    assert command(bus, "roster", "set-model-vendor", "worker", "openai") == 0
+    assert capsys.readouterr().out == (
+        "roster: worker model vendor set to openai (operator-configured, not provider attestation).\n")
+    assert command(bus, "roster", "set-model-vendor", "worker", "--clear") == 0
+    assert capsys.readouterr().out == (
+        "roster: worker model vendor cleared (operator-configured, not provider attestation).\n")
+
+
 @pytest.mark.parametrize("mapping", [{"ghost": "openai"}, {"worker": "qwen"}, [], {"worker": 1}])
 def test_invalid_vendor_config_refused(bus, mapping):
     cfg = bus.load_config()

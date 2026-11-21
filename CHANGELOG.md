@@ -10,8 +10,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The lead setup brief explains how to run a Claude seat in a strict permission mode (#826).**
+  Before this, the brief said that a wrapped Claude seat runs with no approval prompts and no
+  sandbox unless you choose another mode, and left the rest to the team. Now its step 10a gives a
+  starting set of allow and deny rules for Claude Code's `dontAsk` mode, based on one that another
+  team built and tested on Windows with Claude Code 2.1.326 and agenttalk 0.105.0 (issue #823).
+  It covers the rule for the agenttalk command a strict seat is given (the interpreter's path
+  written out, with the rule the wrapper prints from #828 on, and the older `PATH` workaround for
+  versions before it), the rule that lets a seat write its reply drafts (with the two-slash form
+  for absolute paths on Linux and macOS), which settings files Claude Code adds together, how a
+  strict seat gets its own rules when its launch does not load `CLAUDE.local.md`
+  (`--append-system-prompt-file`), and how to test your own rules. Every statement about Claude Code says whether the other team reported
+  it, agenttalk's maintainers measured it, or Claude Code's documentation says it. It also says
+  what such rules cannot catch: git options and settings that write or read files or start a
+  program, `git branch` changes, reads that name no file such as `grep -r`, and agenttalk's own
+  `--file` option, which reads any file the account can read even when shortened to `--fi`
+  (#827). It is a guardrail, not a sandbox: anything the rules allow runs with the user account's
+  full rights, and only a separate account, virtual machine or container keeps the account's
+  secrets and the seats' settings files out of their reach.
+  Steps 4 and 5 gain two short notes: the user account's own Claude instructions reach wrapped
+  seats too, and on Windows the process number the start script saves belongs to a launcher.
+
 ### Changed
 
+- **The release checklist now names the README as the only install pin.** Since the user manuals
+  stopped carrying their own install line (#835), step 1 of the release ritual in
+  `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
+  refuses. It now says to update the README's install line and its link to the lead setup brief only.
+  Wording only.
 - **Windows test jobs in CI may now run for 360 minutes instead of 330.** Between 16 and 18 November,
   18 Windows test jobs were stopped at the 330-minute limit without a single failing test, so pull
   requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
@@ -51,6 +79,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text.
 
 ### Fixed
+
+- **Three first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
+  line for every seat; now it names the seat and the change, for example "roster: worker model vendor
+  set to openai (operator-configured, not provider attestation)." or "... cleared ...", so a script
+  that sets several seats can tell them apart. `install-skills --claude-only` and `--codex-only`
+  installed the dev-discipline pack into both the Claude and the Codex skills folders without saying
+  so; now their output adds one line that says this and that `--no-devkit` leaves the pack out, and
+  their help says the same. With `--devkit-only` the line says instead that the flag has no effect.
+  What gets installed is unchanged, with one exception: `--devkit-only` together with `--no-devkit`
+  used to install the pack anyway, and is now refused before anything is written, because the two
+  contradict each other. A Claude seat with no capacity reading
+  yet read like a fault: `status` showed `capacity=unknown(claude_source_not_configured)` and
+  `capacity` said "Claude capacity source not configured", even for a seat that had simply not had its
+  first turn. Now `status` shows `capacity=unknown(no reading yet)`, and `capacity` explains that a
+  new seat usually gets a reading after its first turn and when to set up a status line. The reason
+  code `claude_source_not_configured` is unchanged wherever programs read it (`status --json`, the
+  capacity file, the dashboard data), and the dashboard page still shows the code as it is (issue
+  #824, items 1 to 3).
+
+- **A strict-mode Claude seat whose Python sits in a folder with brackets now gets the full-path form too.**
+  Since #828, a Claude seat in a stricter permission mode is told to run agenttalk through the full path
+  of its Python, but a path with `(` or `)`, such as one under `Program Files (x86)`, fell back to the old
+  form, which such a seat cannot run. A live Claude Code in `dontAsk` mode was tried with the rule for a
+  path holding `Program Files (x86)`: it allowed only that exact command, the same as for a path without
+  brackets. So the wrapper no longer refuses brackets. It still refuses a `*` (a rule reads it as "any
+  text"), characters that are unsafe inside double quotes, and a path that is not an existing full path
+  (#860).
+- **`agenttalk doctor` no longer calls the PowerShell host check "not needed" while a seat that left the
+  team list may still run a continuous Codex wrapper.** Retiring, renaming or removing a seat leaves its
+  health marker behind, and its wrapper may still be running. Doctor now reads those markers too: a
+  continuous Codex marker of a seat that is no longer on the roster keeps the missing-PowerShell error,
+  names the seat with "(not on the roster)" and says which marker file to remove once no wrapper runs for
+  it. A marker that needs no host still gives N/A, and one that cannot be read gives "could not check"
+  (#847, #869).
+- **The skills check now reads the pinned-interpreter rule correctly (#801, #861, #864,
+  #865).** The check tells whether a skill states the rule "when `AGENTTALK_PY` is set, use the
+  pinned command; otherwise the plain one" before it shows the plain `python -m agenttalk` form.
+  It was fooled in four ways, which are fixed. A "do not" after the pinned command ("must not be
+  used") now stops the sentence from counting as the rule. A command split over two lines (a
+  Bash backslash or a PowerShell backtick) is read as one command. A period inside a code span
+  (such as `-m agenttalk.assurance` or `reply.md`) no longer ends the sentence early, and a
+  period right before a closing quote or bracket now ends it. A Windows drive path, including
+  the drive-relative kind like `<drive>:file`, no longer counts as the end of a sentence part.
+  The bundled skills are unchanged: the check gives the same answer for all of them.
+- **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
+  Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
+  variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run
+  `"$AGENTTALK_PY" -m agenttalk ...` (issue #822). Before this, such a seat could not reply, report
+  progress or send by command. Now the wrapper writes the Python interpreter's full path into that
+  seat's instructions (`"<path with forward slashes>" -m agenttalk ...`), tells it to use the Bash tool,
+  and prints at start the allow rule the team can add, for example
+  `Bash("<env>/Scripts/python.exe" -m agenttalk *)`. The wrapper never adds the rule itself: in a
+  strict profile the team decides what a seat may run. Seats in the default `bypassPermissions` mode,
+  and Codex seats, see no change. A strict seat keeps the old form when the interpreter's path is not
+  an existing full path, is not safe inside double quotes, or holds a character that has a meaning in
+  the printed rule. Those characters are `*`, which a rule reads as "any text" even inside quotes, so
+  a path such as `/opt/pinned*/bin/python` would let the rule allow other programs too, and `(` and
+  `)`, which enclose the rule. The source is Claude Code's permissions page
+  (code.claude.com/docs/en/permissions, "Wildcard patterns"). Not changed here: the skills (they keep
+  their `AGENTTALK_PY` rule), the supervisor's own resume rule `Bash(agenttalk *)`, the PowerShell
+  forms, and the lead setup brief (#826 changes it).
+- **A settings file nested too deeply no longer crashes agenttalk (#846).** A team
+  configuration or PowerShell host selection file holding JSON nested so deeply that
+  Python cannot read it is now reported as damaged: doctor names it and goes on with its
+  other checks, other commands print one line and stop, and `init --force` can repair
+  such a configuration.
 
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,
@@ -135,6 +229,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.powershell-host.lock.generation`, you can safely delete that folder: it
   holds no messages or roster, but can still make folders below it look like
   part of the same project. Do not delete it if it contains anything else.
+
+- **A committed delivery with a damaged checkout path can finish publication (#771, part of #729).**
+  Retrying `lane deliver` publishes the existing evidence and leaves cleanup pending,
+  without using the damaged path. (One shape is the exception: a delivery committed with a
+  relative worktree path and no absolute canonical path in its saved copy cannot be
+  completed by this version. It is kept and reported instead, see below and #787.)
+  This also holds when the path was already blank or
+  relative before an older version prepared that delivery: the saved copy of the lane
+  carries the same damage, and a valid committed final is still published instead of
+  being set aside, from the folder it was made in or from any other: a blank or relative
+  saved canonical path is not read against the retry's folder, and the checkout itself is
+  still checked against Git. A saved copy of the lane whose worktree path is not a full
+  absolute path (relative, or a Windows `C:x` or `\x`) is never read against any folder
+  (from inside some other checkout that would read the wrong one). Two cases: (1) if the
+  saved copy also holds an absolute canonical path, the checkout is verified through that
+  path, from any folder, and the publication and its rollback then go exactly as for the
+  same delivery with an absolute worktree path: same checks, same refusals, same rollback.
+  The worktree cleanup after a publication is not covered by this: it still reads the
+  lane row's own path, so a relative row path is still read from the folder the retry runs
+  in there (a separate follow-up); (2) if it holds
+  no absolute canonical path, the retry changes nothing (the committed final, the pending
+  delivery and the lane row stay exactly as they were, even if another lane became active or
+  a release barrier was sent since the first attempt, because this is decided before any
+  rollback; a final that fails its integrity check is still refused as before) and says: this version cannot
+  complete this delivery; the evidence is kept; report it. Replacing `worktree_path` in the
+  lane row does not help there, because the check reads the saved copy of the lane inside
+  the pending delivery, not the row; completing such a delivery is not built yet (follow-up
+  #787). Without a valid
+  committed final, such a delivery is still refused. Once the original checkout is gone,
+  the lane can be retired with
+  `lane abandon --acknowledge-missing-worktree`; if the saved canonical path is relative,
+  repair it first (set it to the checkout's real absolute folder; removing it does not help
+  when it is the lane's only saved checkout path, because there is then nothing to
+  acknowledge), because retiring the lane does not clear it. A lane whose saved worktree path is relative
+  cannot be acknowledged as missing at all: the folder it names depends on where the command
+  that wrote it ran, which cannot be recovered. `lane abandon --acknowledge-missing-worktree`
+  then refuses and records nothing, for every spelling that is not absolute (a Windows
+  `C:x` or `\x` included, and a path of only spaces, which Git allows as a folder name: only
+  an empty value is retired directly); replace `worktree_path` with the checkout's real
+  absolute folder (if a folder with exactly that name exists where the lane ran, write its
+  absolute path) or, when the checkout is really gone and no such folder exists anywhere, set
+  it to empty text (`""`), and acknowledge again (removing the field does not help: a lane
+  with no worktree path has nothing to acknowledge and stays active). This replaces the earlier behavior, where a
+  relative path was read from the repository root and a missing folder there was
+  acknowledged. The advice for a damaged checkout field follows the lane: when a delivered
+  lane's delivery is unfinished it says to run `lane recover` first, and for a relative
+  worktree path it says to replace it before retiring the lane. A saved path that holds an
+  embedded NUL character is refused as damage in its own field, like a blank one, instead of
+  ending in a bare lookup error. `lane status` names `lane deliver` alone, not `lane recover`,
+  for a lane whose publication is finished and whose cleanup is still pending. If that
+  cleanup marker is damaged (not an explicit true or false), no command clears it, so
+  status says to set `cleanup_pending` in the lane's record in `lanes.json` instead:
+  `true` if the checkout still needs removing, `false` if the cleanup is done.
+  Every message about an existing lane's record that suggests a lane step (status, abandon,
+  deliver, recover, check, workspace, reset and the worktree release) now asks the same damage
+  check first and names only a step that runs on that state. The two early refusals of
+  `lane assign` (the lane already exists; the delivery marker is not complete) are not part of
+  this and are unchanged: for a damaged row `lane status` keeps only the
+  acknowledgement step from the damage message (it no longer adds `lane deliver`, which
+  refuses there); the record-only retirement skips a damaged saved path (blank, whitespace,
+  or with an embedded NUL) and looks at the healthy one; `lane recover` says so for a
+  committed final that this version cannot complete instead of naming `lane deliver`;
+  `reset` points at the step `lane status` prints; and the worktree release refusal keeps
+  the reason ("contains an embedded NUL character") instead of calling the path relative.
+  For a committed final that this version cannot complete, `lane deliver` and `lane status`
+  now print only that report (the evidence is kept; report it): `lane deliver` no longer adds
+  "retry the same command", and `lane status`, in its text and in its `--json` output, no
+  longer offers `lane deliver`, `lane recover` or a repair step there (also when the current
+  row was repaired since: the saved copy inside the delivery is what cannot be located). A saved path that holds a character that cannot be written to
+  `lanes.json` (an unpaired surrogate, which a JSON escape can store but the file, saved as
+  strict UTF-8, cannot hold) is refused as damage, with that reason.
+  A saved canonical path like that is refused before any save, with the repair advice for a
+  canonical path, so retiring a lane no longer ends in a bare encoding error. A committed
+  delivery whose saved worktree path is only spaces (Git allows such a folder name) is now
+  treated like any other path that is not a full absolute path: its checkout is verified
+  through the saved absolute canonical path from any folder, or, with none, the delivery is
+  kept and the same report is printed. A retired lane whose saved worktree path is only spaces
+  (or another non-absolute spelling) still blocks the checkout release, so `lane status` keeps
+  listing it, with the replace-or-empty advice, and the release refusal gives that advice
+  instead of "use a new lane id". A saved worktree path that holds an unpaired surrogate gets
+  the same hand-edit advice as a canonical one (no command can save the lane while it is
+  there), never the acknowledgement step.
+  When a lane's own saved checkout path is damaged but its other saved path still names a folder that
+  exists, the advice no longer offers the missing-worktree acknowledgement (it is refused while the folder
+  exists, and so is a plain `lane abandon` while a field is damaged): it says to set the damaged field to
+  the folder's real absolute path in `lanes.json`, then run `lane abandon`. The advice says only what was
+  found: a real folder is called a folder; a file or a link (a link is never offered as the value to set) is
+  called that, with the two ways out, both of which repair the lane's own record in `lanes.json` and leave
+  that entry alone, since a damaged record can name a file that is not the lane's (name the real checkout
+  folder in both fields, then `lane abandon`, or, with no checkout, set the field that names it to empty
+  text and repeat the command); an entry that could not be examined is said to be
+  unexamined, with the reason, and is not claimed to exist. In none of these is the missing-worktree
+  acknowledgement offered. For a lane whose delivery is unfinished it says to run `lane recover` first and
+  then repeat the command, which names what is left.
+
+- **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
+  The next supervisor poll names the lane and damaged field without launching it,
+  so `lane abandon --acknowledge-missing-worktree` can retire the lane afterwards.
+
+- **Lane cleanup no longer removes a folder that belongs to another lane, or a file that belongs to no delivery (#771, part of #729 and #834).**
+  Three damaged-record cases could lose work or delete an unrelated file; each now stops and changes nothing.
+  A saved checkout name that is not a full path was read from the folder the command ran in when the checkout
+  was checked, but from the store folder when it was removed, so one checkout could be checked and another lane's
+  removed; the removal is now given the same full path the check read. A checkout that is not on its lane branch (it sits at the same commit)
+  is accepted as that lane's only when no other lane's record names it and the lane branch is not checked out
+  elsewhere; `lane abandon`, `lane deliver` and `lane gc --delete` all apply this. Another lane's record whose
+  checkout path is not a full path (and that saves no full canonical path) also stops the removal, and the
+  message names that lane and says to put its real folder in `lanes.json`, since that record could be naming the
+  checkout. And a delivery retry deleted
+  whatever file a damaged delivery record named as its prepared copy; it now deletes only the delivery's own
+  prepared file, never one reached through a linked or junction folder, and says that it left the file alone.
+  Two things more were closed in the same change. A checkout that another lane still lists among its earlier
+  checkouts (after a forced reassignment) now counts as that lane's too. And a removal only takes a checkout that
+  lies inside this store's folder, where `lane assign` always makes it: two stores that share one Git repository
+  (a copied store folder, a restored `lanes.json`) could remove each other's checkouts, and `lane gc --delete` could
+  also delete the other store's branch. `lane abandon`, the cleanup after `lane deliver` and `lane gc` now leave a
+  checkout outside the store folder (or in a store nested inside it) alone and say so; `lane deliver` refuses such a
+  lane before it writes anything. A lane whose checkout really is outside the store folder (a hand-edited
+  record, a checkout moved away with `git worktree move`) needs the manual exit: inspect the checkout, save its
+  ignored files, remove it with `git worktree remove`, then run `lane abandon --acknowledge-missing-worktree`.
+  The same removals also stop when the checkout holds a store of its own (an `.agenttalk` folder, in any letter
+  case, at its root or anywhere below it, which Git ignores and which would be deleted with it), and say where
+  it is. They stop too for a directory link (a junction or symbolic link) named like a store folder, and on
+  Windows for any directory link that leads out of the checkout, because some Git versions follow such a link while
+  removing a checkout and delete what it points at. The undo of a failed `lane assign` stops the same way, so a
+  store made in the new checkout by a hook is no longer deleted with it. A checkout that legitimately holds such a
+  link takes the manual exit: remove the link yourself, then the checkout.
+
+- **A blank lane checkout folder now gets a clear refusal (#729).** Commands and launches name the lane and damaged field before using its folder or changing it. Status lists the damaged lane, and the supervisor workspace map skips it while keeping healthy lanes. A relative `worktree_path` still works as before (except in a delivery that was already committed with a relative path and no absolute canonical path, which this version keeps and reports instead of completing: #771, #787), but a saved canonical path (`worktree_toplevel_canonical`) must be absolute: a relative one, including one an older agenttalk already saved, is refused by the lane commands (exit 2, and status lists the lane) until you edit that lane's record in `lanes.json`: remove the `worktree_toplevel_canonical` field (the lane then relies on `worktree_path` alone) or set it to the checkout's real absolute folder. The message names no command, because retiring the lane would not clear it for worktree release. One exception stays: a delivery whose committed evidence is already valid still finishes publication (exit 0), with its cleanup left pending: the checkout is not cleaned up and the field is left as it is until you repair it. A UNC share root such as `\\server\share` counts as an absolute path, with or without a trailing slash. Every recovery command names the lane you selected, never the id written inside its record. The record-only abandon option retires acknowledged damage without deleting a checkout; status stops repeating the advice and unrelated checkout release can proceed. Supervised seats are compared with any usable folder that remains; if none remains, the refusal says to stop them first. Saved paths are checked without trimming them. A usable folder that still exists prevents acknowledgement, even when the other field is damaged. `lane assign --force` no longer repairs a lane whose damaged field is not the one in use; retire it with the record-only option, then use a new lane id. The supervisor reports a damaged lane once per process, rather than on every poll.
 
 - **The bundled skills no longer teach advice that went wrong (skills review of 0.105.0).**
   A first read of the 0.105.0 skills against the real commands found four pieces of advice
