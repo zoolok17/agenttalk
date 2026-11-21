@@ -473,3 +473,72 @@ def test_the_preview_lists_every_kept_checkout_even_past_the_display_limit(estat
     assert len(report.candidates) == 17
     assert f"REFUSED (kept) {busy}" in preview, preview
     assert "and 1 more" in preview, preview  # 17 candidates: 15 listed by age, the kept one named, one left over
+
+
+@pytest.mark.parametrize("failure", [(1, "", "git list failed"), (None, "", "git is not resolvable")])
+@pytest.mark.parametrize("held_first", [False, True])
+def test_a_failed_final_listing_of_checkouts_keeps_the_candidate_and_is_reported_as_failed(
+    estate, monkeypatch, failure, held_first
+):
+    """Git's list of registered checkouts is compared at the delete. A failed listing is not an empty one: with an
+    empty first list and a failed final one, an active checkout that appeared under the folder would not be seen."""
+    repo, wt, cfg = estate
+    parent = repo / ".worktrees" / "group"
+    if held_first:
+        checkout(repo, "group", "first")
+    else:
+        parent.mkdir(parents=True)
+    report = janitor.build_report(cfg)
+    assert any(c.path == parent for c in report.candidates)
+    real_changed, real_git = janitor._checkouts_changed, janitor._run_git_checked
+    created = []
+
+    def changed(c, worktrees, cfg):
+        if c.path == parent:
+            lane = checkout(repo, "group", "new")
+            _write_record(repo, "active-lane", lane)
+            created.append(lane)
+
+            def failed_git(repo, *args, **kwargs):
+                if args[:3] == ("worktree", "list", "--porcelain"):
+                    return failure
+                return real_git(repo, *args, **kwargs)
+
+            monkeypatch.setattr(janitor, "_run_git_checked", failed_git)
+        return real_changed(c, worktrees, cfg)
+
+    monkeypatch.setattr(janitor, "_checkouts_changed", changed)
+
+    text = janitor.apply(cfg, report)
+
+    assert created and created[0].exists() and parent.is_dir(), text
+    assert report.apply_failed and "FAILED" in text and "could not list the registered checkouts" in text, text
+    assert "removed: 1" not in text
+
+
+def test_a_successful_final_listing_still_lets_a_folder_with_a_checkout_go(estate):
+    repo, wt, cfg = estate
+    checkout(repo, "group", "only")
+
+    report, text = sweep(cfg)
+
+    assert not (repo / ".worktrees" / "group").exists(), text
+    assert not report.apply_failed
+
+
+def test_a_report_made_while_git_cannot_list_checkouts_says_so(estate, monkeypatch):
+    """When the first listing already failed, the final comparison is not stricter than the first look (discovery is
+    untrusted then, and refuses a folder that holds a checkout)."""
+    repo, wt, cfg = estate
+    real = janitor._run_git_checked
+
+    def failed_git(repo, *args, **kwargs):
+        if args[:3] == ("worktree", "list", "--porcelain"):
+            return 1, "", "git list failed"
+        return real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(janitor, "_run_git_checked", failed_git)
+
+    assert janitor.build_report(cfg).listing_ok is False
+    monkeypatch.undo()
+    assert janitor.build_report(cfg).listing_ok is True

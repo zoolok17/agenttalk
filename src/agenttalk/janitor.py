@@ -152,6 +152,9 @@ class JanitorReport:
     # Candidates that a lane, launch or supervisor record still names (or whose use could not be checked), with the
     # reason. A preview only: `apply` reads the records again (#858).
     in_use: dict[Path, str] = dataclasses.field(default_factory=dict)
+    # Whether Git's list of registered worktrees could be had when the report was made. When it could not, discovery
+    # is not trusted (`_worktrees_discovery_ok`) and the final comparison cannot be stricter than the first look.
+    listing_ok: bool = True
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -758,6 +761,7 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
         dirty_worktrees=dirty, foreign_kept=foreign, access_errors=access_errors,
         ancestor_ids=ancestor_ids,
         in_use=in_use,
+        listing_ok=_worktrees_discovery_ok(cfg.repo)[0],
     )
 
 
@@ -1249,13 +1253,19 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         # The last look, made at the removal: every record again under the lane writers' lock, and
                         # the set of checkouts that this removal takes with it.
                         with guard.final_window() if guard else contextlib.nullcontext():
-                            keep = _checkouts_changed(c, worktrees, cfg)
+                            try:
+                                keep = _checkouts_changed(c, worktrees, cfg)
+                            except _UseCheckFailed:
+                                if report.listing_ok:
+                                    raise  # the first listing worked: a failed one now is not "nothing registered"
                             if keep is None and guard:
                                 guard.reread()  # the very last look, after the comparison above
                             if keep is None:
                                 result, reason = remove_plainly(c.path)
                     except worktree_release.Refused as exc:
                         keep = str(exc)
+                    except _UseCheckFailed as exc:
+                        result, reason = "FAILED", str(exc)
                     except (OSError, ValueError, TypeError) as exc:
                         result, reason = "FAILED", _use_check_failure(exc)
                     if keep:
@@ -1289,13 +1299,25 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     return "\n".join(store_mod.report_line(line) for line in lines)
 
 
+def _registered_worktrees_listed(repo: Path) -> list[Path]:
+    """Git's list of registered worktrees, or `_UseCheckFailed` when it could not be had. `get_registered_worktrees`
+    answers `[]` for a failed listing on purpose (its callers remove nothing on that answer); a comparison that reads
+    that as "none registered" would miss a checkout that appeared since the first look."""
+    rc, out, err = _run_git_checked(repo, "worktree", "list", "--porcelain")
+    if rc is None or rc != 0:
+        why = "git is not resolvable" if rc is None else f"git worktree list failed, rc={rc}: {err.strip()[:200]}"
+        raise _UseCheckFailed(
+            f"could not list the registered checkouts to compare them before the delete ({why}); it was kept")
+    return [Path(line[len("worktree "):]) for line in out.splitlines() if line.startswith("worktree ")]
+
+
 def _checkouts_changed(c: Candidate, worktrees: list[Path], cfg: JanitorConfig) -> str | None:
     """Why `c` must be kept because the registered checkouts under it are no longer the ones that were checked (one
     was added, or one is gone), or None. A candidate that held none is looked at again too: a checkout can be
     registered under a plain folder after the report was made. A link is only unlinked and is not looked at."""
     if c.link:
         return None
-    now = [w for w in get_registered_worktrees(cfg.repo) if w.exists() and _contains_worktree(c.path, w)]
+    now = [w for w in _registered_worktrees_listed(cfg.repo) if w.exists() and _contains_worktree(c.path, w)]
     if len(now) != len(worktrees) or not all(any(_same_worktree(w, x) for x in worktrees) for w in now):
         return "the registered checkouts under it changed while it was being checked; run the sweep again"
     return None
