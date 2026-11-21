@@ -20,8 +20,11 @@ def _no_use_check():
 class _NoGuard:
     """A guard that finds nothing in use: the activity check has its own tests (test_janitor_active_lanes.py)."""
 
-    def __init__(self, cfg, targets):
+    def __init__(self, cfg, targets, **kwargs):
         pass
+
+    def reread(self):
+        return None
 
     def __enter__(self):
         return self

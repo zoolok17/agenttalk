@@ -818,8 +818,12 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
                 lines.append(f"  REFUSED (kept) {c.path}: {report.in_use[c.path]}")
             else:
                 lines.append(f"  {when} {c.path}")
-        if len(report.candidates) > 15:
-            lines.append(f"  ... and {len(report.candidates) - 15} more")
+        # A kept checkout is never left to "and N more": every refusal is listed, whatever the display limit.
+        later = [c for c in sorted(report.candidates, key=lambda c: c.mtime)[15:] if c.path in report.in_use]
+        for c in later:
+            lines.append(f"  REFUSED (kept) {c.path}: {report.in_use[c.path]}")
+        if len(report.candidates) > 15 + len(later):
+            lines.append(f"  ... and {len(report.candidates) - 15 - len(later)} more")
         lines.append("re-run with --apply to preserve dirty removal candidates as WIP commits, "
                       "delete, and prune.")
     return "\n".join(store_mod.report_line(line) for line in lines)
@@ -1165,7 +1169,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                     in_use = [w for w in worktrees if not _same_worktree(w, cfg.repo)]
                     if in_use and not keep:
                         try:
-                            guard = worktree_release.RemovalGuard(cfg, in_use)
+                            guard = worktree_release.RemovalGuard(cfg, in_use, closed_window=True)
                             held.enter_context(guard)
                         except worktree_release.Refused as exc:
                             keep = str(exc)
@@ -1246,6 +1250,8 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         # the set of checkouts that this removal takes with it.
                         with guard.final_window() if guard else contextlib.nullcontext():
                             keep = _checkouts_changed(c, worktrees, cfg)
+                            if keep is None and guard:
+                                guard.reread()  # the very last look, after the comparison above
                             if keep is None:
                                 result, reason = remove_plainly(c.path)
                     except worktree_release.Refused as exc:
@@ -1285,9 +1291,9 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
 
 def _checkouts_changed(c: Candidate, worktrees: list[Path], cfg: JanitorConfig) -> str | None:
     """Why `c` must be kept because the registered checkouts under it are no longer the ones that were checked (one
-    was added, or one is gone), or None. Only a candidate that held checkouts is looked at again: a plain folder pays
-    nothing."""
-    if not worktrees:
+    was added, or one is gone), or None. A candidate that held none is looked at again too: a checkout can be
+    registered under a plain folder after the report was made. A link is only unlinked and is not looked at."""
+    if c.link:
         return None
     now = [w for w in get_registered_worktrees(cfg.repo) if w.exists() and _contains_worktree(c.path, w)]
     if len(now) != len(worktrees) or not all(any(_same_worktree(w, x) for x in worktrees) for w in now):

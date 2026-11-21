@@ -615,28 +615,38 @@ class RemovalGuard:
     order, one claim per lane even when two checkouts name it) and refuses, releasing every claim taken, when a record
     makes any of them in use or a claim is not free. The claims are kept until the block ends, so no session can start
     on those lanes through everything that follows (a work-in-progress commit, the removal). `final_window()` is the
-    last look, made at the removal itself."""
+    last look, made at the removal itself.
 
-    def __init__(self, cfg: janitor.JanitorConfig, targets: list[Path]):
+    `closed_window` is for the sweep. A release takes the lane writers' lock only when a lane named a checkout at the
+    first look, and reads the records once under it: a lane that names the checkout only after that read (a record
+    written by a program that does not take the lock, a session on a lane it did not name) is not seen. With
+    `closed_window` the lock is taken whenever the store exists, and `reread()`, called last, reads the records again
+    and takes a claim on every lane that names a checkout now and did not before, kept until the block ends. A release
+    is left as it was; its window is the one between its last read and Git's removal."""
+
+    def __init__(self, cfg: janitor.JanitorConfig, targets: list[Path], *, closed_window: bool = False):
         self.cfg = cfg
         self.targets = _in_claim_order(targets)
         self.named: list[str] = []
+        self.closed_window = closed_window
         self._claims = contextlib.ExitStack()
+        self._claimed: set[str] = set()
+
+    def _claim(self, store, lane_id):
+        if lane_id in self._claimed:
+            return None
+        busy = self._claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
+        if busy is None:
+            self._claimed.add(lane_id)
+        return busy
+
+    def _take_claims(self) -> None:
+        for target in self.targets:
+            self.named += [lane for lane in _free_lanes(self.cfg, target, self._claim) if lane not in self.named]
 
     def __enter__(self) -> "RemovalGuard":
-        claimed: set[str] = set()
-
-        def claim(store, lane_id):
-            if lane_id in claimed:
-                return None
-            busy = self._claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
-            if busy is None:
-                claimed.add(lane_id)
-            return busy
-
         try:
-            for target in self.targets:
-                self.named += [lane for lane in _free_lanes(self.cfg, target, claim) if lane not in self.named]
+            self._take_claims()
         except BaseException:
             self._claims.close()
             raise
@@ -645,17 +655,31 @@ class RemovalGuard:
     def __exit__(self, *exc_info) -> None:
         self._claims.close()
 
+    def reread(self) -> None:
+        """The last look before the removal (`closed_window`): every record again, a claim on any lane that names a
+        checkout now, and a second look at the names that were read as absent (`_still_absent`)."""
+        with _watching_absent() as seen:
+            self._take_claims()
+        _still_absent(seen)
+
     @contextlib.contextmanager
     def final_window(self):
         """Re-reads every record under the lock that every lane writer takes, then lets the caller remove. The token
         does not stop a lane writer; this lock, which every one of them takes, does. It is taken only here, not around
         the checks that hash every file: lane writers wait 10 seconds for it. Names read as absent are looked at once
         more before the caller goes on (`_still_absent`)."""
-        with store_mod.Store(self.cfg.repo)._config_lock() if self.named else contextlib.nullcontext():
-            with _watching_absent() as seen:
-                for target in self.targets:
-                    _activity(self.cfg, target)
-            _still_absent(seen)
+        if self.named:
+            locked = True
+        else:
+            locked = self.closed_window and (self.cfg.repo / ".agenttalk").is_dir()  # no store, no lane writers
+        with store_mod.Store(self.cfg.repo)._config_lock() if locked else contextlib.nullcontext():
+            if self.closed_window:
+                self.reread()
+            else:
+                with _watching_absent() as seen:
+                    for target in self.targets:
+                        _activity(self.cfg, target)
+                _still_absent(seen)
             yield
 
 

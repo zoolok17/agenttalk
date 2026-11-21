@@ -332,3 +332,144 @@ def test_the_report_escapes_what_a_record_puts_in_the_reason(estate, capsys):
 
     assert "\x1b" not in out and "\nFAILED forged" not in out and f"REFUSED (kept) {lane}" in out, out
     assert lane.exists()
+
+
+def test_a_checkout_registered_under_an_empty_candidate_before_the_delete_keeps_it(estate, monkeypatch):
+    """A plain folder (no checkout at the first look) gains an active checkout just before the last comparison."""
+    repo, wt, cfg = estate
+    parent = repo / ".worktrees" / "group"
+    parent.mkdir(parents=True)
+    report = janitor.build_report(cfg)
+    assert any(c.path == parent for c in report.candidates)
+    real = janitor._checkouts_changed
+    created = []
+
+    def register(c, worktrees, cfg):
+        if c.path == parent:
+            lane = checkout(repo, "group", "new")
+            _write_record(repo, "active-lane", lane)
+            created.append(lane)
+        return real(c, worktrees, cfg)
+
+    monkeypatch.setattr(janitor, "_checkouts_changed", register)
+
+    text = janitor.apply(cfg, report)
+
+    assert created and created[0].exists() and parent.is_dir(), text
+    assert "REFUSED (kept)" in text and "removed: 1" not in text, text
+
+
+def test_a_plain_folder_with_no_new_checkout_is_still_removed(estate):
+    repo, wt, cfg = estate
+    parent = repo / ".worktrees" / "plain"
+    parent.mkdir(parents=True)
+    (parent / "note.txt").write_text("x")
+
+    report, text = sweep(cfg)
+
+    assert not parent.exists(), text
+
+
+def test_a_lane_and_a_session_that_appear_at_the_last_look_keep_the_checkout(estate, monkeypatch):
+    """Nothing named the checkout at the first look; a delivered lane and a running session appear after the list of
+    checkouts was compared. The last read of the records and the occupancy claim come after that comparison."""
+    repo, wt, cfg = estate
+    lane = checkout(repo, "one")
+    report = janitor.build_report(cfg)
+    real = janitor._checkouts_changed
+    sessions = []
+
+    def start(c, worktrees, cfg):
+        if c.path == lane:
+            _finished_lane(repo, lane, "delivered")
+            session = _session_on_lane(repo)
+            session.__enter__()
+            sessions.append(session)
+        return real(c, worktrees, cfg)
+
+    monkeypatch.setattr(janitor, "_checkouts_changed", start)
+    try:
+        text = janitor.apply(cfg, report)
+        assert sessions and lane.exists(), text
+        assert lane_occupancy.refusal("one", lane_occupancy.IN_USE) in text, text
+    finally:
+        for session in sessions:
+            session.__exit__(None, None, None)
+
+
+def test_a_lane_that_appears_at_the_last_look_is_claimed_through_the_delete(estate, monkeypatch):
+    """A lane that names the checkout only after the first claims were taken gets a claim too, kept to the end."""
+    repo, wt, cfg = estate
+    lane = checkout(repo, "one")
+    report = janitor.build_report(cfg)
+    real_changed, real_remove = janitor._checkouts_changed, janitor.remove_plainly
+    seen = {}
+
+    def appears(c, worktrees, cfg):
+        if c.path == lane:
+            _finished_lane(repo, lane, "delivered")
+        return real_changed(c, worktrees, cfg)
+
+    def looking(path):
+        seen["token"] = lane_occupancy.peek(Store(repo), "one")
+        return real_remove(path)
+
+    monkeypatch.setattr(janitor, "_checkouts_changed", appears)
+    monkeypatch.setattr(janitor, "remove_plainly", looking)
+
+    text = janitor.apply(cfg, report)
+
+    assert not lane.exists(), text  # a finished lane with a free token does not keep a checkout, as in a release
+    assert seen.get("token") is not None, "the new lane's token was free during the delete"
+
+
+def test_the_lock_every_lane_writer_takes_is_held_through_the_delete_even_when_no_lane_named_it(estate, monkeypatch):
+    repo, wt, cfg = estate
+    lane = checkout(repo, "one")
+    seen = {}
+    real = janitor.remove_plainly
+
+    def looking(path):
+        with contextlib.suppress(TimeoutError):
+            with Store(repo).config_lock(timeout=0.2):
+                seen["lock"] = "free"
+        return real(path)
+
+    monkeypatch.setattr(janitor, "remove_plainly", looking)
+
+    report, text = sweep(cfg)
+
+    assert not lane.exists(), text
+    assert "lock" not in seen, "a lane writer could have got in between the last look and the delete"
+
+
+def test_a_repository_without_a_store_is_swept_without_making_one(estate):
+    import shutil
+
+    repo, wt, cfg = estate
+    lane = checkout(repo, "one")
+    shutil.rmtree(repo / ".agenttalk")
+
+    report, text = sweep(cfg)
+
+    assert not lane.exists(), text
+    assert not (repo / ".agenttalk").exists()
+
+
+def test_the_preview_lists_every_kept_checkout_even_past_the_display_limit(estate):
+    """Only the oldest 15 candidates are listed, but a checkout that is in use must never hide in `and N more`."""
+    repo, wt, cfg = estate
+    old = 1_000_000_000
+    for number in range(16):
+        folder = repo / ".worktrees" / f"plain-{number:02d}"
+        folder.mkdir(parents=True)
+        os.utime(folder, (old + number, old + number))
+    busy = checkout(repo, "busy")  # the newest candidate: outside the 15 that are listed
+    _write_record(repo, "active-lane", busy)
+
+    report = janitor.build_report(cfg)
+    preview = janitor.format_report(report, cfg, apply=False)
+
+    assert len(report.candidates) == 17
+    assert f"REFUSED (kept) {busy}" in preview, preview
+    assert "and 1 more" in preview, preview  # 17 candidates: 15 listed by age, the kept one named, one left over

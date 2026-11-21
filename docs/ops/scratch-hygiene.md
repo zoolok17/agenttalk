@@ -222,9 +222,15 @@ not a failure and does not change the exit code; a record that cannot be read is
 and the reason says it could not be checked. A folder that holds several checkouts is kept
 whole when any one is in use, and no work-in-progress commit is made on any of them. The
 report is a preview: `--apply` reads the records again, takes the lanes' non-waiting
-occupancy claims, and looks at the records and the checkouts under the folder once more just
-before the delete. Limits: a record is evidence that something may be using the checkout, not
-proof that a process is; a checkout that Git does not list is not looked up; and a folder that
+occupancy claims, and, just before the delete, compares the checkouts under the folder with the
+ones it checked (a folder that held none is compared too, so a checkout registered after the
+report keeps it). From then to the end of that folder's delete it holds the lock that every lane
+writer takes, and makes its last read of the records, with a claim on any lane that names a
+checkout only now. A lane command run during a large delete therefore waits for it (it gives up
+after 10 seconds). The preview lists every kept checkout, even past the 15 it lists by age. Limits: a record is evidence that something may be using the checkout, not
+proof that a process is; a checkout registered in the instant after the last comparison is not
+seen; `janitor --release` takes its lock only when a lane named the checkout at the first look,
+so a lane record written after its last read is not seen there (follow-up); a checkout that Git does not list is not looked up; and a folder that
 is renamed by another program in the instant between the last look and the delete cannot be
 stopped by any check made by path.
 

@@ -2139,8 +2139,11 @@ class _NoGuard:
     """The activity check (#858) reads a real config; this test uses a stand-in one and tests the report lines. The
     check has its own tests (test_janitor_active_lanes.py)."""
 
-    def __init__(self, cfg, targets):
+    def __init__(self, cfg, targets, **kwargs):
         pass
+
+    def reread(self):
+        return None
 
     def __enter__(self):
         return self
