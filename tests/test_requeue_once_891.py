@@ -16,7 +16,9 @@ def test_each_non_opener_is_requeued_once(tmp_path, monkeypatch, kind, capsys):
     assert _requeue(store, original) == 0
     copy = store.messages_for("beta")[-1]
     assert _requeue(store, original) == 2
-    assert copy.id in capsys.readouterr().err
+    refusal = capsys.readouterr().err
+    assert copy.id in refusal
+    assert "--again --reason TEXT" in refusal
     assert len(store.messages_for("beta")) == 1
 
 
@@ -61,12 +63,13 @@ def test_old_non_opener_copy_is_accepted_once(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("damaged", [b"{}", b"{", b"\xff"])
-def test_damaged_record_needs_explicit_again(tmp_path, monkeypatch, damaged):
+def test_damaged_record_needs_explicit_again(tmp_path, monkeypatch, damaged, capsys):
     store = _requeue_store(tmp_path, monkeypatch, False)
     original = _send(store, "body")
     _dead_payload(store, original)
     store._requeue_state_path("beta", original.id).write_bytes(damaged)
     assert _requeue(store, original) == 2
+    assert "--again --reason TEXT" in capsys.readouterr().err
     assert _requeue(store, original, "--again", "--reason", "repair") == 0
     assert store.messages_for("beta")[-1].meta["requeued_again_after"] == "unreadable"
 

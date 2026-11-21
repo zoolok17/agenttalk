@@ -16849,7 +16849,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 )
                 + (" If the earlier requeue is why it was refused, pass --again --reason TEXT."
                    if orig.get("kind") not in _dl_tags.OPENERS
-                   and not isinstance(e, store_mod.RequeueStateReadError) else "")
+                   and (e.again_allowed or isinstance(e, store_mod.RequeueStateDamaged))
+                   and not problem else "")
                 + "\n"
             )
             return 2

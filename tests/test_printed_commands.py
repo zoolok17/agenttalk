@@ -1121,7 +1121,7 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
             failure_class="poison",
             at="2099-01-01T00:00:00Z",
         )
-        s.send(sender="alpha", recipient="beta", body="live replacement", kind="task", meta={"request_id": rid})
+        live = s.send(sender="alpha", recipient="beta", body="live replacement", kind="task", meta={"request_id": rid})
         before = {p.name: p.read_bytes() for p in s.messages_dir.glob("*.json")}
         payload_before = payload.read_bytes()
     capsys.readouterr()
@@ -1230,8 +1230,8 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
         out = ""
         err = (
             f"agenttalk dead-letter requeue: beta already has a live copy of request {shown}; "
-            f"nothing was published. Use the existing copy, or resend by hand with a new request "
-            f"id.\n"
+            f"nothing was published. Existing copy: {live.id}. Use the existing copy, "
+            "or resend by hand with a new request id.\n"
         )
         expected_code = 2
     elif site in {"relay-live", "relay-no-handoff"}:
@@ -1407,6 +1407,13 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
             raw = s.read_dead_letter_payload("beta", opener.id)
             monkeypatch.setattr(Store, "list_dead_letters", lambda *args: [{"message_id": rid}])
             monkeypatch.setattr(Store, "read_dead_letter_payload", lambda *args: raw)
+            # The legacy ID contains a line break, which cannot be a Windows filename.
+            # Keep its echo under test while giving the requeue record a portable path.
+            monkeypatch.setattr(
+                Store,
+                "_requeue_state_path",
+                lambda store, agent, message_id: store.dead_letter_dir / agent / f"{opener.id}.requeue-state",
+            )
             real_send = Store.send
 
             def send_copy(store, **kwargs):

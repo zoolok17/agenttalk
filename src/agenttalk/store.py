@@ -1043,9 +1043,10 @@ class RequeueRefused(ValueError):
     """A requeue refused because the dead letter was already requeued. ``retry`` is a failed copy that may be
     retried instead, or None; the caller adds the advice, after the lock is released."""
 
-    def __init__(self, message: str, retry: str | None = None):
+    def __init__(self, message: str, retry: str | None = None, *, again_allowed: bool = False):
         super().__init__(message)
         self.retry = retry
+        self.again_allowed = again_allowed
 
 
 class RequeueStateDamaged(RequeueRefused):
@@ -5360,7 +5361,7 @@ class Store:
                     raise
             else:
                 if block is not None and again_after is None:
-                    raise RequeueRefused(f"{block[0]}; nothing was published.", block[1])
+                    raise RequeueRefused(f"{block[0]}; nothing was published.", block[1], again_allowed=True)
             claim = {"requeued_as": new_id, "session_id": session_id, "state": "claimed"}
             self._write_requeue_state(agent, dead_letter_id, claim)
         except OSError as exc:
