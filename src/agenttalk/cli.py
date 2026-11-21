@@ -1807,7 +1807,21 @@ def _status_redact_home(value, *, root=None, project_id=None):
         if not stripped or stripped == "~" or re.fullmatch(r"[a-zA-Z]:", stripped):
             continue
         parts = re.split(r"[\\/]", stripped)
-        pattern = r"[\\/]+".join(re.escape(part) for part in parts)
+
+        def shown_or_raw(part):
+            # Warnings can contain paths escaped by printed_commands.shown.
+            pieces = []
+            for char in part:
+                escaped = pc.shown(char, limit=1)[1:-1]
+                choices = {re.escape(char), re.escape(escaped)}
+                if os.name == "nt" and escaped != char:
+                    for variant in (char.lower(), char.upper()):
+                        if len(variant) == 1:
+                            choices.add(re.escape(pc.shown(variant, limit=1)[1:-1]))
+                pieces.append(next(iter(choices)) if len(choices) == 1 else f"(?:{'|'.join(sorted(choices))})")
+            return "".join(pieces)
+
+        pattern = r"(?:[\\/]|\\u005[cC])+".join(shown_or_raw(part) for part in parts)
         name = f"path{len(patterns)}"
         patterns.append(fr"(?P<{name}>{pattern})(?![\w-]|\.[\w-])")
         replacements[name] = replacement
