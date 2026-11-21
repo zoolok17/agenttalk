@@ -199,8 +199,8 @@ including those created with `core.ignoreStat=true`, cause HOLD without a dirty
 artifact until inspected and their flags cleared, or a truthful dirty artifact is
 recorded. Changed status reads show submodule changes even when project ignore
 settings hide them; an untracked build file in a submodule can therefore cause
-HOLD. Clean that submodule or record a truthful dirty artifact. Close does not
-recursively inspect hidden files inside submodules (follow-up #796). Lane and
+HOLD. Clean that submodule or record a truthful dirty artifact. Close inspects
+nested submodules, using about five Git calls per initialized submodule with no overall limit. Lane and
 acceptance attestation parity (#797) and old malformed close records (#798) remain
 separate work. The stricter `janitor --release` flag and full-content checks above
 retain their existing sparse-checkout limits.

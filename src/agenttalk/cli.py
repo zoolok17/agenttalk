@@ -3359,6 +3359,9 @@ def _print_index_recovery(root, reason, *, action=None):
         if action:
             sys.stderr.write("Close will HOLD without a dirty artifact until these files are inspected "
                              "and the relevant flags are cleared.\n")
+    elif action and reason == index_safety.SUBMODULE_NOT_CLEAN:
+        sys.stderr.write("Close will HOLD without a dirty artifact until the submodule is inspected "
+                         "and cleaned.\n")
 
 
 def _close_lead_set(store) -> set[str]:

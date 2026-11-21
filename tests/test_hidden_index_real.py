@@ -234,8 +234,10 @@ def test_unpopulated_gitlink_content_survives_abandon(tmp_path, capsys, monkeypa
 
 
 @pytest.mark.parametrize("consumer", ["close", "acceptance"])
-@pytest.mark.parametrize("case", ["clean", "tracked", "untracked", "head", "assume", "skip", "uninitialized"])
-def test_close_submodule_cleanliness_real(tmp_path, case, consumer):
+@pytest.mark.parametrize(
+    "case", ["clean", "tracked", "untracked", "head", "assume", "skip", "uninitialized", "missing"]
+)
+def test_close_submodule_cleanliness_real(tmp_path, case, consumer, capsys):
     root = tmp_path / "parent"
     root.mkdir()
     root, _ = _repo(root)
@@ -251,7 +253,9 @@ def test_close_submodule_cleanliness_real(tmp_path, case, consumer):
     revision = _git(root, "rev-parse", "HEAD").strip()
     module = root / "module"
     _git(root, "config", "submodule.module.ignore", "all")
-    if case == "untracked":
+    if case == "missing":
+        shutil.rmtree(module)
+    elif case == "untracked":
         (module / "new-file").write_text("untracked", encoding="utf-8")
     elif case == "head":
         checked(module, "config", "user.name", "test")
@@ -293,6 +297,11 @@ def test_close_submodule_cleanliness_real(tmp_path, case, consumer):
             == 0
         )
         assert close.load_close(store, "sub")["revision_clean"] is (case == "clean")
+        if case == "missing":
+            output = capsys.readouterr()
+            assert "HOLD" in output.err
+            assert cli.main(["--root", str(root), "close", "check", "--id", "sub"]) == 3
+            assert "HOLD" in capsys.readouterr().out
         if case == "assume":
             with close.close_transaction(store, "sub") as transaction:
                 transaction.record["revision_clean"] = True
