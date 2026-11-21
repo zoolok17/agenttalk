@@ -2189,28 +2189,28 @@ def test_requeue_allowed_again_after_live_copy_is_dead_lettered(tmp_path, monkey
 
 @_DL_KINDS
 @_DL_SIGNED
-def test_requeue_without_request_id_keeps_legacy_repeat_behavior(tmp_path, monkeypatch, kind, signed):
+def test_requeue_without_request_id_refuses_repeat(tmp_path, monkeypatch, kind, signed):
     s = _requeue_store(tmp_path, monkeypatch, signed)
     original = _send(s, "legacy", kind=kind)
     assert "request_id" not in original.meta
     _dead_payload(s, original)
 
     assert _requeue(s, original) == 0
-    assert _requeue(s, original) == 0
+    assert _requeue(s, original) == 2
 
-    assert len(s.messages_for("beta")) == 2
+    assert len(s.messages_for("beta")) == 1
 
 
 @_DL_SIGNED
-def test_requeue_plain_message_keeps_repeat_behavior(tmp_path, monkeypatch, signed):
+def test_requeue_plain_message_refuses_repeat(tmp_path, monkeypatch, signed):
     s = _requeue_store(tmp_path, monkeypatch, signed)
     original = _send(s, "plain", meta={"request_id": "tk-plain"})
     _dead_payload(s, original)
 
     assert _requeue(s, original) == 0
-    assert _requeue(s, original) == 0
+    assert _requeue(s, original) == 2
 
-    assert len(s.messages_for("beta")) == 2
+    assert len(s.messages_for("beta")) == 1
 
 
 def test_requeue_copy_only_metadata_is_exact():
@@ -2529,6 +2529,7 @@ def test_706_retry_is_not_replay(tmp_path, monkeypatch, capsys):
     assert first.id in err and f"dead-letter requeue --agent beta --id {first.id}" in err
 
     assert _requeue(s, first) == 0  # the later copy that itself failed: a retry
+    assert _requeue(s, first) == 2  # the printed command refuses a second use
     second = _706_copy_of(s, first)
     _dead_payload(s, second)
     assert _requeue(s, second) == 0  # and again: no chain of failures gets stuck

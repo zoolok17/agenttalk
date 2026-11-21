@@ -3845,6 +3845,7 @@ class Store:
         _dispatch_vendors: dict | None = None,
         _refuse_live_request: bool = False,
         _requeue_source: tuple[str, str] | None = None,
+        _requeue_again: str | None = None,
         _validate_only: bool = False,
     ) -> Message:
         if not self.initialized():
@@ -3869,6 +3870,7 @@ class Store:
                     _dispatch_vendors=_dispatch_vendors,
                     _refuse_live_request=_refuse_live_request,
                     _requeue_source=_requeue_source,
+                    _requeue_again=_requeue_again,
                     _validate_only=_validate_only,
                 )
         config_before = os.stat(self.config_path)
@@ -3900,6 +3902,11 @@ class Store:
         # A caller that already supplied `epoch_at_send` wins (broadcast
         # snapshots one epoch for the whole fan-out — B3).
         meta = supplied_meta
+        previous_requeue = None
+        if _requeue_again is not None and _requeue_source is not None:
+            previous_requeue = self._requeue_previous(*_requeue_source)
+            meta["requeued_again"] = _requeue_again
+            meta["requeued_again_after"] = previous_requeue
         if authority_sensitive:
             roster = list(cfg.get("agents") or [])
             roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
@@ -4030,10 +4037,11 @@ class Store:
                         for m in self.valid_messages()
                         if m.kind in work_tags.OPENERS and m.meta.get("request_id") == rid
                     ]
-                    if any(m.recipient == recipient for m in copies):
+                    recipient_copy = next((m for m in copies if m.recipient == recipient), None)
+                    if recipient_copy is not None:
                         raise ValueError(
                             f"{recipient} already has a live copy of request {pc.meta_text(rid)}; "
-                            "nothing was published. "
+                            f"nothing was published. Existing copy: {pc.meta_text(recipient_copy.id)}. "
                             "Use the existing copy, or resend by hand with a new request id."
                         )
                     if copies and _dispatch_vendors is None:  # a fresh stamp could not match the copies still live
@@ -4066,7 +4074,10 @@ class Store:
                     )
                 claimed = None
                 if _requeue_source is not None:
-                    claimed = self._claim_requeue(_requeue_source, msg.id, str(cfg.get("session_id") or ""))
+                    claimed = self._claim_requeue(
+                        _requeue_source, msg.id, str(cfg.get("session_id") or ""),
+                        **({"again_after": previous_requeue} if _requeue_again is not None else {}),
+                    )
                 self._reserve_message_publication_sequence(
                     msg.id,
                     self.valid_messages(),
@@ -5315,14 +5326,29 @@ class Store:
                 pass
         return f"this dead letter was already requeued as {earlier}, which is now {where}", retry
 
-    def _claim_requeue(self, source: tuple[str, str], new_id: str, session_id: str) -> tuple[str, str, dict]:
+    def _requeue_previous(self, agent: str, dead_letter_id: str) -> str:
+        try:
+            state = self._read_requeue_state(agent, dead_letter_id)
+        except RequeueRefused:
+            return "unreadable"
+        return state["requeued_as"] if state else "none"
+
+    def _claim_requeue(self, source: tuple[str, str], new_id: str, session_id: str,
+                       *, again_after: str | None = None) -> tuple[str, str, dict]:
         """Refuse a replay, else record this requeue as claimed before it is published."""
         agent, dead_letter_id = source
         self.requeue_mark_failure = None
         try:
-            block = self._requeue_block(agent, dead_letter_id, session_id)
-            if block is not None:
-                raise RequeueRefused(f"{block[0]}; nothing was published.", block[1])
+            if again_after is not None and self._requeue_previous(agent, dead_letter_id) != again_after:
+                raise RequeueRefused("the earlier requeue changed while preparing; retry; nothing was published.")
+            try:
+                block = self._requeue_block(agent, dead_letter_id, session_id)
+            except RequeueRefused:
+                if again_after is None:
+                    raise
+            else:
+                if block is not None and again_after is None:
+                    raise RequeueRefused(f"{block[0]}; nothing was published.", block[1])
             claim = {"requeued_as": new_id, "session_id": session_id, "state": "claimed"}
             self._write_requeue_state(agent, dead_letter_id, claim)
         except OSError as exc:

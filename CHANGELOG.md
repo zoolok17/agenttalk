@@ -80,6 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A dead letter can no longer be requeued twice by accident (#891).** Previously, rerunning the command for a reply, message, rescind or end sent another copy; now a repeat for every kind exits 2 and names the first copy. To send deliberately again, pass `--again --reason TEXT`; the reason is recorded. A task or review request with a live copy of the same request ID remains blocked. An older non-opener dead letter requeued before this change has no record, so its next requeue is accepted once before later repeats are refused. Scripts that deliberately repeat the command need the new flags.
+
 - **Three first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
   line for every seat; now it names the seat and the change, for example "roster: worker model vendor
   set to openai (operator-configured, not provider attestation)." or "... cleared ...", so a script

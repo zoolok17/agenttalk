@@ -1333,7 +1333,7 @@ typed-evidence shape at the milestone level.
 | `wrap` | Structured-stream adapter around a CLI child: visibility, working-turn heartbeat, degraded-output detection. `--loop` for supervised long-running mode, `--one-shot` for a single turn, `--turn-events` for the optional turn journal. |
 | `supervisor` | Read-only status over the supervisor's own state file. |
 | `supervise` | Scaffold (`--init`), preflight (`--bootstrap-check`), and script-refresh (`--refresh-scripts`) operations for the external monitor. |
-| `dead-letter {list,show,requeue,resolve,purge}` | Messages that exhausted automatic retry. |
+| `dead-letter {list,show,requeue,resolve,purge}` | Inspect and recover messages that exhausted automatic retry. Requeue refuses a repeat for every kind; use `--again --reason TEXT` to send again deliberately. A live task or review request with the same request ID still blocks requeue. |
 | `managed-lead-loop {set,clear,list}` | Configure which identities may run the leased lead-loop controller. |
 | `deadman` | Threshold check for unresponsive agents. |
 | `checkpoint {save,resume,show}` | Capture/restore context headroom, git state, and actionable threads across a compaction. |
@@ -1342,6 +1342,8 @@ typed-evidence shape at the milestone level.
 | `session fresh --for <agent> --reason "..."` | Ask one agent's wrapper to start its next turn on a fresh conversation. Use it when a conversation has grown so long that every turn is slow or costly. The wrapper applies it between turns; nothing is stopped and no file is edited. `agenttalk status` shows `fresh=pending` and then `fresh=applied`. The old session record is kept beside it as `<agent>.wrapper-session.before-fresh-<id>.json`. Handover notes are not part of this command, so the agent starts without its old conversation. |
 | `request-launch` | Request a fresh ephemeral agent for a profile/skill/revision. |
 | `commit-gate {status,reset}` | Per-agent breaker state and authenticated reset. |
+
+When recovering a dead letter, inspect the earlier copy before using `--again --reason TEXT`; a non-opener requeued before this rule may be accepted once more because no record was kept.
 
 **Workspace hygiene and setup**
 
