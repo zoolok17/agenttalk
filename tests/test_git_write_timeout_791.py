@@ -11,6 +11,47 @@ import pytest
 from agenttalk import cli
 
 
+def _capture_snapshot_tree(root_pid, parents, observe, close):
+    root = observe(root_pid)
+    assert root is not None
+    accepted = {root_pid: root}
+    pending = {pid: parent for pid, parent in parents.items() if pid != root_pid}
+    while True:
+        progressed = False
+        for pid, parent in list(pending.items()):
+            if parent not in accepted:
+                continue
+            del pending[pid]
+            child = observe(pid)
+            if child is None:
+                continue
+            if child[1] < accepted[parent][1]:
+                close(child[0])
+                continue
+            accepted[pid] = child
+            progressed = True
+        if not progressed:
+            return accepted
+
+
+def test_snapshot_tree_excludes_reused_parent_and_unreadable_processes():
+    parents = {101: 100, 102: 101, 103: 102, 104: 101, 105: 104, 106: 101}
+    # 102 predates its apparent parent, 104 cannot be observed, and equal creation times are allowed.
+    observations = {
+        100: ("root", 1000),
+        101: ("child", 1100),
+        102: ("stranger", 900),
+        103: ("stranger-child", 1200),
+        104: None,
+        105: ("unknown-child", 1300),
+        106: ("same-time-child", 1100),
+    }
+    closed = []
+    found = _capture_snapshot_tree(100, parents, observations.get, closed.append)
+    assert set(found) == {100, 101, 106}
+    assert closed == ["stranger"]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows tree stop")
 @pytest.mark.parametrize(
     "outcome", ["success", "failed", "exited", "missing", "timeout", "denied", "kill-error", "system-lookup"]
@@ -142,9 +183,14 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
     monkeypatch.setenv("FILTER_READY_791", str(ready))
     monkeypatch.setenv("FILTER_RELEASE_791", str(release))
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     handles = []
@@ -171,17 +217,23 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
                 ok = kernel.Process32NextW(snapshot, ctypes.byref(entry))
         finally:
             kernel.CloseHandle(snapshot)
-        found = {proc.pid}
-        while True:
-            expanded = found | {pid for pid, parent in parents.items() if parent in found}
-            if expanded == found:
-                break
-            found = expanded
+        def observe(pid):
+            handle = kernel.OpenProcess(0x100000 | 0x1000, False, pid)
+            if not handle:
+                return None
+            creation, exit_time, user, system = (wintypes.FILETIME() for _ in range(4))
+            if not kernel.GetProcessTimes(
+                handle, ctypes.byref(creation), ctypes.byref(exit_time), ctypes.byref(system), ctypes.byref(user)
+            ):
+                kernel.CloseHandle(handle)
+                return None
+            ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            return handle, ticks
+
+        assert proc.poll() is None, "launcher exited before process capture"
+        found = _capture_snapshot_tree(proc.pid, parents, observe, kernel.CloseHandle)
+        handles.extend(handle for handle, _ in found.values())
         assert filter_pid in found and len(found) >= 3, "expected launcher, Git and filter descendants"
-        for pid in found:
-            handle = kernel.OpenProcess(0x100000, False, pid)
-            assert handle, f"cannot open test process {pid}: {ctypes.get_last_error()}"
-            handles.append(handle)
 
     def popen(cmd, *args, **kwargs):
         nonlocal process
