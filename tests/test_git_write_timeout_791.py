@@ -217,7 +217,7 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
                     root, ["worktree", "add", "-b", "lane/tree791", "--", str(tmp_path / "wt"), base], timeout=0.1
                 )
         assert handles, "the filter tree must have been captured"
-        states = [kernel.WaitForSingleObject(handle, 0) for handle in handles]
+        states = [kernel.WaitForSingleObject(handle, 5000 if tree_stop else 0) for handle in handles]
         if tree_stop:
             if not os.environ.get("CI") and tree_results and tree_results[0][0] == 1 and tree_results[0][2].strip() in {
                 "ERROR: Access denied", "ERROR: Access denied."
