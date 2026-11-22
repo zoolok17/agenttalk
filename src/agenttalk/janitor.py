@@ -152,9 +152,6 @@ class JanitorReport:
     # Candidates that a lane, launch or supervisor record still names (or whose use could not be checked), with the
     # reason. A preview only: `apply` reads the records again (#858).
     in_use: dict[Path, str] = dataclasses.field(default_factory=dict)
-    # Whether Git's list of registered worktrees could be had when the report was made. When it could not, discovery
-    # is not trusted (`_worktrees_discovery_ok`) and the final comparison cannot be stricter than the first look.
-    listing_ok: bool = True
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -761,7 +758,6 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
         dirty_worktrees=dirty, foreign_kept=foreign, access_errors=access_errors,
         ancestor_ids=ancestor_ids,
         in_use=in_use,
-        listing_ok=_worktrees_discovery_ok(cfg.repo)[0],
     )
 
 
@@ -1253,11 +1249,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         # The last look, made at the removal: every record again under the lane writers' lock, and
                         # the set of checkouts that this removal takes with it.
                         with guard.final_window() if guard else contextlib.nullcontext():
-                            try:
-                                keep = _checkouts_changed(c, worktrees, cfg)
-                            except _UseCheckFailed:
-                                if report.listing_ok:
-                                    raise  # the first listing worked: a failed one now is not "nothing registered"
+                            keep = _checkouts_changed(c, worktrees, cfg)
                             if keep is None and guard:
                                 guard.reread()  # the very last look, after the comparison above
                             if keep is None:

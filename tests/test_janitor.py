@@ -1467,9 +1467,11 @@ def test_r3_link_inside_candidate_is_never_descended_into(tmp_path, monkeypatch)
     assert not any(p == candidate for p, _reason in access_errors)
 
     report = janitor.build_report(cfg)
-    janitor.apply(cfg, report)
-    assert not candidate.exists()  # the candidate itself IS removed
-    assert other_wt.exists()  # but the link's target was never entered
+    text = janitor.apply(cfg, report)
+    # Git cannot be run here, so nothing shows that the candidate holds no checkout at the delete: it is kept and
+    # reported as FAILED (#858), and the link's target was never entered.
+    assert candidate.exists() and report.apply_failed and "could not list the registered checkouts" in text
+    assert other_wt.exists()
     assert (other_wt / "precious.txt").exists()
 
 
