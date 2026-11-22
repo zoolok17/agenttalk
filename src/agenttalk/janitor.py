@@ -1299,7 +1299,9 @@ def _registered_worktrees_listed(repo: Path) -> list[Path]:
     if rc is None or rc != 0:
         why = "git is not resolvable" if rc is None else f"git worktree list failed, rc={rc}: {err.strip()[:200]}"
         raise _UseCheckFailed(
-            f"could not list the registered checkouts to compare them before the delete ({why}); it was kept")
+            f"could not list the registered checkouts to compare them before the delete ({why}); it was kept. "
+            "Git could not list this repository's checkouts, so nothing shows that this folder holds none: fix Git "
+            "for it (`git worktree list` must work there), then run the sweep again")
     return [Path(line[len("worktree "):]) for line in out.splitlines() if line.startswith("worktree ")]
 
 

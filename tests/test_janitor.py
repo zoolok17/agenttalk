@@ -1471,6 +1471,7 @@ def test_r3_link_inside_candidate_is_never_descended_into(tmp_path, monkeypatch)
     # Git cannot be run here, so nothing shows that the candidate holds no checkout at the delete: it is kept and
     # reported as FAILED (#858), and the link's target was never entered.
     assert candidate.exists() and report.apply_failed and "could not list the registered checkouts" in text
+    assert "Git could not list this repository's checkouts" in text and "then run the sweep again" in text
     assert other_wt.exists()
     assert (other_wt / "precious.txt").exists()
 

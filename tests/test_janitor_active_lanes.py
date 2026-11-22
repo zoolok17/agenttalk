@@ -513,6 +513,7 @@ def test_a_failed_final_listing_of_checkouts_keeps_the_candidate_and_is_reported
 
     assert created and created[0].exists() and parent.is_dir(), text
     assert report.apply_failed and "FAILED" in text and "could not list the registered checkouts" in text, text
+    assert "then run the sweep again" in text, text
     assert "removed: 1" not in text
 
 
@@ -588,3 +589,4 @@ def test_every_candidate_is_kept_and_reported_as_failed_when_git_cannot_list_che
 
     assert folder.is_dir() and report.apply_failed
     assert "FAILED" in text and "could not list the registered checkouts" in text, text
+    assert "Git could not list this repository's checkouts" in text and "then run the sweep again" in text, text
