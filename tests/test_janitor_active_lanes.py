@@ -590,3 +590,69 @@ def test_every_candidate_is_kept_and_reported_as_failed_when_git_cannot_list_che
     assert folder.is_dir() and report.apply_failed
     assert "FAILED" in text and "could not list the registered checkouts" in text, text
     assert "Git could not list this repository's checkouts" in text and "then run the sweep again" in text, text
+
+
+def listing_fails(monkeypatch):
+    real_git = janitor._run_git_checked
+
+    def failed_git(repo, *args, **kwargs):
+        if args[:3] == ("worktree", "list", "--porcelain"):
+            return 1, "", "git list failed"
+        return real_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(janitor, "_run_git_checked", failed_git)
+
+
+def test_the_failed_list_never_tells_the_person_to_remove_a_folder_that_was_not_checked(estate, monkeypatch):
+    """A folder kept because Git could not list its checkouts may hold a live one: the report must not say to remove it
+    by hand, which would skip the check that could not be made. Each is named with what to do instead."""
+    repo, wt, cfg = estate
+    folders = [repo / ".probe-first", repo / ".probe-second"]
+    for folder in folders:
+        folder.mkdir()
+    listing_fails(monkeypatch)
+    report = janitor.build_report(cfg)
+
+    text = janitor.apply(cfg, report)
+
+    assert report.apply_failed and all(folder.exists() for folder in folders), text
+    assert all(folder.name in text for folder in folders), text
+    assert "remove it yourself" not in text and "Look at each one" not in text, text
+    assert "do not remove them by hand" in text and "fix Git" in text and "run the sweep again" in text, text
+
+
+def test_mixed_failures_advise_removal_only_for_the_candidates_that_were_checked(estate, monkeypatch):
+    """One candidate could not be checked, another was checked and its delete failed: the old advice stays for the
+    second one only, and the first one is never listed under it."""
+    repo, wt, cfg = estate
+    unchecked, failed_delete = repo / ".probe-unchecked", repo / ".probe-failed"
+    for folder in (unchecked, failed_delete):
+        folder.mkdir()
+    report = janitor.build_report(cfg)
+    real_changed, real_remove = janitor._checkouts_changed, janitor.remove_plainly
+
+    def changed(c, worktrees, cfg):
+        if c.path == unchecked:
+            raise janitor._UseCheckFailed("could not list the registered checkouts to compare them (test)")
+        return real_changed(c, worktrees, cfg)
+
+    def remove(path):
+        if path == failed_delete:
+            return "FAILED", "injected delete failure"
+        return real_remove(path)
+
+    monkeypatch.setattr(janitor, "_checkouts_changed", changed)
+    monkeypatch.setattr(janitor, "remove_plainly", remove)
+
+    text = janitor.apply(cfg, report)
+
+    lines = text.splitlines()
+    old = next(n for n, line in enumerate(lines) if "Look at each one, then remove it yourself:" in line)
+    new = next(n for n, line in enumerate(lines) if "do not remove them by hand" in line)
+    section = {
+        old: lines[old + 1 : new] if old < new else lines[old + 1 :],
+        new: lines[new + 1 : old] if new < old else lines[new + 1 :],
+    }
+    assert ".probe-failed" in "\n".join(section[old]) and ".probe-unchecked" not in "\n".join(section[old]), text
+    assert ".probe-unchecked" in "\n".join(section[new]) and ".probe-failed" not in "\n".join(section[new]), text
+    assert unchecked.exists() and report.apply_failed

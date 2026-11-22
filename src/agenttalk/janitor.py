@@ -1136,6 +1136,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         return refuse_ancestry(reason)
     summary: dict[str, int] = {}
     failed: list[tuple[Path, str]] = []
+    not_checked: list[tuple[Path, str]] = []  # kept because nothing could show whether anything uses them
     from . import worktree_release  # imported here: that module imports this one
 
     held = contextlib.ExitStack()  # the occupancy claims of the candidate being processed
@@ -1143,6 +1144,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         for c in report.candidates:
             held.close()  # the previous candidate's claims
             guard = None
+            unchecked = False  # set when what was kept could not be checked (not when a delete failed)
             reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
             if reason is not None:
                 result = "FAILED"
@@ -1202,9 +1204,9 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         summary["refused"] = summary.get("refused", 0) + 1
                         continue
                 except _UseCheckFailed as exc:
-                    reason = str(exc)
+                    reason, unchecked = str(exc), True
                 except (OSError, RuntimeError) as exc:
-                    reason = f"could not check worktree identity: {exc}"
+                    reason, unchecked = f"could not check worktree identity: {exc}", True
 
                 refused = False
                 for w in worktrees:
@@ -1257,9 +1259,9 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                     except worktree_release.Refused as exc:
                         keep = str(exc)
                     except _UseCheckFailed as exc:
-                        result, reason = "FAILED", str(exc)
+                        result, reason, unchecked = "FAILED", str(exc), True
                     except (OSError, ValueError, TypeError) as exc:
-                        result, reason = "FAILED", _use_check_failure(exc)
+                        result, reason, unchecked = "FAILED", _use_check_failure(exc), True
                     if keep:
                         lines.append(f"  REFUSED (kept) {c.path}: {keep}")
                         summary["refused"] = summary.get("refused", 0) + 1
@@ -1267,7 +1269,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
             summary[result] = summary.get(result, 0) + 1
             if result == "FAILED":
                 report.apply_failed = True
-                failed.append((c.path, reason or "unknown"))
+                (not_checked if unchecked else failed).append((c.path, reason or "unknown"))
 
     finally:
         held.close()
@@ -1287,6 +1289,14 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         lines.append(f"FAILED ({len(failed)}) - kept, not removed: janitor never forces a delete. "
                      "Look at each one, then remove it yourself:")
         for path, reason in failed:
+            lines.append(f"  {_scanned_root_relative(path, cfg)}: {reason}")
+    if not_checked:
+        # Never "remove it yourself": a folder whose checkout status could not be established may hold a live
+        # checkout, and removing it by hand skips the very check that could not be made.
+        lines.append(f"FAILED ({len(not_checked)}) - kept, not removed, and not checked: janitor could not establish "
+                     "whether these folders hold a checkout or are in use, so do not remove them by hand. Fix the "
+                     "cause named for each (for Git: fix Git for this repository), then run the sweep again:")
+        for path, reason in not_checked:
             lines.append(f"  {_scanned_root_relative(path, cfg)}: {reason}")
     return "\n".join(store_mod.report_line(line) for line in lines)
 
