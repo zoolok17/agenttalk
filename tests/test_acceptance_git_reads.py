@@ -85,7 +85,13 @@ def test_resolver_reuses_enclosing_cli_command_scope(case, monkeypatch):
     monkeypatch.setattr(acceptance, "resolve", resolve)
     assert command(case, "check", "--id", "attempt", "--json") == 3
     assert resolved
-    assert len(metadata_reads) == 1
+    # One combined fixed-commit metadata read, and one live root read for
+    # each of the explicit and resolver calls within the command scope.
+    commands = [args[3:] for args in metadata_reads]
+    assert commands.count(["rev-parse", "--show-toplevel", "--verify", "--end-of-options",
+                           f"{case['sha']}^{{commit}}"]) == 1
+    assert commands.count(["rev-parse", "--show-toplevel"]) == 2
+    assert len(commands) == 3
 
 
 def test_command_reads_project_metadata_once_but_rechecks_live_state(case, monkeypatch):
@@ -99,11 +105,20 @@ def test_command_reads_project_metadata_once_but_rechecks_live_state(case, monke
 
     monkeypatch.setattr(subprocess, "run", counted)
     assert open_attempt(case) == 0
-    assert sum("--show-toplevel" in args for args in calls) == 1
+    # Open verifies twice: one combined fixed-commit metadata read, two
+    # independent live checkout-root reads, and two live status reads.
+    metadata = ["rev-parse", "--show-toplevel", "--verify", "--end-of-options", f"{case['sha']}^{{commit}}"]
+    root_read = ["rev-parse", "--show-toplevel"]
+    assert calls.count(metadata) == 1
+    assert calls.count(root_read) == 2
+    assert sum("--show-toplevel" in args for args in calls) == 3
     assert sum(args[0] == "status" for args in calls) == 2
     calls.clear()
     assert command(case, "check", "--id", "attempt", "--json") == 3
-    assert sum("--show-toplevel" in args for args in calls) == 1
+    # Check has its own command scope and verifies the checkout once.
+    assert calls.count(metadata) == 1
+    assert calls.count(root_read) == 1
+    assert sum("--show-toplevel" in args for args in calls) == 2
 
 
 @pytest.mark.parametrize("change", ["dirty", "head"])
@@ -120,6 +135,47 @@ def test_command_cannot_reuse_live_success_after_prepare(case, monkeypatch, caps
     monkeypatch.setattr(acceptance, "prepare", prepare)
     assert open_attempt(case) != 0
     assert "acceptance_project_unverified" in capsys.readouterr().err
+
+
+def test_index_is_rechecked_within_one_command_scope(case):
+    from agenttalk.acceptance_git import command_scope
+
+    with command_scope():
+        acceptance.verify_project(case["project"], case["sha"])
+        git(case["project"], "update-index", "--assume-unchanged", "source.txt")
+        with pytest.raises(acceptance.AcceptanceError, match="index is not verifiably clean"):
+            acceptance.verify_project(case["project"], case["sha"])
+
+
+@pytest.mark.parametrize("live", [True, False])
+@pytest.mark.parametrize("remove_checkout", [False, True])
+def test_checkout_root_is_rechecked_within_command_scope(tmp_path, live, remove_checkout):
+    from agenttalk.acceptance_git import command_scope
+
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    git(parent, "init")
+    git(parent, "config", "user.email", "test@example.invalid")
+    git(parent, "config", "user.name", "Test")
+    (parent / "source.txt").write_text("original\n", encoding="utf-8")
+    (parent / ".gitignore").write_text("/nested/\n", encoding="utf-8")
+    git(parent, "add", "source.txt", ".gitignore")
+    git(parent, "commit", "-m", "initial")
+    git(parent, "clone", ".", "nested")
+    nested = parent / "nested"
+    sha = git(nested, "rev-parse", "HEAD").strip()
+    with command_scope():
+        assert acceptance.verify_project(nested, sha, live=live)["revision"] == sha
+        if remove_checkout:
+            (nested / ".git").rename(tmp_path / "saved-git")
+            (nested / "source.txt").write_text("unverified change\n", encoding="utf-8")
+            assert git(nested, "rev-parse", "--show-toplevel").strip().replace("\\", "/").lower() == (
+                str(parent).replace("\\", "/").lower()
+            )
+            with pytest.raises(acceptance.AcceptanceError, match="checkout root"):
+                acceptance.verify_project(nested, sha, live=live)
+        else:
+            assert acceptance.verify_project(nested, sha, live=live)["revision"] == sha
 
 
 def test_direct_project_reads_are_fresh_without_a_command(case):
@@ -155,10 +211,22 @@ def test_project_read_scopes_reset_on_nested_calls_and_exceptions(case, monkeypa
                 acceptance.verify_project(case["project"], case["sha"], live=False)
             again = acceptance.verify_project(case["project"], case["sha"], live=False)
             assert again["roots"] == [case["sha"]]
-            assert len(calls) == 2
+            commands = [args[3:] for args in calls]
+            metadata = ["rev-parse", "--show-toplevel", "--verify", "--end-of-options",
+                        f"{case['sha']}^{{commit}}"]
+            root_read = ["rev-parse", "--show-toplevel"]
+            # Two scopes each fetch fixed-commit metadata; all three calls
+            # independently recheck the live checkout root.
+            assert commands.count(metadata) == 2
+            assert commands.count(root_read) == 3
+            assert len(commands) == 5
             raise RuntimeError("abort")
     acceptance.verify_project(case["project"], case["sha"], live=False)
-    assert len(calls) == 3
+    commands = [args[3:] for args in calls]
+    # The scope exited exceptionally, so this call gets fresh metadata and root.
+    assert commands.count(metadata) == 3
+    assert commands.count(root_read) == 4
+    assert len(commands) == 7
 
 
 def test_template_copy_keeps_objects_index_and_config_independent(case, acceptance_project_template):
