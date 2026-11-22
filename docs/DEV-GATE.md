@@ -446,10 +446,12 @@ is 7,200 seconds on Linux and macOS. On Windows the limit is `windows_timeout_se
 chooses the limit.
 
 The CI job ceilings in `.github/workflows/tests.yml` follow from these limits:
-- **Each Windows part: 165 minutes**: its one group's 150-minute limit plus 15 minutes
-  for setup and the evidence upload, so a slow group stops at its own limit and its
-  evidence is still uploaded. Before the split (#378) one job ran all four groups and
-  needed the hosted maximum of 360 minutes; 18 such jobs stopped at the previous
+- **Each Windows part: 165 minutes**: 150 minutes for its one test group, plus a 15-minute
+  allowance for setup, collection and saving evidence. In run 44956093100 the largest
+  measured time outside the group was 3 minutes 40 seconds. The allowance is not a
+  guarantee: if a job reaches its limit, GitHub stops it and the evidence upload can be
+  interrupted. Before the split (#378) one job ran all four groups and needed the hosted
+  maximum of 360 minutes; 18 such jobs stopped at the previous
   330-minute ceiling with no failing test (see `windows_timeout_reason`).
 - **Linux and macOS: 90 minutes.**
 
