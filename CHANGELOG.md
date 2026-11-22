@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Reopening a close now checks the revision against the checkout.** Git must
+  resolve the requested revision and show it as HEAD, including when the close
+  keeps its existing revision. A missing checkout, unavailable Git, unresolved
+  revision, or different HEAD stops reopening without changing the record.
+  Reopening without `--revision` checks cleanliness again, so a previously clean
+  close can go on HOLD. A store outside a Git checkout can open with a full pin,
+  but cannot reopen. Check out the revision in the checkout that holds the store,
+  or pass `--revision` with its current HEAD. The HEAD check runs just before
+  the close lock is taken, so a checkout moved in that gap is not caught.
+  The close record also distinguishes unknown cleanliness from a checkout not
+  shown clean, and the hold message no longer calls an unchecked checkout dirty.
 - **The release checklist now names the README as the only install pin.** Since the user manuals
   stopped carrying their own install line (#835), step 1 of the release ritual in
   `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
@@ -79,6 +90,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text.
 
 ### Fixed
+
+- **Close checks no longer report hidden submodule work as clean (#796).**
+  Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.
+
+- **Closes now hold and show repair steps when their saved checkout cleanliness is damaged (#798).**
+  If the saved record cannot say whether the checkout was clean, the close stays on HOLD and shows repair steps,
+  even when its saved review requirements are damaged too.
+
+- **Closes also hold when saved isolation or dirty-artifact fields are damaged (#809).**
+  A damaged field no longer waives isolation or counts as a recorded diff; the close names how to start again.
+
+- **Reopening a close no longer records a checkout as clean when Git cannot check it (#810).**
+  The close instead records the checkout as not clean and warns that Git could not check it.
+
+- **Opening a close no longer records a checkout as clean when Git cannot check it (#862).**
+  Teams whose store is outside a Git checkout will see ordinary closes hold until they record a diff artifact.
 
 - **Three first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
   line for every seat; now it names the seat and the change, for example "roster: worker model vendor

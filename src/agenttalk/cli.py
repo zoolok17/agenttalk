@@ -3310,6 +3310,26 @@ def _resolve_revision(root, ref: str) -> tuple[str, str]:
         "pass a full 40-char SHA or run inside the repo")
 
 
+def _reopen_revision(root, ref: str) -> str:
+    """Require the store's enclosing checkout to be at the requested commit."""
+    from agenttalk import close as close_mod
+    rc, inside = _git(root, ["rev-parse", "--is-inside-work-tree"])
+    if rc != 0 or inside.strip() != "true":
+        raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
+    rc, resolved = _git(root, ["rev-parse", "--quiet", "--verify", "--end-of-options", f"{ref}^{{commit}}"])
+    revision = resolved.strip()
+    if rc == 1:
+        raise close_mod.CloseError("requested revision could not be resolved in this checkout")
+    if rc != 0 or not close_mod._FULL_SHA_RE.fullmatch(revision):
+        raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
+    rc, head = _git(root, ["rev-parse", "--verify", "HEAD^{commit}"])
+    if rc != 0 or not close_mod._FULL_SHA_RE.fullmatch(head.strip()):
+        raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
+    if head.strip() != revision:
+        raise close_mod.CloseError("checkout HEAD differs from the requested revision; inspect the checkout")
+    return revision
+
+
 def _worktree_clean(root) -> bool | None:
     """None only for unavailable status; False also includes index uncertainty."""
     return _worktree_clean_detail(root)[0]
@@ -3325,6 +3345,22 @@ def _worktree_clean_detail(root) -> tuple[bool | None, str | None]:
     return result.state == "safe", result.reason
 
 
+def _close_clean_detail(root) -> tuple[bool | None, str | None]:
+    clean, reason = _worktree_clean_detail(root)
+    if clean is not True:
+        return clean, reason
+    result = index_safety.check_close_submodules(root)
+    return result.state == "safe", result.reason
+
+
+def _print_unknown_cleanliness(action, *, hold_hint=False):
+    message = (f"agenttalk close {action}: WARNING - Git could not report whether this checkout is clean; "
+               "it is not recorded as clean.")
+    if hold_hint:
+        message += " close check will HOLD on revision until a recorded diff artifact is provided."
+    sys.stderr.write(message + "\n")
+
+
 def _print_index_recovery(root, reason, *, action=None):
     if action:
         sys.stderr.write(
@@ -3334,6 +3370,9 @@ def _print_index_recovery(root, reason, *, action=None):
         if action:
             sys.stderr.write("Close will HOLD without a dirty artifact until these files are inspected "
                              "and the relevant flags are cleared.\n")
+    elif action and reason == index_safety.SUBMODULE_NOT_CLEAN:
+        sys.stderr.write("Close will HOLD without a dirty artifact until the submodule is inspected "
+                         "and cleaned.\n")
 
 
 def _close_lead_set(store) -> set[str]:
@@ -4061,7 +4100,7 @@ def _print_verdict(close_id: str, result: dict) -> None:
 def _close_worktree_eval(store, record: dict) -> dict | None:
     if not isinstance(record, dict):
         return {"status": "unverified", "reason": "close record is malformed"}
-    if record.get("non_lane_isolation_not_asserted"):
+    if record.get("non_lane_isolation_not_asserted") is True:
         return {"status": "not_applicable", "reason": "non-lane close; isolation not asserted"}
     artifact_raw = record.get("lane_delivery_artifact")
     if not artifact_raw:
@@ -4206,11 +4245,13 @@ def cmd_close(args: argparse.Namespace) -> int:
         except (OSError, ValueError, TypeError, KeyError) as e:
             sys.stderr.write(f"agenttalk close open: invalid acceptance input: {e}\n")
             return 2
-        clean, index_reason = (True, None) if prepared else _worktree_clean_detail(store.root)
+        clean, index_reason = (True, None) if prepared else _close_clean_detail(store.root)
         if index_reason:
             _print_index_recovery(store.root, index_reason, action="open")
-        if clean is None:  # git could not report; trust the explicit flags
-            clean = not bool(args.dirty_artifact) if not args.allow_dirty else False
+        unknown_cleanliness = clean is None
+        if unknown_cleanliness:
+            clean = False
+            _print_unknown_cleanliness("open", hold_hint=not args.dirty_artifact)
         opener = _resolve_self(getattr(args, "actor", None), roster=roster)
         record = close_mod.empty_close(
             close_id, scope=args.scope, revision=revision, revision_kind=kind,
@@ -4221,12 +4262,13 @@ def cmd_close(args: argparse.Namespace) -> int:
             lane_delivery_artifact=getattr(args, "lane_artifact", None),
             non_lane_isolation_not_asserted=bool(
                 getattr(args, "non_lane_isolation_not_asserted", False)))
+        record["revision_clean_state"] = "unknown" if unknown_cleanliness else ("clean" if clean else "not_clean")
         record["worktree_isolation"] = _close_worktree_eval(store, record)
         if prepared:
             # A crash before the freeze transaction must leave a HOLD-only close.
             record["schema_version"] = close_mod.ACCEPTANCE_SCHEMA_VERSION
             record["acceptance_route"] = {"pending": True}
-        if not clean and not args.dirty_artifact and not index_reason:
+        if not clean and not unknown_cleanliness and not args.dirty_artifact and not index_reason:
             sys.stderr.write(
                 "agenttalk close open: WARNING - worktree is dirty and no "
                 "--dirty-artifact was recorded; close check will HOLD on revision "
@@ -4582,23 +4624,29 @@ def cmd_close(args: argparse.Namespace) -> int:
     if action == "reopen":
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "reopen")
-        revision = None
-        clean = None
-        if getattr(args, "revision", None):
-            try:
-                revision, _kind = _resolve_revision(store.root, args.revision)
-            except close_mod.CloseError as e:
-                sys.stderr.write(f"agenttalk close reopen: {e}\n")
-                return 2
-            wc, index_reason = _worktree_clean_detail(store.root)
+        try:
+            initial = close_mod.load_close(store, args.id)
+            if "acceptance_route" in initial:
+                raise close_mod.CloseError("acceptance reopen requires --successor and a new plan/project/revision; "
+                                           "preserve this attempt")
+            recorded_revision = initial.get("revision")
+            if args.revision is None and (not isinstance(recorded_revision, str)
+                                          or not close_mod._FULL_SHA_RE.fullmatch(recorded_revision)):
+                raise close_mod.CloseError("this close has no recorded full revision; pass --revision")
+            revision = _reopen_revision(store.root, args.revision if args.revision is not None else recorded_revision)
+            wc, index_reason = _close_clean_detail(store.root)
             if index_reason:
                 _print_index_recovery(store.root, index_reason, action="reopen")
-            clean = True if wc is None else wc
-        try:
+            if wc is None:
+                _print_unknown_cleanliness("reopen")
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
+                if args.revision is None and record.get("revision") != recorded_revision:
+                    raise close_mod.CloseConflict("recorded revision changed while reopening; retry")
+                changed = revision != record.get("revision")
                 close_mod.reopen(record, by=actor, at=_iso_now(),
-                                 revision=revision, revision_clean=clean)
+                                 revision=revision, revision_clean=wc is True)
+                record["revision_clean_state"] = "unknown" if wc is None else ("clean" if wc else "not_clean")
                 transaction.commit()
         except (close_mod.CloseConflict, TimeoutError) as e:
             return _close_conflict_result("reopen", e)
@@ -4606,7 +4654,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             sys.stderr.write(f"agenttalk close reopen: {e}\n")
             return 2
         print(f"reopened close {args.id} by {actor}"
-              + (f" @ {revision[:12]} (prior lens acks now stale)" if revision else ""))
+              + f" @ {revision[:12]}" + (" (prior lens acks now stale)" if changed else ""))
         return 0
 
     if action == "list":
@@ -18954,7 +19002,8 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--allow", action="append",
                        help="Authorize a lens ack: LENS:AGENT or LENS:@ROLE (repeatable).")
     copen.add_argument("--dirty-artifact", help="Pointer to a recorded diff when the worktree is dirty.")
-    copen.add_argument("--allow-dirty", action="store_true", help="Proceed on a dirty worktree (records dirty).")
+    copen.add_argument("--allow-dirty", action="store_true",
+                       help="Kept for compatibility; a checkout not shown clean is recorded as not clean.")
     copen.add_argument("--lane-artifact",
                        help="Path to a lane delivery artifact proving worktree isolation.")
     copen.add_argument("--non-lane-isolation-not-asserted", action="store_true",
