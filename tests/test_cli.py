@@ -5831,7 +5831,10 @@ def test_870_status_hides_personal_paths_and_recovers(tmp_path, capsys, monkeypa
     import copy
 
     home = tmp_path / ("Users" if home_style == "windows" else "home") / "invented-login"
-    local = tmp_path / "outside" / "invented-login" / "appdata"
+    # LOCALAPPDATA is a Windows folder: status reads it only on Windows, so off Windows the
+    # path holds no login and is expected to stay as it is.
+    local_owner = "invented-login" if os.name == "nt" else "shared"
+    local = tmp_path / "outside" / local_owner / "appdata"
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("LOCALAPPDATA", str(local))
@@ -5858,7 +5861,8 @@ def test_870_status_hides_personal_paths_and_recovers(tmp_path, capsys, monkeypa
     assert cli.main(args) == 0
     default = capsys.readouterr().out
     assert "invented-login" not in default and pid not in default
-    assert "<home>" in default and "<localappdata>" in default
+    assert "<home>" in default
+    assert ("<localappdata>" in default) is (os.name == "nt")
     if as_json:
         data = json.loads(default)
         assert "root" not in data and "project_id" not in data
