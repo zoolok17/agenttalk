@@ -24,7 +24,7 @@ import pytest
 from agenttalk import dev_gate as gate
 from agenttalk import dev_gate_trial as trial
 from agenttalk import dev_gate_experiment as frozen_installs
-from test_dev_gate import _binding, _leg_artifact, _manifest
+from test_dev_gate import _binding, _ci_inputs, _leg_artifact, _manifest
 
 
 @pytest.fixture
@@ -231,7 +231,7 @@ def test_04_experiment_artifact_never_votes(exp, request_factory, tmp_path, monk
     ordinary["artifact_type"] = exp.TYPE
     with pytest.raises(gate.GateBlock, match="artifact schema or type"):
         gate.validate_run_artifact(ordinary, manifest)
-    legs = [_leg_artifact(manifest, leg) for leg in gate.expected_ci_legs(manifest, "release")]
+    legs = _ci_inputs(manifest)
     monkeypatch.setattr(gate, "_committed_version", lambda root: "0.78.1")
     aggregate = gate.aggregate_leg_artifacts(manifest, "release", legs, _binding(manifest, root=tmp_path))
     gate.validate_aggregate_artifact(aggregate, manifest)

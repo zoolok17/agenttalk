@@ -52,6 +52,9 @@ WINDOWS_GROUP_A = [
     "tests/test_cli.py",
     "tests/test_owed_action_detection.py",
 ]
+# #378: each Windows CI leg runs as these jobs, one package mode and one test group each, so no job comes near the
+# hosted six-hour limit. The aggregate expects every part of every Windows leg.
+WINDOWS_PARTS = ["source-a", "source-b", "wheel-a", "wheel-b"]
 REQUIRED_CHECK_KINDS = {
     "pytest",
     "ruff",
@@ -343,6 +346,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "test_requirement",
         "xdist_requirement",
         "windows_group_a",
+        "windows_parts",
     }
     for check_id, expected_kind in REQUIRED_CONFIGURED_CHECKS.items():
         spec = _require_object(checks.get(check_id), f"checks.{check_id}")
@@ -362,6 +366,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "pytest": {
             "paths": ["tests"],
             "windows_group_a": WINDOWS_GROUP_A,
+            "windows_parts": WINDOWS_PARTS,
             # -rs: every skipped test and its reason in the log, so a test that
             # silently never runs on a leg is visible (#320). --durations: the
             # time of every setup, call and teardown, printed into this same
@@ -459,6 +464,31 @@ def parse_ci_leg(value: str, manifest: dict[str, Any], profile: str = DEFAULT_PR
     return normalized
 
 
+def parse_ci_part(part: Any, manifest: dict[str, Any], leg: str | None) -> tuple[str, str]:
+    """The package mode and test group of one declared Windows part: "source-a" is ("source", "A")."""
+    if leg is None or not leg.startswith("windows/"):
+        raise GateBlock("ci_part_invalid", "only a declared Windows CI leg runs in parts")
+    if not isinstance(part, str) or part not in manifest["checks"]["pytest"]["windows_parts"]:
+        raise GateBlock("ci_part_invalid", f"undeclared Windows CI part {part!r}")
+    mode, group = part.split("-")
+    return mode, group.upper()
+
+
+def ci_input_label(leg: str, part: str | None) -> str:
+    return leg if part is None else f"{leg}/{part}"
+
+
+def expected_ci_inputs(manifest: dict[str, Any], profile: str = DEFAULT_PROFILE) -> list[tuple[str, str | None]]:
+    """Every evidence file the aggregate expects, in order: one per leg, and one per part of a Windows leg."""
+    validated = validate_manifest(manifest)
+    parts = validated["checks"]["pytest"]["windows_parts"]
+    return [
+        (leg, part)
+        for leg in expected_ci_legs(validated, profile)
+        for part in (parts if leg.startswith("windows/") else [None])
+    ]
+
+
 def _normalized_logical_plan(manifest: dict[str, Any], profile: str) -> dict[str, Any]:
     validated = validate_manifest(manifest)
     if profile not in validated["profiles"]:
@@ -496,9 +526,17 @@ def required_check_ids(
     *,
     execution_scope: str,
     ci_leg: str | None = None,
+    part: str | None = None,
 ) -> list[str]:
+    """The checks a run must report. A Windows part runs its own mode's checks and both bindings; the parts of a
+    leg together cover the whole leg."""
     validated = validate_manifest(manifest)
     profile_config = validated["profiles"][profile]
+    part_mode = None
+    if part is not None:
+        if execution_scope != "ci-leg":
+            raise GateBlock("ci_part_invalid", "a part belongs to a CI leg")
+        part_mode, _group = parse_ci_part(part, validated, parse_ci_leg(ci_leg, validated, profile) if ci_leg else None)
     if execution_scope == "local":
         pythons = profile_config["local"]["python_minors"]
         base_checks = profile_config["local"]["required_checks"]
@@ -526,6 +564,13 @@ def required_check_ids(
                 result.append(f"{check_id}-{_python_suffix(python)}")
         else:
             result.append(check_id)
+    if part_mode is not None:
+        result = [
+            check_id
+            for check_id in result
+            if check_id in {"git-binding", "final-binding"}
+            or check_id.startswith("pytest-source-") == (part_mode == "source")
+        ]
     return result
 
 
@@ -894,13 +939,25 @@ def _validate_collection_time(row: dict[str, Any]) -> None:
 
 
 def _validate_pytest_groups(
-    item: dict[str, Any], spec: dict[str, Any], bundle_root: Path | None, *, collecting_logs: bool = False
+    item: dict[str, Any],
+    spec: dict[str, Any],
+    bundle_root: Path | None,
+    *,
+    collecting_logs: bool = False,
+    only_group: str | None = None,
 ) -> None:
+    """Both groups of a whole Windows mode, or the one group of a part (``only_group``), each exactly its share of
+    the full collection."""
     full = _selection_ids(item["selection"])
     _validate_collection_time(item)
     groups = _require_list(item["group_runs"], "pytest group_runs")
-    if len(groups) != 2:
-        raise GateBlock("pytest_selection_invalid", "both pytest groups A and B are required")
+    names = ("A", "B") if only_group is None else (only_group,)
+    if len(groups) != len(names):
+        raise GateBlock(
+            "pytest_selection_invalid",
+            "both pytest groups A and B are required" if only_group is None
+            else f"a part runs exactly its pytest group {only_group}",
+        )
     selected = {}
     for index, group in enumerate(groups):
         row = _require_object(group, "pytest group run")
@@ -909,9 +966,11 @@ def _validate_pytest_groups(
             {"group", "argv", "status", "exit_code", "duration_ms", "collection_duration_ms", "selection", "log"},
             "pytest group run",
         )
-        name = ("A", "B")[index]
+        name = names[index]
         if row["group"] != name:
-            raise GateBlock("pytest_selection_invalid", "pytest group order must be A, B")
+            if only_group is None:
+                raise GateBlock("pytest_selection_invalid", "pytest group order must be A, B")
+            raise GateBlock("pytest_selection_invalid", f"a part runs exactly its pytest group {name}")
         selected[name] = _selection_ids(row["selection"])
         if (
             not isinstance(row["duration_ms"], int)
@@ -962,7 +1021,18 @@ def _validate_pytest_groups(
                 raise GateBlock("evidence_log_invalid", f"cannot read pytest group log: {exc}") from exc
     if item["duration_ms"] < sum(row["duration_ms"] for row in groups):
         raise GateBlock("pytest_selection_invalid", "mode time is shorter than its group runs")
-    if item["status"] == "pass":
+    if item["status"] == "pass" and only_group is not None:
+        a_files = set(spec["windows_group_a"])
+        if not full:
+            raise GateBlock("pytest_selection_invalid", "full pytest collection is empty")
+        share = {node for node in full if (node.split("::", 1)[0] in a_files) == (only_group == "A")}
+        if selected[only_group] != share or (
+            only_group == "A" and {node.split("::", 1)[0] for node in share} != a_files
+        ):
+            raise GateBlock(
+                "pytest_selection_invalid", f"pytest group {only_group} is not its share of the full collection"
+            )
+    elif item["status"] == "pass":
         a, b = selected["A"], selected["B"]
         a_files = set(spec["windows_group_a"])
         if not full:
@@ -1017,7 +1087,8 @@ def validate_run_artifact(
         "blockers",
         "summary",
     }
-    _require_artifact_fields(record, required_top, "artifact")
+    # "part" is checked below: only a Windows part has it (#378).
+    _require_artifact_fields(record, required_top | ({"part"} & set(record)), "artifact")
     if (
         not isinstance(record["schema_version"], int)
         or isinstance(record["schema_version"], bool)
@@ -1033,12 +1104,19 @@ def validate_run_artifact(
     if not isinstance(record["verdict"], str) or record["verdict"] not in {"pass", "block"}:
         raise GateBlock("evidence_schema_invalid", "verdict must be pass or block")
     scope = record["execution_scope"]
+    # A Windows part names itself; evidence for a whole leg (a local run or the mode trial) has no "part" field.
+    part = record.get("part")
+    part_mode = part_group = None
+    if "part" in record and scope != "ci-leg":
+        raise GateBlock("evidence_schema_invalid", "only CI leg evidence names a part")
     if scope == "ci-leg":
         if record["complete"] is not False:
             raise GateBlock("evidence_schema_invalid", "CI leg evidence must be incomplete")
         leg = parse_ci_leg(record["ci_leg"], manifest, record["profile"])
+        if "part" in record:
+            part_mode, part_group = parse_ci_part(part, manifest, leg)
         expected_ids = required_check_ids(
-            manifest, record["profile"], execution_scope="ci-leg", ci_leg=leg
+            manifest, record["profile"], execution_scope="ci-leg", ci_leg=leg, part=part
         )
         expected_minors = [leg.split("/", 1)[1]]
         expected_os = leg.split("/", 1)[0]
@@ -1284,7 +1362,9 @@ def validate_run_artifact(
         ):
             raise GateBlock("evidence_schema_invalid", f"checks[{index}] lacks blocking execution evidence")
         if grouped and "group_runs" in item:
-            _validate_pytest_groups(item, manifest["checks"]["pytest"], bundle_root, collecting_logs=_collecting_logs)
+            _validate_pytest_groups(
+                item, manifest["checks"]["pytest"], bundle_root, collecting_logs=_collecting_logs, only_group=part_group
+            )
         if needs_provenance and item["status"] == "pass":
             _validate_import_provenance(
                 item["import_provenance"],
@@ -1350,7 +1430,8 @@ def validate_run_artifact(
                 )
 
     artifacts = _require_object(record["artifacts"], "artifacts")
-    allowed_artifacts = {"sdist", "wheel"}
+    # A source part builds no package, so it can carry no package evidence.
+    allowed_artifacts = set() if part_mode == "source" else {"sdist", "wheel"}
     if "pip-audit" in expected_ids:
         allowed_artifacts.add("audit_requirements")
     if not set(artifacts).issubset(allowed_artifacts):
@@ -1369,7 +1450,7 @@ def validate_run_artifact(
             or item["size_bytes"] < 0
         ):
             raise GateBlock("evidence_schema_invalid", f"artifacts.{artifact_id} is malformed")
-    if checks_by_id["package-build"]["status"] == "pass" and not {"sdist", "wheel"}.issubset(artifacts):
+    if checks_by_id.get("package-build", {}).get("status") == "pass" and not {"sdist", "wheel"}.issubset(artifacts):
         raise GateBlock("evidence_cardinality_invalid", "passing package build lacks sdist or wheel evidence")
     if checks_by_id.get("pip-audit", {}).get("status") == "pass" and "audit_requirements" not in artifacts:
         raise GateBlock("evidence_cardinality_invalid", "passing pip-audit lacks requirements evidence")
@@ -1683,6 +1764,72 @@ def write_preflight_block_evidence(
     return output_path, sha256_bytes(raw), artifact
 
 
+def _artifact_label(artifact: Any) -> Any:
+    if not isinstance(artifact, dict) or not isinstance(artifact.get("ci_leg"), str):
+        return None
+    part = artifact.get("part")
+    return ci_input_label(artifact["ci_leg"], part if isinstance(part, str) else None)
+
+
+def _aggregate_row(artifact: dict[str, Any], artifact_sha256: str) -> dict[str, Any]:
+    """One aggregate row per evidence file: a leg, or one part of a Windows leg, with its group times."""
+    return {
+        "ci_leg": artifact["ci_leg"],
+        "part": artifact.get("part"),
+        "run_id": artifact["run_id"],
+        "verdict": artifact["verdict"],
+        "artifact_sha256": artifact_sha256,
+        "pytest_group_times_ms": {
+            check["id"]: {group["group"]: group["duration_ms"] for group in check["group_runs"]}
+            for check in artifact["checks"]
+            if "group_runs" in check
+        },
+        "pytest_collection_times_ms": {
+            check["id"]: {
+                "full": check["collection_duration_ms"],
+                **{group["group"]: group["collection_duration_ms"] for group in check["group_runs"]},
+            }
+            for check in artifact["checks"]
+            if "group_runs" in check
+        },
+    }
+
+
+def _check_windows_parts(by_label: dict[str, dict[str, Any]], manifest: dict[str, Any], profile: str) -> None:
+    """The parts of one Windows leg must add up to the whole leg: per mode, the groups do not overlap and together
+    equal the one full collection both parts made, and the wheel parts tested the same wheel."""
+    parts = manifest["checks"]["pytest"]["windows_parts"]
+    for leg in expected_ci_legs(manifest, profile):
+        if not leg.startswith("windows/"):
+            continue
+        suffix = _python_suffix(leg.split("/", 1)[1])
+        for mode in REQUIRED_MODES:
+            check_id = f"pytest-{mode}-{suffix}"
+            runs = []
+            for part in parts:
+                if parse_ci_part(part, manifest, leg)[0] != mode:
+                    continue
+                check = next(c for c in by_label[ci_input_label(leg, part)]["checks"] if c["id"] == check_id)
+                if check["status"] == "pass":
+                    runs.append((set(check["selection"]), set(check["group_runs"][0]["selection"])))
+            if len(runs) < 2:
+                continue  # a failed part already blocks the leg
+            groups = [group for _full, group in runs]
+            if any(groups[i] & groups[j] for i in range(len(groups)) for j in range(i + 1, len(groups))):
+                raise GateBlock("aggregate_part_mismatch", f"{leg} {mode} parts ran the same test twice")
+            # Each part checked its own group against its own full collection; only here do the halves meet.
+            union = set().union(*groups)
+            if any(full != union for full, _group in runs):
+                raise GateBlock("aggregate_part_mismatch", f"{leg} {mode} parts do not add up to the collected tests")
+        wheels = {
+            by_label[ci_input_label(leg, part)]["artifacts"]["wheel"]["sha256"]
+            for part in parts
+            if "wheel" in by_label[ci_input_label(leg, part)]["artifacts"]
+        }
+        if len(wheels) > 1:
+            raise GateBlock("aggregate_part_mismatch", f"{leg} wheel parts tested different wheels")
+
+
 def aggregate_leg_artifacts(
     manifest: dict[str, Any],
     profile: str,
@@ -1691,16 +1838,15 @@ def aggregate_leg_artifacts(
     input_sha256_by_leg: dict[str, str] | None = None,
     bundle_roots: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
+    """Aggregate one evidence file per declared input (``expected_ci_inputs``). ``input_sha256_by_leg`` and
+    ``bundle_roots`` are keyed by ``ci_input_label``: the leg, or the leg and part for a Windows part."""
     validated = validate_manifest(manifest)
-    expected = expected_ci_legs(validated, profile)
+    expected = [ci_input_label(leg, part) for leg, part in expected_ci_inputs(validated, profile)]
     validated_artifacts = [
-        validate_run_artifact(
-            artifact, validated,
-            bundle_root=(bundle_roots or {}).get(artifact.get("ci_leg")) if isinstance(artifact, dict) else None,
-        )
+        validate_run_artifact(artifact, validated, bundle_root=(bundle_roots or {}).get(_artifact_label(artifact)))
         for artifact in artifacts
     ]
-    legs = [artifact["ci_leg"] for artifact in validated_artifacts]
+    legs = [_artifact_label(artifact) for artifact in validated_artifacts]
     duplicates = sorted({leg for leg in legs if leg is not None and legs.count(leg) > 1})
     if duplicates:
         raise GateBlock("aggregate_duplicate_leg", "duplicate CI leg(s): " + ", ".join(duplicates))
@@ -1742,7 +1888,8 @@ def aggregate_leg_artifacts(
                 "aggregate_binding_mismatch",
                 f"leg {group}.{field} does not match the current checkout",
             )
-    by_leg = {artifact["ci_leg"]: artifact for artifact in validated_artifacts}
+    by_leg = {_artifact_label(artifact): artifact for artifact in validated_artifacts}
+    _check_windows_parts(by_leg, validated, profile)
     ordered = [by_leg[leg] for leg in expected]
     if input_sha256_by_leg is not None:
         if set(input_sha256_by_leg) != set(expected) or not all(
@@ -1765,35 +1912,16 @@ def aggregate_leg_artifacts(
         "manifest": ordered[0]["manifest"],
         "authority": ordered[0]["authority"],
         "legs": [
-            {
-                "ci_leg": artifact["ci_leg"],
-                "run_id": artifact["run_id"],
-                "verdict": artifact["verdict"],
-                "artifact_sha256": (
-                    input_sha256_by_leg[artifact["ci_leg"]]
-                    if input_sha256_by_leg is not None
-                    else sha256_bytes(
-                        json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                    )
-                ),
-                "pytest_group_times_ms": {
-                    check["id"]: {group["group"]: group["duration_ms"] for group in check["group_runs"]}
-                    for check in artifact["checks"]
-                    if "group_runs" in check
-                },
-                "pytest_collection_times_ms": {
-                    check["id"]: {
-                        "full": check["collection_duration_ms"],
-                        **{group["group"]: group["collection_duration_ms"] for group in check["group_runs"]},
-                    }
-                    for check in artifact["checks"]
-                    if "group_runs" in check
-                },
-            }
+            _aggregate_row(
+                artifact,
+                input_sha256_by_leg[_artifact_label(artifact)]
+                if input_sha256_by_leg is not None
+                else sha256_bytes(json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")),
+            )
             for artifact in ordered
         ],
         "blockers": [
-            {"code": "ci_leg_blocked", "check_id": artifact["ci_leg"], "detail": "CI leg blocked"}
+            {"code": "ci_leg_blocked", "check_id": _artifact_label(artifact), "detail": "CI leg blocked"}
             for artifact in ordered
             if artifact["verdict"] != "pass"
         ],
@@ -2796,6 +2924,7 @@ def _run_pytest_groups(
     tool_version: str,
     provenance: dict[str, Any],
     runtime_environment: dict[str, Any] | None,
+    only_group: str | None = None,
 ) -> dict[str, Any]:
     check_id = f"pytest-{mode}-{_python_suffix(interpreter.requested)}"
     spec = manifest["checks"]["pytest"]
@@ -2868,7 +2997,7 @@ def _run_pytest_groups(
     record["selection"] = full
     record["group_runs"] = []
     try:
-        for group in ("A", "B"):
+        for group in ("A", "B") if only_group is None else (only_group,):
             outcome, ids, collection_ms = collect_or_run(group, pytest_group_selectors(spec, group))
             record["group_runs"].append(
                 {
@@ -2885,12 +3014,12 @@ def _run_pytest_groups(
             record["duration_ms"] += outcome.duration_ms
             if outcome.status != "pass":
                 record = _change_record_failure(record, "pytest_group_failed", f"group {group}: {outcome.diagnostic}")
-        _validate_pytest_groups(record, spec, None)
+        _validate_pytest_groups(record, spec, None, only_group=only_group)
     except GateBlock as exc:
         record = _change_record_failure(record, exc.code, exc.detail)
         try:
             # Keep complete run times and logs when well-formed selections fail the partition proof.
-            _validate_pytest_groups(record, spec, None)
+            _validate_pytest_groups(record, spec, None, only_group=only_group)
         except GateBlock:
             record.pop("collection_duration_ms", None)
             record.pop("selection", None)
@@ -2911,6 +3040,7 @@ def _run_pytest_mode(
     logs_dir: Path,
     runtime_environment: dict[str, Any] | None = None,
     windows_groups: bool = False,
+    only_group: str | None = None,
 ) -> dict[str, Any]:
     check_id = f"pytest-{mode}-{_python_suffix(interpreter.requested)}"
     spec = manifest["checks"]["pytest"]
@@ -2942,6 +3072,7 @@ def _run_pytest_mode(
             tool_version=tool_version,
             provenance=provenance,
             runtime_environment=runtime_environment,
+            only_group=only_group,
         )
     # #(ci-xdist-posix): two xdist workers on Linux/macOS only - see #232's
     # probe for why Windows stays serial (PowerShell-host startup capacity
@@ -3657,8 +3788,9 @@ def execute_gate(
     python_overrides: dict[str, Path] | None = None,
     trial_mode: str | None = None,
     trial_installs: dict[str, Any] | None = None,
+    part: str | None = None,
 ) -> GateRunResult:
-    """Execute one local precheck or one explicitly named CI matrix leg."""
+    """Execute one local precheck, one explicitly named CI matrix leg, or one part of a Windows leg."""
 
     started_at = _utc_now()
     run_id = uuid.uuid4().hex
@@ -3672,6 +3804,12 @@ def execute_gate(
         trial_mode not in REQUIRED_MODES or normalized_leg is None or not normalized_leg.startswith("windows/")
     ):
         raise GateBlock("trial_partition_invalid", "trial modes require a declared Windows CI leg")
+    part_group = None
+    run_mode = trial_mode
+    if part is not None:
+        if trial_mode is not None:
+            raise GateBlock("ci_part_invalid", "a trial mode and a part cannot be combined")
+        run_mode, part_group = parse_ci_part(part, manifest, normalized_leg)
     if normalized_leg is not None:
         expected_os = normalized_leg.split("/", 1)[0]
         observed_os = _platform_label()
@@ -3710,6 +3848,7 @@ def execute_gate(
         profile,
         execution_scope=scope,
         ci_leg=normalized_leg,
+        part=part,
     )
     required_set = set(required_ids)
     checks_by_id: dict[str, dict[str, Any]] = {}
@@ -3749,7 +3888,7 @@ def execute_gate(
             source_root = _export_phase(binding, run_root, "source")
             source_env = source_environment(base_env, source_root)
             for minor in minors:
-                if trial_mode == "wheel":
+                if run_mode == "wheel":
                     continue
                 interpreter = interpreters.get(minor)
                 if interpreter is None:
@@ -3766,9 +3905,10 @@ def execute_gate(
                     basetemp=run_root / f"pt-s-{_python_suffix(minor)}",
                     logs_dir=logs_dir,
                     windows_groups=normalized_leg is not None and normalized_leg.startswith("windows/"),
+                    only_group=part_group,
                 )
 
-            if trial_mode != "source":
+            if run_mode != "source":
                 build_interpreter = next((interpreters[minor] for minor in minors if minor in interpreters), None)
                 wheel: Path | None = None
                 package_root = _export_phase(binding, run_root, "package")
@@ -3901,6 +4041,7 @@ def execute_gate(
                             logs_dir=logs_dir,
                             runtime_environment=test_proof,
                             windows_groups=normalized_leg is not None and normalized_leg.startswith("windows/"),
+                            only_group=part_group,
                         )
                         if checks_by_id[wheel_test_id]["status"] == "pass":
                             external_inputs.append(
@@ -3980,6 +4121,7 @@ def execute_gate(
         "complete": scope == "local",
         "execution_scope": scope,
         "ci_leg": normalized_leg,
+        **({"part": part} if part is not None else {}),
         "subject": {
             "candidate_sha": binding.candidate_sha,
             "candidate_tree": binding.candidate_tree,
@@ -4132,7 +4274,8 @@ def validate_aggregate_artifact(
         item = _require_object(leg, f"aggregate.legs[{index}]")
         _require_artifact_fields(
             item,
-            {"ci_leg", "run_id", "verdict", "artifact_sha256", "pytest_group_times_ms", "pytest_collection_times_ms"},
+            {"ci_leg", "run_id", "verdict", "artifact_sha256", "pytest_group_times_ms", "pytest_collection_times_ms"}
+            | ({"part"} & set(item)),
             f"aggregate.legs[{index}]",
         )
         if (
@@ -4145,29 +4288,39 @@ def validate_aggregate_artifact(
             raise GateBlock("evidence_schema_invalid", f"aggregate.legs[{index}] is invalid")
         if not _is_hash(item["artifact_sha256"], 64):
             raise GateBlock("evidence_schema_invalid", f"aggregate.legs[{index}] digest is malformed")
-        times = _require_object(item["pytest_group_times_ms"], "aggregate pytest group times")
+        # Rows written before #378's parts have no "part" field: they stand for a whole leg.
+        part = item.get("part")
+        windows = item["ci_leg"].startswith("windows/")
+        if part is not None:
+            try:
+                part_mode, part_group = parse_ci_part(part, manifest, item["ci_leg"])
+            except GateBlock as exc:
+                raise GateBlock("evidence_schema_invalid", f"aggregate.legs[{index}]: {exc.detail}") from exc
+        suffix = _python_suffix(item["ci_leg"].split("/")[1])
         expected_modes = (
-            {f"pytest-{mode}-{_python_suffix(item['ci_leg'].split('/')[1])}" for mode in REQUIRED_MODES}
-            if item["ci_leg"].startswith("windows/")
+            {f"pytest-{part_mode}-{suffix}"} if part is not None
+            else {f"pytest-{mode}-{suffix}" for mode in REQUIRED_MODES} if windows
             else set()
         )
+        expected_groups = {part_group} if part is not None else {"A", "B"}
+        times = _require_object(item["pytest_group_times_ms"], "aggregate pytest group times")
         if not set(times).issubset(expected_modes) or (item["verdict"] == "pass" and set(times) != expected_modes):
             raise GateBlock("evidence_schema_invalid", "aggregate pytest group times are incomplete")
         for groups in times.values():
             row = _require_object(groups, "aggregate pytest group times")
-            if set(row) != {"A", "B"} or any(type(value) is not int or value < 0 for value in row.values()):
+            if set(row) != expected_groups or any(type(value) is not int or value < 0 for value in row.values()):
                 raise GateBlock("evidence_schema_invalid", "aggregate pytest group times are malformed")
         collection_times = _require_object(item["pytest_collection_times_ms"], "aggregate collection times")
         if set(collection_times) != set(times):
             raise GateBlock("evidence_schema_invalid", "aggregate collection times are incomplete")
         for phases in collection_times.values():
             row = _require_object(phases, "aggregate collection times")
-            if set(row) != {"full", "A", "B"} or any(
+            if set(row) != {"full", *expected_groups} or any(
                 not (value is None and item["verdict"] != "pass") and (type(value) is not int or value < 0)
                 for value in row.values()
             ):
                 raise GateBlock("evidence_schema_invalid", "aggregate collection times are malformed")
-        leg_ids.append(item["ci_leg"])
+        leg_ids.append(ci_input_label(item["ci_leg"], part))
     if len(leg_ids) != len(set(leg_ids)):
         raise GateBlock("evidence_cardinality_invalid", "aggregate contains duplicate legs")
     blockers = _require_list(record["blockers"], "aggregate.blockers")
@@ -4177,7 +4330,7 @@ def validate_aggregate_artifact(
         if not all(_is_nonempty_string(item[field]) for field in ("code", "check_id", "detail")):
             raise GateBlock("evidence_schema_invalid", f"aggregate.blockers[{index}] is invalid")
     if record["complete"]:
-        if leg_ids != expected:
+        if leg_ids != [ci_input_label(leg, part) for leg, part in expected_ci_inputs(manifest, record["profile"])]:
             raise GateBlock("evidence_cardinality_invalid", "complete aggregate lacks the exact ordered CI matrix")
         should_pass = all(leg["verdict"] == "pass" for leg in legs)
         if (record["verdict"] == "pass") != should_pass or (should_pass and blockers):
@@ -4323,7 +4476,7 @@ def execute_aggregate(
             detail = exc.detail if isinstance(exc, GateBlock) else str(exc)
             problem = GateBlock("aggregate_input_invalid", f"{path}: {detail}")
             break
-        leg = validated["ci_leg"]
+        leg = _artifact_label(validated)
         if leg in digests:
             problem = GateBlock("aggregate_duplicate_leg", f"duplicate CI leg {leg}")
             break
@@ -4331,27 +4484,7 @@ def execute_aggregate(
         digests[leg] = digest
         bundle_roots[leg] = path.parent
         artifacts.append(validated)
-        observed_legs.append(
-            {
-                "ci_leg": leg,
-                "run_id": validated["run_id"],
-                "verdict": validated["verdict"],
-                "artifact_sha256": digest,
-                "pytest_group_times_ms": {
-                    check["id"]: {group["group"]: group["duration_ms"] for group in check["group_runs"]}
-                    for check in validated["checks"]
-                    if "group_runs" in check
-                },
-                "pytest_collection_times_ms": {
-                    check["id"]: {
-                        "full": check["collection_duration_ms"],
-                        **{group["group"]: group["collection_duration_ms"] for group in check["group_runs"]},
-                    }
-                    for check in validated["checks"]
-                    if "group_runs" in check
-                },
-            }
-        )
+        observed_legs.append(_aggregate_row(validated, digest))
     if problem is None:
         try:
             artifact = aggregate_leg_artifacts(

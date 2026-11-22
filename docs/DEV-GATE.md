@@ -134,7 +134,7 @@ runs so the candidate SHA and the tested package version describe the same revis
 
 ```text
 agenttalk dev-gate [--profile release]
-                   [--ci-leg OS/PYTHON | --aggregate DIRECTORY]
+                   [--ci-leg OS/PYTHON [--part PART] | --aggregate DIRECTORY]
                    [--evidence ABSOLUTE_PATH]
                    [--temp-root ABSOLUTE_DIRECTORY]
                    [--python MINOR=ABSOLUTE_EXE ...]
@@ -144,9 +144,14 @@ agenttalk dev-gate [--profile release]
   Its artifact has `complete: true` for the local scope, but it is not the authoritative CI matrix decision.
 - `--ci-leg` accepts one declared matrix member: Linux, Windows, or macOS on Python 3.10 through 3.13. A leg
   artifact always has `complete: false`; it cannot claim a full gate pass by itself.
+- `--part` runs one declared part of a Windows leg: `source-a`, `source-b`, `wheel-a` or `wheel-b`
+  (`checks.pytest.windows_parts`; see [Windows parts](#windows-parts)). It needs a Windows `--ci-leg` and
+  writes a `part` field into the leg artifact. Without it, a Windows leg runs whole, as a local run or the
+  mode trial does.
 - `--aggregate` reads leg artifacts recursively, rejects malformed, missing, duplicate, stale, or mixed-bound
   evidence, and compares the common SHA/tree/manifest binding with the current clean checkout. Only the exact
-  12-leg set can produce `complete: true`.
+  set can produce `complete: true`: one artifact for each Linux and macOS leg and one for each part of each
+  Windows leg, 24 in all.
 - `--evidence` and `--temp-root` must resolve outside both the candidate worktree and `AGENTTALK_ROOT`. Defaults
   use the system temporary directory. Pytest basetemps are short children of that external run directory.
 - The same rule applies when running `pytest` directly (not via `agenttalk dev-gate`), e.g. for a targeted
@@ -312,11 +317,12 @@ a distinction this plan's single-command, identical-everywhere model cannot expr
 
 ### Windows file groups
 
-Each of the four Windows legs runs source A, source B, wheel A and wheel B on
-one runner, in that order (layout 3a). Every test still runs in both modes on
-every required Python version. Linux and macOS keep one full run per mode with
-two workers; their faster runs do not need the extra collection step. Local
-prechecks also keep one full run per mode.
+Windows runs each pytest mode as two file groups, A and B. In CI each group of
+each mode runs in its own job (see [Windows parts](#windows-parts)); a local
+run or the mode trial runs a whole mode, A and then B. Every test still runs in
+both modes on every required Python version. Linux and macOS keep one full run
+per mode with two workers; their faster runs do not need the extra collection
+step. Local prechecks also keep one full run per mode.
 
 Group A is exactly `tests/test_acceptance.py`, `tests/test_lanes.py`,
 `tests/test_supervisor.py`, `tests/test_web.py`, `tests/test_cli.py` and
@@ -324,23 +330,48 @@ Group A is exactly `tests/test_acceptance.py`, `tests/test_lanes.py`,
 Group B selects `tests` with one `--ignore` for each A file. New test files land
 in B by default. A missing or renamed A file blocks the mode before tests run.
 
-The gate collects the full suite before each Windows mode. A recorder in each
-group run captures its actual selected test IDs after collection hooks. The
-union of A and B must equal the full collection, with no overlap or duplicate
-IDs, and each ID must belong to its declared file group. Every named A file
-must contribute IDs. The aggregate repeats this proof from the evidence and
-rejects a missing group or changed selection. Counts alone cannot pass it.
+The gate collects the full suite before each Windows mode, and again in each
+part. A recorder in each group run captures its actual selected test IDs after
+collection hooks. The union of A and B must equal the full collection,
+with no overlap or duplicate IDs, and each ID must belong to its declared file group.
+Every named A file must contribute IDs. The aggregate repeats this proof from
+the evidence and rejects a missing group or changed selection. Counts alone
+cannot pass it.
+
+### Windows parts
+
+Each Windows leg runs in CI as four jobs, one package mode and one group each:
+`source-a`, `source-b`, `wheel-a` and `wheel-b`, the parts declared in
+`checks.pytest.windows_parts` and pinned in the gate's code (#378). One job per
+leg took up to the hosted 6-hour maximum. The longest group took 107.5 minutes
+in a historical sample of 37 master runs (12 to 21 November 2026), and 116.4
+minutes in this layout's first run, 44956093100, whose longest job took 119.75
+minutes (see `windows_timeout_reason`). Each part runs both binding
+checks; a source part runs only its source group, and a wheel part builds the
+package, runs the wheel checks and runs its wheel group.
+
+A part's artifact carries `ci_leg` and `part`, and the CI artifact is named
+`dev-gate-leg-windows-<python>-<part>`. A part must contain exactly its own
+group, and that group must be exactly its share of the part's full collection.
+
+The aggregate expects every part of every Windows leg. A missing, duplicate,
+extra or wrong-commit part blocks it, and so does a whole Windows leg in place
+of its parts, so a missing half never passes. For each leg and mode, the two
+parts must have collected the same full suite, their groups must not overlap,
+and together they must equal it. The two wheel parts must have tested the same
+wheel (the same SHA-256). Each part has its own row in the aggregate's `legs`,
+with a `part` field and the times of its one group.
 
 The existing `pytest-source-py310` and `pytest-wheel-py310` check IDs (and their
 other Python versions) remain mode summaries. Each Windows summary records
 `selection`, the full collection, and `group_runs`, with A/B commands, selected
 IDs, statuses, exit codes, `duration_ms` and log hashes. The mode time includes
-full collection and both groups. The aggregate reports each group's time in
+full collection and its groups. The aggregate reports each group's time in
 `legs[].pytest_group_times_ms`. Each grouped mode and group also records
 `collection_duration_ms`, measured inside pytest's collection hook. This excludes
-process startup and test execution. The aggregate preserves all three phases
-(full, A and B) per mode in `legs[].pytest_collection_times_ms`; the group-times
-step reports their total per Windows leg, across both modes. Missing measurements
+process startup and test execution. The aggregate preserves the phases (the
+full collection and the part's group) in `legs[].pytest_collection_times_ms`;
+the group-times step reports their total per Windows part. Missing measurements
 are unavailable, never inferred from run time. Count this collection time when
 setting the later limits.
 
@@ -366,7 +397,8 @@ version, manifest blob/digest, and logical plan digest and that the current chec
 CI uploads every leg artifact even when its gate command blocks. The always-run aggregate converts a crashed
 or evidence-less leg into an incomplete blocking artifact instead of silently reducing the matrix.
 
-To investigate a red lane, download its `dev-gate-leg-<os>-<python>` artifact and open
+To investigate a red lane, download its `dev-gate-leg-<os>-<python>` artifact (for a
+Windows part, `dev-gate-leg-windows-<python>-<part>`) and open
 `dev-gate-evidence.json`. For each failing check, follow `checks[].log.artifact_path`
 to `logs/<check-id>.log` in the same artifact. This file contains the complete combined
 stdout/stderr, including pytest's captured product output and output written before a
@@ -378,8 +410,9 @@ missing or changed logs block the aggregate. Older JSON artifacts may lack the r
 Windows group logs use `checks[].group_runs[].log.artifact_path`, pointing to
 `logs/<check-id>-A.log` or `logs/<check-id>-B.log`. They are collected and
 verified under the same size and hash rules. The relative reference is required
-for every collected group log; a missing reference blocks aggregation. A passing Windows mode requires
-both group records; earlier full-run Windows evidence cannot satisfy this plan.
+for every collected group log; a missing reference blocks aggregation. A passing whole Windows mode requires
+both group records, and a passing part exactly its own; earlier full-run Windows evidence cannot satisfy
+this plan.
 
 Each collected check log is limited to 16 MiB. Larger logs block with
 `check_log_size_exceeded`, rather than silently omitting assertion output. Collection
@@ -401,7 +434,7 @@ about 10,500 tests it adds roughly 3.5 MiB to a log that is otherwise about 20 K
 under the 16 MiB limit. On Windows the pytest modes run as file groups: there
 `logs/<check-id>.log` holds only the collection list, so a passing mode's `diagnostic`
 ends with "N tests collected", and the durations and the result lines are in the group
-logs `logs/<check-id>-A.log` and `logs/<check-id>-B.log`.
+logs `logs/<check-id>-A.log` and `logs/<check-id>-B.log` (a part has only its own).
 
 A run stopped by its time limit never reaches that section. Its log ends with
 `agenttalk dev-gate: timed out after <N>s`, then
@@ -415,16 +448,19 @@ is 7,200 seconds on Linux and macOS. On Windows the limit is `windows_timeout_se
 chooses the limit.
 
 The CI job ceilings in `.github/workflows/tests.yml` follow from these limits:
-- **Windows: 360 minutes**, the hosted runner maximum (raised from 330 on 2026-11-18,
-  after 18 jobs stopped at 330 minutes with no failing test; see `windows_timeout_reason`).
-  This whole-job ceiling stays independent of the four group limits. Layout 3a shortens
-  each run but keeps the job near its previous length; four groups reaching their
-  individual limits would exceed the ceiling. Splitting the Windows job is the follow-up.
+- **Each Windows part: 165 minutes**: 150 minutes for its one test group, plus a 15-minute
+  allowance for setup, collection and saving evidence. In run 44956093100 the largest
+  measured time outside the group was 3 minutes 40 seconds. The allowance is not a
+  guarantee: if a job reaches its limit, GitHub stops it and the evidence upload can be
+  interrupted. Before the split (#378) one job ran all four groups and needed the hosted
+  maximum of 360 minutes; 18 such jobs stopped at the previous
+  330-minute ceiling with no failing test (see `windows_timeout_reason`).
 - **Linux and macOS: 90 minutes.**
 
-The margins recorded in `windows_timeout_reason` in `dev-gate.json` come from two hosted
-runs, and these limits were retained; changing them needs new evidence. This change does not
-claim a shorter total job or share wheel coverage between versions.
+The margins recorded in `windows_timeout_reason` in `dev-gate.json` come from hosted
+runs, and the group limits were retained; changing them needs new evidence. The parts
+share no work between Python versions; each wheel part builds its own wheel, and the
+aggregate checks that both wheel parts of a leg built the same one.
 
 # Windows source/wheel trial (stage 1)
 
@@ -467,9 +503,11 @@ binding checks appear in both modes; every other Windows check belongs to
 exactly one. Nothing runs in parallel inside either Windows pytest process.
 All check deadlines stay the same. The Windows pytest allowance is 9,000
 seconds per group run, retained under #378: two hosted runs gave the margins recorded
-in `windows_timeout_reason`, and changing the limit needs new evidence. The existing
-Windows job ceiling (360 minutes since 2026-11-18, previously 330) and the 20-minute
-aggregation ceiling remain in use.
+in `windows_timeout_reason`, and changing the limit needs new evidence. Each trial job
+keeps a 360-minute ceiling (the dev-gate's Windows parts have 165 minutes since the
+#378 split), and the 20-minute aggregation ceiling remains in use. The trial still runs
+whole modes, so its evidence has no `part` field, and its comparison now lists the
+dev-gate's Windows part jobs.
 
 Trial timings are not directly comparable with earlier trial data: each mode
 now runs a full collection pass followed by groups A and B, each collecting
