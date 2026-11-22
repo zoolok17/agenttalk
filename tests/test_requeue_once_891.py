@@ -352,3 +352,70 @@ def test_again_cannot_waive_requeue_record_read_error(tmp_path, monkeypatch, cap
     assert "--again" not in output.err
     assert record.read_bytes() == previous
     assert {message.id for message in store.valid_messages()} == before
+
+
+@pytest.mark.parametrize("kind", ["message", "review-result", "rescind", "end"])
+@pytest.mark.parametrize("again", [False, True])
+def test_non_opener_read_error_names_record_and_retry_without_fresh_send(tmp_path, monkeypatch, capsys, kind, again):
+    import shlex
+    from pathlib import Path
+    from agenttalk import printed_commands as pc
+    from test_dead_letter import _run
+
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body", kind=kind)
+    store.dead_letter("beta", original.to_dict(), reason="poison", failure_class="poison", at="t")
+    assert _requeue(store, original) == 0
+    record = store._requeue_state_path("beta", original.id)
+    previous = record.read_bytes()
+    before = {message.id for message in store.valid_messages()}
+    read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == record:
+            raise PermissionError(13, "synthetic read failure")
+        return read_text(path, *args, **kwargs)
+
+    capsys.readouterr()
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    flags = ["--again", "--reason", "retry"] if again else []
+    assert _requeue(store, original, *flags) == 2
+    error = capsys.readouterr().err
+    assert "new request id" not in error and "agenttalk send" not in error
+    assert pc.shown(str(record), pc.PATH_SHOWN_MAX_CHARACTERS,
+                    source="is the requeue record beside this dead letter in the store") in error
+    assert "access" in error and "retry" in error.lower()
+    assert f"agenttalk dead-letter requeue --agent beta --id {original.id}" in error
+    assert record.read_bytes() == previous
+    assert {message.id for message in store.valid_messages()} == before
+    printed = error.split("Then retry the same dead letter: ", 1)[1].strip().removesuffix(".")
+    monkeypatch.setattr(Path, "read_text", read_text)
+    assert _run(shlex.split(printed)[1:], store.root) == 2
+    assert "--again --reason TEXT" in capsys.readouterr().err
+
+
+def test_non_opener_read_error_retry_retains_resolved_options(tmp_path, monkeypatch, capsys):
+    from pathlib import Path
+    from test_dead_letter import _run
+
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body", kind="review-result")
+    _dead_payload(store, original)
+    assert _requeue(store, original) == 0
+    assert _run(["dead-letter", "resolve", "--agent", "beta", "--id", original.id,
+                 "--from", "lead", "--reason", "done"], store.root) == 0
+    record = store._requeue_state_path("beta", original.id)
+    read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == record:
+            raise PermissionError(13, "synthetic read failure")
+        return read_text(path, *args, **kwargs)
+
+    capsys.readouterr()
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    assert _requeue(store, original, "--force-resolved", "--from", "lead", "--reason", "retry") == 2
+    error = capsys.readouterr().err
+    assert f"agenttalk dead-letter requeue --agent beta --id {original.id}" in error
+    assert "--force-resolved --from lead --reason retry" in error
+    assert "new request id" not in error and "agenttalk send" not in error

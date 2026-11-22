@@ -16842,6 +16842,21 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             if (orig.get("kind") not in _dl_tags.OPENERS
                     and (e.again_allowed or isinstance(e, store_mod.RequeueStateDamaged))):
                 advice = "If the earlier requeue is why it was refused, pass --again --reason TEXT."
+            elif orig.get("kind") not in _dl_tags.OPENERS:
+                template = "agenttalk dead-letter requeue --agent {agent} --id {id}"
+                values = {"agent": args.agent, "id": args.id}
+                if reopen_event is not None:
+                    template += " --force-resolved --from {actor} --reason {reason}"
+                    values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
+                if isinstance(e, store_mod.RequeueStateReadError):
+                    record = pc.shown(
+                        str(store._requeue_state_path(args.agent, args.id)), pc.PATH_SHOWN_MAX_CHARACTERS,
+                        source="is the requeue record beside this dead letter in the store",
+                    )
+                    fix = f"Resolve the reported access problem first; the requeue record is {record}. "
+                else:
+                    fix = attention + "Resolve the refusal above first. "
+                advice = fix + "Then retry the same dead letter: " + pc.cmd(template, **values) + "."
             else:
                 advice = (
                     "Retry that copy instead: "

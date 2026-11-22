@@ -1431,10 +1431,11 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
             if site == "dead-requeue-store-error":
                 err = f"agenttalk dead-letter requeue: message {escaped} missing\n"
             elif site == "dead-requeue-record-error":
-                monkeypatch.setattr(cli, "_requeue_route", lambda *args: "Send fresh work by hand.")
                 err = (
                     f"agenttalk dead-letter requeue: record {escaped} missing; nothing was published. "
-                    "Send fresh work by hand.\n"
+                    "Resolve the refusal above first. Then retry the same dead letter: "
+                    + pc.cmd("agenttalk dead-letter requeue --agent {agent} --id {id}", agent="beta", id=rid)
+                    + ".\n"
                 )
             else:
                 expected_code, out, err = 0, None, ""
