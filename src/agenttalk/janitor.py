@@ -1144,7 +1144,9 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         for c in report.candidates:
             held.close()  # the previous candidate's claims
             guard = None
-            unchecked = False  # set when what was kept could not be checked (not when a delete failed)
+            # Not checked unless the checks completed and the delete itself ran: an identity or ancestry failure at any
+            # point leaves what is at the path unestablished, and the report must not advise removing it by hand.
+            unchecked = True
             reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
             if reason is not None:
                 result = "FAILED"
@@ -1204,9 +1206,9 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         summary["refused"] = summary.get("refused", 0) + 1
                         continue
                 except _UseCheckFailed as exc:
-                    reason, unchecked = str(exc), True
+                    reason = str(exc)
                 except (OSError, RuntimeError) as exc:
-                    reason, unchecked = f"could not check worktree identity: {exc}", True
+                    reason = f"could not check worktree identity: {exc}"
 
                 refused = False
                 for w in worktrees:
@@ -1256,6 +1258,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                                 guard.reread()  # the very last look, after the comparison above
                             if keep is None:
                                 result, reason = remove_plainly(c.path)
+                                unchecked = False  # every check completed; a failure now is the delete's own
                     except worktree_release.Refused as exc:
                         keep = str(exc)
                     except _UseCheckFailed as exc:

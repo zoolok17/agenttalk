@@ -656,3 +656,68 @@ def test_mixed_failures_advise_removal_only_for_the_candidates_that_were_checked
     assert ".probe-failed" in "\n".join(section[old]) and ".probe-unchecked" not in "\n".join(section[old]), text
     assert ".probe-unchecked" in "\n".join(section[new]) and ".probe-failed" not in "\n".join(section[new]), text
     assert unchecked.exists() and report.apply_failed
+
+
+def sections(text):
+    """The FAILED headings of a report and the lines under each: {heading start: [lines]}."""
+    lines, found, current = text.splitlines(), {}, None
+    for line in lines:
+        if line.startswith("FAILED (") and line.endswith(":"):
+            current = line
+            found[current] = []
+        elif current is not None and line.startswith("  "):
+            found[current].append(line)
+        elif current is not None:
+            current = None
+    return found
+
+
+@pytest.mark.parametrize("when", ["after-discovery", "later-in-the-checks"])
+def test_a_candidate_whose_identity_changed_is_never_advised_for_removal_by_hand(estate, monkeypatch, when):
+    """The path changed after discovery (or between the checks and the delete): its checkout and use were not
+    established for what is there now, so it is listed as not checked, never under "remove it yourself"."""
+    repo, wt, cfg = estate
+    folder = repo / ".probe-swapped"
+    folder.mkdir()
+    report = janitor.build_report(cfg)
+    assert any(c.path == folder for c in report.candidates)
+    if when == "after-discovery":
+        folder.rmdir()
+        directory_link(folder, wt)  # a link where the folder was: it may lead to a live checkout
+    else:
+        real, calls = janitor._path_change_reason, []
+
+        def changed(c, cfg):
+            if c.path != folder:
+                return real(c, cfg)
+            calls.append(1)
+            return None if len(calls) < 2 else "the candidate changed since it was found (test)"
+
+        monkeypatch.setattr(janitor, "_path_change_reason", changed)
+    try:
+        text = janitor.apply(cfg, report)
+    finally:
+        if when == "after-discovery" and os.path.lexists(folder):
+            folder.rmdir() if os.name == "nt" else folder.unlink()
+
+    found = sections(text)
+    assert report.apply_failed, text
+    assert "remove it yourself" not in text and "Look at each one" not in text, text
+    (heading,) = [h for h in found if "do not remove them by hand" in h]
+    assert any(".probe-swapped" in line for line in found[heading]), text
+
+
+def test_a_candidate_whose_delete_failed_still_gets_the_old_advice(estate, monkeypatch):
+    """The checks completed and only the delete failed: the folder was checked, so the old advice is right for it."""
+    repo, wt, cfg = estate
+    folder = repo / ".probe-failed"
+    folder.mkdir()
+    report = janitor.build_report(cfg)
+    monkeypatch.setattr(janitor, "remove_plainly", lambda path: ("FAILED", "injected delete failure"))
+
+    text = janitor.apply(cfg, report)
+
+    found = sections(text)
+    (heading,) = [h for h in found if "remove it yourself" in h]
+    assert any(".probe-failed" in line for line in found[heading]), text
+    assert not [h for h in found if "do not remove them by hand" in h], text
