@@ -1331,8 +1331,11 @@ def _parse_worktree_list_z(out) -> list[Path]:
     Anything that does not look like that output is not guessed at: `_UseCheckFailed`."""
     if isinstance(out, str):  # a stand-in that answers text
         out = out.encode("utf-8", "surrogateescape")
-    if not out.endswith(b"\0"):
-        raise _listing_failure("its output is not complete")
+    if not out.endswith(b"\0\0"):
+        # Every record ends with an empty field after its last field (git worktree: with -z "the terminator is NUL
+        # instead of LF" and the empty line between records becomes an empty field), so complete output ends NUL NUL.
+        # Output cut after a field, even after a NUL, is cut short.
+        raise _listing_failure("its output is not complete (the last record is not closed)")
     paths, in_record = [], False
     for field in out.split(b"\0")[:-1]:
         if field == b"":

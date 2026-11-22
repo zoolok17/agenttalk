@@ -842,3 +842,69 @@ def test_a_held_lane_session_refusal_says_what_to_do_next(estate):
     for text in (preview, applied):
         line = next(line for line in text.splitlines() if f"REFUSED (kept) {lane}" in line)
         assert "then run the sweep again" in line, line
+
+
+# ---------------------------- a listing cut short is never read as complete (Git ends every record with an empty field)
+
+
+def truncated_listings(repo):
+    main = b"worktree " + str(repo).encode("utf-8")
+    return {
+        "after-the-path": main + b"\0",
+        "after-a-field": main + b"\0HEAD abc\0",
+        "after-the-last-field": main + b"\0HEAD abc\0branch refs/heads/main\0",
+        "second-record-after-its-path": main + b"\0HEAD abc\0\0worktree " + str(repo).encode("utf-8") + b"2\0",
+        "second-record-after-a-field": main + b"\0HEAD abc\0\0worktree x\0HEAD abc\0",
+    }
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "after-the-path",
+        "after-a-field",
+        "after-the-last-field",
+        "second-record-after-its-path",
+        "second-record-after-a-field",
+    ],
+)
+def test_a_listing_cut_short_never_lets_a_late_checkout_be_deleted(estate, monkeypatch, shape):
+    """Every record of `git worktree list --porcelain -z` ends with an empty field after its last field, so the whole
+    output ends with two NULs (Git's own output: a locked worktree's last field is `locked`, then NUL NUL). A successful
+    answer cut anywhere before that is incomplete: a checkout registered after the report may be in the missing part."""
+    repo, wt, cfg = estate
+    parent = repo / ".probe-truncated"
+    parent.mkdir()
+    report = janitor.build_report(cfg)
+    lane = parent / "café"
+    git(repo, "worktree", "add", "-q", "-b", "lane/late-truncated", str(lane))
+    (lane / "unsaved.txt").write_text("only copy")
+    _write_record(repo, "active-lane", lane)
+    answer = truncated_listings(repo)[shape]
+    real = janitor._run_git_checked
+
+    def cut(path, *args, **kwargs):
+        if args[:3] == ("worktree", "list", "--porcelain") and kwargs.get("raw"):
+            return 0, answer, b""
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(janitor, "_run_git_checked", cut)
+
+    text = janitor.apply(cfg, report)
+
+    assert (lane / "unsaved.txt").read_text() == "only copy" and parent.is_dir(), text
+    assert report.apply_failed and "removed: 1" not in text, text
+    found = sections(text)
+    (heading,) = [h for h in found if "do not remove them by hand" in h]
+    assert any(".probe-truncated" in line for line in found[heading]), text
+
+
+def test_the_parser_accepts_exactly_what_git_writes_and_nothing_cut_short():
+    complete = b"worktree /a/b\0HEAD abc\0branch refs/heads/main\0\0worktree /a/c\0HEAD def\0detached\0locked why\0\0"
+    assert [str(p).replace("\\", "/") for p in janitor._parse_worktree_list_z(complete)] == ["/a/b", "/a/c"]
+    for cut in range(1, len(complete)):
+        prefix = complete[:cut]
+        if prefix.endswith(b"\0\0"):
+            continue  # a prefix that ends exactly at a record boundary is a complete list of fewer records
+        with pytest.raises(janitor._UseCheckFailed):
+            janitor._parse_worktree_list_z(prefix)
