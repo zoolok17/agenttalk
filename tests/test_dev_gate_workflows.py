@@ -16,7 +16,7 @@ from agenttalk import dev_gate
 
 
 @pytest.mark.parametrize(
-    "state", ["complete", "missing", "no-field", "one-mode", "five-values", "null", "string", "boolean"]
+    "state", ["complete", "missing", "no-field", "one-mode", "five-values", "null", "string", "boolean", "part"]
 )
 def test_681_group_report_handles_missing_evidence_and_reports_collection_total(tmp_path, state):
     workflow = Path(".github/workflows/tests.yml").read_text()
@@ -40,7 +40,14 @@ def test_681_group_report_handles_missing_evidence_and_reports_collection_total(
                 }
             )
         )
-    if state not in {"complete", "missing"}:
+    if state == "part":
+        # #378: a Windows part's row has one mode, with its full collection and its own group.
+        evidence.write_text(json.dumps({"legs": [{
+            "ci_leg": "windows/3.10", "part": "source-b",
+            "pytest_group_times_ms": {"pytest-source-py310": {"B": 4000}},
+            "pytest_collection_times_ms": {"pytest-source-py310": {"full": 100, "B": 30}},
+        }]}))
+    if state not in {"complete", "missing", "part"}:
         artifact = json.loads(evidence.read_text())
         leg = artifact["legs"][0]
         phases = leg["pytest_collection_times_ms"]
@@ -64,6 +71,9 @@ def test_681_group_report_handles_missing_evidence_and_reports_collection_total(
     report = summary.read_text()
     if state == "missing":
         assert "aggregate evidence file is missing" in report
+    elif state == "part":
+        assert "| windows/3.10/source-b | pytest-source-py310 | B | 4.000 |" in report
+        assert "| windows/3.10/source-b | 0.130 |" in report
     elif state != "complete":
         assert "| windows/3.10 | unavailable |" in report
     else:
@@ -122,19 +132,25 @@ def test_windows_ci_job_ceiling_matches_the_windows_capacity_stopgap() -> None:
     (which PR #230 measured at 177/180 min, 98%) is a test failure, not a
     rediscovery under load. Linux/macOS keep the tight cap."""
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
-    # #378: grouping shortens each pytest run but retains the whole-job ceiling.
-    assert "timeout_minutes: 360  # #378: the hosted maximum; raised from 330 on 2026-11-18" in workflow
-    assert workflow.count("timeout_minutes: 90") == 2
-    for stale in ("timeout_minutes: 270", "timeout_minutes: 180", "timeout_minutes: 120"):
-        assert stale not in workflow
-    assert "#378 layout 3a: four Windows runners" in workflow
-    assert "wheel A and wheel B" in workflow
-    assert "Linux/macOS keep one run per mode" in workflow
     manifest = json.loads(Path("dev-gate.json").read_text(encoding="utf-8"))
+    parts = manifest["checks"]["pytest"]["windows_parts"]
+    # #378: each Windows leg is one job per declared part, each with the group limit plus 15 minutes.
+    legs = workflow.split("  dev-gate-leg:", 1)[1].split("  dev-gate-aggregate:", 1)[0]
+    matrix = legs.split("        os:\n", 1)[1].split("        python-version:", 1)[0]
+    ceiling = "timeout_minutes: 165  # #378: the 9000s group limit plus 15 minutes for setup and upload"
+    for part in parts:
+        assert f"          - id: windows\n            part: {part}\n            runner: windows-latest\n" \
+            f"            {ceiling}\n" in matrix
+    assert matrix.count("- id: windows") == len(parts) == 4
+    assert matrix.count(ceiling) == len(parts)
+    assert workflow.count("timeout_minutes: 90") == 2
+    for stale in ("timeout_minutes: 360", "timeout_minutes: 270", "timeout_minutes: 180", "timeout_minutes: 120"):
+        assert stale not in workflow
+    assert "${{ matrix.os.part && format('--part {0}', matrix.os.part) || '' }}" in legs
+    assert "Linux/macOS keep one run per mode" in workflow
     windows_pytest_minutes = manifest["checks"]["pytest"]["windows_timeout_seconds"] / 60
-    assert windows_pytest_minutes == 150
-    # Groups have separate run limits; the unchanged whole-job ceiling is independent.
-    assert "Two hosted runs gave the margins recorded in windows_timeout_reason" in workflow
+    assert windows_pytest_minutes == 150 == 165 - 15
+    assert "a part's 165-minute ceiling is that limit" in workflow
     assert "name: Report Windows group times" in workflow
     assert 'leg.get("pytest_group_times_ms", {})' in workflow
 

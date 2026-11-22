@@ -18289,6 +18289,8 @@ def _dev_gate_forward_argv(args: argparse.Namespace) -> list[str]:
     argv = ["--profile", args.profile]
     if args.ci_leg:
         argv.extend(["--ci-leg", args.ci_leg])
+    if args.part:
+        argv.extend(["--part", args.part])
     if args.aggregate:
         argv.extend(["--aggregate", str(Path(args.aggregate).resolve())])
     if args.evidence:
@@ -18322,6 +18324,8 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 raise dev_gate_mod.GateBlock(
                     "aggregate_argument_invalid", "--python is not valid with --aggregate"
                 )
+            if args.part:
+                raise dev_gate_mod.GateBlock("aggregate_argument_invalid", "--part is not valid with --aggregate")
             result = dev_gate_mod.execute_aggregate(
                 root=root,
                 input_root=Path(args.aggregate),
@@ -18337,6 +18341,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 evidence_path=Path(args.evidence) if args.evidence else None,
                 temp_base=Path(args.temp_root) if args.temp_root else None,
                 python_overrides=dev_gate_mod.parse_python_overrides(args.python),
+                part=args.part,
             )
     except Exception as caught:
         exc = (
@@ -18416,6 +18421,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--aggregate",
         type=Path,
         help="Aggregate a directory of exact CI-leg JSON artifacts into authoritative evidence.",
+    )
+    pdev.add_argument(
+        "--part",
+        help="With a Windows --ci-leg: run only this declared part of the leg (checks.pytest.windows_parts).",
     )
     pdev.add_argument(
         "--evidence",
