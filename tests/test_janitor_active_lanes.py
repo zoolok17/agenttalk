@@ -721,3 +721,124 @@ def test_a_candidate_whose_delete_failed_still_gets_the_old_advice(estate, monke
     (heading,) = [h for h in found if "remove it yourself" in h]
     assert any(".probe-failed" in line for line in found[heading]), text
     assert not [h for h in found if "do not remove them by hand" in h], text
+
+
+# ------------------------------------------------ the checkouts under a candidate are compared without lossy decoding
+
+
+@pytest.mark.parametrize("name", ["café", "a b", "日本語"], ids=["accent", "line-separator", "cjk"])
+def test_a_late_checkout_with_a_non_ascii_name_keeps_the_candidate_and_its_unsaved_file(estate, monkeypatch, name):
+    """The listing was decoded with the console's encoding and split with splitlines(): a name such as `café` read as a
+    path that does not exist, and one with U+2028 was cut in two, so the checkout registered under an empty allowed
+    folder after the report was not seen and was deleted with its unsaved files (data loss). The listing is read as
+    bytes, with NUL record boundaries, and compared as the paths Git wrote."""
+    repo, wt, cfg = estate
+    parent = repo / ".probe-parent"
+    parent.mkdir()
+    report = janitor.build_report(cfg)
+    assert any(c.path == parent for c in report.candidates)
+    real_changed = janitor._checkouts_changed
+    created = []
+
+    def late(c, worktrees, cfg):
+        if c.path == parent:
+            lane = parent / name
+            git(repo, "worktree", "add", "-q", "-b", "lane/late", str(lane))
+            (lane / "unsaved.txt").write_text("not saved anywhere else")
+            _write_record(repo, "active-lane", lane)
+            created.append(lane)
+        return real_changed(c, worktrees, cfg)
+
+    monkeypatch.setattr(janitor, "_checkouts_changed", late)
+
+    text = janitor.apply(cfg, report)
+
+    assert created and (created[0] / "unsaved.txt").read_text() == "not saved anywhere else", text
+    assert parent.is_dir() and "removed: 1" not in text, text
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (0, b"", b""),
+        (0, b"no record here", b""),
+        (0, b"HEAD abc\0\0", b""),
+        (0, b"worktree \xff\xfe\0\0", b""),
+        (0, b"worktree " + b"x" * 5, b""),
+    ],
+    ids=["empty", "no-record", "field-before-a-record", "undecodable-path", "record-not-terminated"],
+)
+def test_an_inventory_that_cannot_be_read_reliably_keeps_the_candidate_as_not_checked(estate, monkeypatch, answer):
+    repo, wt, cfg = estate
+    folder = repo / ".probe-unreadable"
+    folder.mkdir()
+    report = janitor.build_report(cfg)
+    real_git = janitor._run_git_checked
+
+    def odd_git(repo, *args, **kwargs):
+        if args[:3] == ("worktree", "list", "--porcelain") and args[-1:] == ("-z",):
+            return answer
+        return real_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(janitor, "_run_git_checked", odd_git)
+
+    text = janitor.apply(cfg, report)
+
+    assert folder.is_dir() and report.apply_failed, text
+    found = sections(text)
+    (heading,) = [h for h in found if "do not remove them by hand" in h]
+    assert any(".probe-unreadable" in line for line in found[heading]), text
+    assert "could not list the registered checkouts" in text and "then run the sweep again" in text, text
+
+
+def test_the_listing_is_read_with_nul_boundaries_as_bytes(estate, monkeypatch):
+    """The reader asks Git for `-z` and for bytes, so no decoding and no line splitting can change a path."""
+    repo, wt, cfg = estate
+    seen = []
+    real = janitor._run_git_checked
+
+    def watching(repo, *args, **kwargs):
+        if args[:3] == ("worktree", "list", "--porcelain"):
+            seen.append((args, kwargs))
+        return real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(janitor, "_run_git_checked", watching)
+
+    listed = janitor._registered_worktrees_listed(repo)
+
+    assert any(janitor._same_worktree(path, repo) for path in listed)
+    assert seen and seen[-1][0][-1] == "-z" and seen[-1][1].get("raw") is True, seen
+
+
+# --------------------------------------------------------------- a kept checkout gets a next step
+
+
+@pytest.mark.parametrize(
+    "kind", ["active-lane", "pending-lane", "supervisor-state", "store-supervisor", "launch-request"]
+)
+def test_every_refusal_for_an_active_use_says_what_to_do_next(estate, kind):
+    repo, wt, cfg = estate
+    lane = checkout(repo, "l1")
+    _write_record(repo, kind, lane)
+    report = janitor.build_report(cfg)
+
+    preview = janitor.format_report(report, cfg, apply=False)
+    applied = janitor.apply(cfg, report)
+
+    for text in (preview, applied):
+        line = next(line for line in text.splitlines() if f"REFUSED (kept) {lane}" in line)
+        assert "leave it until what uses it has finished" in line and "then run the sweep again" in line, line
+    assert lane.exists()
+
+
+def test_a_held_lane_session_refusal_says_what_to_do_next(estate):
+    repo, wt, cfg = estate
+    lane = checkout(repo, "one")
+    _finished_lane(repo, lane, "delivered")
+    with _session_on_lane(repo):
+        report = janitor.build_report(cfg)
+        preview = janitor.format_report(report, cfg, apply=False)
+        applied = janitor.apply(cfg, report)
+    for text in (preview, applied):
+        line = next(line for line in text.splitlines() if f"REFUSED (kept) {lane}" in line)
+        assert "then run the sweep again" in line, line

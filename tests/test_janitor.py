@@ -2343,10 +2343,10 @@ def test_410_unknown_ignored_files_keep_worktree(tmp_path, monkeypatch):
     (wt / "tracked.txt").write_text("unfinished", encoding="utf-8")
     run_git = janitor._run_git_checked
 
-    def unreadable_ignored(path, *args):
+    def unreadable_ignored(path, *args, **kwargs):
         if args[0] == "ls-files":
             return 1, "", "simulated ignored-file failure"
-        return run_git(path, *args)
+        return run_git(path, *args, **kwargs)
 
     monkeypatch.setattr(janitor, "_run_git_checked", unreadable_ignored)
     text = janitor.apply(t["cfg"], janitor.build_report(t["cfg"]))

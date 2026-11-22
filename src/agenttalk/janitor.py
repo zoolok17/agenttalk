@@ -261,7 +261,7 @@ def _safe_iterdir(path: Path) -> tuple[list[Path], tuple[Path, str] | None]:
         return [], (path, _os_error_text(exc))
 
 
-def _run_git_checked(repo: Path, *args: str) -> tuple[int | None, str, str]:
+def _run_git_checked(repo: Path, *args: str, raw: bool = False) -> tuple[int | None, str, str]:
     """Run git, returning (returncode, stdout, stderr). returncode is
     `None` if git itself is unresolvable - callers that need to
     distinguish "genuinely nothing to report" from "could not even run
@@ -271,13 +271,14 @@ def _run_git_checked(repo: Path, *args: str) -> tuple[int | None, str, str]:
     post-commit clean confirmation) silently treated an unrunnable git
     the same as a successful, empty answer - the exact mechanism that let
     a live, dirty, untracked-file-holding worktree be removed with no
-    refusal printed anywhere."""
+    refusal printed anywhere. `raw=True` returns the bytes Git wrote (no decoding with the console's encoding, no
+    newline translation) for a caller that must keep paths exactly as Git wrote them."""
     git = shutil.which("git")
     if git is None:
         return None, "", "git is not resolvable"
     result = subprocess.run(  # nosec B603 - resolved executable, argv list
         [git, "-C", str(repo), *args],
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=not raw, check=False,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -740,7 +741,10 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
     if ancestor_errors:
         return JanitorReport([], [], [], [], ancestor_errors)
     candidates, access_errors = find_candidates(cfg)
-    registered = get_registered_worktrees(cfg.repo)
+    try:
+        registered = _registered_worktrees_listed(cfg.repo)  # the same reading as the comparison at the delete
+    except _UseCheckFailed:
+        registered = get_registered_worktrees(cfg.repo)  # best effort: discovery has refused what it cannot trust
     dirty = [
         w for w in registered
         if not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
@@ -759,6 +763,16 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
         ancestor_ids=ancestor_ids,
         in_use=in_use,
     )
+
+
+_IN_USE_NEXT_STEP = (
+    "; leave it until what uses it has finished (or the record that names it is retired), then run the sweep again"
+)
+
+
+def _in_use_text(exc: Exception) -> str:
+    """A refusal because something uses the checkout, with what to do next."""
+    return str(exc) + _IN_USE_NEXT_STEP
 
 
 class _UseCheckFailed(Exception):
@@ -780,7 +794,7 @@ def _in_use_reason(cfg: JanitorConfig, targets: list[Path]) -> str | None:
     try:
         worktree_release.check_unused(cfg, targets)
     except worktree_release.Refused as exc:
-        return str(exc)
+        return _in_use_text(exc)
     except (OSError, ValueError, TypeError) as exc:
         return _use_check_failure(exc)
     return None
@@ -1176,7 +1190,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                             guard = worktree_release.RemovalGuard(cfg, in_use, closed_window=True)
                             held.enter_context(guard)
                         except worktree_release.Refused as exc:
-                            keep = str(exc)
+                            keep = _in_use_text(exc)
                         except (OSError, ValueError, TypeError) as exc:
                             raise _UseCheckFailed(_use_check_failure(exc)) from exc
                     for w in worktrees:
@@ -1260,7 +1274,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                                 result, reason = remove_plainly(c.path)
                                 unchecked = False  # every check completed; a failure now is the delete's own
                     except worktree_release.Refused as exc:
-                        keep = str(exc)
+                        keep = _in_use_text(exc)
                     except _UseCheckFailed as exc:
                         result, reason, unchecked = "FAILED", str(exc), True
                     except (OSError, ValueError, TypeError) as exc:
@@ -1304,18 +1318,52 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     return "\n".join(store_mod.report_line(line) for line in lines)
 
 
+def _listing_failure(why: str) -> "_UseCheckFailed":
+    return _UseCheckFailed(
+        f"could not list the registered checkouts to compare them before the delete ({why}); it was kept. "
+        "Git could not list this repository's checkouts, so nothing shows that this folder holds none: fix Git "
+        "for it (`git worktree list` must work there), then run the sweep again")
+
+
+def _parse_worktree_list_z(out) -> list[Path]:
+    """The paths of `git worktree list --porcelain -z`, read from the bytes Git wrote: NUL ends every field and an empty
+    field ends a record, so a path with a newline, U+2028 or any non-ASCII letter is one path, exactly as written.
+    Anything that does not look like that output is not guessed at: `_UseCheckFailed`."""
+    if isinstance(out, str):  # a stand-in that answers text
+        out = out.encode("utf-8", "surrogateescape")
+    if not out.endswith(b"\0"):
+        raise _listing_failure("its output is not complete")
+    paths, in_record = [], False
+    for field in out.split(b"\0")[:-1]:
+        if field == b"":
+            in_record = False
+        elif field.startswith(b"worktree "):
+            if in_record or len(field) == len(b"worktree "):
+                raise _listing_failure("its output could not be read reliably")
+            try:
+                paths.append(Path(field[len(b"worktree "):].decode("utf-8")))
+            except UnicodeDecodeError:
+                raise _listing_failure("a checkout path in its output is not valid UTF-8") from None
+            in_record = True
+        elif not in_record:
+            raise _listing_failure("its output could not be read reliably")
+    if not paths:
+        raise _listing_failure("its output names no checkout")
+    return paths
+
+
 def _registered_worktrees_listed(repo: Path) -> list[Path]:
-    """Git's list of registered worktrees, or `_UseCheckFailed` when it could not be had. `get_registered_worktrees`
-    answers `[]` for a failed listing on purpose (its callers remove nothing on that answer); a comparison that reads
-    that as "none registered" would miss a checkout that appeared since the first look."""
-    rc, out, err = _run_git_checked(repo, "worktree", "list", "--porcelain")
+    """Git's list of registered worktrees, or `_UseCheckFailed` when it could not be had or read reliably.
+    `get_registered_worktrees` answers `[]` for a failed listing on purpose (its callers remove nothing on that answer),
+    and reads text with the console's encoding; a comparison that reads either as "none registered" would miss a
+    checkout that appeared since the first look. This one reads bytes with NUL boundaries (`-z`)."""
+    rc, out, err = _run_git_checked(repo, "worktree", "list", "--porcelain", "-z", raw=True)
     if rc is None or rc != 0:
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
         why = "git is not resolvable" if rc is None else f"git worktree list failed, rc={rc}: {err.strip()[:200]}"
-        raise _UseCheckFailed(
-            f"could not list the registered checkouts to compare them before the delete ({why}); it was kept. "
-            "Git could not list this repository's checkouts, so nothing shows that this folder holds none: fix Git "
-            "for it (`git worktree list` must work there), then run the sweep again")
-    return [Path(line[len("worktree "):]) for line in out.splitlines() if line.startswith("worktree ")]
+        raise _listing_failure(why)
+    return _parse_worktree_list_z(out)
 
 
 def _checkouts_changed(c: Candidate, worktrees: list[Path], cfg: JanitorConfig) -> str | None:
