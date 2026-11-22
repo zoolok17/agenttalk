@@ -182,9 +182,10 @@ def _interruption_remedy(agent: str, head_id: object, *, k: int, kind: str,
     remedy = (f"this message's turns were killed {k} times by {kind}{budget}; "
               f"raise turn_watchdog.turn_elapsed_seconds for {agent}, split the task, "
               "or inspect it first and decide whether to send it again (the requeue command refuses, and says "
-              f"why, when the message cannot be retried): "
+              "why, when the message cannot be retried). Requeue it once: "
               "`" + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=agent, i=head_id) + "`, then `"
-              + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=agent, i=head_id) + "`")
+              + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=agent, i=head_id)
+              + "`; to resend it deliberately when allowed, add --again --reason TEXT")
     if preserved_draft is not None:
         remedy += f"; the last preserved partial progress is at: {pc.line(str(preserved_draft))}"
     return remedy

@@ -14606,8 +14606,9 @@ def _dead_letter_notifier(store, agent: str):
                     + "Inspect: " + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=ag, i=mid))
             if disposed:
                 body += ("  If it still makes sense to send it again (the requeue command refuses, and says why, "
-                         "when the message cannot be retried): "
-                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid))
+                         "when the message cannot be retried), requeue it once: "
+                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid)
+                         + ". To resend it deliberately when allowed, add --again --reason TEXT.")
             store.send(sender=agent, recipient=target, kind="question",
                        subject="dead-letter notice", body=body,
                        meta={"needs_operator": "true", "dead_letter": "true",
@@ -16838,21 +16839,18 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 if problem
                 else ""
             )
-            sys.stderr.write(
-                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
-                + (
+            if (orig.get("kind") not in _dl_tags.OPENERS
+                    and (e.again_allowed or isinstance(e, store_mod.RequeueStateDamaged))):
+                advice = "If the earlier requeue is why it was refused, pass --again --reason TEXT."
+            else:
+                advice = (
                     "Retry that copy instead: "
                     + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=args.agent, i=retry)
                     + "."
                     if retry and not problem
                     else attention + _requeue_route(args, orig)
                 )
-                + (" If the earlier requeue is why it was refused, pass --again --reason TEXT."
-                   if orig.get("kind") not in _dl_tags.OPENERS
-                   and (e.again_allowed or isinstance(e, store_mod.RequeueStateDamaged))
-                   and not problem else "")
-                + "\n"
-            )
+            sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))} {advice}\n")
             return 2
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))}\n")

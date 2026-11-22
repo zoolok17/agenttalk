@@ -52,7 +52,7 @@ def test_unretryable_copy_advice_shows_the_stored_id_without_publishing(
     before = list(store.valid_messages())
 
     def refuse_send(self, **kwargs):
-        raise RequeueRefused("previous copy needs attention; nothing was published.", retry=retry, again_allowed=True)
+        raise RequeueRefused("previous copy needs attention; nothing was published.", retry=retry)
 
     monkeypatch.setattr(Store, "send", refuse_send)
     monkeypatch.setattr(cli, "_retry_problem", lambda *args: "saved payload" + separator + "FORGED_REASON")

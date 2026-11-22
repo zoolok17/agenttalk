@@ -19,6 +19,8 @@ def test_each_non_opener_is_requeued_once(tmp_path, monkeypatch, kind, capsys):
     refusal = capsys.readouterr().err
     assert copy.id in refusal
     assert "--again --reason TEXT" in refusal
+    assert "new request id" not in refusal
+    assert "agenttalk send" not in refusal
     assert len(store.messages_for("beta")) == 1
 
 
@@ -69,9 +71,26 @@ def test_damaged_record_needs_explicit_again(tmp_path, monkeypatch, damaged, cap
     _dead_payload(store, original)
     store._requeue_state_path("beta", original.id).write_bytes(damaged)
     assert _requeue(store, original) == 2
-    assert "--again --reason TEXT" in capsys.readouterr().err
+    refusal = capsys.readouterr().err
+    assert "--again --reason TEXT" in refusal
+    assert "new request id" not in refusal
     assert _requeue(store, original, "--again", "--reason", "repair") == 0
     assert store.messages_for("beta")[-1].meta["requeued_again_after"] == "unreadable"
+
+
+@pytest.mark.parametrize("kind", ["message", "review-result"])
+def test_non_opener_repeat_with_failed_copy_only_suggests_again(tmp_path, monkeypatch, capsys, kind):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body", kind=kind)
+    _dead_payload(store, original)
+    assert _requeue(store, original) == 0
+    copied = store.messages_for("beta")[-1]
+    _dead_payload(store, copied)
+    capsys.readouterr()
+    assert _requeue(store, original) == 2
+    refusal = capsys.readouterr().err
+    assert copied.id in refusal and "--again --reason TEXT" in refusal
+    assert "new request id" not in refusal and "Retry that copy instead" not in refusal
 
 
 def test_again_does_not_override_live_opener(tmp_path, monkeypatch):
@@ -141,6 +160,7 @@ def test_printed_retry_command_runs_once_then_refuses(tmp_path, monkeypatch, sou
         text = store.messages_for("lead")[-1].body
     else:
         text = _interruption_remedy("beta", original.id, k=2, kind="timeout", budget_seconds=1)
+    assert "once" in text and "--again --reason TEXT" in text
     match = re.search(r"agenttalk dead-letter requeue --agent beta --id [A-Za-z0-9-]+", text)
     assert match
     command = shlex.split(match.group())[1:]
