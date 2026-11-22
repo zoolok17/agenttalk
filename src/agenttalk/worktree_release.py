@@ -381,11 +381,11 @@ def _still_absent(seen: list[str]) -> None:
         except OSError as exc:
             raise Refused(
                 f"a path that a record names could not be looked at again before the removal ({_why(exc)}); "
-                "the checkout was kept"
+                "the checkout was kept; make that path readable, then run the release again"
             ) from exc
         raise Refused(
             "a path that a record names, and that was absent when the records were read, exists now; "
-            "the checkout was kept"
+            "the checkout was kept; run the release again: it reads the records afresh and says what uses it"
         )
 
 
@@ -790,8 +790,17 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                     continue
                 _unchanged(candidate_ids)
                 with contextlib.ExitStack() as claims:  # kept through the removal: no session can start on these lanes
-                    named = _free_lanes(cfg, path, lambda store, lane: claims.enter_context(
-                        lane_occupancy.cleanup_claim(store, lane)))
+                    claimed: set[str] = set()
+
+                    def claim(store, lane, claims=claims, claimed=claimed):  # one claim per lane, however often named
+                        if lane in claimed:
+                            return None
+                        busy = claims.enter_context(lane_occupancy.cleanup_claim(store, lane))
+                        if busy is None:
+                            claimed.add(lane)
+                        return busy
+
+                    named = _free_lanes(cfg, path, claim)
                     # Re-read mutable eligibility, then recheck identities at the
                     # deletion boundary. No stale report can authorize a removal.
                     _, current_head = _check_worktree(cfg, path, default)
@@ -802,8 +811,12 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                     # The token does not stop a lane writer; this lock, which every one of them takes, does. Only
                     # here, not around the checks above: they hash every file, and lane writers wait 10 seconds.
                     with store_mod.Store(cfg.repo)._config_lock() if named else contextlib.nullcontext():
+                        # The last read is the whole first look again, ended lanes and their retained occupancy paths
+                        # included: a session can outlive its lane, so a name such a lane saved and that was read as
+                        # absent is watched too, and a lane that names the checkout only now has its token tried and
+                        # held through the removal.
                         with _watching_absent() as seen:
-                            _activity(cfg, path)
+                            _free_lanes(cfg, path, claim)
                         _still_absent(seen)
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")

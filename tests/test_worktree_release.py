@@ -2691,3 +2691,144 @@ def test_a_recorded_path_that_stays_absent_through_the_final_check_still_lets_re
     _write_record(repo, "active-lane", repo.parent / "long-gone" / "deeper")
     code, text = run(cfg, wt)
     assert code == 0 and "REMOVED" in text, text
+
+
+# --- #853 fix round (the maintainers' P1): an ended lane's paths are part of the last look too ---------------------
+
+
+def _ended_lane_naming(repo, field, path):
+    """An abandoned lane whose saved `worktree_path`, or one of its retained `occupancy_worktrees`, names `path`."""
+    state = repo / ".agenttalk" / "state"
+    state.mkdir(exist_ok=True)
+    if field == "worktree_path":
+        row = {"status": "abandoned", "worktree_path": str(path)}
+    else:
+        row = {"status": "abandoned", "occupancy_worktrees": [str(path)]}
+    (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}))
+
+
+def _link_or_skip(kind, link, target):
+    """A real folder link of `kind`: a junction (Windows) or a directory symlink (where the runner may make one)."""
+    if kind == "junction":
+        if os.name != "nt":
+            pytest.skip("a junction is a Windows folder link")
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"this runner cannot make a directory symlink ({exc.strerror or exc})")
+
+
+def _can_link(kind, where):
+    probe_target = where / "link-probe-target"
+    probe_target.mkdir()
+    probe = where / "link-probe"
+    _link_or_skip(kind, probe, probe_target)
+    probe.rmdir() if os.name == "nt" else probe.unlink()
+    probe_target.rmdir()
+
+
+def _unlink(link):
+    if os.path.lexists(link):
+        link.rmdir() if os.name == "nt" else link.unlink()
+
+
+@pytest.mark.parametrize("link_kind", ["junction", "symlink"])
+@pytest.mark.parametrize("field", ["worktree_path", "occupancy_worktrees"])
+def test_an_ended_lanes_missing_path_that_becomes_a_link_before_the_last_recheck_keeps_the_checkout(
+    estate, monkeypatch, field, link_kind
+):
+    """The maintainers' probe: a session still holds the token of a lane that ended (abandoned), and the lane's saved
+    path is missing. Right after the last read of the records, before the names read as absent are looked at again,
+    that name becomes a link to the checkout. The ended lane's paths must be part of that second look, or release
+    removes a checkout the running session uses."""
+    repo, wt, cfg = estate
+    _can_link(link_kind, repo.parent)
+    gone = repo.parent / "long-gone"
+    _ended_lane_naming(repo, field, gone)
+    real = worktree_release._still_absent
+    fired = []
+
+    def recheck(seen):
+        if not fired:
+            fired.append(1)
+            _link_or_skip(link_kind, gone, wt)  # it appears now: the last read has already answered "absent"
+        return real(seen)
+
+    monkeypatch.setattr(worktree_release, "_still_absent", recheck)
+    try:
+        with _session_on_lane(repo):
+            assert lane_occupancy.peek(Store(repo), "one") == lane_occupancy.IN_USE  # the token is really held
+            code, text = run(cfg, wt)
+        assert fired, "the recheck seam never ran"
+        assert code != 0 and f"KEPT {wt}" in text, text
+        assert "exists now" in text and "run the release again" in text, text
+        assert wt.is_dir() and (wt / "source.txt").exists()
+    finally:
+        _unlink(gone)
+
+
+@pytest.mark.parametrize("link_kind", ["junction", "symlink"])
+@pytest.mark.parametrize("field", ["worktree_path", "occupancy_worktrees"])
+def test_an_ended_lane_that_names_the_checkout_only_at_the_last_read_keeps_it_while_its_session_runs(
+    estate, monkeypatch, field, link_kind
+):
+    """The same session, but the link appears before the last read (during the checks inside the claims): the last read
+    must see that the ended lane now names the checkout, try its token, and refuse because the session holds it."""
+    repo, wt, cfg = estate
+    _can_link(link_kind, repo.parent)
+    gone = repo.parent / "long-gone"
+    _ended_lane_naming(repo, field, gone)
+    real = worktree_release._check_worktree
+    calls = []
+
+    def check(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:  # the re-check inside the claims, before the last read
+            _link_or_skip(link_kind, gone, wt)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    try:
+        with _session_on_lane(repo):
+            code, text = run(cfg, wt)
+        assert len(calls) >= 2, "the seam never ran"
+        assert code != 0 and lane_occupancy.refusal("one", lane_occupancy.IN_USE) in text, text
+        assert wt.is_dir() and (wt / "source.txt").exists()
+    finally:
+        _unlink(gone)
+
+
+def test_an_ended_lane_named_only_at_the_last_read_with_a_free_token_is_claimed_through_the_removal(
+    estate, monkeypatch
+):
+    """The control: no session, so the newly named ended lane does not keep the checkout, but its token is claimed
+    until the removal is over, so no session can start on it in between."""
+    repo, wt, cfg = estate
+    gone = repo.parent / "long-gone"
+    _ended_lane_naming(repo, "worktree_path", gone)
+    real_check, real_git = worktree_release._check_worktree, worktree_release._read_git
+    calls, seen = [], {}
+
+    def check(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            directory_link(gone, wt)
+        return real_check(*args, **kwargs)
+
+    def read_git(where, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            seen["token"] = lane_occupancy.peek(Store(repo), "one")
+        return real_git(where, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    monkeypatch.setattr(worktree_release, "_read_git", read_git)
+    try:
+        code, text = run(cfg, wt)
+        assert code == 0 and "REMOVED" in text, text
+        assert seen.get("token") is not None, "the newly named lane's token was free during the removal"
+    finally:
+        _unlink(gone)
