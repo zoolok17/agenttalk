@@ -1868,8 +1868,8 @@ def test_committed_pytest_time_limits_are_pinned_per_os() -> None:
     for observed in ("3962 s (44%)", "4 h 18 min (78%)", "72 minutes", "A and B balanced on every leg",
                      "234", "240", "five recent ungrouped runs", "41-65 s", "42306971465", "42419154846",
                      "+17.5%", "retain 9000 seconds", "330-minute", "360 minutes", "44264760386",
-                     "no failing test", "four jobs", "165-minute", "37 master runs", "6449 s", "4566 s",
-                     "1.95 times", "214 minutes"):
+                     "no failing test", "four jobs", "165-minute", "37 master runs", "sample maximum", "6449 s",
+                     "4566 s", "1.95 times", "214 minutes", "44956093100", "116.4 minutes", "119.75 minutes"):
         assert observed in reason, observed
 
 

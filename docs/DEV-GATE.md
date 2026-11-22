@@ -343,8 +343,10 @@ cannot pass it.
 Each Windows leg runs in CI as four jobs, one package mode and one group each:
 `source-a`, `source-b`, `wheel-a` and `wheel-b`, the parts declared in
 `checks.pytest.windows_parts` and pinned in the gate's code (#378). One job per
-leg took up to the hosted 6-hour maximum; the longest group took 107.5 minutes
-over 37 master runs (`windows_timeout_reason`). Each part runs both binding
+leg took up to the hosted 6-hour maximum. The longest group took 107.5 minutes
+in a historical sample of 37 master runs (12 to 21 November 2026), and 116.4
+minutes in this layout's first run, 44956093100, whose longest job took 119.75
+minutes (see `windows_timeout_reason`). Each part runs both binding
 checks; a source part runs only its source group, and a wheel part builds the
 package, runs the wheel checks and runs its wheel group.
 

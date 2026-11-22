@@ -60,10 +60,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   six-hour limit (#378).** Before, one job ran the whole suite from the source and then from the built
   wheel, in two groups each, and took up to six hours; four pull-request legs were stopped at that
   limit with no failing test. Now each job runs one of those four pieces. The longest piece took
-  107.5 minutes over 37 master runs, and each job may run for 165 minutes. The required
-  `dev-gate aggregate` check expects all four pieces of every Windows leg. It fails when a piece is
-  missing, doubled or from another commit, when the two pieces of a mode do not add up to the whole
-  suite, or when the two wheel pieces tested different wheels. Linux and macOS are unchanged.
+  107.5 minutes in a sample of 37 master runs (12 to 21 November) and 116.4 minutes in this
+  change's first CI run, whose longest job took 119.75 minutes; each job may run for 165
+  minutes. The required `dev-gate aggregate` check expects all four pieces of every Windows leg.
+  It fails when a piece is missing, doubled or from another commit, when the two pieces of a mode
+  do not add up to the whole suite, or when the two wheel pieces tested different wheels. Linux
+  and macOS are unchanged.
   `agenttalk dev-gate --ci-leg windows/<python> --part <part>` runs one piece.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run

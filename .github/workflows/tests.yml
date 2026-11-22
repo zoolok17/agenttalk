@@ -157,8 +157,9 @@ jobs:
     # #378: each Windows leg runs as four jobs, one package mode and one test
     # group each: source-a, source-b, wheel-a and wheel-b, the parts declared
     # in checks.pytest.windows_parts in dev-gate.json. A leg in one job took up
-    # to 6 hours (the hosted maximum); the longest group took 107.5 minutes
-    # over 37 master runs (windows_timeout_reason in dev-gate.json). Each group
+    # to 6 hours (the hosted maximum). The longest group was 107.5 minutes in a
+    # sample of 37 master runs (12 to 21 November 2026) and 116.4 minutes in
+    # this layout's first run (windows_timeout_reason in dev-gate.json). Each group
     # keeps its 9000s run limit, and a part's 165-minute ceiling is that limit
     # plus setup and the evidence upload. The aggregate requires every part.
     # Linux/macOS keep one run per mode and the 90-minute job ceiling.
