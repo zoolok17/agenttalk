@@ -1512,7 +1512,7 @@ class Store:
         if self.initialized():
             try:
                 raw = json.loads(self.config_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
+            except (ValueError, OSError, RecursionError):
                 raw = None
             raw_list = raw.get("retired") if isinstance(raw, dict) else None
             if isinstance(raw_list, list):
@@ -1721,7 +1721,12 @@ class Store:
             raise FileNotFoundError(
                 f"agenttalk not initialized in {self.root}. Run `agenttalk init` first."
             )
-        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        try:
+            cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except RecursionError as exc:
+            raise ValueError(
+                f"corrupt config at {self.config_path}: JSON is nested too deeply"
+            ) from exc
         if not isinstance(cfg, dict):
             raise ValueError(
                 f"corrupt config at {self.config_path}: root must be a JSON object"

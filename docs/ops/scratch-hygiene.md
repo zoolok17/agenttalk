@@ -126,7 +126,10 @@ still holds the token, runs, even when the new generation has no worktree; it do
 not wait. Remembered checkout links do not expire, so an old folder remains protected
 while any newer session of the same lane holds the token. Older lanes can have relative worktree paths: release
 checks those against both the main repository and the calling folder, and checks
-any saved canonical worktree path too. A path relative to a different historical
+any saved canonical worktree path too. Only `worktree_path` has these legacy
+relative-path semantics: a stored `worktree_toplevel_canonical` must be absolute, and a relative one is
+refused (by release and by `lane abandon --acknowledge-missing-worktree` alike), so repair it in
+`lanes.json` first. A path relative to a different historical
 starting folder cannot be inferred; record its absolute or canonical path before
 release. An unrelated lane does not block release;
 a refusal names the lane and its record. Both `.agenttalk/supervisor-state.json` and the alternate
@@ -199,8 +202,8 @@ including those created with `core.ignoreStat=true`, cause HOLD without a dirty
 artifact until inspected and their flags cleared, or a truthful dirty artifact is
 recorded. Changed status reads show submodule changes even when project ignore
 settings hide them; an untracked build file in a submodule can therefore cause
-HOLD. Clean that submodule or record a truthful dirty artifact. Close does not
-recursively inspect hidden files inside submodules (follow-up #796). Lane and
+HOLD. Clean that submodule or record a truthful dirty artifact. Close inspects
+nested submodules, using about five Git calls per initialized submodule with no overall limit. Lane and
 acceptance attestation parity (#797) and old malformed close records (#798) remain
 separate work. The stricter `janitor --release` flag and full-content checks above
 retain their existing sparse-checkout limits.

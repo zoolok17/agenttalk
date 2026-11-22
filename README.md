@@ -1304,6 +1304,22 @@ command for the full set.
 | `knowledge {publish,curate,pull,search,onboard}` | Durable pointer notes and lessons hung off the domain registry. |
 | `dev-gate` | Build + test evidence a `review-request`/`review-result` can point to: source and wheel, per Python minor, aggregated across CI legs. |
 
+Ordinary `close reopen` checks the Git checkout enclosing the store. Git must
+resolve the requested revision and the checkout's HEAD must match it; when
+`--revision` is omitted, the recorded revision is checked. If Git or the
+checkout is unavailable, the revision cannot be resolved, or HEAD differs,
+reopen stops without changing the record. Check out the revision in the checkout
+that holds the store, or pass `--revision` with its current HEAD. A store outside
+a Git checkout can open a close with a full revision pin, but cannot reopen it.
+The HEAD check runs just before the close lock is taken, so a checkout moved in that gap is not caught.
+Reopen checks cleanliness again even when `--revision` is omitted, so a close
+previously recorded clean can go on HOLD if the checkout has changed. Reopen
+records an unchecked worktree as not clean; without a recorded diff artifact the
+close remains on HOLD. Ordinary open and reopen records use
+`revision_clean_state` to distinguish `unknown`, `not_clean`, and `clean`;
+older records may lack that field. Acceptance successors check their explicitly
+named project checkout separately.
+
 A `review-request` (`send --kind review-request`) is an ordinary
 message with `base_sha`/`head_sha` meta and a body naming what changed,
 how to verify, and where to focus. A `review-result` with `--meta
@@ -1384,7 +1400,10 @@ in agenttalk waits for it or is held back by it.
   Below it, each seat shows its own reading, newest first, with how long ago it was seen. Readings
   are never merged across seats: to judge the account, read the newest seat's row.
 - `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or
-  `capacity=unknown(<reason>)` to each seat that has written a reading.
+  `capacity=unknown(<reason>)` to each seat that has written a reading; a seat that has written
+  none, such as a newly set-up seat, shows no `capacity=` field. When a Claude seat's reading has
+  no figures yet (reason `claude_source_not_configured`), the field reads
+  `capacity=unknown(no reading yet)`; `status --json` keeps the reason code.
   `status --json` shows `account_group` as the sorted seats in this status output sharing an account;
   the capacity text display also counts a retired seat's old reading.
   Both group only well-formed Claude, Codex and OVH-Qwen account keys; other readings stand alone.
@@ -1427,7 +1446,8 @@ in agenttalk waits for it or is held back by it.
     reason is `claude_seat_source_unknown`.
   - For a seat whose supervisor entry gives it its own `CLAUDE_CONFIG_DIR`, pass that folder's
     `statusline-last-input.json` with `--statusline-path`, or let the seat's wrapper refresh it.
-  - With neither source, the reason is `claude_source_not_configured`.
+  - With neither source, the reason is `claude_source_not_configured`. A new seat usually has a
+    reading after its first turn; if a seat still has none after some turns, set up a status line.
 - **Codex seats:** the seat's own session file under its `CODEX_HOME`. A seat without a Codex home
   of its own reads the shared `~/.codex` (also when `CODEX_HOME` names that same folder, directly or
   through a link). There it
