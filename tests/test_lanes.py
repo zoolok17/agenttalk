@@ -4346,9 +4346,6 @@ def test_m12_git_write_env_timeout_and_allowlist(monkeypatch: pytest.MonkeyPatch
                        str(tmp_path / "bad"), full_sha])
 
     class StuckProc:
-        def poll(self):
-            return 0
-
         def communicate(self, timeout=None):  # noqa: ANN001
             raise subprocess.TimeoutExpired("git", timeout)
 
@@ -4500,9 +4497,6 @@ def test_m12_git_write_kill_raising_does_not_replace_the_timeout_error(
     seen: dict = {}
 
     class RaisingKillProc:
-        def poll(self):
-            return 0
-
         def kill(self):
             seen["kill_called"] = True
             raise PermissionError("simulated: process handle already closing")
@@ -4534,8 +4528,6 @@ def test_m12_git_write_routine_timeout_reaps_via_wait_on_second_timeout(
     seen: dict = {}
 
     class StuckRoutineRetryProc:
-        pid = 12345
-
         def __init__(self) -> None:
             self.communicate_calls = 0
             self._returncode = None
@@ -4556,7 +4548,6 @@ def test_m12_git_write_routine_timeout_reaps_via_wait_on_second_timeout(
             return self._returncode
 
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: StuckRoutineRetryProc())
-    monkeypatch.setattr(cli.subprocess, "run", lambda *_a, **_kw: SimpleNamespace(returncode=1))
     with pytest.raises(cli.GitWriteError, match="could not be reaped"):
         cli._git_write(
             tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
@@ -8860,26 +8851,15 @@ def test_786_content_filter_timeout_printed_steps_unlock_remove_and_retry(tmp_pa
         for proc in processes:
             proc.communicate(timeout=15)
     completed = done.read_bytes().count(b"done\n") if done.exists() else 0
-    assert completed in ({0, 1, 2} if os.name == "nt" else {1, 2})
+    assert completed in {1, 2}, "at least the started filter must finish"
     wt = planned[0]
     assert len(captured) == 1
-    existing = {
-        path.relative_to(wt).as_posix(): path.read_bytes()
-        for path in wt.rglob("*") if path.is_file() and path.relative_to(wt).as_posix() != ".git"
-    }
     missing = tuple(rel for rel in ("src/core/a.py", "src/core/b.py") if not (wt / rel).exists())
     saved = root / "saved-filter-work"
     reset_used, restore_used, force_used, _status = _786_run_timeout_recovery(
         root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True, missing=missing
     )
-    if completed == 0:
-        # A successful Windows tree stop can leave the first filter unfinished.
-        assert os.name == "nt" and reset_used
-        if missing:
-            assert restore_used
-        if force_used:
-            assert all((saved / rel).read_bytes() == data for rel, data in existing.items())
-    elif completed == 1:
+    if completed == 1:
         assert reset_used and restore_used and not force_used, (
             "half-finished checkout needs index and missing-file repair"
         )

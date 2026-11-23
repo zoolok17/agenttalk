@@ -64,16 +64,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The close record also distinguishes unknown cleanliness from a checkout not
   shown clean, and the hold message no longer calls an unchecked checkout dirty.
 
-- **Windows Git write timeouts stop the process tree without launching another program (#791).**
-  When a changing Git command runs past its time limit, agenttalk now stops Git and the programs it
-  started through Windows itself, not through `taskkill.exe` (whose launch can fail with a pop-up
-  dialog under heavy load). Only processes that provably belong to the command are stopped: an older,
-  unrelated program that happens to name a reused process number is left alone. If the stop cannot be
-  confirmed, Git or a child may still be running; the error says so; wait before retrying or cleaning
-  up. A partial checkout or lock may still need recovery. Two limits remain: a process that Git's
-  child started after the look at the process list, or a middle process that had already exited, can
-  survive; and creation times are clock times, so a clock stepped backwards between a parent's and a
-  child's start hides that child. Other platforms are unchanged.
+- **A Windows Git write timeout now always says that Git's own programs may still be running (#791).**
+  When a changing Git command runs past its time limit, agenttalk stops the Git launcher and does not
+  stop the programs Git started (for example a content filter), so on Windows the error now always adds
+  that Git or a program it started may still be running and that you should wait before retrying or
+  cleaning up. It no longer says the command "was killed" on Windows, because only the launcher was.
+  No program (such as `taskkill.exe`) is launched while this is handled, and pressing Ctrl-C at any point
+  still kills and reaps the launcher and raises the original interruption, even if a clean-up step fails
+  or a second Ctrl-C arrives. A partial checkout or lock may still need recovery. Stopping the programs
+  Git started, by making them members of a job that ends with the launcher, is a planned follow-up.
+  Other platforms are unchanged.
 
 - **The release checklist now names the README as the only install pin.** Since the user manuals
   stopped carrying their own install line (#835), step 1 of the release ritual in

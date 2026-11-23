@@ -2,12 +2,18 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 from agenttalk import cli
+
+try:  # Windows only; the test that patches it must still run on Linux and macOS
+    import _winapi
+except ImportError:  # pragma: no cover - not Windows
+    _winapi = None
 
 
 def _capture_snapshot_tree(root_pid, parents, observe, close):
@@ -34,6 +40,56 @@ def _capture_snapshot_tree(root_pid, parents, observe, close):
             return accepted
 
 
+# --- the launch observer: no program may be started while a timed-out Git command is dealt with ---
+
+_LAUNCH_EVENTS = {
+    "subprocess.Popen",
+    "_winapi.CreateProcess",
+    "os.system",
+    "os.spawn",
+    "os.exec",
+    "os.startfile",
+    "os.posix_spawn",
+}
+_LAUNCH_FUNCTIONS = {"CreateProcessW", "CreateProcessA", "ShellExecuteW", "ShellExecuteExW", "WinExec"}
+_armed = {"thread": None, "seen": []}
+
+
+def _launch_observer(event, args):
+    if _armed["thread"] != threading.get_ident():
+        return
+    named = event == "ctypes.dlsym" and any(str(a) in _LAUNCH_FUNCTIONS for a in args)
+    if event in _LAUNCH_EVENTS or named:
+        _armed["seen"].append(event)
+        raise RuntimeError(f"a program was launched in the timeout path: {event}")
+
+
+sys.addaudithook(_launch_observer)  # audit hooks cannot be removed: this one only acts while armed
+
+
+def arm_launch_observer():
+    """Arm the launch observer for this thread; returns the list that collects what it sees."""
+    _armed["seen"] = []
+    _armed["thread"] = threading.get_ident()
+    return _armed["seen"]
+
+
+def disarm_launch_observer():
+    _armed["thread"] = None
+
+
+def test_the_launch_observer_sees_every_way_a_program_can_start():
+    seen = arm_launch_observer()
+    try:
+        with pytest.raises(RuntimeError):
+            subprocess.run([sys.executable, "-c", "pass"], check=False)
+        with pytest.raises(RuntimeError):
+            os.system("exit 0")  # noqa: S605  # nosec B605
+    finally:
+        disarm_launch_observer()
+    assert seen == ["subprocess.Popen", "os.system"]
+
+
 class _NtOS:
     name = "nt"
 
@@ -41,236 +97,173 @@ class _NtOS:
         return getattr(os, key)
 
 
-class _TimedOutGit:
-    """A Git launcher whose first wait times out; ``reap`` says what the second wait does."""
+_WARNING = "may still be running"
+_FIRST = KeyboardInterrupt("first")
+_REAP_TIMEOUT = subprocess.TimeoutExpired("git", 5)
+
+
+class _Launcher:
+    """A Git launcher whose first wait times out.
+
+    ``interrupt``: the reap in the timeout path (the second communicate) raises ``_FIRST``.
+    ``interrupt_in_wait``: the wait() that follows a reap that timed out raises ``_FIRST`` instead.
+    ``fail``: step name -> the error that step raises once the cleanup after an interruption has begun.
+    """
 
     pid = 100
-    _handle = 1
 
-    def __init__(self, *, reap="ok", exited=False):
-        self.count, self.killed, self.waited, self.reap, self.exited = 0, 0, 0, reap, exited
+    def __init__(self, *, interrupt=False, reap_times_out=False, interrupt_in_wait=False, fail=None):
+        self.interrupt, self.interrupt_in_wait = interrupt, interrupt_in_wait
+        self.reap_times_out = reap_times_out or interrupt_in_wait
+        self.fail = fail or {}
+        self.communicates = self.killed = self.waited = 0
+        self.cleanup = False
+
+    def _maybe_fail(self, step):
+        error = self.fail.get(step) if self.cleanup else None
+        if error is not None:
+            raise error
 
     def poll(self):
-        return 0 if self.exited or (self.killed and self.reap == "ok") else None
-
-    def communicate(self, timeout=None):
-        self.count += 1
-        if self.count == 1:
-            raise subprocess.TimeoutExpired("git", timeout)
-        if self.count == 2 and self.reap == "timeout":
-            raise subprocess.TimeoutExpired("git", timeout)
-        if self.count == 2 and self.reap == "interrupt":
-            raise KeyboardInterrupt
-        return "", ""
-
-    def wait(self, timeout=None):
-        self.waited += 1
-        return 0
+        self._maybe_fail("poll")
+        return None  # a killed launcher can still answer "running" for a moment, so the cleanup must act
 
     def kill(self):
         self.killed += 1
-        if self.reap == "kill-error":
-            raise OSError("simulated kill failure")
-
-
-def _windows_timeout(tmp_path, monkeypatch, world, git):
-    """Run ``_git_write`` through the timeout path as if on Windows, with a fake native layer."""
-    from agenttalk import windows_tree_stop as wts
-
-    monkeypatch.setattr(cli, "os", _NtOS())
-    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: git)
-    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: pytest.fail("no program may be launched"))
-    monkeypatch.setattr(wts, "_default_native", lambda: world)
-    return cli._git_write(
-        tmp_path, ["worktree", "add", "-b", "lane/safe", "--", str(tmp_path / "wt"), "a" * 40], timeout=0.01
-    )
-
-
-_WARNING = "may still be running"
-
-
-def _timeout_error(tmp_path, monkeypatch, world, git):
-    with pytest.raises(cli.GitWriteError) as error:
-        _windows_timeout(tmp_path, monkeypatch, world, git)
-    return str(error.value)
-
-
-def test_confirmed_tree_stop_adds_no_warning_and_does_not_kill_again(tmp_path, monkeypatch):
-    from test_windows_tree_stop_791 import World, no_launch
-
-    world = World((101, 100, 1100), (102, 101, 1200))
-    git = _TimedOutGit()
-    with no_launch() as seen:
-        message = _timeout_error(tmp_path, monkeypatch, world, git)
-    assert seen == []
-    assert _WARNING not in message and "and was killed" in message
-    assert git.killed == 0
-    assert not any(world.alive(pid) for pid in (100, 101, 102))
-
-
-@pytest.mark.parametrize("fault", ["snapshot", "open101", "times101", "terminate101", "times100"])
-def test_unconfirmed_tree_stop_warns_and_kills_the_launcher(tmp_path, monkeypatch, fault):
-    from test_windows_tree_stop_791 import World
-
-    world = World((101, 100, 1100))
-    world.fail.add(fault)
-    git = _TimedOutGit()
-    message = _timeout_error(tmp_path, monkeypatch, world, git)
-    assert _WARNING in message and "and was killed" not in message
-    assert git.killed == 1
-
-
-def test_unconfirmed_stop_with_a_failing_kill_still_raises_the_warned_error(tmp_path, monkeypatch):
-    from test_windows_tree_stop_791 import World
-
-    world = World((101, 100, 1100))
-    world.fail.add("terminate101")
-    message = _timeout_error(tmp_path, monkeypatch, world, _TimedOutGit(reap="kill-error"))
-    assert _WARNING in message
-
-
-def test_a_launcher_that_already_ended_is_walked_and_a_confirmed_stop_adds_no_warning(tmp_path, monkeypatch):
-    from test_windows_tree_stop_791 import World
-
-    world = World((101, 100, 1100))
-    world.procs[100].alive = False
-    world.procs[100].listed_when_dead = True
-    git = _TimedOutGit(exited=True)
-    message = _timeout_error(tmp_path, monkeypatch, world, git)
-    assert not world.alive(101)
-    assert _WARNING not in message and git.killed == 0
-
-
-def test_a_reap_that_times_out_after_a_confirmed_stop_keeps_the_warning(tmp_path, monkeypatch):
-    from test_windows_tree_stop_791 import World
-
-    world = World((101, 100, 1100))
-    git = _TimedOutGit(reap="timeout")
-    message = _timeout_error(tmp_path, monkeypatch, world, git)
-    assert "could not be reaped" in message and _WARNING in message
-    assert git.killed == 0 and git.waited == 1
-
-
-def test_an_interruption_during_the_stop_kills_and_reaps_the_launcher_and_is_raised_again(tmp_path, monkeypatch):
-    from test_windows_tree_stop_791 import World
-
-    world = World((101, 100, 1100))
-
-    def interrupt(w, p, ms):
-        raise KeyboardInterrupt
-
-    world.on_wait = interrupt
-    git = _TimedOutGit()
-    with pytest.raises(KeyboardInterrupt):
-        _windows_timeout(tmp_path, monkeypatch, world, git)
-    assert git.killed == 1 and git.count == 2  # killed, then reaped
-    world.assert_handles_closed()
-
-
-def test_an_interruption_during_the_reap_kills_and_reaps_the_launcher_and_is_raised_again(tmp_path, monkeypatch):
-    from test_windows_tree_stop_791 import World
-
-    world = World((101, 100, 1100))
-    git = _TimedOutGit(reap="interrupt")
-    with pytest.raises(KeyboardInterrupt):
-        _windows_timeout(tmp_path, monkeypatch, world, git)
-    assert git.killed == 1 and git.count == 3
-    world.assert_handles_closed()
-
-
-def test_a_cleanup_error_never_replaces_the_interruption_in_the_timeout_path(tmp_path, monkeypatch):
-    from test_windows_tree_stop_791 import World
-
-    world = World((101, 100, 1100))
-
-    def interrupt(w, p, ms):
-        raise KeyboardInterrupt
-
-    world.on_wait = interrupt
-    git = _TimedOutGit(reap="kill-error")  # the launcher kill fails
-    original_communicate = git.communicate
-
-    def broken_reap(timeout=None):
-        if git.count >= 1:
-            git.count += 1
-            raise OSError("the reap itself failed")
-        return original_communicate(timeout=timeout)
-
-    git.communicate = broken_reap
-    with pytest.raises(KeyboardInterrupt):
-        _windows_timeout(tmp_path, monkeypatch, world, git)
-    world.assert_handles_closed()
-
-
-def test_an_interruption_during_the_reap_stops_the_verified_processes_that_survived_the_stop(tmp_path, monkeypatch):
-    from test_windows_tree_stop_791 import World
-
-    world = World((101, 100, 1100))
-    world.procs[101].hang = True  # the stop is not confirmed: 101 is verified, held and still alive
-    git = _TimedOutGit(reap="interrupt")
-    real_terminate = world.terminate
-    asked = []
-    world.terminate = lambda handle: (asked.append(world.handles[handle].pid), real_terminate(handle))[1]
-    with pytest.raises(KeyboardInterrupt):
-        _windows_timeout(tmp_path, monkeypatch, world, git)
-    assert asked.count(101) == 2  # once in the stop, once more by the interruption cleanup
-    assert git.killed >= 1
-    world.assert_handles_closed()
-
-
-class _LauncherWithBrokenStep:
-    """A launcher where exactly one cleanup call fails, so each step must stand on its own."""
-
-    def __init__(self, broken):
-        self.broken, self.killed, self.communicates, self.waited = broken, False, 0, 0
-
-    def poll(self):
-        if self.broken == "poll":
-            raise OSError("simulated poll failure")
-        return None
-
-    def kill(self):
-        self.killed = True
-        if self.broken == "kill":
-            raise OSError("simulated kill failure")
+        self._maybe_fail("kill")
 
     def communicate(self, timeout=None):
         self.communicates += 1
         if self.communicates == 1:
             raise subprocess.TimeoutExpired("git", timeout)
-        if self.broken == "communicate":
-            raise OSError("simulated communicate failure")
-        if self.broken in ("communicate-timeout", "wait"):
-            raise subprocess.TimeoutExpired("git", timeout)
+        if self.communicates == 2:
+            if self.interrupt:
+                self.cleanup = True
+                raise _FIRST
+            if self.reap_times_out:
+                raise subprocess.TimeoutExpired("git", timeout)
+            return "", ""
+        self._maybe_fail("communicate")
         return "", ""
 
     def wait(self, timeout=None):
         self.waited += 1
-        if self.broken == "wait":
-            raise OSError("simulated wait failure")
+        if self.interrupt_in_wait and self.waited == 1:
+            self.cleanup = True
+            raise _FIRST
+        self._maybe_fail("wait")
         return 0
 
 
-@pytest.mark.parametrize("broken", ["poll", "kill", "communicate", "communicate-timeout", "wait"])
-def test_each_launcher_cleanup_step_is_best_effort_and_the_interruption_is_raised(tmp_path, monkeypatch, broken):
-    from agenttalk import windows_tree_stop as wts
-
-    launcher = _LauncherWithBrokenStep(broken)  # "wait": the reap times out, so wait() runs and then fails
+def _timeout(tmp_path, monkeypatch, launcher, *, windows=True):
+    """Run ``_git_write`` through the timeout path with a fake launcher, on Windows rules unless told otherwise."""
+    if windows:
+        monkeypatch.setattr(cli, "os", _NtOS())
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: launcher)
+    return cli._git_write(
+        tmp_path, ["worktree", "add", "-b", "lane/safe", "--", str(tmp_path / "wt"), "a" * 40], timeout=0.01
+    )
 
-    def interrupted(self):  # before any tree handle exists: only the launcher can be stopped
-        raise KeyboardInterrupt("original")
 
-    monkeypatch.setattr(wts.TreeStop, "run", interrupted)
-    monkeypatch.setattr(cli, "os", _NtOS())
-    with pytest.raises(KeyboardInterrupt, match="original"):
-        cli._git_write(
-            tmp_path, ["worktree", "add", "-b", "lane/safe", "--", str(tmp_path / "wt"), "a" * 40], timeout=0.01
-        )
-    assert launcher.killed, "a failing poll must not skip the kill"
-    assert launcher.communicates == 2, "a failing kill must not skip the reap"
-    if broken in ("communicate", "communicate-timeout", "wait"):
+def _timeout_error(tmp_path, monkeypatch, launcher):
+    with pytest.raises(cli.GitWriteError) as error:
+        _timeout(tmp_path, monkeypatch, launcher)
+    return str(error.value)
+
+
+def test_a_windows_timeout_kills_the_launcher_always_warns_and_launches_nothing(tmp_path, monkeypatch):
+    """Children are not stopped, so the error never claims a kill of the whole command and always warns."""
+    if _winapi is not None:
+        monkeypatch.setattr(_winapi, "CreateProcess", lambda *a, **k: pytest.fail("CreateProcess was called"))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: pytest.fail("no program may be launched"))
+    launcher = _Launcher()
+    seen = arm_launch_observer()
+    try:
+        message = _timeout_error(tmp_path, monkeypatch, launcher)
+    finally:
+        disarm_launch_observer()
+    assert seen == []
+    assert _WARNING in message and "and was killed" not in message
+    assert launcher.killed == 1 and launcher.communicates == 2
+
+
+def test_a_windows_timeout_with_a_failing_kill_still_raises_the_warned_error(tmp_path, monkeypatch):
+    launcher = _Launcher()
+
+    def failing_kill():
+        launcher.killed += 1
+        raise OSError("simulated kill failure")
+
+    launcher.kill = failing_kill
+    assert _WARNING in _timeout_error(tmp_path, monkeypatch, launcher)
+    assert launcher.killed == 1
+
+
+def test_a_windows_reap_that_times_out_keeps_the_warning_and_waits(tmp_path, monkeypatch):
+    launcher = _Launcher(reap_times_out=True)
+    message = _timeout_error(tmp_path, monkeypatch, launcher)
+    assert "could not be reaped" in message and _WARNING in message
+    assert launcher.killed == 1 and launcher.waited == 1
+
+
+def test_an_interruption_during_the_reap_kills_and_reaps_the_launcher_and_is_raised_again(tmp_path, monkeypatch):
+    launcher = _Launcher(interrupt=True)
+    with pytest.raises(KeyboardInterrupt) as error:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert error.value is _FIRST
+    assert launcher.killed == 2 and launcher.communicates == 3  # the timeout path's kill, the cleanup's, the reap
+
+
+def test_an_interruption_in_the_last_step_of_the_timeout_handling_is_cleaned_up_and_raised_again(tmp_path, monkeypatch):
+    """The whole timeout handling sits inside the interruption boundary, its last step (the wait) included."""
+    launcher = _Launcher(interrupt_in_wait=True)
+    with pytest.raises(KeyboardInterrupt) as error:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert error.value is _FIRST
+    assert launcher.killed == 2 and launcher.communicates == 3  # the cleanup kills and reaps the launcher again
+
+
+@pytest.mark.parametrize(
+    "fail",
+    [
+        {"poll": OSError("simulated poll failure")},
+        {"kill": OSError("simulated kill failure")},
+        {"communicate": OSError("simulated reap failure")},
+        {"communicate": _REAP_TIMEOUT},
+        {"communicate": _REAP_TIMEOUT, "wait": OSError("simulated wait failure")},
+    ],
+    ids=["poll", "kill", "communicate", "communicate-timeout", "wait"],
+)
+def test_each_launcher_cleanup_step_is_best_effort_and_the_interruption_is_raised(tmp_path, monkeypatch, fail):
+    """A failing poll never skips the kill, a failing kill never skips the reap, a failed or timed-out reap is
+    followed by wait(); each step stands alone and the original interruption is what is raised."""
+    launcher = _Launcher(interrupt=True, fail=fail)
+    with pytest.raises(KeyboardInterrupt) as error:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert error.value is _FIRST
+    assert launcher.killed == 2, "a failing poll must not skip the kill"
+    assert launcher.communicates == 3, "a failing kill must not skip the reap"
+    if "communicate" in fail:
         assert launcher.waited == 1, "a failed or timed-out reap is followed by wait()"
+
+
+@pytest.mark.parametrize("second", [KeyboardInterrupt("second"), SystemExit("second")], ids=["ctrl-c", "exit"])
+@pytest.mark.parametrize("step", ["poll", "kill", "communicate", "wait"])
+def test_a_second_interruption_while_one_is_being_handled_never_replaces_the_first(tmp_path, monkeypatch, step, second):
+    """The original interruption is kept through the whole best-effort cleanup, and the steps after the one that was
+    interrupted still run."""
+    fail = {step: second}
+    if step == "wait":
+        fail["communicate"] = _REAP_TIMEOUT  # the reap fails, so wait() runs, and the second interruption lands there
+    launcher = _Launcher(interrupt=True, fail=fail)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert raised.value is _FIRST
+    assert launcher.killed == 2
+    if step in ("poll", "kill"):
+        assert launcher.communicates == 3, "the reap still ran after the interrupted step"
+    if step == "communicate":
+        assert launcher.waited == 1, "the wait still ran after the interrupted reap"
 
 
 def test_posix_timeout_keeps_direct_kill_and_original_message(tmp_path, monkeypatch):
@@ -307,12 +300,10 @@ def test_posix_timeout_keeps_direct_kill_and_original_message(tmp_path, monkeypa
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process tree")
-@pytest.mark.parametrize("tree_stop", [True, False])
-def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypatch, tree_stop):
+def test_a_git_filter_keeps_running_after_a_windows_timeout_and_the_error_warns(tmp_path, monkeypatch):
     import ctypes
     from ctypes import wintypes
 
-    from agenttalk import windows_tree_stop
     from agenttalk.supervisor_lifecycle import _PROCESSENTRY32W
     from test_lanes import _commit, _git, _repo
 
@@ -350,8 +341,6 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
     kernel.GetProcessTimes.restype = wintypes.BOOL
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    from test_windows_tree_stop_791 import arm_launch_observer, disarm_launch_observer
-
     handles = []
     real_popen = subprocess.Popen
     process = None
@@ -419,9 +408,6 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
     try:
         with monkeypatch.context() as patch:
             patch.setattr(cli.subprocess, "Popen", popen)
-            if not tree_stop:
-                # the stop is not confirmed: only the launcher is killed, so a child must survive
-                patch.setattr(windows_tree_stop.TreeStop, "run", lambda self: False)
             try:
                 with pytest.raises(cli.GitWriteError) as error:
                     cli._git_write(
@@ -432,43 +418,40 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
         assert handles, "the filter tree must have been captured"
         assert fired, "the timeout must have fired"
         assert launched == [[]], "no program may be launched in the timeout path"
-        states = [kernel.WaitForSingleObject(handle, 5000 if tree_stop else 0) for handle in handles]
-        if tree_stop:
-            assert all(state == 0 for state in states), f"a captured Git process is still alive: {states}"
-            assert "may still be running" not in str(error.value)
-            # Whatever the audit hook cannot see: no process created after the timeout fired is a child of ours.
-            snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
+        states = [kernel.WaitForSingleObject(handle, 0) for handle in handles]
+        # The launcher is stopped, the programs Git started are not: a child is still running, and the error says so.
+        assert 0x102 in states, "a child must still be alive: the programs Git started are not stopped"
+        assert "may still be running" in str(error.value) and "and was killed" not in str(error.value)
+        # Whatever the audit hook cannot see: no process created after the timeout fired is a child of ours.
+        snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            ours = []
+            ok = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+            while ok:
+                if int(entry.th32ParentProcessID) == os.getpid():
+                    ours.append(int(entry.th32ProcessID))
+                ok = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel.CloseHandle(snapshot)
+        for pid in ours:
+            handle = kernel.OpenProcess(0x1000, False, pid)
+            if not handle:
+                continue
             try:
-                entry = _PROCESSENTRY32W()
-                entry.dwSize = ctypes.sizeof(entry)
-                ours = []
-                ok = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
-                while ok:
-                    if int(entry.th32ParentProcessID) == os.getpid():
-                        ours.append(int(entry.th32ProcessID))
-                    ok = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+                creation, exit_time, user, system = (wintypes.FILETIME() for _ in range(4))
+                if kernel.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(system),
+                    ctypes.byref(user),
+                ):
+                    created = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+                    assert created < fired[0], f"process {pid} was started after the timeout fired"
             finally:
-                kernel.CloseHandle(snapshot)
-            for pid in ours:
-                handle = kernel.OpenProcess(0x1000, False, pid)
-                if not handle:
-                    continue
-                try:
-                    creation, exit_time, user, system = (wintypes.FILETIME() for _ in range(4))
-                    if kernel.GetProcessTimes(
-                        handle,
-                        ctypes.byref(creation),
-                        ctypes.byref(exit_time),
-                        ctypes.byref(system),
-                        ctypes.byref(user),
-                    ):
-                        created = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
-                        assert created < fired[0], f"process {pid} was started after the timeout fired"
-                finally:
-                    kernel.CloseHandle(handle)
-        else:
-            assert 0x102 in states, "a child must still be alive to exercise the fallback"
-            assert "may still be running" in str(error.value)
+                kernel.CloseHandle(handle)
     finally:
         release.touch()
         for handle in handles:

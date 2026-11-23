@@ -3291,8 +3291,8 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
 
     This is intentionally separate from `_git`: callers must opt into mutating git,
     every positional path/ref remains an argv element. On Windows, a timeout attempts
-    to stop the process tree natively (no program is launched); an unconfirmed stop can
-    leave children running, and a partial checkout or lock may still need recovery.
+    to kill the launcher and warn: the programs Git started are not stopped and may still
+    be running, and a partial checkout or lock may still need recovery.
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
@@ -3358,7 +3358,7 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     except subprocess.TimeoutExpired as e:
         _raise_git_write_timeout(proc, timeout, e)  # looks after its own interruptions
     except BaseException:
-        _kill_and_reap_quietly(proc)
+        _kill_and_reap(proc)
         raise
     return proc.returncode, out or "", err or ""
 
@@ -3368,16 +3368,13 @@ _GIT_STILL_RUNNING = (
 )
 
 
-def _kill_and_reap_quietly(proc, tree=None) -> None:
-    """Clean up while an interruption is already in flight.
-
-    No cleanup error may replace that interruption, and one failed step never skips the next:
-    first ask every verified descendant still held to stop, then kill and reap the launcher.
-    """
-    for step in (tree.stop_held if tree is not None else None, lambda: _kill_and_reap(proc)):
-        if step is not None:
-            with contextlib.suppress(Exception):
-                step()
+def _best_effort(step) -> None:
+    """Run one cleanup step. Nothing it raises, a second Ctrl-C or SystemExit included, escapes: the caller is already
+    handling an interruption and that original one must be the one that is raised."""
+    try:
+        step()
+    except BaseException:  # noqa: BLE001, S110  # nosec B110
+        pass
 
 
 def _kill_and_reap(proc) -> None:
@@ -3386,49 +3383,44 @@ def _kill_and_reap(proc) -> None:
     A failing poll never skips the kill, a failing kill never skips the reap, and a failing or
     timed-out reap is followed by wait(), which does not touch the pipes. Each step is bounded.
     """
-    try:
-        running = proc.poll() is None
-    except Exception:
-        running = True  # cannot tell, so act as if it were still running
-    if not running:
+    running = [True]  # cannot tell when poll() fails, so act as if it were still running
+
+    def poll() -> None:
+        running[0] = proc.poll() is None
+
+    _best_effort(poll)
+    if not running[0]:
         return
-    with contextlib.suppress(Exception):
-        proc.kill()
-    try:
+    _best_effort(proc.kill)
+    reaped = []
+
+    def reap() -> None:
         proc.communicate(timeout=5)
-    except Exception:
+        reaped.append(True)
+
+    _best_effort(reap)
+    if not reaped:
         # A hook or descendant holding the captured stdout/stderr pipe handles open can keep
         # communicate() blocked past this retry even though the killed process is already
         # dead - wait() does not touch the pipes at all, so it still completes once the
         # process is actually gone. A second timeout leaves the launcher's reap unconfirmed.
-        with contextlib.suppress(Exception):
-            proc.wait(timeout=25)
+        _best_effort(lambda: proc.wait(timeout=25))
 
 
 def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired):
     """Stop a timed-out Git command and raise ``GitWriteError`` (never returns).
 
-    On Windows the whole tree is stopped through the native helper, which starts no program.
-    Unless that is confirmed, the launcher is killed and the error says a child may still be running.
-    The helper's handles stay open until the reap is over, so an interruption (Ctrl-C) anywhere in
-    here can still stop the verified descendants before the launcher is killed and the interruption
-    is raised again.
+    The launcher is killed (through Popen's own handle on Windows) and reaped. The programs Git started are NOT
+    stopped, so on Windows the error always says they may still be running. No program is launched here. The whole
+    handling sits inside the interruption boundary: Ctrl-C anywhere in it kills and reaps the launcher through
+    best-effort steps, and the original interruption is the one raised.
     """
-    tree = None
     try:
-        tree_stopped = False
-        if os.name == "nt":
-            from agenttalk import windows_tree_stop
-
-            tree = windows_tree_stop.TreeStop(proc)
-            tree_stopped = tree.run()
-        warning = _GIT_STILL_RUNNING if os.name == "nt" and not tree_stopped else ""
         # kill() can itself raise (PermissionError on Windows,
         # ProcessLookupError if the child already exited) - guarded so it
         # can never pre-empt the GitWriteError raised below.
-        if not tree_stopped:
-            with contextlib.suppress(OSError):
-                proc.kill()
+        with contextlib.suppress(OSError):
+            proc.kill()
         try:
             out, err = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired as reap:
@@ -3436,23 +3428,20 @@ def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.Timeout
             # reaps the launcher without waiting for those pipes to close.
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=25)
-            # Open pipes after a confirmed stop mean a process the stop missed: the warning stays.
             raise GitWriteError(
                 "mutating git timed out and could not be reaped; git/config lock may be stranded"
                 + (_GIT_STILL_RUNNING if os.name == "nt" else "")
             ) from reap
         result = f"mutating git timed out after {timeout:g}s"
-        if os.name != "nt" or tree_stopped:
+        if os.name != "nt":
             result += " and was killed"
+        warning = _GIT_STILL_RUNNING if os.name == "nt" else ""
         raise GitWriteError(f"{result}: {err or out or timed_out}" + warning) from timed_out
     except GitWriteError:
         raise
     except BaseException:
-        _kill_and_reap_quietly(proc, tree)
+        _kill_and_reap(proc)
         raise
-    finally:
-        if tree is not None:
-            tree.close()
 
 
 def _resolve_revision(root, ref: str) -> tuple[str, str]:
