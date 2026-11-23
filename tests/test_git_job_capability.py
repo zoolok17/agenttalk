@@ -2,9 +2,10 @@
 
 This tests the operating system and the host, not the product (it passes on a tree that has no job code at all). It is
 the first commit of the change, before any product change: if the host refuses the assignment or the resume, the
-helper is dropped. Run it with ``-m windows_capability -s``, so the facts it records are shown, not captured. It also
-writes them to a small JSON artifact (``AGENTTALK_JOB_CAPABILITY_ARTIFACT`` names the file; the default is next to the
-test's temporary folder).
+helper is dropped. The facts it records are shown in the normal test output, with no ``-s`` and no workflow step: one
+pytest warning of its own class (``GitJobHostFacts``) carrying them as one JSON line, in pytest's warnings summary, so
+every run's log keeps them. It also writes them to a small JSON artifact (``AGENTTALK_JOB_CAPABILITY_ARTIFACT`` names
+the file; the default is next to the test's temporary folder).
 
 It records: the Windows version, whether pytest already runs inside a job (``IsProcessInJob`` with no job), the session
 id (0 is a service session), and the outer job's limit flags when there is an outer job. When pytest runs in no job, a
@@ -18,6 +19,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import warnings
 from ctypes import wintypes
 from pathlib import Path
 
@@ -27,6 +29,24 @@ CREATE_SUSPENDED = 0x00000004
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows job objects")
+
+FACTS_PREFIX = "git-job-capability: "
+
+
+class GitJobHostFacts(UserWarning):
+    """Not a problem: the host facts of the capability check, carried as a warning only so that pytest shows them in
+    its warnings summary without ``-s``."""
+
+
+def report_host_facts(report: dict) -> str:
+    """Show the facts once, as one JSON line in one `GitJobHostFacts` warning. The warning is switched to "always" here,
+    inside the test, so a project or command-line setting that turns warnings into errors cannot hide it or fail the
+    test. Returns the line."""
+    line = FACTS_PREFIX + json.dumps(report, sort_keys=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("always", GitJobHostFacts)
+        warnings.warn(line, GitJobHostFacts, stacklevel=2)
+    return line
 
 
 class _BasicLimits(ctypes.Structure):
@@ -206,7 +226,7 @@ def _assert_capable(facts: dict) -> None:
 
 
 @pytest.mark.windows_capability
-def test_check_git_job_capability(tmp_path, capsys):
+def test_check_git_job_capability(tmp_path):
     git = shutil.which("git")
     if git is None:
         pytest.skip("git is not on PATH")
@@ -214,11 +234,23 @@ def test_check_git_job_capability(tmp_path, capsys):
     report = {"host": host_facts(_libraries()[0]), "direct": plain}
     if plain.get("pytest_process_in_a_job") is False:
         report["nested_in_an_outer_job"] = run_inside_an_outer_job(git)  # no outer job here: make one
-    with capsys.disabled():  # shown even without -s: this is the record
-        print("\ngit-job-capability: " + json.dumps(report, sort_keys=True))
+    report_host_facts(report)  # the record: in the warnings summary, with no -s
     artifact = Path(os.environ.get("AGENTTALK_JOB_CAPABILITY_ARTIFACT") or tmp_path / "git-job-capability.json")
     artifact.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     _assert_capable(plain)
     if "nested_in_an_outer_job" in report:
         _assert_capable(report["nested_in_an_outer_job"])
         assert report["nested_in_an_outer_job"]["pytest_process_in_a_job"] is True  # the child really was nested
+
+
+def test_the_facts_warning_is_one_json_line_and_never_an_error():
+    """Even with every warning turned into an error (a project setting, `-W error`, a strict CI leg), the facts are
+    still recorded as one `GitJobHostFacts` warning and nothing is raised."""
+    facts = {"windows": "made up", "session_id": 1}
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("error")
+        line = report_host_facts(facts)
+    ours = [w for w in seen if issubclass(w.category, GitJobHostFacts)]
+    assert len(ours) == 1 and str(ours[0].message) == line
+    assert "\n" not in line and line.startswith(FACTS_PREFIX)
+    assert json.loads(line[len(FACTS_PREFIX) :]) == facts
