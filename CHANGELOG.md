@@ -35,6 +35,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Status hides personal paths and project ID by default (#870).** `status --json`
+  omits `root`, `project_id` and `hmac_key.path`, so scripts reading those keys must
+  use `--show-personal` to recover them. Text marks them hidden. The option also
+  replaces the unreleased `--show-account` on status and capacity. Home and external
+  local app-data paths in status free text are replaced by placeholders by default.
+  The text `powershell:` line hides its path; JSON omits `powershell_host.path`,
+  `.identity`, `.project_id` and fields outside its allowlist. The project root outside
+  home and the project ID are replaced in free text as well.
+- **Capacity headings now omit account identifiers by default.** This makes routine
+  output safer to share. To see the operating-system login and home-folder fingerprint
+  as before, run `agenttalk capacity --show-personal`. The same protection now covers
+  `agenttalk status --json` (#867). A malformed account is not shown in the default capacity heading.
+- **Status JSON no longer exposes account text by default (#867).** Each capacity
+  reading with an account now has `account_group`, the sorted seats sharing it,
+  instead of `account`; a script reading `account` now finds the key missing. To keep the old account text, use `status --json
+  --show-personal`; to group seats, compare `account_group`. Budget readers need
+  no change. The store itself records the login, so review it before sharing it.
+- **Reopening a close now checks the revision against the checkout.** Git must
+  resolve the requested revision and show it as HEAD, including when the close
+  keeps its existing revision. A missing checkout, unavailable Git, unresolved
+  revision, or different HEAD stops reopening without changing the record.
+  Reopening without `--revision` checks cleanliness again, so a previously clean
+  close can go on HOLD. A store outside a Git checkout can open with a full pin,
+  but cannot reopen. Check out the revision in the checkout that holds the store,
+  or pass `--revision` with its current HEAD. The HEAD check runs just before
+  the close lock is taken, so a checkout moved in that gap is not caught.
+  The close record also distinguishes unknown cleanliness from a checkout not
+  shown clean, and the hold message no longer calls an unchecked checkout dirty.
 - **The release checklist now names the README as the only install pin.** Since the user manuals
   stopped carrying their own install line (#835), step 1 of the release ritual in
   `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
@@ -45,6 +73,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
   limit for each test group inside the job is unchanged, and splitting the Windows job is the follow-up
   (#378). The evidence is recorded in `windows_timeout_reason` in `dev-gate.json`.
+- **Each Windows test leg in CI now runs as four jobs instead of one, so none comes near GitHub's
+  six-hour limit (#378).** Before, one job ran the whole suite from the source and then from the built
+  wheel, in two groups each, and took up to six hours; four pull-request legs were stopped at that
+  limit with no failing test. Now each job runs one of those four pieces. The longest piece took
+  107.5 minutes in a sample of 37 master runs (12 to 21 November) and 116.4 minutes in this
+  change's first CI run, whose longest job took 119.75 minutes; each job may run for 165
+  minutes. The required `dev-gate aggregate` check expects all four pieces of every Windows leg.
+  It fails when a piece is missing, doubled or from another commit, when the two pieces of a mode
+  do not add up to the whole suite, or when the two wheel pieces tested different wheels. Linux
+  and macOS are unchanged.
+  `agenttalk dev-gate --ci-leg windows/<python> --part <part>` runs one piece.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
@@ -79,6 +118,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text.
 
 ### Fixed
+
+- **Close checks no longer report hidden submodule work as clean (#796).**
+  Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.
+
+- **Closes now hold and show repair steps when their saved checkout cleanliness is damaged (#798).**
+  If the saved record cannot say whether the checkout was clean, the close stays on HOLD and shows repair steps,
+  even when its saved review requirements are damaged too.
+
+- **Closes also hold when saved isolation or dirty-artifact fields are damaged (#809).**
+  A damaged field no longer waives isolation or counts as a recorded diff; the close names how to start again.
+
+- **Reopening a close no longer records a checkout as clean when Git cannot check it (#810).**
+  The close instead records the checkout as not clean and warns that Git could not check it.
+
+- **Opening a close no longer records a checkout as clean when Git cannot check it (#862).**
+  Teams whose store is outside a Git checkout will see ordinary closes hold until they record a diff artifact.
+
+- **A dead letter can no longer be requeued twice by accident (#891).** Previously, rerunning the command for a message, review result or other reply, rescind, end, or task or review request without a request ID exited 0 and sent another copy; now a repeat for every kind exits 2 and names the first copy. When that copy is still found, the refusal says the dead letter was “already requeued as” the copy and says where it is. When the record says the copy was published but it is no longer found, the refusal names the record and copy, says it “was published,” and says the copy is no longer in the places the store keeps; this also exits 2. An incomplete claim from an earlier store session has different wording. A live task or review request with the same request ID, or an unreadable record, also causes exit 2. Scripts should account for these forms rather than matching only “already requeued.” To send deliberately again, pass `--again --reason TEXT`; the reason is recorded. A task or review request with a live copy of the same request ID remains blocked even with `--again`. An older non-opener dead letter, or a dead letter of any kind with no request ID, requeued before this change has no record, so its next requeue is accepted once before later repeats are refused. Scripts that deliberately repeat the command need the new flags.
+
+  An interrupted deliberate repeat keeps its earlier copy and reason in the requeue record, so a plain retry is refused when an earlier copy exists. Older versions ignore these optional record fields and cannot provide that protection. Retry advice after a reset keeps `--again` and its reason. Printed retry commands name the store with `--root`, even if the original command did not; refusal advice puts the command on its own indented line without a trailing full stop. A retry suggested for a different copy does not carry the original item's override.
 
 - **The ordinary clean-up (`janitor --apply`) now keeps a checkout that an active lane, a launch or supervisor record, or a running lane session still uses, and says why (#858).** The release step already refused such a checkout, but the routine sweep removed it right afterwards, so a lane that was still working lost its folder (its commits and branch stayed in Git). The sweep and the plain report now apply the release step's activity rules to every registered checkout a candidate would take with it: the report shows `REFUSED (kept)` with the reason, a folder holding several checkouts is kept whole when one is in use, nothing is committed to a kept checkout, and a record that cannot be read or placed keeps the checkout and says so. A kept checkout is an expected refusal, not a failure; a check that itself fails is reported as FAILED. `--apply` reads the records again, holds the lanes' occupancy claims through the work-in-progress commit and the delete, compares the checkouts under the folder with the ones it checked (a folder that held none too), and then, holding the lane writers' lock through that folder's delete, makes its last read of the records and claims any lane that names a checkout only by then. The plain report lists every kept checkout, even past the 15 it lists by age. The comparison at the delete reads Git's list of checkouts as the bytes Git wrote (NUL-separated), not as text decoded with the console's encoding and split into lines, so a checkout registered under a name with an accent, a non-Latin letter or a line-separator character is seen like any other (before this, such a name read as a path that does not exist and the checkout was deleted with its unsaved files); a list that cannot be read reliably keeps the candidate as FAILED, not checked. Every refusal because something uses a checkout now ends with what to do next: leave it until what uses it has finished (or the record that names it is retired), then run the sweep again. When Git cannot list the registered checkouts at the delete, the sweep now keeps the candidate and reports it as FAILED (exit 1) instead of reading the failed listing as "none registered"; so the sweep now keeps every candidate when Git cannot list its checkouts (links aside); each one is reported as FAILED with the reason and what to do: fix Git for that repository, then run the sweep again. The report lists these under their own heading and never advises removing them by hand (the "look at each one, then remove it yourself" advice stays only for a candidate that was fully checked and whose delete itself failed; a candidate whose path changed since it was found, or whose checks did not complete for any reason, counts as not checked). When the report's own strict listing of the checkouts fails (so its list comes from the older reader, which turns a name with an accent or a line-separator character into a path that does not exist), the sweep decides nothing from that list: every candidate that is not a link is kept and reported as not checked (fix Git for that repository, then run the sweep again), and the preview says so. Before this, a checkout with such a name that held the candidate (a task folder inside it) was not seen by the check for a candidate inside a registered checkout, and the unsaved files in that folder were deleted. The sweep's search for what to remove now decides which checkouts belong to the repository from that same exact list (it used the older text reader, so a separate clone sitting at the name that reader made of a registered checkout, such as `cafÃ©` next to `café`, was taken for the registered checkout and removed with its unsaved file); that clone is now refused and kept, and with no usable list nothing under `.worktrees` is offered. Not changed: the rules for what a release accepts, the lane and record formats, and the checks of links, ignored files and nested content. A record is evidence of use, not proof that a process is running; a checkout Git does not list is not covered, and a rename by another program in the instant before the delete cannot be stopped by a path check.
 
@@ -167,7 +226,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the submodule or record a truthful dirty artifact. Scratch release keeps its
   existing stricter rules.
 
-- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for dead-letter replies and control messages, retry the same requeue command to keep their original correlation.
+- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for any dead-letter kind, retry the same requeue command to keep its original correlation; the advice preserves an explicit store root and prints the command separately. A refused prepared send ends with these codes (already so since 0.105.0, now documented and tested): `send_rejected` for a web-intent send, and HTTP 409 `lead_chat_send_rejected` for a lead-chat send.
 
 - **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
   Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail

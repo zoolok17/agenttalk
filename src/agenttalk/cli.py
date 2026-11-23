@@ -1765,30 +1765,142 @@ def cmd_overview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _groupable_capacity_account(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(
+        r"(?:claude|codex|ovh-qwen):[^:]*:home-[0-9a-f]{8}", value
+    ) is not None
+
+
+def _status_redact_home(value, *, root=None, project_id=None):
+    """Hide known personal values in status text, including nested diagnostics."""
+    if isinstance(value, dict):
+        return {key: _status_redact_home(item, root=root, project_id=project_id) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_status_redact_home(item, root=root, project_id=project_id) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    home = os.path.expanduser("~")
+    home_stripped = home.rstrip("\\/")
+    if not home_stripped or home_stripped == "~" or re.fullmatch(r"[a-zA-Z]:", home_stripped):
+        home = ""
+    local = os.environ.get("LOCALAPPDATA", "") if os.name == "nt" else ""
+
+    def path_key(path):
+        key = str(path or "").replace("\\", "/").rstrip("/")
+        return key.casefold() if os.name == "nt" else key
+
+    def inside(path, parent):
+        path, parent = path_key(path), path_key(parent)
+        return bool(parent and (path == parent or path.startswith(parent + "/")))
+
+    folders = [(home, "<home>")]
+    if local and not inside(local, home):
+        folders.append((local, "<localappdata>"))
+    if root and not inside(root, home):
+        folders.append((root, "<root>"))
+
+    patterns = []
+    replacements = {}
+    for folder, replacement in sorted(folders, key=lambda pair: len(str(pair[0])), reverse=True):
+        stripped = str(folder or "").rstrip("\\/")
+        if not stripped or stripped == "~" or re.fullmatch(r"[a-zA-Z]:", stripped):
+            continue
+        parts = re.split(r"[\\/]", stripped)
+
+        def shown_or_raw(part):
+            # Warnings can contain paths escaped by printed_commands.shown.
+            pieces = []
+            for char in part:
+                escaped = pc.shown(char, limit=1)[1:-1]
+                choices = {re.escape(char), re.escape(escaped)}
+                if escaped != char:
+                    choices.add(re.escape(escaped[:2] + escaped[2:].upper()))
+                if os.name == "nt" and escaped != char:
+                    for variant in (char.lower(), char.upper()):
+                        if len(variant) == 1:
+                            choices.add(re.escape(pc.shown(variant, limit=1)[1:-1]))
+                pieces.append(next(iter(choices)) if len(choices) == 1 else f"(?:{'|'.join(sorted(choices))})")
+            return "".join(pieces)
+
+        def normalized_part(part):
+            forms = {unicodedata.normalize(form, part) for form in ("NFC", "NFD")}
+            options = sorted(shown_or_raw(form) for form in forms)
+            return options[0] if len(options) == 1 else f"(?:{'|'.join(options)})"
+
+        pattern = r"(?:[\\/]|\\u005[cC])+".join(normalized_part(part) for part in parts)
+        name = f"path{len(patterns)}"
+        patterns.append(fr"(?P<{name}>{pattern})(?![\w-]|\.[\w-]|\\u(?:005[fF]|007[eE]))")
+        replacements[name] = replacement
+    if isinstance(project_id, str) and project_id:
+        patterns.append(fr"(?P<project_id>{re.escape(project_id)})")
+        replacements["project_id"] = "<project_id>"
+    if not patterns:
+        return value
+    def replace(match):
+        # Encoded letters, digits and combining marks can continue a sibling folder name;
+        # punctuation and symbols can also end a path, so hide the ambiguous prefix.
+        if match.lastgroup != "project_id":
+            tail = value[match.end():match.end() + 10]
+            escaped = re.match(r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))", tail)
+            if escaped:
+                code = int(escaped.group(1) or escaped.group(2), 16)
+                if 0x80 <= code <= 0x10ffff and unicodedata.category(chr(code))[0] in "LMN":
+                    return match.group()
+        return replacements[match.lastgroup]
+
+    return re.sub("|".join(patterns), replace, value, flags=re.IGNORECASE if os.name == "nt" else 0)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _get_store(args)
     payload = _gather_status(store)
+    show_personal = getattr(args, "show_personal", False)
+    root, project_id = payload.get("root"), payload.get("project_id")
+    if not show_personal:
+        payload.pop("root", None)
+        payload.pop("project_id", None)
+        if isinstance(payload.get("hmac_key"), dict):
+            payload["hmac_key"].pop("path", None)
+        if isinstance(payload.get("powershell_host"), dict):
+            host = payload["powershell_host"]
+            payload["powershell_host"] = {key: value for key, value in host.items()
+                                          if key in {"status", "edition", "version", "age_seconds", "warning"}}
     if args.json:
+        if not show_personal:
+            groups: dict[str, list[str]] = {}
+            for row in payload["agents"]:
+                account = row.get("capacity", {}).get("account")
+                if _groupable_capacity_account(account):
+                    groups.setdefault(account, []).append(row["name"])
+            for row in payload["agents"]:
+                if "capacity" in row:
+                    account = row["capacity"].pop("account", None)
+                    if _groupable_capacity_account(account):
+                        row["capacity"]["account_group"] = sorted(groups[account])
+        if not show_personal:
+            payload = _status_redact_home(payload, root=root, project_id=project_id)
         print(json.dumps(payload, indent=2))
         return 0
-    print(f"root:       {payload['root']}")
+    if not show_personal:
+        payload = _status_redact_home(payload, root=root, project_id=project_id)
+    root = payload.get("root", "(hidden; add --show-personal to show the project folder)")
+    print(f"root:       {root}")
     print(f"session_id: {payload['session_id']}")
     print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
     print(f"messages:   {payload['message_count']}")
     print(f"operator:   {payload.get('operator_questions_pending', 0)} operator question(s) pending")
     if "powershell_host" in payload:
         host = payload["powershell_host"]
-        print(
-            "powershell: "
-            f"{host.get('status', 'unknown').upper()} "
-            f"{host.get('path', 'unavailable')}"
-        )
+        host_path = host.get("path", "unavailable") if show_personal else "(path hidden; add --show-personal)"
+        print(f"powershell: {host.get('status', 'unknown').upper()} {host_path}")
         if host.get("warning"):
             print(f"  warning:  {host['warning']}")
     if payload["signing_enforced"]:
         hk = payload.get("hmac_key") or {}
         status_label = "OK" if hk.get("exists") and hk.get("readable") and not hk.get("mode_warning") else "PROBLEM"
-        print(f"hmac:       enforced · key {status_label} ({hk.get('path', '?')})")
+        key_path = hk.get("path", "?") if show_personal else "path hidden; add --show-personal to show it"
+        print(f"hmac:       enforced · key {status_label} ({key_path})")
         if hk.get("mode_warning"):
             print(f"  warning:  {hk['mode_warning']}")
         if hk.get("in_project_dir"):
@@ -1803,7 +1915,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if legacy_flag is not None:
             print(f"            legacy require_signatures = {legacy_flag}")
         if legacy_pid is not None:
-            print(f"            legacy project_id = {legacy_pid}")
+            legacy_value = legacy_pid if show_personal else "(hidden; add --show-personal)"
+            print(f"            legacy project_id = {legacy_value}")
     if payload["invalid_messages"]:
         n = len(payload["invalid_messages"])
         print(f"INVALID:    {n} message{'s' if n != 1 else ''} failed schema/roster validation "
@@ -3310,6 +3423,26 @@ def _resolve_revision(root, ref: str) -> tuple[str, str]:
         "pass a full 40-char SHA or run inside the repo")
 
 
+def _reopen_revision(root, ref: str) -> str:
+    """Require the store's enclosing checkout to be at the requested commit."""
+    from agenttalk import close as close_mod
+    rc, inside = _git(root, ["rev-parse", "--is-inside-work-tree"])
+    if rc != 0 or inside.strip() != "true":
+        raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
+    rc, resolved = _git(root, ["rev-parse", "--quiet", "--verify", "--end-of-options", f"{ref}^{{commit}}"])
+    revision = resolved.strip()
+    if rc == 1:
+        raise close_mod.CloseError("requested revision could not be resolved in this checkout")
+    if rc != 0 or not close_mod._FULL_SHA_RE.fullmatch(revision):
+        raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
+    rc, head = _git(root, ["rev-parse", "--verify", "HEAD^{commit}"])
+    if rc != 0 or not close_mod._FULL_SHA_RE.fullmatch(head.strip()):
+        raise close_mod.CloseError("Git or the checkout is unavailable; cannot verify the revision")
+    if head.strip() != revision:
+        raise close_mod.CloseError("checkout HEAD differs from the requested revision; inspect the checkout")
+    return revision
+
+
 def _worktree_clean(root) -> bool | None:
     """None only for unavailable status; False also includes index uncertainty."""
     return _worktree_clean_detail(root)[0]
@@ -3325,6 +3458,22 @@ def _worktree_clean_detail(root) -> tuple[bool | None, str | None]:
     return result.state == "safe", result.reason
 
 
+def _close_clean_detail(root) -> tuple[bool | None, str | None]:
+    clean, reason = _worktree_clean_detail(root)
+    if clean is not True:
+        return clean, reason
+    result = index_safety.check_close_submodules(root)
+    return result.state == "safe", result.reason
+
+
+def _print_unknown_cleanliness(action, *, hold_hint=False):
+    message = (f"agenttalk close {action}: WARNING - Git could not report whether this checkout is clean; "
+               "it is not recorded as clean.")
+    if hold_hint:
+        message += " close check will HOLD on revision until a recorded diff artifact is provided."
+    sys.stderr.write(message + "\n")
+
+
 def _print_index_recovery(root, reason, *, action=None):
     if action:
         sys.stderr.write(
@@ -3334,6 +3483,9 @@ def _print_index_recovery(root, reason, *, action=None):
         if action:
             sys.stderr.write("Close will HOLD without a dirty artifact until these files are inspected "
                              "and the relevant flags are cleared.\n")
+    elif action and reason == index_safety.SUBMODULE_NOT_CLEAN:
+        sys.stderr.write("Close will HOLD without a dirty artifact until the submodule is inspected "
+                         "and cleaned.\n")
 
 
 def _close_lead_set(store) -> set[str]:
@@ -4061,7 +4213,7 @@ def _print_verdict(close_id: str, result: dict) -> None:
 def _close_worktree_eval(store, record: dict) -> dict | None:
     if not isinstance(record, dict):
         return {"status": "unverified", "reason": "close record is malformed"}
-    if record.get("non_lane_isolation_not_asserted"):
+    if record.get("non_lane_isolation_not_asserted") is True:
         return {"status": "not_applicable", "reason": "non-lane close; isolation not asserted"}
     artifact_raw = record.get("lane_delivery_artifact")
     if not artifact_raw:
@@ -4206,11 +4358,13 @@ def cmd_close(args: argparse.Namespace) -> int:
         except (OSError, ValueError, TypeError, KeyError) as e:
             sys.stderr.write(f"agenttalk close open: invalid acceptance input: {e}\n")
             return 2
-        clean, index_reason = (True, None) if prepared else _worktree_clean_detail(store.root)
+        clean, index_reason = (True, None) if prepared else _close_clean_detail(store.root)
         if index_reason:
             _print_index_recovery(store.root, index_reason, action="open")
-        if clean is None:  # git could not report; trust the explicit flags
-            clean = not bool(args.dirty_artifact) if not args.allow_dirty else False
+        unknown_cleanliness = clean is None
+        if unknown_cleanliness:
+            clean = False
+            _print_unknown_cleanliness("open", hold_hint=not args.dirty_artifact)
         opener = _resolve_self(getattr(args, "actor", None), roster=roster)
         record = close_mod.empty_close(
             close_id, scope=args.scope, revision=revision, revision_kind=kind,
@@ -4221,12 +4375,13 @@ def cmd_close(args: argparse.Namespace) -> int:
             lane_delivery_artifact=getattr(args, "lane_artifact", None),
             non_lane_isolation_not_asserted=bool(
                 getattr(args, "non_lane_isolation_not_asserted", False)))
+        record["revision_clean_state"] = "unknown" if unknown_cleanliness else ("clean" if clean else "not_clean")
         record["worktree_isolation"] = _close_worktree_eval(store, record)
         if prepared:
             # A crash before the freeze transaction must leave a HOLD-only close.
             record["schema_version"] = close_mod.ACCEPTANCE_SCHEMA_VERSION
             record["acceptance_route"] = {"pending": True}
-        if not clean and not args.dirty_artifact and not index_reason:
+        if not clean and not unknown_cleanliness and not args.dirty_artifact and not index_reason:
             sys.stderr.write(
                 "agenttalk close open: WARNING - worktree is dirty and no "
                 "--dirty-artifact was recorded; close check will HOLD on revision "
@@ -4582,23 +4737,29 @@ def cmd_close(args: argparse.Namespace) -> int:
     if action == "reopen":
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "reopen")
-        revision = None
-        clean = None
-        if getattr(args, "revision", None):
-            try:
-                revision, _kind = _resolve_revision(store.root, args.revision)
-            except close_mod.CloseError as e:
-                sys.stderr.write(f"agenttalk close reopen: {e}\n")
-                return 2
-            wc, index_reason = _worktree_clean_detail(store.root)
+        try:
+            initial = close_mod.load_close(store, args.id)
+            if "acceptance_route" in initial:
+                raise close_mod.CloseError("acceptance reopen requires --successor and a new plan/project/revision; "
+                                           "preserve this attempt")
+            recorded_revision = initial.get("revision")
+            if args.revision is None and (not isinstance(recorded_revision, str)
+                                          or not close_mod._FULL_SHA_RE.fullmatch(recorded_revision)):
+                raise close_mod.CloseError("this close has no recorded full revision; pass --revision")
+            revision = _reopen_revision(store.root, args.revision if args.revision is not None else recorded_revision)
+            wc, index_reason = _close_clean_detail(store.root)
             if index_reason:
                 _print_index_recovery(store.root, index_reason, action="reopen")
-            clean = True if wc is None else wc
-        try:
+            if wc is None:
+                _print_unknown_cleanliness("reopen")
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
+                if args.revision is None and record.get("revision") != recorded_revision:
+                    raise close_mod.CloseConflict("recorded revision changed while reopening; retry")
+                changed = revision != record.get("revision")
                 close_mod.reopen(record, by=actor, at=_iso_now(),
-                                 revision=revision, revision_clean=clean)
+                                 revision=revision, revision_clean=wc is True)
+                record["revision_clean_state"] = "unknown" if wc is None else ("clean" if wc else "not_clean")
                 transaction.commit()
         except (close_mod.CloseConflict, TimeoutError) as e:
             return _close_conflict_result("reopen", e)
@@ -4606,7 +4767,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             sys.stderr.write(f"agenttalk close reopen: {e}\n")
             return 2
         print(f"reopened close {args.id} by {actor}"
-              + (f" @ {revision[:12]} (prior lens acks now stale)" if revision else ""))
+              + f" @ {revision[:12]}" + (" (prior lens acks now stale)" if changed else ""))
         return 0
 
     if action == "list":
@@ -13129,16 +13290,23 @@ def cmd_capacity(args: argparse.Namespace) -> int:
     # is shown under the account, newest first, never merged with another seat's.
     accounts: dict[str, list[str]] = {}
     for agent in sorted(caps):
-        accounts.setdefault(str(caps[agent].get("account") or ""), []).append(agent)
+        account = caps[agent].get("account")
+        if args.show_personal:
+            account = str(account or "")
+        elif not _groupable_capacity_account(account):
+            account = ""
+        accounts.setdefault(account, []).append(agent)
     kw = {"threshold": args.threshold, "reset_soon_min": args.reset_soon_min,
           "context_threshold": args.context_threshold}
     for account, agents in sorted(accounts.items()):
         indent = "  "
         if account:  # a file written before #301 names no account: rows stand alone
             provider, _, rest = account.partition(":")
-            user, _, home = rest.partition(":")
-            print(f"  {provider} account of OS user {user}{f' ({home})' if home else ''}, "
-                  f"{len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
+            label = f"{provider} account"
+            if args.show_personal:
+                user, _, home = rest.partition(":")
+                label += f" of OS user {user}{f' ({home})' if home else ''}"
+            print(f"  {label}, {len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
             indent = "    "
         ages = {a: capmod.age_seconds(str(capmod.newest_observed_at(caps[a]) or "")) for a in agents}
         for agent in sorted(agents, key=lambda a: float("inf") if ages[a] is None else ages[a]):
@@ -14608,8 +14776,9 @@ def _dead_letter_notifier(store, agent: str):
                     + "Inspect: " + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=ag, i=mid))
             if disposed:
                 body += ("  If it still makes sense to send it again (the requeue command refuses, and says why, "
-                         "when the message cannot be retried): "
-                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid))
+                         "when the message cannot be retried), requeue it once: "
+                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid)
+                         + ". To resend it deliberately when allowed, add --again --reason TEXT.")
             store.send(sender=agent, recipient=target, kind="question",
                        subject="dead-letter notice", body=body,
                        meta={"needs_operator": "true", "dead_letter": "true",
@@ -16715,6 +16884,11 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):
             sys.stderr.write("agenttalk dead-letter requeue: --agent and --id are required.\n")
             return 2
+        again = bool(getattr(args, "again", False))
+        reason = getattr(args, "reason", None)
+        if again and (not reason or not reason.strip()):
+            sys.stderr.write("agenttalk dead-letter requeue: --again needs a non-empty --reason.\n")
+            return 2
         if not _is_listed_dead_letter(store, args.agent, args.id):   # F5 traversal/typo guard
             sys.stderr.write(
                 "agenttalk dead-letter requeue: no dead-letter "
@@ -16779,13 +16953,16 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         rid = meta.get("request_id")
         # A live copy is a valid task or review request with this request id and recipient still in the
         # message store, even after it was answered or rescinded; dead-lettering or compaction removes it.
-        if rid and orig.get("kind") in _dl_tags.OPENERS and any(
-                m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
-                for m in store.valid_messages()):
+        live_copy = next((
+            m for m in store.valid_messages()
+            if m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
+        ), None) if rid and orig.get("kind") in _dl_tags.OPENERS else None
+        if live_copy is not None:
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {pc.line(orig.get('to'))} already has a live copy "
-                f"of request {pc.meta_text(rid)}; "
-                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n"
+                f"of request {pc.meta_text(rid)}; nothing was published. "
+                f"Existing copy: {pc.meta_text(live_copy.id)}. "
+                "Use the existing copy, or resend by hand with a new request id.\n"
             )
             return 2
         if not shape_ok:
@@ -16798,21 +16975,15 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             new = store.send(
                 **sendargs,
                 _refuse_live_request=True,
-                _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
+                _requeue_source=(args.agent, args.id),
+                _requeue_again=reason if again else None,
             )
         except PreparedMessageRefused as e:
-            if orig.get("kind") in _dl_tags.OPENERS:
-                route = _requeue_route(args, orig)
-            else:
-                template = "agenttalk dead-letter requeue --agent {agent} --id {id}"
-                values = {"agent": args.agent, "id": args.id}
-                if reopen_event is not None:
-                    template += " --force-resolved --from {actor} --reason {reason}"
-                    values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
-                route = (
-                    "After the reset has finished, retry the same dead letter to keep its original correlation:\n  "
-                    + pc.cmd(template, **values) + "."
-                )
+            note, command = _requeue_retry_command(store, args, reason, reopen_event)
+            route = (
+                "After the reset has finished, retry the same dead letter: run this command once in PowerShell "
+                "or a POSIX shell to keep the dead letter's original correlation.\n" + note + "  " + command
+            )
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {pc.line(str(e))} "
                 + route + "\n"
@@ -16831,17 +17002,27 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 if problem
                 else ""
             )
-            sys.stderr.write(
-                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
-                + (
-                    "Retry that copy instead: "
-                    + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=args.agent, i=retry)
-                    + "."
-                    if retry and not problem
-                    else attention + _requeue_route(args, orig)
-                )
-                + "\n"
-            )
+            if (orig.get("kind") not in _dl_tags.OPENERS
+                    and (e.again_allowed or isinstance(e, store_mod.RequeueStateDamaged))):
+                advice = "If the earlier requeue is why it was refused, pass --again --reason TEXT."
+            elif orig.get("kind") not in _dl_tags.OPENERS:
+                note, command = _requeue_retry_command(store, args, reason, reopen_event)
+                if isinstance(e, store_mod.RequeueStateReadError):
+                    record = pc.shown(
+                        str(store._requeue_state_path(args.agent, args.id)), pc.PATH_SHOWN_MAX_CHARACTERS,
+                        source="is the requeue record beside this dead letter in the store",
+                    )
+                    fix = f"Resolve the reported access problem first; the requeue record is {record}. "
+                else:
+                    fix = attention + "Resolve the refusal above first. "
+                advice = fix + "Then retry the same dead letter once:\n" + note + "  " + command
+            else:
+                if retry and not problem:
+                    note, command = _requeue_retry_command(store, args, reason, reopen_event, message_id=retry)
+                    advice = "Retry that copy instead:\n" + note + "  " + command
+                else:
+                    advice = attention + _requeue_route(args, orig)
+            sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))} {advice}\n")
             return 2
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))}\n")
@@ -16857,6 +17038,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 f"{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} again "
                 f"while the copy is in the store.\n"
             )
+        if again:
+            print(f"requeued again as {pc.meta_text(new.id)} after {pc.meta_text(new.meta['requeued_again_after'])}: "
+                  f"{pc.line(reason)}")
         print(f"requeued dead-letter {pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
@@ -16928,6 +17112,39 @@ def _retry_problem(store: Store, agent: str, copy_id: str) -> str | None:
     except (ValueError, FileNotFoundError) as e:
         return str(e)
     return None
+
+
+def _requeue_retry_command(store, args, reason, reopen_event, *, message_id=None):
+    """Render a retry for the selected store; an override applies only to its original item."""
+    template = "agenttalk --root {root} dead-letter requeue --agent {agent} --id {id}"
+    values = {"root": str(store.root), "agent": args.agent, "id": message_id or args.id}
+    again = message_id is None and getattr(args, "again", False)
+    if message_id is not None:
+        reopen_event = None
+    if again:
+        template += " --again"
+    if reopen_event is not None:
+        template += " --force-resolved --from {actor}"
+        values["actor"] = reopen_event["actor"]
+    if reopen_event is not None or again:
+        retry_reason = reopen_event["reason"] if reopen_event is not None else reason
+        template += " --reason={reason}" if retry_reason.startswith("-") else " --reason {reason}"
+        values["reason"] = retry_reason
+    rendered = {}
+    unsafe = []
+    for name, value in values.items():
+        if pc.is_plain(value):
+            rendered[name] = value
+        elif (isinstance(value, str) and (name == "reason" or not value.startswith("-"))
+              and re.fullmatch(r"[A-Za-z0-9_./:\\ -]+", value)):
+            rendered[name] = shlex.quote(value)
+        else:
+            rendered[name] = f"<{name}>"
+            source = "is the resolved store folder named by --root" if name == "root" else pc.SUPPLIED_SOURCE
+            unsafe.append(f"<{name}> is {pc.shown(value, pc.PATH_SHOWN_MAX_CHARACTERS, source=source)}")
+    note = ("Not a ready command: " + ", ".join(unsafe) + "; replace the placeholders safely.\n"
+            if unsafe else "")
+    return note, template.format(**rendered)
 
 
 def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
@@ -18243,6 +18460,8 @@ def _dev_gate_forward_argv(args: argparse.Namespace) -> list[str]:
     argv = ["--profile", args.profile]
     if args.ci_leg:
         argv.extend(["--ci-leg", args.ci_leg])
+    if args.part:
+        argv.extend(["--part", args.part])
     if args.aggregate:
         argv.extend(["--aggregate", str(Path(args.aggregate).resolve())])
     if args.evidence:
@@ -18276,6 +18495,8 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 raise dev_gate_mod.GateBlock(
                     "aggregate_argument_invalid", "--python is not valid with --aggregate"
                 )
+            if args.part:
+                raise dev_gate_mod.GateBlock("aggregate_argument_invalid", "--part is not valid with --aggregate")
             result = dev_gate_mod.execute_aggregate(
                 root=root,
                 input_root=Path(args.aggregate),
@@ -18291,6 +18512,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 evidence_path=Path(args.evidence) if args.evidence else None,
                 temp_base=Path(args.temp_root) if args.temp_root else None,
                 python_overrides=dev_gate_mod.parse_python_overrides(args.python),
+                part=args.part,
             )
     except Exception as caught:
         exc = (
@@ -18372,6 +18594,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Aggregate a directory of exact CI-leg JSON artifacts into authoritative evidence.",
     )
     pdev.add_argument(
+        "--part",
+        help="With a Windows --ci-leg: run only this declared part of the leg (checks.pytest.windows_parts).",
+    )
+    pdev.add_argument(
         "--evidence",
         type=Path,
         help="Output JSON path; must be outside the candidate worktree and any AgentTalk store.",
@@ -18405,6 +18631,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("status", help="Show roster, message count, per-agent cursor + unread.")
     ps.add_argument("--json", action="store_true",
                     help="Emit structured JSON instead of human-readable text.")
+    ps.add_argument("--show-personal", action="store_true",
+                    help="Show personal paths, project ID, operating-system login name and folder fingerprint.")
     ps.set_defaults(func=cmd_status)
 
     pov = sub.add_parser(
@@ -18956,7 +19184,8 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--allow", action="append",
                        help="Authorize a lens ack: LENS:AGENT or LENS:@ROLE (repeatable).")
     copen.add_argument("--dirty-artifact", help="Pointer to a recorded diff when the worktree is dirty.")
-    copen.add_argument("--allow-dirty", action="store_true", help="Proceed on a dirty worktree (records dirty).")
+    copen.add_argument("--allow-dirty", action="store_true",
+                       help="Kept for compatibility; a checkout not shown clean is recorded as not clean.")
     copen.add_argument("--lane-artifact",
                        help="Path to a lane delivery artifact proving worktree isolation.")
     copen.add_argument("--non-lane-isolation-not-asserted", action="store_true",
@@ -20305,13 +20534,18 @@ def build_parser() -> argparse.ArgumentParser:
     dls.add_argument("--json", action="store_true")
     dls.set_defaults(func=cmd_dead_letter)
     dlr = dlsub.add_parser("requeue",
-                           help="Re-inject as a FRESH message (new id, own fresh attempt "
-                                "count); original evidence preserved. No cursor rewind.")
+                           description="Requeue any kind of dead letter once. Repeating it is refused unless "
+                                       "--again and a non-empty --reason are given. A live task or review request "
+                                       "with the same request ID still blocks requeue.",
+                           help="Requeue any dead-letter kind once as a fresh message; the original is preserved. "
+                                "Use --again --reason to send again; live task/review request copies still block.")
     dlr.add_argument("--agent", required=True)
     dlr.add_argument("--id", required=True, help="The dead-lettered message id.")
     dlr.add_argument("--force-resolved", dest="force_resolved", action="store_true",
                      help="Requeue an item that was RESOLVED (requires --reason).")
-    dlr.add_argument("--reason", help="Reason (required with --force-resolved).")
+    dlr.add_argument("--again", action="store_true", help="Send again intentionally; requires --reason and records it. "
+                     "A live task or review request with the same request id still blocks requeue.")
+    dlr.add_argument("--reason", help="Non-empty reason required with --force-resolved or --again.")
     dlr.add_argument("--from", dest="sender", help="Actor for the audit event.")
     dlr.set_defaults(func=cmd_dead_letter)
     dlres = dlsub.add_parser("resolve",
@@ -21088,6 +21322,8 @@ def build_parser() -> argparse.ArgumentParser:
     pcap.add_argument("mode", nargs="?", choices=["show", "refresh"], default="show",
                       help="show (default) the team's published budgets, or refresh (publish your own)")
     pcap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    pcap.add_argument("--show-personal", action="store_true",
+                      help="On show, print the operating-system login name and home-folder fingerprint")
     pcap.add_argument("--source", choices=["auto", "claude", "codex"], default="auto",
                       help="On refresh, which local source to read (default: auto-detect)")
     pcap.add_argument("--threshold", type=float, default=80.0,
