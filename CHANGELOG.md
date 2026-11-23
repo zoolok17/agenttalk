@@ -72,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   No program (such as `taskkill.exe`) is launched while this is handled, and pressing Ctrl-C at any point
   still kills and reaps the launcher and raises the original interruption, even if a clean-up step fails
   or a second Ctrl-C arrives. A partial checkout or lock may still need recovery. Stopping the programs
-  Git started, by making them members of a job that ends with the launcher, is a planned follow-up.
+  Git started, by making them members of a job that ends with the launcher, is a planned follow-up (#907).
   Other platforms are unchanged.
 
 - **The release checklist now names the README as the only install pin.** Since the user manuals
