@@ -1,13 +1,14 @@
 """#907: `agenttalk.git_job` on a fake native layer: who owns what from the job's creation to the hand-over, the handle
 rule, the count, and the cleanup deadline. Nothing here calls Windows, so it runs on every platform."""
 
+import inspect
 import subprocess
 import time
 
 import pytest
 from _git_job_fake import JOB, LAUNCHER_HANDLE, FakeClock, FakeWorld, raising
 
-from agenttalk import git_job
+from agenttalk import cli, git_job
 
 CMD = ["git", "-C", "repo", "worktree", "add"]
 KW = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
@@ -151,7 +152,7 @@ def test_nonzero_status_is_a_resume_failure(monkeypatch, status, text):
         git_job.start_in_job(CMD, **KW)
     assert text in str(raised.value).lower()
     assert world.proc.dead and world.closed == {JOB}  # Git never ran: the launcher is stopped, the job closed
-    assert names(world).count("terminate") == 0  # nothing to stop: the job was never let run
+    assert names(world).count("terminate") == 1  # the job is stopped too: harmless, nothing ran in it
 
 
 def test_a_failing_resume_call_is_a_start_failure_too(monkeypatch):
@@ -177,7 +178,8 @@ def test_failure_or_interrupt_just_before_and_after_resume(monkeypatch, when):
 
 
 def test_interrupt_at_the_hand_over(monkeypatch):
-    """Right after the resume returned, before `start_in_job` returns: still its cleanup, the launcher is stopped."""
+    """Right after the resume returned, before `start_in_job` returns: Git already runs in the job, so its cleanup
+    stops the job (not only the launcher) and closes it."""
     world = FakeWorld()
     first = SystemExit("at the hand-over")
     world.after_hooks["resume"] = [lambda: (_ for _ in ()).throw(first)]
@@ -185,6 +187,7 @@ def test_interrupt_at_the_hand_over(monkeypatch):
     with pytest.raises(SystemExit) as raised:
         git_job.start_in_job(CMD, **KW)
     assert raised.value is first and world.proc.dead and world.closed == {JOB}
+    assert world.terminated_jobs == 1 and names(world).index("terminate") < names(world).index("close")
 
 
 def test_a_second_interruption_during_the_setup_cleanup_is_absorbed_and_the_first_is_raised(monkeypatch):
@@ -372,3 +375,35 @@ def test_starting_a_job_and_stopping_it_never_asks_for_a_process_list_an_id_or_a
     job.count_after_stop(git_job.Deadline())
     job.close()
     assert world.forbidden == [] and guard.forbidden == []
+
+
+# --- a standing guard for direct system calls (section 9) --------------------------------------------------------
+
+# Every way a program could list processes, open one by its id, or read when one started. The fake layer above fails the
+# test when the product asks it for one; this reads the code itself, so a direct call through `ctypes` (which never goes
+# through the fake) is caught too.
+_WALKING_CALLS = (
+    "CreateToolhelp32Snapshot",
+    "Process32First",
+    "Process32Next",
+    "OpenProcess",
+    "GetProcessTimes",
+    "NtQueryInformationProcess",
+    "EnumProcesses",
+)
+_JOB_PATH_FUNCTIONS = (
+    "_git_write",
+    "_raise_git_write_timeout",
+    "_kill_and_reap",
+    "_job_confirmed",
+    "_close_job",
+    "_reap_after_failed_start",
+)
+
+
+def test_the_job_code_never_names_a_call_that_walks_processes():
+    sources = {"git_job.py": inspect.getsource(git_job)}
+    sources.update({f"cli.{name}": inspect.getsource(getattr(cli, name)) for name in _JOB_PATH_FUNCTIONS})
+    assert all(len(text) > 100 for text in sources.values()), "a source was not read: the guard would pass for nothing"
+    found = sorted((where, call) for where, text in sources.items() for call in _WALKING_CALLS if call in text)
+    assert found == [], f"a call that walks processes, ids or start times is named: {found}"

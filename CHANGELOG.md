@@ -76,8 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kill and reap the launcher, step by step (it may not succeed if the kill and the reap keep failing), and
   raises the original interruption; a failing clean-up step or a second Ctrl-C from the keyboard is not
   meant to replace it (best effort, with limits stated in the code); this stronger clean-up applies on
-  every platform, while the timeout message itself is unchanged outside Windows. A partial checkout or lock may still need recovery. Stopping the programs Git started, by making
-  them members of a job that ends with the launcher, is done in the next entry (#907).
+  every platform, while the timeout message itself is unchanged outside Windows. A partial checkout or lock may still need recovery. Stopping the programs Git started on a time-out is done in the next entry (#907).
 
 - **On Windows, a Git write that runs out of time now stops the programs Git started too (#907).**
   A changing Git command is now started inside a Windows job of its own: a group that Windows keeps the

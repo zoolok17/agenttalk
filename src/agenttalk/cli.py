@@ -3385,9 +3385,11 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
 
 
 def _reap_after_failed_start(proc, job) -> None:
-    """The bounded cleanup of a launcher that was started paused and could not be resumed (or was interrupted on
-    the way): kill and reap it, then close the job. Nothing escapes; the caller raises the original error."""
-    _kill_and_reap(proc, job=job)
+    """The bounded cleanup of a launcher that was started paused and could not be resumed, or was interrupted on the
+    way (also right after the resume, when Git already runs in the job): stop the job, kill and reap the launcher,
+    then close the job. Stopping before the resume is harmless, since nothing ran. Nothing escapes; the caller raises
+    the original error."""
+    _kill_and_reap(proc, job=job, stop_job=True)
 
 
 _GIT_STILL_RUNNING = (

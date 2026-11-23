@@ -216,7 +216,21 @@ def test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped(
     with pytest.raises(cli.GitWriteError, match="mutating git failed to start: could not resume it"):
         run_write(tmp_path)
     assert "kill" in names(world) and "communicate" in names(world)  # the launcher never ran: it is reaped
-    assert "terminate" not in names(world)
+    assert names(world).count("terminate") == 1  # the (empty) job is stopped with it: harmless, nothing ran
+    assert world.closed == {JOB} and world.violations == []
+
+
+def test_an_interruption_right_after_the_resume_stops_the_job_git_already_runs_in(monkeypatch, tmp_path):
+    """The hand-over: the resume returned 0 (Git runs in the job), the write is interrupted before it gets its job
+    back. The cleanup must stop the job, not only the launcher, and close it; the interruption is the one raised."""
+    world = make(monkeypatch)
+    first = KeyboardInterrupt("at the hand-over")
+    world.after_hooks["resume"] = [raising(first)]
+    with pytest.raises(KeyboardInterrupt) as raised:
+        run_write(tmp_path)
+    assert raised.value is first
+    log = names(world)
+    assert log.count("terminate") == 1 and log.index("resume") < log.index("terminate") < log.index("close")
     assert world.closed == {JOB} and world.violations == []
 
 
@@ -583,4 +597,4 @@ def test_a_failed_resume_runs_the_bounded_launcher_cleanup(monkeypatch, tmp_path
     with pytest.raises(cli.GitWriteError, match="failed to start"):
         run_write(tmp_path)
     log = names(world)
-    assert log[log.index("resume") :][:2] == ["resume", "poll"] and "kill" in log and log[-1] == "close"
+    assert log[log.index("resume") :][:3] == ["resume", "terminate", "poll"] and "kill" in log and log[-1] == "close"

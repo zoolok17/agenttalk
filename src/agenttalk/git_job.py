@@ -9,9 +9,10 @@ its time limit, the caller stops the whole job with one system call (``GitJob.st
 job sets no limits at all (no kill-on-close, no breakaway), so whatever stays in it after a normal end, such as Git's
 file-system monitor, keeps running.
 
-A program in the job cannot take itself out of it by asking to break away (Windows answers access denied), and a
-program that makes its own inner job still stays in this one. A program started on Git's behalf by another process, such
-as a service or a scheduled task, never was in the job and is not covered.
+Asking to break away does not take a program out of the job: Windows refuses, or, under an outer job that allows
+breakaway, lets the request through and the program stays in this job. A program that makes its own inner job still
+stays in this one. A program started on Git's behalf by another process, such as a service or a scheduled task, never
+was in the job and is not covered.
 
 The native layer is loaded on the first call, never at import, so importing this module (and ``cli``) on Linux and macOS
 loads nothing. The layer is replaceable (``_load_native``), so tests run this module's own logic on a fake one.
@@ -235,8 +236,9 @@ def start_in_job(
        and it is a start failure: Git never ran);
     5. the hand-over.
 
-    An interruption in steps 3 to 5 stops and reaps the launcher through `reap(proc, job)` (a bounded, swallowing
-    cleanup that closes the job as its last step) and is raised again; the first interruption is the one raised.
+    An interruption in steps 3 to 5 goes through `reap(proc, job)` (a bounded, swallowing cleanup: it stops the job,
+    kills and reaps the launcher, and closes the job as its last step; Git may already be running in the job after the
+    resume) and is raised again; the first interruption is the one raised.
     """
     native = _load_native()  # step 0
     try:
@@ -282,7 +284,11 @@ def start_in_job(
 
 
 def _default_reap(proc: Any, job: GitJob | None) -> None:
-    """The cleanup used when the caller gives none: kill the launcher, then close the job. Nothing escapes."""
+    """The cleanup used when the caller gives none: stop the job (Git may already be running in it), kill the launcher,
+    then close the job. Nothing escapes."""
+    if job is not None:
+        with contextlib.suppress(BaseException):
+            job.stop()
     with contextlib.suppress(BaseException):
         proc.kill()
     if job is not None:
