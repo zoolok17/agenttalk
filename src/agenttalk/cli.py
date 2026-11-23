@@ -17113,15 +17113,18 @@ def _retry_problem(store: Store, agent: str, copy_id: str) -> str | None:
 
 
 def _requeue_retry_command(store, args, reason, reopen_event, *, message_id=None):
-    """Render the same retry for every refusal, including its selected store."""
+    """Render a retry for the selected store; an override applies only to its original item."""
     template = "agenttalk --root {root} dead-letter requeue --agent {agent} --id {id}"
     values = {"root": str(store.root), "agent": args.agent, "id": message_id or args.id}
-    if getattr(args, "again", False):
+    again = message_id is None and getattr(args, "again", False)
+    if message_id is not None:
+        reopen_event = None
+    if again:
         template += " --again"
     if reopen_event is not None:
         template += " --force-resolved --from {actor}"
         values["actor"] = reopen_event["actor"]
-    if reopen_event is not None or getattr(args, "again", False):
+    if reopen_event is not None or again:
         retry_reason = reopen_event["reason"] if reopen_event is not None else reason
         template += " --reason={reason}" if retry_reason.startswith("-") else " --reason {reason}"
         values["reason"] = retry_reason
