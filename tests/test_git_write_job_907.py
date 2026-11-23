@@ -473,11 +473,22 @@ def test_success_wording_keeps_output_and_recovery_advice(monkeypatch, tmp_path)
     assert message.endswith("a partial checkout or a Git lock may still need recovery")
 
 
-def test_the_cause_is_still_the_writes_timeout(monkeypatch, tmp_path):
-    world = make(monkeypatch, (("timeout",), ("timeout",)))
+CAUSE_SCRIPTS = {
+    "reaped": (("timeout",), ("return", "", "")),
+    "reap_timed_out": (("timeout",), ("timeout",)),
+    "reap_failed": (("timeout",), ("raise", RuntimeError("simulated pipe failure"))),
+}
+
+
+@pytest.mark.parametrize("path", list(CAUSE_SCRIPTS))
+def test_the_cause_is_still_the_writes_timeout(monkeypatch, tmp_path, path):
+    """On every path the cause is the write's own TimeoutExpired (the lane assignment's recovery is keyed on it)."""
+    world = make(monkeypatch, CAUSE_SCRIPTS[path])
     error = timeout_error(tmp_path)
+    assert isinstance(error.__cause__, subprocess.TimeoutExpired)
     assert error.__cause__ is world.proc.raised[0]  # the write's own, not the reap's
-    assert error.__context__ is world.proc.raised[1]
+    if path == "reap_timed_out":
+        assert error.__context__ is world.proc.raised[1]
 
 
 def test_the_no_job_and_posix_timings_are_unchanged(monkeypatch, tmp_path):
