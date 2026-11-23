@@ -35,6 +35,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Status hides personal paths and project ID by default (#870).** `status --json`
+  omits `root`, `project_id` and `hmac_key.path`, so scripts reading those keys must
+  use `--show-personal` to recover them. Text marks them hidden. The option also
+  replaces the unreleased `--show-account` on status and capacity. Home and external
+  local app-data paths in status free text are replaced by placeholders by default.
+  The text `powershell:` line hides its path; JSON omits `powershell_host.path`,
+  `.identity`, `.project_id` and fields outside its allowlist. The project root outside
+  home and the project ID are replaced in free text as well.
+- **Capacity headings now omit account identifiers by default.** This makes routine
+  output safer to share. To see the operating-system login and home-folder fingerprint
+  as before, run `agenttalk capacity --show-personal`. The same protection now covers
+  `agenttalk status --json` (#867). A malformed account is not shown in the default capacity heading.
+- **Status JSON no longer exposes account text by default (#867).** Each capacity
+  reading with an account now has `account_group`, the sorted seats sharing it,
+  instead of `account`; a script reading `account` now finds the key missing. To keep the old account text, use `status --json
+  --show-personal`; to group seats, compare `account_group`. Budget readers need
+  no change. The store itself records the login, so review it before sharing it.
+- **Reopening a close now checks the revision against the checkout.** Git must
+  resolve the requested revision and show it as HEAD, including when the close
+  keeps its existing revision. A missing checkout, unavailable Git, unresolved
+  revision, or different HEAD stops reopening without changing the record.
+  Reopening without `--revision` checks cleanliness again, so a previously clean
+  close can go on HOLD. A store outside a Git checkout can open with a full pin,
+  but cannot reopen. Check out the revision in the checkout that holds the store,
+  or pass `--revision` with its current HEAD. The HEAD check runs just before
+  the close lock is taken, so a checkout moved in that gap is not caught.
+  The close record also distinguishes unknown cleanliness from a checkout not
+  shown clean, and the hold message no longer calls an unchecked checkout dirty.
+
 - **Windows Git write timeouts attempt to stop the process tree (#791).** If the stop cannot be
   confirmed, Git or a child may still be running; wait before retrying or cleaning up. A partial
   checkout or lock may still need recovery.
@@ -49,6 +78,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests waited for reruns. 360 minutes is the most GitHub's hosted runners allow; the 9,000-second
   limit for each test group inside the job is unchanged, and splitting the Windows job is the follow-up
   (#378). The evidence is recorded in `windows_timeout_reason` in `dev-gate.json`.
+- **Each Windows test leg in CI now runs as four jobs instead of one, so none comes near GitHub's
+  six-hour limit (#378).** Before, one job ran the whole suite from the source and then from the built
+  wheel, in two groups each, and took up to six hours; four pull-request legs were stopped at that
+  limit with no failing test. Now each job runs one of those four pieces. The longest piece took
+  107.5 minutes in a sample of 37 master runs (12 to 21 November) and 116.4 minutes in this
+  change's first CI run, whose longest job took 119.75 minutes; each job may run for 165
+  minutes. The required `dev-gate aggregate` check expects all four pieces of every Windows leg.
+  It fails when a piece is missing, doubled or from another commit, when the two pieces of a mode
+  do not add up to the whole suite, or when the two wheel pieces tested different wheels. Linux
+  and macOS are unchanged.
+  `agenttalk dev-gate --ci-leg windows/<python> --part <part>` runs one piece.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
@@ -83,6 +123,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text.
 
 ### Fixed
+
+- **Close checks no longer report hidden submodule work as clean (#796).**
+  Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.
+
+- **Closes now hold and show repair steps when their saved checkout cleanliness is damaged (#798).**
+  If the saved record cannot say whether the checkout was clean, the close stays on HOLD and shows repair steps,
+  even when its saved review requirements are damaged too.
+
+- **Closes also hold when saved isolation or dirty-artifact fields are damaged (#809).**
+  A damaged field no longer waives isolation or counts as a recorded diff; the close names how to start again.
+
+- **Reopening a close no longer records a checkout as clean when Git cannot check it (#810).**
+  The close instead records the checkout as not clean and warns that Git could not check it.
+
+- **Opening a close no longer records a checkout as clean when Git cannot check it (#862).**
+  Teams whose store is outside a Git checkout will see ordinary closes hold until they record a diff artifact.
 
 - **Three first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
   line for every seat; now it names the seat and the change, for example "roster: worker model vendor
