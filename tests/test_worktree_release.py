@@ -2710,6 +2710,68 @@ def test_a_missing_recorded_path_that_becomes_a_link_at_the_final_reread_keeps_t
             gone.rmdir() if os.name == "nt" else gone.unlink()
 
 
+class _OsWithRules:
+    """`worktree_release.os` for another platform's rules (separators, path module), with every other call real. The
+    one name in `appears` is looked at as if it had just been created: the real folder `like` answers for it."""
+
+    def __init__(self, name, sep, altsep, path_module, like):
+        self.name, self.sep, self.altsep, self.path = name, sep, altsep, path_module
+        self._like, self.appears = like, None
+
+    def __getattr__(self, key):
+        return getattr(os, key)
+
+    def lstat(self, path, *args, **kwargs):
+        if self.appears is not None and os.fspath(path) == self.appears:
+            return os.lstat(self._like)
+        return os.lstat(path, *args, **kwargs)
+
+
+def _watch_a_missing_name(tmp_path, monkeypatch, rules, name):
+    """Place `<tmp>/<name>` (a name that is not there) as the records are read under the locks, and return the watched
+    names and the folder that exists."""
+    shim = _OsWithRules(*rules, like=tmp_path)
+    monkeypatch.setattr(worktree_release, "os", shim)
+    with worktree_release._watching_absent() as seen:
+        worktree_release._placed(f"{tmp_path.as_posix()}/{name}")
+    return shim, list(seen)
+
+
+def test_an_absent_recorded_name_ending_in_a_backslash_is_watched_exactly_on_posix_rules(tmp_path, monkeypatch):
+    """On Linux and macOS a backslash is an ordinary character of a file name. `gone\\` and `gone` are two names, so
+    watching `gone` for `gone\\` lets the real `gone\\` appear as a link to the checkout after the last read and be
+    missed. With POSIX rules simulated (separator `/`, no alternative), the watched entry is the exact name, and when
+    that name appears, the second look refuses, which keeps the checkout."""
+    import posixpath
+
+    shim, seen = _watch_a_missing_name(tmp_path, monkeypatch, ("posix", "/", None, posixpath), "gone\\")
+    assert seen == [f"{tmp_path.as_posix()}/gone\\"]
+    shim.appears = seen[0]  # the exact name is created now, as a link to the checkout
+    with pytest.raises(worktree_release.Refused, match="exists now"):
+        worktree_release._still_absent(seen)
+
+
+def test_an_absent_recorded_name_with_trailing_separators_is_still_watched_without_them_on_posix_rules(
+    tmp_path, monkeypatch
+):
+    import posixpath
+
+    _shim, seen = _watch_a_missing_name(tmp_path, monkeypatch, ("posix", "/", None, posixpath), "gone/")
+    assert seen == [f"{tmp_path.as_posix()}/gone"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the Windows rules need a Windows path module")
+@pytest.mark.parametrize("name", ["gone\\", "gone/"], ids=["backslash", "slash"])
+def test_an_absent_recorded_name_with_a_trailing_separator_is_watched_without_it_on_windows_rules(
+    tmp_path, monkeypatch, name
+):
+    """On Windows both forms are separators, so a trailing one is stripped and the folder named before it is watched."""
+    import ntpath
+
+    _shim, seen = _watch_a_missing_name(tmp_path, monkeypatch, ("nt", "\\", "/", ntpath), name)
+    assert [os.path.normcase(entry) for entry in seen] == [os.path.normcase(os.path.join(os.fspath(tmp_path), "gone"))]
+
+
 def test_a_recorded_path_that_stays_absent_through_the_final_check_still_lets_release_go_on(estate):
     """The control for the race test: the same record, nothing created, so the checkout is removed as before."""
     repo, wt, cfg = estate

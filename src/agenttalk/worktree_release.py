@@ -413,7 +413,9 @@ def _placed(path: Path) -> str:
             os.lstat(current)
             break
         except FileNotFoundError:
-            parent, name = os.path.split(current.rstrip("\\/"))
+            # Only this platform's separators: on Linux and macOS a backslash is an ordinary character of a name,
+            # and stripping it would watch `gone` for a recorded `gone\`, which a real `gone\` could then slip past.
+            parent, name = os.path.split(current.rstrip(os.sep + (os.altsep or "")))
             if not name or not parent or parent == current:
                 raise
             if name in (".", "..") or (os.name == "nt" and ":" in name):
