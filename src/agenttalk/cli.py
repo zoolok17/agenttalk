@@ -3291,8 +3291,8 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
 
     This is intentionally separate from `_git`: callers must opt into mutating git,
     every positional path/ref remains an argv element. On Windows, a timeout attempts
-    to stop the process tree; an unconfirmed stop can leave children running, and a
-    partial checkout or lock may still need recovery.
+    to stop the process tree natively (no program is launched); an unconfirmed stop can
+    leave children running, and a partial checkout or lock may still need recovery.
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
@@ -3356,69 +3356,78 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        tree_stopped = False
-        if os.name == "nt":
-            try:
-                if proc.poll() is None:
-                    import ctypes
-
-                    get_system_directory = ctypes.WinDLL("kernel32", use_last_error=True).GetSystemDirectoryW
-                    get_system_directory.argtypes = [ctypes.POINTER(ctypes.c_wchar), ctypes.c_uint]
-                    get_system_directory.restype = ctypes.c_uint
-                    system_directory = ctypes.create_unicode_buffer(32768)
-                    size = get_system_directory(system_directory, len(system_directory))
-                    if 0 < size < len(system_directory) and Path(system_directory.value).is_absolute():
-                        taskkill = str(Path(system_directory.value) / "taskkill.exe")
-                        tree_stopped = subprocess.run(  # noqa: S603  # nosec B603
-                            [taskkill, "/PID", str(proc.pid), "/T", "/F"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False,
-                        ).returncode == 0
-            except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
-                tree_stopped = False
-        warning = (
-            " Git or a program it started may still be running; wait for it to finish before retrying or cleaning up."
-            if os.name == "nt" and not tree_stopped else ""
-        )
-        # kill() can itself raise (PermissionError on Windows,
-        # ProcessLookupError if the child already exited) - guarded so it
-        # can never pre-empt the GitWriteError raised below.
-        if not tree_stopped:
-            with contextlib.suppress(OSError):
-                proc.kill()
         try:
-            out, err = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired as reap:
-            # A child can hold the pipes open after the launcher exits. wait()
-            # reaps the launcher without waiting for those pipes to close.
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=25)
-            raise GitWriteError(
-                "mutating git timed out and could not be reaped; git/config lock may be stranded" + warning
-            ) from reap
-        result = f"mutating git timed out after {timeout:g}s"
-        if os.name != "nt" or tree_stopped:
-            result += " and was killed"
-        raise GitWriteError(f"{result}: {err or out or e}" + warning) from e
+            _raise_git_write_timeout(proc, timeout, e)
+        except GitWriteError:
+            raise
+        except BaseException:  # an interruption during the stop or the reap
+            _kill_and_reap(proc)
+            raise
     except BaseException:
-        if proc.poll() is None:
-            # kill() can itself raise - unguarded, that secondary error
-            # would replace the owner BaseException being handled here and
-            # skip the reap fallback below entirely.
-            with contextlib.suppress(OSError):
-                proc.kill()
-            try:
-                proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                # A hook or descendant holding the captured stdout/stderr
-                # pipe handles open can keep communicate() blocked past
-                # this retry even though the killed process is already
-                # dead - wait() does not touch the pipes at all, so it
-                # still completes once the process is actually gone.
-                # A second timeout leaves the launcher's reap unconfirmed.
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=25)
+        _kill_and_reap(proc)
         raise
     return proc.returncode, out or "", err or ""
+
+
+_GIT_STILL_RUNNING = (
+    " Git or a program it started may still be running; wait for it to finish before retrying or cleaning up."
+)
+
+
+def _kill_and_reap(proc) -> None:
+    if proc.poll() is None:
+        # kill() can itself raise - unguarded, that secondary error
+        # would replace the owner BaseException being handled and
+        # skip the reap fallback below entirely.
+        with contextlib.suppress(OSError):
+            proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # A hook or descendant holding the captured stdout/stderr
+            # pipe handles open can keep communicate() blocked past
+            # this retry even though the killed process is already
+            # dead - wait() does not touch the pipes at all, so it
+            # still completes once the process is actually gone.
+            # A second timeout leaves the launcher's reap unconfirmed.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=25)
+
+
+def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired):
+    """Stop a timed-out Git command and raise ``GitWriteError`` (never returns).
+
+    On Windows the whole tree is stopped through the native helper, which starts no program.
+    Unless that is confirmed, the launcher is killed and the error says a child may still be running.
+    """
+    tree_stopped = False
+    if os.name == "nt":
+        from agenttalk import windows_tree_stop
+
+        tree_stopped = windows_tree_stop.stop_process_tree(proc)
+    warning = _GIT_STILL_RUNNING if os.name == "nt" and not tree_stopped else ""
+    # kill() can itself raise (PermissionError on Windows,
+    # ProcessLookupError if the child already exited) - guarded so it
+    # can never pre-empt the GitWriteError raised below.
+    if not tree_stopped:
+        with contextlib.suppress(OSError):
+            proc.kill()
+    try:
+        out, err = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired as reap:
+        # A child can hold the pipes open after the launcher exits. wait()
+        # reaps the launcher without waiting for those pipes to close.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=25)
+        # Open pipes after a confirmed stop mean a process the stop missed: the warning stays.
+        raise GitWriteError(
+            "mutating git timed out and could not be reaped; git/config lock may be stranded"
+            + (_GIT_STILL_RUNNING if os.name == "nt" else "")
+        ) from reap
+    result = f"mutating git timed out after {timeout:g}s"
+    if os.name != "nt" or tree_stopped:
+        result += " and was killed"
+    raise GitWriteError(f"{result}: {err or out or timed_out}" + warning) from timed_out
 
 
 def _resolve_revision(root, ref: str) -> tuple[str, str]:

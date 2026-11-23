@@ -4,7 +4,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +11,7 @@ from agenttalk import cli
 
 
 def _capture_snapshot_tree(root_pid, parents, observe, close):
+    """The test's own, independent walk of the tree (the product has its own): strictly later than the parent."""
     root = observe(root_pid)
     assert root is not None
     accepted = {root_pid: root}
@@ -25,7 +25,7 @@ def _capture_snapshot_tree(root_pid, parents, observe, close):
             child = observe(pid)
             if child is None:
                 continue
-            if child[1] < accepted[parent][1]:
+            if child[1] <= accepted[parent][1]:
                 close(child[0])
                 continue
             accepted[pid] = child
@@ -34,87 +34,148 @@ def _capture_snapshot_tree(root_pid, parents, observe, close):
             return accepted
 
 
-def test_snapshot_tree_excludes_reused_parent_and_unreadable_processes():
-    parents = {101: 100, 102: 101, 103: 102, 104: 101, 105: 104, 106: 101}
-    # 102 predates its apparent parent, 104 cannot be observed, and equal creation times are allowed.
-    observations = {
-        100: ("root", 1000),
-        101: ("child", 1100),
-        102: ("stranger", 900),
-        103: ("stranger-child", 1200),
-        104: None,
-        105: ("unknown-child", 1300),
-        106: ("same-time-child", 1100),
-    }
-    closed = []
-    found = _capture_snapshot_tree(100, parents, observations.get, closed.append)
-    assert set(found) == {100, 101, 106}
-    assert closed == ["stranger"]
+class _NtOS:
+    name = "nt"
+
+    def __getattr__(self, key):
+        return getattr(os, key)
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows tree stop")
-@pytest.mark.parametrize(
-    "outcome", ["success", "failed", "exited", "missing", "timeout", "denied", "kill-error", "system-lookup"]
-)
-def test_timeout_tree_stop_is_absolute_and_unconfirmed_stop_warns(tmp_path, monkeypatch, outcome):
-    calls = []
+class _TimedOutGit:
+    """A Git launcher whose first wait times out; ``reap`` says what the second wait does."""
 
-    class Git:
-        pid = 12345
+    pid = 100
+    _handle = 1
 
-        def __init__(self):
-            self.count = 0
-            self.killed = False
+    def __init__(self, *, reap="ok", exited=False):
+        self.count, self.killed, self.waited, self.reap, self.exited = 0, 0, 0, reap, exited
 
-        def poll(self):
-            return 0 if outcome == "exited" else None
+    def poll(self):
+        return 0 if self.exited or (self.killed and self.reap == "ok") else None
 
-        def communicate(self, timeout=None):
-            self.count += 1
-            if self.count == 1:
-                raise subprocess.TimeoutExpired("git", timeout)
-            return "", ""
+    def communicate(self, timeout=None):
+        self.count += 1
+        if self.count == 1:
+            raise subprocess.TimeoutExpired("git", timeout)
+        if self.count == 2 and self.reap == "timeout":
+            raise subprocess.TimeoutExpired("git", timeout)
+        if self.count == 2 and self.reap == "interrupt":
+            raise KeyboardInterrupt
+        return "", ""
 
-        def kill(self):
-            self.killed = True
-            if outcome == "kill-error":
-                raise OSError("simulated kill failure")
+    def wait(self, timeout=None):
+        self.waited += 1
+        return 0
 
-    proc = Git()
-    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: proc)
-    if outcome == "system-lookup":
-        import ctypes
+    def kill(self):
+        self.killed += 1
+        if self.reap == "kill-error":
+            raise OSError("simulated kill failure")
 
-        monkeypatch.setattr(
-            ctypes, "WinDLL", lambda *args, **kwargs: SimpleNamespace(GetSystemDirectoryW=lambda *args: 0)
-        )
 
-    def taskkill(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        if outcome == "missing":
-            raise FileNotFoundError("simulated missing taskkill")
-        if outcome == "timeout":
-            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-        return SimpleNamespace(
-            returncode=0 if outcome == "success" else 1,
-            stderr="ERROR: Access denied." if outcome == "denied" else "",
-        )
+def _windows_timeout(tmp_path, monkeypatch, world, git):
+    """Run ``_git_write`` through the timeout path as if on Windows, with a fake native layer."""
+    from agenttalk import windows_tree_stop as wts
 
-    monkeypatch.setattr(cli.subprocess, "run", taskkill)
+    monkeypatch.setattr(cli, "os", _NtOS())
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: git)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: pytest.fail("no program may be launched"))
+    monkeypatch.setattr(wts, "_default_native", lambda: world)
+    return cli._git_write(
+        tmp_path, ["worktree", "add", "-b", "lane/safe", "--", str(tmp_path / "wt"), "a" * 40], timeout=0.01
+    )
+
+
+_WARNING = "may still be running"
+
+
+def _timeout_error(tmp_path, monkeypatch, world, git):
     with pytest.raises(cli.GitWriteError) as error:
-        cli._git_write(
-            tmp_path, ["worktree", "add", "-b", "lane/safe", "--", str(tmp_path / "wt"), "a" * 40], timeout=0.01
-        )
-    if outcome in {"exited", "system-lookup"}:
-        assert not calls
-    else:
-        assert len(calls) == 1
-        cmd, kwargs = calls[0]
-        assert Path(cmd[0]).is_absolute() and Path(cmd[0]).name.lower() == "taskkill.exe"
-        assert cmd[1:] == ["/PID", "12345", "/T", "/F"]
-        assert kwargs["timeout"] > 0 and not kwargs.get("shell", False)
-    assert proc.killed == (outcome != "success")
-    assert ("may still be running" in str(error.value)) == (outcome != "success")
+        _windows_timeout(tmp_path, monkeypatch, world, git)
+    return str(error.value)
+
+
+def test_confirmed_tree_stop_adds_no_warning_and_does_not_kill_again(tmp_path, monkeypatch):
+    from test_windows_tree_stop_791 import World, no_launch
+
+    world = World((101, 100, 1100), (102, 101, 1200))
+    git = _TimedOutGit()
+    with no_launch() as seen:
+        message = _timeout_error(tmp_path, monkeypatch, world, git)
+    assert seen == []
+    assert _WARNING not in message and "and was killed" in message
+    assert git.killed == 0
+    assert not any(world.alive(pid) for pid in (100, 101, 102))
+
+
+@pytest.mark.parametrize("fault", ["snapshot", "open101", "times101", "terminate101", "times100"])
+def test_unconfirmed_tree_stop_warns_and_kills_the_launcher(tmp_path, monkeypatch, fault):
+    from test_windows_tree_stop_791 import World
+
+    world = World((101, 100, 1100))
+    world.fail.add(fault)
+    git = _TimedOutGit()
+    message = _timeout_error(tmp_path, monkeypatch, world, git)
+    assert _WARNING in message and "and was killed" not in message
+    assert git.killed == 1
+
+
+def test_unconfirmed_stop_with_a_failing_kill_still_raises_the_warned_error(tmp_path, monkeypatch):
+    from test_windows_tree_stop_791 import World
+
+    world = World((101, 100, 1100))
+    world.fail.add("terminate101")
+    message = _timeout_error(tmp_path, monkeypatch, world, _TimedOutGit(reap="kill-error"))
+    assert _WARNING in message
+
+
+def test_a_launcher_that_already_ended_is_walked_and_a_confirmed_stop_adds_no_warning(tmp_path, monkeypatch):
+    from test_windows_tree_stop_791 import World
+
+    world = World((101, 100, 1100))
+    world.procs[100].alive = False
+    world.procs[100].listed_when_dead = True
+    git = _TimedOutGit(exited=True)
+    message = _timeout_error(tmp_path, monkeypatch, world, git)
+    assert not world.alive(101)
+    assert _WARNING not in message and git.killed == 0
+
+
+def test_a_reap_that_times_out_after_a_confirmed_stop_keeps_the_warning(tmp_path, monkeypatch):
+    from test_windows_tree_stop_791 import World
+
+    world = World((101, 100, 1100))
+    git = _TimedOutGit(reap="timeout")
+    message = _timeout_error(tmp_path, monkeypatch, world, git)
+    assert "could not be reaped" in message and _WARNING in message
+    assert git.killed == 0 and git.waited == 1
+
+
+def test_an_interruption_during_the_stop_kills_and_reaps_the_launcher_and_is_raised_again(tmp_path, monkeypatch):
+    from test_windows_tree_stop_791 import World
+
+    world = World((101, 100, 1100))
+
+    def interrupt(w, p, ms):
+        raise KeyboardInterrupt
+
+    world.on_wait = interrupt
+    git = _TimedOutGit()
+    with pytest.raises(KeyboardInterrupt):
+        _windows_timeout(tmp_path, monkeypatch, world, git)
+    assert git.killed == 1 and git.count == 2  # killed, then reaped
+    world.assert_handles_closed()
+
+
+def test_an_interruption_during_the_reap_kills_and_reaps_the_launcher_and_is_raised_again(tmp_path, monkeypatch):
+    from test_windows_tree_stop_791 import World
+
+    world = World((101, 100, 1100))
+    git = _TimedOutGit(reap="interrupt")
+    with pytest.raises(KeyboardInterrupt):
+        _windows_timeout(tmp_path, monkeypatch, world, git)
+    assert git.killed == 1 and git.count == 3
+    world.assert_handles_closed()
 
 
 def test_posix_timeout_keeps_direct_kill_and_original_message(tmp_path, monkeypatch):
@@ -156,6 +217,7 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
     import ctypes
     from ctypes import wintypes
 
+    from agenttalk import windows_tree_stop
     from agenttalk.supervisor_lifecycle import _PROCESSENTRY32W
     from test_lanes import _commit, _git, _repo
 
@@ -193,17 +255,19 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
     kernel.GetProcessTimes.restype = wintypes.BOOL
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    from test_windows_tree_stop_791 import arm_launch_observer, disarm_launch_observer
+
     handles = []
     real_popen = subprocess.Popen
-    real_run = subprocess.run
-    tree_results = []
     process = None
+    fired = []
+    launched = []
 
     def capture_tree(proc):
         deadline = time.monotonic() + 20
         while not ready.exists():
             assert time.monotonic() < deadline, "filter did not start"
-            time.sleep(.02)
+            time.sleep(0.02)
         filter_pid = int(ready.with_suffix(".pid").read_text())
         snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
         assert snapshot != wintypes.HANDLE(-1).value
@@ -217,6 +281,7 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
                 ok = kernel.Process32NextW(snapshot, ctypes.byref(entry))
         finally:
             kernel.CloseHandle(snapshot)
+
         def observe(pid):
             handle = kernel.OpenProcess(0x100000 | 0x1000, False, pid)
             if not handle:
@@ -245,7 +310,13 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
             def synced(timeout=None):
                 if not handles:
                     capture_tree(proc)
-                return communicate(timeout=timeout)
+                try:
+                    return communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    if not fired:
+                        fired.append(int((time.time() + 11644473600) * 10_000_000))  # as Windows file time
+                        launched.append(arm_launch_observer())  # from here on, only the product runs
+                    raise
 
             proc.communicate = synced
         return proc
@@ -254,30 +325,52 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
         with monkeypatch.context() as patch:
             patch.setattr(cli.subprocess, "Popen", popen)
             if not tree_stop:
-                patch.setattr(cli.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1))
-            else:
-
-                def capture_taskkill(*args, **kwargs):
-                    kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    result = real_run(*args, **kwargs)
-                    tree_results.append((result.returncode, result.stdout, result.stderr))
-                    return result
-
-                patch.setattr(cli.subprocess, "run", capture_taskkill)
-            with pytest.raises(cli.GitWriteError) as error:
-                cli._git_write(
-                    root, ["worktree", "add", "-b", "lane/tree791", "--", str(tmp_path / "wt"), base], timeout=0.1
-                )
+                # the stop is not confirmed: only the launcher is killed, so a child must survive
+                patch.setattr(windows_tree_stop, "stop_process_tree", lambda proc: False)
+            try:
+                with pytest.raises(cli.GitWriteError) as error:
+                    cli._git_write(
+                        root, ["worktree", "add", "-b", "lane/tree791", "--", str(tmp_path / "wt"), base], timeout=0.1
+                    )
+            finally:
+                disarm_launch_observer()
         assert handles, "the filter tree must have been captured"
+        assert fired, "the timeout must have fired"
+        assert launched == [[]], "no program may be launched in the timeout path"
         states = [kernel.WaitForSingleObject(handle, 5000 if tree_stop else 0) for handle in handles]
         if tree_stop:
-            if not os.environ.get("CI") and tree_results and tree_results[0][0] == 1 and tree_results[0][2].strip() in {
-                "ERROR: Access denied", "ERROR: Access denied."
-            }:
-                pytest.skip("taskkill denied: Access denied (sandboxed environment); this test must run outside it")
-            assert tree_results and tree_results[0][0] == 0, f"taskkill failed: {tree_results}"
-            assert all(state == 0 for state in states), f"a captured Git process is still alive: {tree_results}"
+            assert all(state == 0 for state in states), f"a captured Git process is still alive: {states}"
             assert "may still be running" not in str(error.value)
+            # Whatever the audit hook cannot see: no process created after the timeout fired is a child of ours.
+            snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
+            try:
+                entry = _PROCESSENTRY32W()
+                entry.dwSize = ctypes.sizeof(entry)
+                ours = []
+                ok = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+                while ok:
+                    if int(entry.th32ParentProcessID) == os.getpid():
+                        ours.append(int(entry.th32ProcessID))
+                    ok = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+            finally:
+                kernel.CloseHandle(snapshot)
+            for pid in ours:
+                handle = kernel.OpenProcess(0x1000, False, pid)
+                if not handle:
+                    continue
+                try:
+                    creation, exit_time, user, system = (wintypes.FILETIME() for _ in range(4))
+                    if kernel.GetProcessTimes(
+                        handle,
+                        ctypes.byref(creation),
+                        ctypes.byref(exit_time),
+                        ctypes.byref(system),
+                        ctypes.byref(user),
+                    ):
+                        created = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+                        assert created < fired[0], f"process {pid} was started after the timeout fired"
+                finally:
+                    kernel.CloseHandle(handle)
         else:
             assert 0x102 in states, "a child must still be alive to exercise the fallback"
             assert "may still be running" in str(error.value)
