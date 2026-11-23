@@ -152,6 +152,10 @@ class JanitorReport:
     # Candidates that a lane, launch or supervisor record still names (or whose use could not be checked), with the
     # reason. A preview only: `apply` reads the records again (#858).
     in_use: dict[Path, str] = dataclasses.field(default_factory=dict)
+    # False when Git's strict listing of the checkouts failed while the report was made, so `registered_worktrees` is
+    # the best-effort reader's answer: it may hold wrong paths (a name with an accent or U+2028) or miss a checkout.
+    # No safety decision may rest on it: `apply` keeps every folder that is not a link, as not checked (#858).
+    registered_strict: bool = True
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -741,10 +745,13 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
     if ancestor_errors:
         return JanitorReport([], [], [], [], ancestor_errors)
     candidates, access_errors = find_candidates(cfg)
+    strict = True
     try:
         registered = _registered_worktrees_listed(cfg.repo)  # the same reading as the comparison at the delete
     except _UseCheckFailed:
-        registered = get_registered_worktrees(cfg.repo)  # best effort: discovery has refused what it cannot trust
+        # Best effort, for the counts and the preview only: discovery has refused what it cannot trust, and this
+        # reader turns a name with an accent or U+2028 into a path that does not exist. `apply` decides nothing on it.
+        registered, strict = get_registered_worktrees(cfg.repo), False
     dirty = [
         w for w in registered
         if not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
@@ -761,7 +768,7 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
         candidates=candidates, registered_worktrees=registered,
         dirty_worktrees=dirty, foreign_kept=foreign, access_errors=access_errors,
         ancestor_ids=ancestor_ids,
-        in_use=in_use,
+        in_use=in_use, registered_strict=strict,
     )
 
 
@@ -812,6 +819,9 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
         f"registered worktrees: {len(report.registered_worktrees)}",
         f"dirty registered worktrees: {len(report.dirty_worktrees)}",
     ]
+    if not report.registered_strict:
+        lines.append("Git could not list the registered checkouts reliably, so the counts above may be wrong and "
+                     "`--apply` keeps every folder as not checked: fix Git for this repository, then run it again.")
     if report.dirty_worktrees:
         lines.append(
             "DIRTY includes checkouts that could not be fully checked; hidden tracked files are kept for inspection."
@@ -1162,6 +1172,11 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
             # point leaves what is at the path unestablished, and the report must not advise removing it by hand.
             unchecked = True
             reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+            if reason is None and not c.link and not report.registered_strict:
+                # The report's list of checkouts is the best-effort reader's: it can name a checkout by a path that
+                # does not exist, so neither the ancestor protection nor the lookup of checkouts under a candidate
+                # could be trusted. Nothing is decided on it, in either direction of containment.
+                reason = str(_listing_failure("the listing the report was made from failed or could not be read"))
             if reason is not None:
                 result = "FAILED"
             else:

@@ -528,12 +528,13 @@ def test_a_successful_final_listing_still_lets_a_folder_with_a_checkout_go(estat
 
 
 @pytest.mark.parametrize("final_works", [True, False])
-def test_a_checkout_that_appears_under_an_empty_candidate_is_kept_whatever_the_first_listing_did(
+def test_a_checkout_that_appears_under_an_empty_candidate_is_kept_whatever_the_final_listing_does(
     estate, monkeypatch, final_works
 ):
-    """The listing failed when the report was made (so the folder looked empty and plain), then an active checkout was
-    registered under it. At the delete the listing works (the folder is kept: it changed) or fails again (it is kept
-    and reported as FAILED): a failed listing is never read as "no checkout", whatever the first one did."""
+    """The report was made with a working listing and the folder looked empty and plain, then an active checkout was
+    registered under it. At the delete the listing works (the folder is kept: it changed) or fails (it is kept and
+    reported as FAILED): a failed listing is never read as "no checkout". (When the report's own listing failed, every
+    candidate is kept before this point; see the tests of `registered_strict`.)"""
     repo, wt, cfg = estate
     parent = repo / ".probe-parent"
     parent.mkdir()
@@ -544,9 +545,8 @@ def test_a_checkout_that_appears_under_an_empty_candidate_is_kept_whatever_the_f
             return 1, "", "git list failed"
         return real_git(repo, *args, **kwargs)
 
-    monkeypatch.setattr(janitor, "_run_git_checked", failed_git)
     report = janitor.build_report(cfg)
-    assert any(c.path == parent for c in report.candidates)
+    assert report.registered_strict and any(c.path == parent for c in report.candidates)
     real_changed = janitor._checkouts_changed
     created = []
 
@@ -556,8 +556,8 @@ def test_a_checkout_that_appears_under_an_empty_candidate_is_kept_whatever_the_f
             git(repo, "worktree", "add", "-q", "-b", "lane/new", str(lane))
             _write_record(repo, "active-lane", lane)
             created.append(lane)
-            if final_works:
-                monkeypatch.setattr(janitor, "_run_git_checked", real_git)
+            if not final_works:
+                monkeypatch.setattr(janitor, "_run_git_checked", failed_git)
         return real_changed(c, worktrees, cfg)
 
     monkeypatch.setattr(janitor, "_checkouts_changed", changed)
@@ -908,3 +908,113 @@ def test_the_parser_accepts_exactly_what_git_writes_and_nothing_cut_short():
             continue  # a prefix that ends exactly at a record boundary is a complete list of fewer records
         with pytest.raises(janitor._UseCheckFailed):
             janitor._parse_worktree_list_z(prefix)
+
+
+def first_strict_listing_fails(monkeypatch):
+    """Only the report's own strict listing fails (once); the later reads work. Returns the number of failed calls."""
+    real, failed = janitor._registered_worktrees_listed, []
+
+    def listed(repo):
+        if not failed:
+            failed.append(1)
+            raise janitor._UseCheckFailed("could not list the registered checkouts to compare them (test)")
+        return real(repo)
+
+    monkeypatch.setattr(janitor, "_registered_worktrees_listed", listed)
+    return failed
+
+
+def probe(repo, cfg, name, direction):
+    """(candidate, unsaved file, `add_checkout`) for one of the two ways a checkout and a candidate can contain each
+    other. `add_checkout()` registers the checkout, puts a file in it that exists nowhere else and names it in an active
+    lane, and returns it. A checkout that holds the candidate is there before the report; one inside the candidate is
+    registered after it (a report never offers a folder that already holds a checkout), so the caller decides when."""
+    if direction == "checkout-contains-candidate":
+        lane = cfg.scratch_root / name  # the agent folder of the scratch layout, `<agent>/<task>` below it
+        candidate, unsaved = lane / "task", lane / "task" / "unsaved.txt"
+
+        def add_checkout():
+            git(repo, "worktree", "add", "-q", "-b", "lane/holder", str(lane))
+            candidate.mkdir()
+            unsaved.write_text("only copy")
+            for path in (unsaved, candidate):
+                os.utime(path, (1_000_000_000, 1_000_000_000))  # a stale task: the sweep finds it
+            _write_record(repo, "active-lane", lane)
+            return lane
+    else:
+        candidate = repo / ".probe-holder"
+        candidate.mkdir()
+        lane = candidate / name
+        unsaved = lane / "unsaved.txt"
+
+        def add_checkout():
+            git(repo, "worktree", "add", "-q", "-b", "lane/inside", str(lane))
+            unsaved.write_text("only copy")
+            _write_record(repo, "active-lane", lane)
+            return lane
+
+    return candidate, unsaved, add_checkout
+
+
+NAMES = pytest.mark.parametrize("name", ["café", "a b"], ids=["accent", "line-separator"])
+DIRECTIONS = pytest.mark.parametrize("direction", ["checkout-contains-candidate", "checkout-inside-candidate"])
+
+
+def probe_report(repo, cfg, name, direction):
+    """The probe's report, built the way each direction needs; returns what the checks then need."""
+    candidate, unsaved, add_checkout = probe(repo, cfg, name, direction)
+    if direction == "checkout-contains-candidate":
+        lane = add_checkout()
+        report = janitor.build_report(cfg)
+    else:
+        report = janitor.build_report(cfg)
+        lane = add_checkout()
+    assert candidate in [c.path for c in report.candidates]
+    return report, lane, candidate, unsaved
+
+
+@NAMES
+@DIRECTIONS
+def test_with_the_strict_listing_healthy_the_probe_is_kept(estate, direction, name):
+    """The control: the same estate, the report's listing works. Nothing is lost and nothing is removed."""
+    repo, wt, cfg = estate
+    report, lane, candidate, unsaved = probe_report(repo, cfg, name, direction)
+
+    text = janitor.apply(cfg, report)
+
+    assert unsaved.read_text() == "only copy" and lane.is_dir() and "removed: 1" not in text, text
+
+
+@NAMES
+@DIRECTIONS
+def test_the_report_without_a_strict_listing_keeps_every_candidate_not_checked(estate, monkeypatch, direction, name):
+    """Only the report's first strict listing failed, so its list of checkouts comes from the old reader, which turns
+    an accented or U+2028 name into a path that does not exist. The ancestor protection and the lookup of checkouts
+    inside a candidate would both read that list: a checkout that contains the candidate was not seen, and the file in
+    it was deleted. With no trustworthy list the candidate is kept and reported as not checked, in both directions."""
+    repo, wt, cfg = estate
+    first_strict_listing_fails(monkeypatch)
+    report, lane, candidate, unsaved = probe_report(repo, cfg, name, direction)
+
+    text = janitor.apply(cfg, report)
+
+    assert unsaved.read_text() == "only copy" and lane.is_dir() and candidate.is_dir(), text
+    assert report.apply_failed and "removed: 1" not in text, text
+    found = sections(text)
+    (heading,) = [h for h in found if "do not remove them by hand" in h]
+    assert any(
+        candidate.name in line and "fix Git" in line and "run the sweep again" in line for line in found[heading]
+    ), text
+    assert not any("remove it yourself" in h for h in found), text
+
+
+def test_the_preview_says_when_the_list_of_checkouts_could_not_be_trusted(estate, monkeypatch):
+    repo, wt, cfg = estate
+    healthy = janitor.format_report(janitor.build_report(cfg), cfg, apply=False)
+    first_strict_listing_fails(monkeypatch)
+    report = janitor.build_report(cfg)
+
+    text = janitor.format_report(report, cfg, apply=False)
+
+    assert not report.registered_strict and "could not list the registered checkouts reliably" in text, text
+    assert "could not list the registered checkouts reliably" not in healthy, healthy
