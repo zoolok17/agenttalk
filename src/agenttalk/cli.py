@@ -3357,6 +3357,13 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
         _raise_git_write_timeout(proc, timeout, e)  # looks after its own interruptions
+    except Exception:  # an ordinary error before any timeout: no interruption is in flight, so a new one wins
+        try:
+            _kill_and_reap(proc, interruptible=True)
+        except BaseException:
+            _kill_and_reap(proc)
+            raise
+        raise
     except BaseException:
         _kill_and_reap(proc)
         raise
@@ -3369,8 +3376,9 @@ _GIT_STILL_RUNNING = (
 
 
 def _best_effort(step) -> None:
-    """Run one cleanup step. Nothing it raises, a second Ctrl-C or SystemExit included, escapes: the caller is already
-    handling an interruption and that original one must be the one that is raised."""
+    """Run one cleanup step. Nothing it raises, a second Ctrl-C or SystemExit included, is passed on: the caller is
+    already handling an interruption and that original one is the one that should be raised. See `_run_swallowing`
+    and `_sigint_deferred` for the limits."""
     try:
         step()
     except BaseException:  # noqa: BLE001, S110  # nosec B110
@@ -3390,14 +3398,12 @@ def _best_effort_interruptible(step) -> None:
 def _sigint_deferred():
     """While the cleanup of an interruption already being handled runs, a new Ctrl-C is taken by a temporary handler
     and dropped: the first interruption is the one being raised, and a second must not replace it or cut the bounded
-    cleanup short. The previous handler is read before anything is installed and put back in a finally, also when
-    the install failed or was interrupted part-way; then the cleanup simply goes on without the deferral.
+    cleanup short. The previous handler is read before anything is installed and put back in a finally.
 
-    The limit, plainly: a new Ctrl-C delivered by the operating system during the cleanup is deferred on the main
-    thread. Python can only change handlers there, so off the main thread nothing is deferred (a Ctrl-C is only
-    delivered to the main thread anyway), and one that lands while the handler is being installed cannot be. An
-    exception that code raises by itself at an arbitrary point is not something Python lets us fully guard; see
-    `_run_swallowing` for what is."""
+    Limits, plainly: a main-thread OS Ctrl-C is suppressed while the temporary handler is installed. Installation
+    failures still let cleanup continue; a partly installed handler can stay active until restoration. Python can
+    only change handlers on the main thread, so nothing is deferred elsewhere (a Ctrl-C is only delivered to the
+    main thread anyway). Entry, exit and handler transitions are not an arbitrary-exception guarantee."""
     import signal
 
     previous = signal.getsignal(signal.SIGINT)
@@ -3405,8 +3411,9 @@ def _sigint_deferred():
         try:
             signal.signal(signal.SIGINT, lambda signum, frame: None)
         except BaseException:  # noqa: BLE001, S110  # nosec B110
-            # Not the main thread, the install failed, or it was itself interrupted: the cleanup goes on without the
-            # deferral, and the original interruption is still the one raised by the caller.
+            # Not the main thread, the install failed, or it was itself interrupted: the cleanup still continues (a
+            # partly installed handler can stay active until the finally restores the previous one), and the original
+            # interruption is still the one raised by the caller.
             pass
         yield
     finally:
@@ -3415,17 +3422,20 @@ def _sigint_deferred():
 
 
 def _run_swallowing(steps) -> None:
-    """Run every cleanup step even if an exception is raised between two of them (outside the steps' own guards).
+    """Run the cleanup steps through one guarded dispatcher, so that an exception raised between two of them (outside
+    the steps' own guards) does not replace the interruption being handled.
 
-    All of the loop control (the condition, the choice of the step, the call) is inside one try. A step may repeat,
-    never be skipped: it is marked as started by its own first action, inside `_best_effort`, so an exception on any
-    line of the loop keeps the original interruption, a step that was not started (or whose start was interrupted) is
-    run on the next pass, and one that was started is not run again. Steps are safe to repeat (a kill, a reap and a
-    wait can all be asked twice). The passes are limited, so a fault that keeps coming cannot loop for ever.
+    All of the loop control (the condition, the choice of the step, the call) is inside one try. A step is marked as
+    started by its own first action, inside `_best_effort`; a step that was not started is run on the next pass and
+    one that was started is not run again. Steps are safe to repeat (a kill, a reap and a wait can all be asked
+    twice). The passes are limited.
 
-    The limit, plainly: the few lines that set the loop up, the `try` that starts a pass and the `return` that ends
-    it are outside any guard, and Python offers no way to guard them; an exception that code raises there by itself
-    escapes."""
+    Limits, plainly: one-off failures in the guarded dispatcher are retried while the budget permits. Arbitrary
+    injected exceptions at step marking or entry can leave an operation unattempted; recurring dispatcher failures
+    can exhaust the budget; faults that stop the counter or limit check progressing can defeat that bound. Entry,
+    exit and handler transitions are not an arbitrary-exception guarantee: the few lines that set the loop up, the
+    `try` that starts a pass and the `return` that ends it are outside any guard, and Python offers no way to guard
+    them."""
     started, passes = set(), 0
     while True:
         try:
@@ -3455,10 +3465,10 @@ def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
     timed-out reap is followed by wait(), which does not touch the pipes. Each step is bounded.
     Nothing here confirms that the launcher stopped: with a kill and a reap that keep failing it is left running.
 
-    While an interruption is already being handled (the default) nothing escapes, a second Ctrl-C included: the
-    first one must be the one that is raised. With ``interruptible`` (the caller has no interruption in flight) an
-    interruption that arrives during a step stops the cleanup at once and propagates, so the caller can do its own
-    bounded cleanup and raise it.
+    While an interruption is already being handled (the default) a second Ctrl-C is swallowed so that the first one
+    is the one that is raised (see `_run_swallowing` and `_sigint_deferred` for the limits). With ``interruptible``
+    (the caller has no interruption in flight) an interruption that arrives during a step stops the cleanup at
+    once and propagates, so the caller can do its own bounded cleanup and raise it.
     """
     state = {"running": True, "reaped": False}  # running stays True when poll() fails: cannot tell, so act
 

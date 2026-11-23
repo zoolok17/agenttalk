@@ -126,6 +126,7 @@ class _Launcher:
         wait_error=None,
         kill_error=None,
         fallback=None,
+        first_error=None,
     ):
         self.interrupt, self.interrupt_in_wait = interrupt, interrupt_in_wait
         # An ordinary error (not an interruption) raised after the timeout, by the reap, the wait or the kill.
@@ -138,6 +139,7 @@ class _Launcher:
         # (step, error): after the reap failed with an ordinary error, the fallback's first attempt is interrupted
         # at that step ("communicate" or "wait"); the cleanup that follows then works normally.
         self.fallback, self.phase = fallback, "normal"
+        self.first_error = first_error  # an ordinary error from the FIRST communicate (before any timeout)
 
     def _maybe_fail(self, step):
         error = self.fail.get(step) if self.cleanup else None
@@ -157,6 +159,8 @@ class _Launcher:
     def communicate(self, timeout=None):
         self.communicates += 1
         if self.communicates == 1:
+            if self.first_error is not None:
+                raise self.first_error
             self.first_timeout = subprocess.TimeoutExpired("git", timeout)
             raise self.first_timeout
         if self.communicates == 2:
@@ -524,6 +528,28 @@ def test_a_failed_install_that_changed_nothing_is_not_followed_by_a_restore(monk
     with cli._sigint_deferred():
         pass
     assert len(calls) == 1
+
+
+def test_an_ordinary_error_from_the_first_communicate_is_still_raised_after_the_cleanup(tmp_path, monkeypatch):
+    launcher = _Launcher(first_error=OSError("pipe broke before any timeout"))
+    with pytest.raises(OSError, match="pipe broke"):
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert launcher.killed == 1 and launcher.communicates == 2  # the launcher was still killed and reaped
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt("during-cleanup"), SystemExit("during-cleanup")])
+def test_an_interruption_during_the_cleanup_after_an_ordinary_first_error_wins_over_that_error(
+    tmp_path, monkeypatch, interruption
+):
+    """The first communicate() fails with an ordinary error before any timeout, so no interruption is in flight; a
+    Ctrl-C (or exit request) during the kill and reap that follow is what is raised (as before this change), after
+    the bounded swallow-all cleanup, and not the ordinary error."""
+    launcher = _Launcher(first_error=OSError("pipe broke before any timeout"), interrupt=True)
+    monkeypatch.setitem(globals(), "_FIRST", interruption)  # what the stand-in raises from its second communicate
+    with pytest.raises(BaseException) as raised:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert raised.value is interruption and not isinstance(raised.value, OSError)
+    assert launcher.killed == 2 and launcher.communicates == 3  # the interruptible pass, then the swallow-all one
 
 
 def test_a_real_ctrl_c_during_the_interruption_cleanup_is_deferred_and_the_handler_restored(tmp_path, monkeypatch):

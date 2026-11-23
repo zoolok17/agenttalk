@@ -74,9 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recognises the timeout and keeps its checkout. No program (such as `taskkill.exe`) is launched while this
   is handled. Pressing Ctrl-C at any point during the timeout handling now makes a best-effort attempt to
   kill and reap the launcher, step by step (it may not succeed if the kill and the reap keep failing), and
-  raises the original interruption, even if a clean-up step fails or a second Ctrl-C arrives; this
-  stronger clean-up applies on every platform, while the timeout message itself is unchanged outside
-  Windows. A partial checkout or lock may still need recovery. Stopping the programs Git started, by making
+  raises the original interruption; a failing clean-up step or a second Ctrl-C from the keyboard is not
+  meant to replace it (best effort, with limits stated in the code); this stronger clean-up applies on
+  every platform, while the timeout message itself is unchanged outside Windows. A partial checkout or lock may still need recovery. Stopping the programs Git started, by making
   them members of a job that ends with the launcher, is a planned follow-up (#907).
 
 - **The release checklist now names the README as the only install pin.** Since the user manuals
