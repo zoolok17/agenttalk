@@ -34,10 +34,10 @@ def names(world):
     return [entry[0] for entry in world.log]
 
 
-def after_the_first_stop(world):
-    """The log from the first job stop on: the time-out handling, without the start."""
+def the_timeout_handling(world):
+    """The log from the write's own wait on: the time-out handling, without the start."""
     log = names(world)
-    return log[log.index("terminate") :]
+    return log[log.index("communicate") :]
 
 
 def timeout_error(tmp_path):
@@ -105,14 +105,27 @@ def test_no_unrelated_process_is_stopped_in_history(monkeypatch, tmp_path, name)
 
     world.hooks["communicate"] = [the_command_runs_for_a_while]
 
-    error = timeout_error(tmp_path)
+    timeout_error(tmp_path)
 
-    assert STOPPED in str(error)
     assert all(world.alive(pid) for pid, _p, _c in unrelated), "an unrelated process was stopped"
     assert not world.alive(LAUNCHER_PID)
-    assert all(not world.alive(pid) for pid, _p, _c in members), "a member of the job was not stopped"
     assert world.forbidden == [] and wall.reads == []  # no id, no parent, no creation time, no wall clock was read
-    assert world.violations == [] and world.closed == {JOB}
+    assert world.violations == []
+
+
+@pytest.mark.parametrize("name", [n for n, row in HISTORIES.items() if row[1]])
+def test_the_real_children_in_a_history_are_stopped_with_the_job(monkeypatch, tmp_path, name):
+    """The same histories, looked at from the other side: Git's real children are members, so they end."""
+    unrelated, members, _launch, _stop_sample, _elapsed, _verify = HISTORIES[name]
+    world = make(monkeypatch)
+    for pid, parent, created in unrelated:
+        world.add_process(pid, parent, created)
+    for pid, parent, created in members:
+        world.add_process(pid, parent, created, member=True)
+    assert STOPPED in str(timeout_error(tmp_path))
+    assert all(not world.alive(pid) for pid, _p, _c in members), "a member of the job was not stopped"
+    assert all(world.alive(pid) for pid, _p, _c in unrelated)
+    assert world.closed == {JOB}
 
 
 @pytest.mark.parametrize(
@@ -296,7 +309,7 @@ def test_the_close(monkeypatch, tmp_path, pending, when, kind):
 def test_normal_timeout_stops_the_job_then_kills_reaps_and_counts(monkeypatch, tmp_path):
     world = make(monkeypatch, (("timeout",), ("return", "", "git said no")))
     error = timeout_error(tmp_path)
-    assert after_the_first_stop(world) == ["terminate", "kill", "communicate", "query", "close"]
+    assert the_timeout_handling(world) == ["communicate", "terminate", "kill", "communicate", "query", "close"]
     assert world.log[-1] == ("close", JOB)  # the job is closed last, after the count
     assert str(error) == (
         f"mutating git timed out after 0.01s; {STOPPED}: git said no; "
@@ -308,7 +321,7 @@ def test_normal_timeout_stops_the_job_then_kills_reaps_and_counts(monkeypatch, t
 def test_reap_timeout_after_a_job_stop(monkeypatch, tmp_path):
     world = make(monkeypatch, (("timeout",), ("timeout",)))
     error = timeout_error(tmp_path)
-    assert after_the_first_stop(world) == ["terminate", "kill", "communicate", "wait", "query", "close"]
+    assert the_timeout_handling(world) == ["communicate", "terminate", "kill", "communicate", "wait", "query", "close"]
     assert "could not be reaped" in str(error) and str(error).endswith(f"; {STOPPED}")
     assert WARNING not in str(error)
     assert isinstance(error.__context__, subprocess.TimeoutExpired)
@@ -320,7 +333,16 @@ def test_ordinary_error_fallback_stops_the_job_first(monkeypatch, tmp_path):
     last. (The order is the point: a count after the close would be a read through a closed handle.)"""
     world = make(monkeypatch, (("timeout",), ("raise", RuntimeError("simulated pipe failure"))))
     error = timeout_error(tmp_path)
-    assert after_the_first_stop(world) == ["terminate", "kill", "communicate", "terminate", "poll", "query", "close"]
+    assert the_timeout_handling(world) == [
+        "communicate",
+        "terminate",
+        "kill",
+        "communicate",
+        "terminate",
+        "poll",
+        "query",
+        "close",
+    ]
     assert names(world).count("close") == 1 and world.violations == []
     assert "could not be reaped" in str(error) and "simulated pipe failure" in str(error)
     assert str(error).endswith(f"; {STOPPED}")
@@ -341,7 +363,15 @@ def test_interruption_fallback_stops_the_job(monkeypatch, tmp_path):
     with pytest.raises(KeyboardInterrupt) as raised:
         run_write(tmp_path)
     assert raised.value is first
-    assert after_the_first_stop(world) == ["terminate", "kill", "communicate", "terminate", "poll", "close"]
+    assert the_timeout_handling(world) == [
+        "communicate",
+        "terminate",
+        "kill",
+        "communicate",
+        "terminate",
+        "poll",
+        "close",
+    ]
     assert world.closed == {JOB} and world.violations == []
 
 
