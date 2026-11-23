@@ -328,6 +328,59 @@ def test_an_interruption_before_the_check_never_stops_an_unverified_process(erro
     world.assert_handles_closed()
 
 
+def test_a_failing_stop_during_an_interruption_does_not_skip_the_other_verified_processes():
+    world = World((101, 100, 1100), (102, 101, 1200), (103, 100, 1150))
+    real_terminate = world.terminate
+    calls = {"n": 0}
+
+    def flaky(handle):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("one stop fails")
+        return real_terminate(handle)
+
+    def interrupt(n, listing):
+        if n == 5:  # after both levels were verified and held, before anything was stopped
+            raise KeyboardInterrupt
+        return None
+
+    world.terminate = flaky
+    world.listing_hook = interrupt
+    with pytest.raises(KeyboardInterrupt):
+        world.stop()
+    # The first stop failed; every other verified process was still asked, and the handles are closed.
+    assert calls["n"] == 4 and len(world.terminated) == 3
+    world.assert_handles_closed()
+
+
+def test_a_cleanup_error_during_an_interruption_never_replaces_it():
+    world = World((101, 100, 1100))
+
+    def interrupt(n, listing):
+        if n == 3:
+            raise KeyboardInterrupt
+        return None
+
+    world.listing_hook = interrupt
+    world.terminate = lambda handle: 1 / 0
+    world.close = lambda handle: (_ for _ in ()).throw(OSError("close failed"))
+    with pytest.raises(KeyboardInterrupt):
+        world.stop()
+
+
+def test_tree_stop_object_can_stop_held_processes_after_the_run_and_closes_idempotently():
+    world = World((101, 100, 1100))
+    world.procs[101].hang = True  # the stop is accepted but 101 does not end: not confirmed, still held
+    tree = wts.TreeStop(world.proc, native=world)
+    assert tree.run() is False
+    world.procs[101].hang = False
+    tree.stop_held()  # what an interruption during the reap does
+    assert not world.alive(101)
+    tree.close()
+    tree.close()
+    world.assert_handles_closed()
+
+
 def test_a_bug_in_the_native_layer_is_not_confirmed_not_a_crash():
     world = World((101, 100, 1100))
     world.terminate = lambda handle: 1 / 0

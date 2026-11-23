@@ -240,6 +240,11 @@ class _Walk:
             except Exception:
                 self.ok = False
 
+    def stop_held(self) -> None:
+        for node in sorted(self.nodes, key=lambda n: n.depth, reverse=True):
+            with contextlib.suppress(Exception):
+                self.native.terminate(node.handle)
+
     def release(self) -> None:
         for handle in self.pending:
             self._close(handle)
@@ -250,52 +255,76 @@ class _Walk:
         self.nodes.clear()
 
 
-def stop_process_tree(
-    proc: Any,
-    *,
-    native: Any = None,
-    deadline_seconds: float = STOP_DEADLINE_SECONDS,
-    recheck_passes: int = MAX_RECHECK_PASSES,
-) -> bool:
-    """Stop ``proc`` and its descendants. True only if the stop is confirmed; never raises ``Exception``.
+class TreeStop:
+    """One stop attempt, split so the caller can still act on what was verified.
 
-    ``proc`` is the ``subprocess.Popen`` agenttalk started: its own handle is used, so the
-    launcher is never reopened by process id, and its id cannot be reused while Popen holds it.
-    An interruption (``KeyboardInterrupt``, ``SystemExit``) stops what is already verified,
-    closes every handle taken here, and is raised again.
+    ``run()`` stops the tree and answers whether the stop is confirmed. The handles stay open
+    afterwards, so that an interruption in the caller's own follow-up (the reap) can still call
+    ``stop_held()``; the caller must call ``close()`` when it is done. ``run()`` never raises
+    ``Exception``. On an interruption (``KeyboardInterrupt``, ``SystemExit``) it stops what is
+    already verified and raises the interruption again; handles stay open for ``close()``.
     """
-    try:
-        launcher = int(proc._handle)  # noqa: SLF001  # the handle Popen already holds
-        if native is None:
-            native = _default_native()
-        walk = _Walk(native, time.monotonic() + deadline_seconds)
-        created = native.creation_time(launcher)
-    except Exception:
-        return False
-    if created is None:
-        return False
-    root = _Node(int(proc.pid), launcher, created, 0, False)
-    walk.nodes.append(root)
-    try:
+
+    def __init__(
+        self,
+        proc: Any,
+        *,
+        native: Any = None,
+        deadline_seconds: float = STOP_DEADLINE_SECONDS,
+        recheck_passes: int = MAX_RECHECK_PASSES,
+    ) -> None:
+        self._proc = proc
+        self._native = native
+        self._deadline_seconds = deadline_seconds
+        self._recheck_passes = recheck_passes
+        self._walk: _Walk | None = None
+
+    def run(self) -> bool:
+        try:
+            launcher = int(self._proc._handle)  # noqa: SLF001  # the handle Popen already holds
+            native = self._native if self._native is not None else _default_native()
+            walk = _Walk(native, time.monotonic() + self._deadline_seconds)
+            created = native.creation_time(launcher)
+        except Exception:
+            return False
+        if created is None:
+            return False
+        self._walk = walk
+        root = _Node(int(self._proc.pid), launcher, created, 0, False)
+        walk.nodes.append(root)
         try:
             # The launcher is walked even if it has already ended: a child holding the output
             # pipes is the usual reason the reap after a timeout fails.
             walk.stop(walk.discover([root]) + [root])
-            for _ in range(recheck_passes):
+            for _ in range(self._recheck_passes):
                 fresh = walk.discover(list(walk.nodes))
                 if not fresh:
                     return walk.ok  # a pass that accepted nothing: confirmed unless a step failed
                 walk.stop(fresh)
             return False  # still finding processes after the last pass
-        except BaseException as interruption:
-            if not isinstance(interruption, Exception):
-                with contextlib.suppress(Exception):
-                    for node in sorted(walk.nodes, key=lambda n: n.depth, reverse=True):
-                        walk.native.terminate(node.handle)
-                raise
+        except Exception:
             return False
+        except BaseException:
+            self.stop_held()
+            raise
+
+    def stop_held(self) -> None:
+        """Ask every verified process to stop, deepest first. One failure never skips the rest."""
+        if self._walk is not None:
+            self._walk.stop_held()
+
+    def close(self) -> None:
+        if self._walk is not None:
+            self._walk.release()
+
+
+def stop_process_tree(proc: Any, **options: Any) -> bool:
+    """Stop ``proc`` and its descendants and close every handle. True only if the stop is confirmed."""
+    tree = TreeStop(proc, **options)
+    try:
+        return tree.run()
     finally:
-        walk.release()
+        tree.close()
 
 
 def _default_native() -> Any:

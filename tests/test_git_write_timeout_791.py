@@ -178,6 +178,46 @@ def test_an_interruption_during_the_reap_kills_and_reaps_the_launcher_and_is_rai
     world.assert_handles_closed()
 
 
+def test_a_cleanup_error_never_replaces_the_interruption_in_the_timeout_path(tmp_path, monkeypatch):
+    from test_windows_tree_stop_791 import World
+
+    world = World((101, 100, 1100))
+
+    def interrupt(w, p, ms):
+        raise KeyboardInterrupt
+
+    world.on_wait = interrupt
+    git = _TimedOutGit(reap="kill-error")  # the launcher kill fails
+    original_communicate = git.communicate
+
+    def broken_reap(timeout=None):
+        if git.count >= 1:
+            git.count += 1
+            raise OSError("the reap itself failed")
+        return original_communicate(timeout=timeout)
+
+    git.communicate = broken_reap
+    with pytest.raises(KeyboardInterrupt):
+        _windows_timeout(tmp_path, monkeypatch, world, git)
+    world.assert_handles_closed()
+
+
+def test_an_interruption_during_the_reap_stops_the_verified_processes_that_survived_the_stop(tmp_path, monkeypatch):
+    from test_windows_tree_stop_791 import World
+
+    world = World((101, 100, 1100))
+    world.procs[101].hang = True  # the stop is not confirmed: 101 is verified, held and still alive
+    git = _TimedOutGit(reap="interrupt")
+    real_terminate = world.terminate
+    asked = []
+    world.terminate = lambda handle: (asked.append(world.handles[handle].pid), real_terminate(handle))[1]
+    with pytest.raises(KeyboardInterrupt):
+        _windows_timeout(tmp_path, monkeypatch, world, git)
+    assert asked.count(101) == 2  # once in the stop, once more by the interruption cleanup
+    assert git.killed >= 1
+    world.assert_handles_closed()
+
+
 def test_posix_timeout_keeps_direct_kill_and_original_message(tmp_path, monkeypatch):
     class PosixOS:
         name = "posix"
@@ -326,7 +366,7 @@ def test_filter_process_tree_stopped_or_warned_before_return(tmp_path, monkeypat
             patch.setattr(cli.subprocess, "Popen", popen)
             if not tree_stop:
                 # the stop is not confirmed: only the launcher is killed, so a child must survive
-                patch.setattr(windows_tree_stop, "stop_process_tree", lambda proc: False)
+                patch.setattr(windows_tree_stop.TreeStop, "run", lambda self: False)
             try:
                 with pytest.raises(cli.GitWriteError) as error:
                     cli._git_write(
