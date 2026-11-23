@@ -336,3 +336,46 @@ def test_dead_letter_requeue_refuses_a_nested_requeue_record_and_publishes_nothi
     assert cli.main(["--root", str(tmp_path), *DEAD_LETTER_COMMANDS["requeue"](mid)]) == 2
     assert "cannot be read" in capsys.readouterr().err
     assert store.messages_for("codex") == []
+
+
+# --- the requeue record is the kind master gives its own class and route (#891): too deep is "damaged" too -------
+
+
+@pytest.mark.parametrize("label", ["malformed", "deep"])
+def test_a_nested_requeue_record_raises_the_damaged_class_like_a_malformed_one(tmp_path, too_deep, label):
+    """Master gives a requeue record that cannot be parsed its own class, `RequeueStateDamaged` ("an explicit replay can
+    replace it"); the class, not only the message, decides what the caller offers. A too-deep record must be that class
+    too, with the same message shape."""
+    from agenttalk import store as store_mod
+
+    store, mid = _dead_letter(tmp_path, kind="task", record=MALFORMED if label == "malformed" else too_deep)
+    with pytest.raises(store_mod.RequeueStateDamaged, match="cannot be read .*; nothing was published") as raised:
+        store._read_requeue_state("codex", mid)
+    assert type(raised.value) is store_mod.RequeueStateDamaged  # the damaged class itself, not a wider or other one
+
+
+def test_a_nested_requeue_record_needs_explicit_again_and_is_replaced_like_a_damaged_one(
+    tmp_path, monkeypatch, capsys, too_deep
+):
+    """Through the command that gives the replay advice: both records refuse a plain requeue with the `--again` advice,
+    and an explicit replay replaces each, recorded as having followed an unreadable record."""
+    from test_dead_letter import _dead_payload, _requeue, _requeue_store, _send
+
+    seen = {}
+    for label, text in (("damaged", MALFORMED), ("deep", too_deep)):
+        folder = tmp_path / label
+        folder.mkdir()
+        store = _requeue_store(folder, monkeypatch, False)
+        original = _send(store, "body")
+        _dead_payload(store, original)
+        store._requeue_state_path("beta", original.id).write_bytes(text.encode("utf-8"))
+        assert _requeue(store, original) == 2
+        refusal = capsys.readouterr().err
+        assert "--again --reason TEXT" in refusal and "new request id" not in refusal
+        assert "cannot be read" in refusal
+        assert _requeue(store, original, "--again", "--reason", "repair") == 0
+        capsys.readouterr()
+        copies = store.messages_for("beta")
+        seen[label] = (len(copies), copies[-1].meta["requeued_again_after"])
+    assert seen["deep"] == seen["damaged"] == (1, "unreadable")
+

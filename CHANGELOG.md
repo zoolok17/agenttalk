@@ -193,7 +193,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `message_json_invalid` code is unchanged). `prune --invalid` moves it into the quarantine folder
   like any invalid file; it never deletes. The same fix covers three more readers that had the same
   weakness: `dead-letter show` (prints `<unreadable payload>`), `dead-letter requeue` (refuses, and
-  publishes nothing, for a damaged stored message, or for a damaged requeue record of a task) and the note file that
+  publishes nothing, for a damaged stored message, or for a damaged requeue record of a task, which an explicit
+  `--again --reason TEXT` replaces, a too-deep record included) and the note file that
   `dead-letter list` reads beside a dead letter (the letter is still listed). No exit code and no
   `--json` shape changes. Not changed here: the message scan has no file size limit
   (checkpoints do), and a message that parses but has a deeply nested field is handled as before.

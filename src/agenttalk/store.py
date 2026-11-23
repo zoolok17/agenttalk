@@ -5248,8 +5248,8 @@ class Store:
             raise RequeueStateDamaged(
                 f"{escape_controls(path)} cannot be read ({escape_controls(exc)}); nothing was published."
             ) from exc
-        except RecursionError as exc:  # nested too deeply to read: the same refusal (#874)
-            raise RequeueRefused(
+        except RecursionError as exc:  # nested too deeply to read: damaged like any other unreadable record (#874)
+            raise RequeueStateDamaged(
                 f"{escape_controls(path)} cannot be read (nested too deeply); nothing was published."
             ) from exc
         if not (
