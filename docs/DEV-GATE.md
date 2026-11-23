@@ -325,8 +325,9 @@ per mode with two workers; their faster runs do not need the extra collection
 step. Local prechecks also keep one full run per mode.
 
 Group A is exactly `tests/test_acceptance.py`, `tests/test_lanes.py`,
-`tests/test_supervisor.py`, `tests/test_web.py`, `tests/test_cli.py` and
-`tests/test_owed_action_detection.py`, declared in `checks.pytest.windows_group_a`.
+`tests/test_supervisor.py`, `tests/test_web.py`, `tests/test_cli.py`,
+`tests/test_owed_action_detection.py` and `tests/test_lane_checkout_paths.py`,
+declared in `checks.pytest.windows_group_a`.
 Group B selects `tests` with one `--ignore` for each A file. New test files land
 in B by default. A missing or renamed A file blocks the mode before tests run.
 

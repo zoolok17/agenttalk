@@ -18,6 +18,7 @@ GROUP_A = [
     "tests/test_web.py",
     "tests/test_cli.py",
     "tests/test_owed_action_detection.py",
+    "tests/test_lane_checkout_paths.py",
 ]
 
 

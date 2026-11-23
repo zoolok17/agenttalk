@@ -51,6 +51,7 @@ WINDOWS_GROUP_A = [
     "tests/test_web.py",
     "tests/test_cli.py",
     "tests/test_owed_action_detection.py",
+    "tests/test_lane_checkout_paths.py",
 ]
 # #378: each Windows CI leg runs as these jobs, one package mode and one test group each, so no job comes near the
 # hosted six-hour limit. The aggregate expects every part of every Windows leg.
