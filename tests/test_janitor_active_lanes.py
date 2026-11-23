@@ -723,6 +723,20 @@ def test_a_candidate_whose_delete_failed_still_gets_the_old_advice(estate, monke
     assert not [h for h in found if "do not remove them by hand" in h], text
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot make a folder whose name ends in a backslash")
+def test_the_sweep_keeps_a_checkout_whose_name_ends_in_a_backslash_when_a_record_names_a_missing_child(estate):
+    """Native on Linux and macOS: the record names a child that is not there, below a checkout whose name ends in a
+    literal backslash. Master keeps the checkout (the child is below it); so does the sweep."""
+    repo, wt, cfg = estate
+    odd = checkout(repo, "odd\\", branch="lane/odd")
+    _write_record(repo, "active-lane", odd / "gone")
+
+    report, text = sweep(cfg)
+
+    assert (odd / "source.txt").exists(), text
+    assert odd.is_dir(), text
+
+
 # ------------------------------------------------ the checkouts under a candidate are compared without lossy decoding
 
 

@@ -424,6 +424,12 @@ def _placed(path: Path) -> str:
             missing.append(name)
             current = parent
     token = lanes.canonical_host_path_checked(current)
+    if os.name != "nt":
+        # The shared token turns a literal backslash of a POSIX name into "/": `co\\` and `co/` become one token, and a
+        # name that ends in a backslash gets a trailing "/", so nothing placed below it starts with `token + "/"` and
+        # a missing child was judged unrelated. Here the exact POSIX path is compared, as master does with its path
+        # ancestry. The shared function has just resolved this same part and made its checks, so this cannot differ.
+        token = os.path.realpath(current, strict=True)
     if missing:
         if not stat.S_ISDIR(os.stat(current).st_mode):
             raise NotADirectoryError(errno.ENOTDIR, "cannot be placed: the part that exists is not a folder", current)

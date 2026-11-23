@@ -2715,7 +2715,15 @@ class _OsWithRules:
     one name in `appears` is looked at as if it had just been created: the real folder `like` answers for it."""
 
     def __init__(self, name, sep, altsep, path_module, like):
-        self.name, self.sep, self.altsep, self.path = name, sep, altsep, path_module
+        class Path:  # the other platform's path module, whose `realpath` here answers with the path as given
+            def __getattr__(self, key):
+                return getattr(path_module, key)
+
+            @staticmethod
+            def realpath(path, strict=False):
+                return os.fspath(path)
+
+        self.name, self.sep, self.altsep, self.path = name, sep, altsep, Path()
         self._like, self.appears = like, None
 
     def __getattr__(self, key):
@@ -2770,6 +2778,116 @@ def test_an_absent_recorded_name_with_a_trailing_separator_is_watched_without_it
 
     _shim, seen = _watch_a_missing_name(tmp_path, monkeypatch, ("nt", "\\", "/", ntpath), name)
     assert [os.path.normcase(entry) for entry in seen] == [os.path.normcase(os.path.join(os.fspath(tmp_path), "gone"))]
+
+
+# --- a checkout whose name ends in a backslash (a POSIX name): a missing child below it still names it ---------------
+
+
+def _odd_checkout(repo, wt, name):
+    where = wt.parent / name
+    git(repo, "worktree", "add", "-q", "-b", "lane/odd", str(where))
+    return where
+
+
+@pytest.mark.parametrize("name", ["second", pytest.param("second\\", id="trailing-backslash")])
+def test_a_record_naming_a_missing_child_of_a_checkout_keeps_it(estate, name):
+    """The control (an ordinary name) and the shape that Windows cannot make (a name ending in a literal backslash,
+    run natively on Linux and macOS): a record naming a child that is not there still names the checkout below which it
+    would be, so release keeps it."""
+    if name.endswith("\\") and os.name == "nt":
+        pytest.skip("Windows cannot make a folder whose name ends in a backslash")
+    repo, wt, cfg = estate
+    odd = _odd_checkout(repo, wt, name)
+    _write_record(repo, "active-lane", odd / "gone")
+
+    code, text = run(cfg, odd)
+
+    assert code != 0 and "KEPT" in text, text
+    assert odd.is_dir() and (odd / "source.txt").exists()
+
+
+class _FakePosixFolders:
+    """A tiny POSIX file system seen by `worktree_release` and `lanes` (so a folder named `co\\` can be had
+    on any host): `folders` are the paths that exist. Every other call is the real one."""
+
+    def __init__(self, monkeypatch, tmp_path, folders):
+        import pathlib
+        import posixpath
+
+        from agenttalk import lanes
+
+        self.exists = set(folders)
+        some_folder = os.lstat(tmp_path)
+        outer = self
+
+        def lstat(path, *args, **kwargs):
+            if os.fspath(path) in outer.exists:
+                return some_folder
+            raise FileNotFoundError(2, "absent", os.fspath(path))
+
+        class Path:
+            def __getattr__(self, key):
+                return getattr(posixpath, key)
+
+            @staticmethod
+            def realpath(path, strict=False):
+                if strict and os.fspath(path) not in outer.exists:
+                    raise FileNotFoundError(2, "absent", os.fspath(path))
+                return os.fspath(path)
+
+        class FakeOs:
+            name, sep, altsep, path = "posix", "/", None, Path()
+
+            def __getattr__(self, key):
+                return getattr(os, key)
+
+        FakeOs.lstat = staticmethod(lstat)
+        FakeOs.stat = staticmethod(lstat)
+
+        def token(value):  # `lanes._canonical_token` on POSIX: absolute, and every backslash becomes a slash
+            if os.fspath(value) not in outer.exists:
+                raise FileNotFoundError(2, "absent", os.fspath(value))
+            return posixpath.abspath(os.fspath(value)).replace("\\", "/")
+
+        monkeypatch.setattr(worktree_release, "os", FakeOs())
+        monkeypatch.setattr(worktree_release, "Path", pathlib.PurePosixPath)
+        monkeypatch.setattr(lanes, "canonical_host_path_checked", token)
+        self.purepath = pathlib.PurePosixPath
+
+    def names(self, checkout, recorded):
+        """Whether a record naming `recorded` names the checkout `checkout`, by the code under test."""
+        return worktree_release._names_checkout(
+            {"worktree_path": recorded}, self.purepath(checkout), self.purepath("/w/repo"), lane_id=None
+        )
+
+    def master_names(self, checkout, recorded):
+        """What master decides for the same two paths: `resolve()` and path ancestry, no token."""
+        where = self.purepath(recorded)
+        return self.purepath(checkout) in (where, *where.parents)
+
+
+_CHECKOUT_CASES = [
+    # (the checkout, the recorded path, the folders that exist, what master says)
+    ("/w/co\\", "/w/co\\/gone", ["/w", "/w/co\\"], True),  # the shape: a missing child of a name ending in `\`
+    ("/w/co\\", "/w/co\\/a/b", ["/w", "/w/co\\"], True),  # two missing parts
+    ("/w/co\\", "/w/co\\", ["/w", "/w/co\\"], True),  # the checkout itself
+    ("/w/co", "/w/co/gone", ["/w", "/w/co"], True),  # the ordinary name: unchanged
+    ("/w/co\\", "/w/other/gone", ["/w", "/w/co\\", "/w/other"], False),  # unrelated
+    ("/w/co\\", "/w/co/gone", ["/w", "/w/co\\", "/w/co"], False),  # a different folder `co`, not `co\`
+]
+
+
+@pytest.mark.parametrize("checkout, recorded, folders, expected", _CHECKOUT_CASES)
+def test_a_missing_child_of_a_backslash_named_checkout_is_judged_as_master_judges_it(
+    tmp_path, monkeypatch, checkout, recorded, folders, expected
+):
+    """The comparison, on a stand-in POSIX file system (a real run of this shape is the native test above, on Linux and
+    macOS): the check and master agree on every case, among them the one that was lost, a missing child of a checkout
+    whose name ends in a backslash (the shared token turns that backslash into a slash, so the child was placed beside
+    the checkout and not below it)."""
+    world = _FakePosixFolders(monkeypatch, tmp_path, folders)
+    assert world.master_names(checkout, recorded) is expected
+    assert world.names(checkout, recorded) is expected
 
 
 def test_a_recorded_path_that_stays_absent_through_the_final_check_still_lets_release_go_on(estate):
