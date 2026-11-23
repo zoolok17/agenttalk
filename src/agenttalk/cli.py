@@ -3390,36 +3390,59 @@ def _best_effort_interruptible(step) -> None:
 def _sigint_deferred():
     """While the cleanup of an interruption already being handled runs, a new Ctrl-C is taken by a temporary handler
     and dropped: the first interruption is the one being raised, and a second must not replace it or cut the bounded
-    cleanup short. The previous handler is restored afterwards. Limits: Python can only change handlers from the
-    main thread (elsewhere nothing is deferred, but a Ctrl-C is only delivered to the main thread anyway), and one
-    that lands between the call that installs the handler and its return cannot be deferred."""
+    cleanup short. The previous handler is read before anything is installed and put back in a finally, also when
+    the install failed part-way.
+
+    The limit, plainly: a new Ctrl-C delivered by the operating system during the cleanup is deferred on the main
+    thread. Python can only change handlers there, so off the main thread nothing is deferred (a Ctrl-C is only
+    delivered to the main thread anyway), and one that lands while the handler is being installed cannot be. An
+    exception that code raises by itself at an arbitrary point is not something Python lets us fully guard; see
+    `_run_swallowing` for what is."""
     import signal
 
+    previous = signal.getsignal(signal.SIGINT)
     try:
-        previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
-    except (ValueError, OSError):  # not the main thread
-        yield
-        return
-    try:
+        try:
+            signal.signal(signal.SIGINT, lambda signum, frame: None)
+        except (ValueError, OSError):  # not the main thread, or the install failed
+            pass
         yield
     finally:
-        signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
+        if signal.getsignal(signal.SIGINT) is not previous:  # also covers an install that failed after it took effect
+            signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
 
 
 def _run_swallowing(steps) -> None:
-    """Run every cleanup step even if an interruption lands between two of them (outside the steps' own guards).
+    """Run every cleanup step even if an exception is raised between two of them (outside the steps' own guards).
 
-    The position is advanced before a step runs, so a step is never repeated and none is skipped: whatever is raised
-    in the gaps is dropped and the loop goes on with the next step."""
-    index = 0
-    while index < len(steps):
+    All of the loop control (the condition, the choice of the step, the call) is inside one try. A step is marked as
+    started by its own first action, inside `_best_effort`, so an exception on any line of the loop keeps the
+    original interruption and no step is skipped: a step that was not started is run on the next pass, one that was
+    is not repeated. The passes are limited, so a fault that keeps coming cannot loop for ever.
+
+    The limit, plainly: the few lines that set the loop up, the `try` that starts a pass and the `return` that ends
+    it are outside any guard, and Python offers no way to guard them; an exception that code raises there by itself
+    escapes."""
+    started, passes = set(), 0
+    while True:
         try:
-            while index < len(steps):
-                step = steps[index]
-                index += 1
-                _best_effort(step)
+            passes += 1
+            if passes > 2 * len(steps) + 2:
+                return
+            for position, step in enumerate(steps):
+                if position not in started:
+                    _best_effort(_marking(started, position, step))
+            return
         except BaseException:  # noqa: BLE001, S110  # nosec B110
             pass
+
+
+def _marking(started, position, step):
+    def run() -> None:
+        started.add(position)
+        step()
+
+    return run
 
 
 def _kill_and_reap(proc, *, interruptible: bool = False) -> None:

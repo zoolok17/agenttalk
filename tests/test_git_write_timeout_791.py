@@ -1,7 +1,10 @@
+import ast
+import inspect
 import os
 import shlex
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -316,6 +319,138 @@ def test_an_interruption_between_two_cleanup_steps_never_replaces_the_first_or_s
     assert raised.value is _FIRST
     assert launcher.killed == 2 and launcher.communicates == 3  # the kill and the reap still ran
     assert launcher.waited == (1 if reap_fails else 0)
+
+
+class _CleanupLauncher:
+    """A launcher that only counts what the cleanup does to it."""
+
+    killed = reaped = 0
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        self.killed += 1
+
+    def communicate(self, timeout=None):
+        self.reaped += 1
+        return "", ""
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _lines_of_the_guarded_region():
+    """(line, n): the n-th time the normal path reaches a statement inside the try of the swallow-all loop (a
+    `return` is left out: Python does not run its last instruction inside the try)."""
+    lines, start = inspect.getsourcelines(cli._run_swallowing)
+    function = ast.parse(textwrap.dedent("".join(lines))).body[0]
+    guarded = next(node for node in ast.walk(function) if isinstance(node, ast.Try)).body
+    wanted = {
+        node.lineno + start - 1
+        for statement in guarded
+        for node in ast.walk(statement)
+        if isinstance(node, ast.stmt) and not isinstance(node, ast.Return)  # a `return` is not covered by the try
+    }
+    seen, code = {}, cli._run_swallowing.__code__
+
+    def watch(frame, event, arg):
+        if frame.f_code is code:
+            return watch_lines
+        return None
+
+    def watch_lines(frame, event, arg):
+        if event == "line":
+            seen[frame.f_lineno] = seen.get(frame.f_lineno, 0) + 1
+        return watch_lines
+
+    prior = sys.gettrace()
+    sys.settrace(watch)
+    try:
+        cli._kill_and_reap(_CleanupLauncher())
+    finally:
+        sys.settrace(prior)
+    return [(line, n) for line in sorted(wanted & set(seen)) for n in range(1, seen[line] + 1)]
+
+
+_GUARDED_LINES = _lines_of_the_guarded_region()
+
+
+def test_the_guarded_region_of_the_cleanup_loop_has_lines_to_probe():
+    assert len(_GUARDED_LINES) >= 4, _GUARDED_LINES  # the loop control, the step runner, and the return
+
+
+@pytest.mark.parametrize("line, n", _GUARDED_LINES)
+def test_a_second_exception_at_any_guarded_line_of_the_cleanup_loop_keeps_the_first_and_skips_no_step(line, n):
+    """The loop control sits inside the guarded region: an exception that code raises on any of its lines, on any
+    pass through it (the loop condition, right after a step was chosen, at the call), never escapes to replace the
+    interruption being handled, and no step is skipped."""
+    proc = _CleanupLauncher()
+    code, fired, hits = cli._run_swallowing.__code__, [], []
+
+    def tracer(frame, event, arg):
+        return line_tracer if frame.f_code is code else None
+
+    def line_tracer(frame, event, arg):
+        if event == "line" and frame.f_lineno == line:
+            hits.append(line)
+            if len(hits) == n:
+                fired.append(line)
+                raise SystemExit("second")
+        return line_tracer
+
+    prior = sys.gettrace()
+    try:
+        with pytest.raises(KeyboardInterrupt, match="first"):
+            try:
+                raise KeyboardInterrupt("first")
+            except KeyboardInterrupt:
+                sys.settrace(tracer)
+                cli._kill_and_reap(proc)
+                raise
+    finally:
+        sys.settrace(prior)
+    assert fired == [line]
+    assert proc.killed == 1 and proc.reaped == 1
+
+
+def test_the_previous_sigint_handler_is_restored_after_a_partial_install_failure(monkeypatch):
+    """The previous handler is read before anything is installed, and put back in a finally even when the install
+    itself failed after it had changed the handler."""
+    import signal
+
+    previous = object()
+    state = {"handler": previous, "calls": 0}
+
+    def install(signum, handler):
+        state["calls"] += 1
+        old = state["handler"]
+        state["handler"] = handler
+        if state["calls"] == 1:
+            raise OSError("simulated failure after the handler was installed")
+        return old
+
+    monkeypatch.setattr(signal, "signal", install)
+    monkeypatch.setattr(signal, "getsignal", lambda signum: state["handler"])
+    with cli._sigint_deferred():
+        pass
+    assert state["handler"] is previous
+
+
+def test_a_failed_install_that_changed_nothing_is_not_followed_by_a_restore(monkeypatch):
+    """Off the main thread the install is refused outright: nothing was changed, so nothing is put back."""
+    import signal
+
+    calls = []
+
+    def refuse(signum, handler):
+        calls.append(handler)
+        raise ValueError("signal only works in main thread of the main interpreter")
+
+    monkeypatch.setattr(signal, "signal", refuse)
+    with cli._sigint_deferred():
+        pass
+    assert len(calls) == 1
 
 
 def test_a_real_ctrl_c_during_the_interruption_cleanup_is_deferred_and_the_handler_restored(tmp_path, monkeypatch):
