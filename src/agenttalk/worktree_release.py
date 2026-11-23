@@ -381,11 +381,11 @@ def _still_absent(seen: list[str]) -> None:
         except OSError as exc:
             raise Refused(
                 f"a path that a record names could not be looked at again before the removal ({_why(exc)}); "
-                "the checkout was kept"
+                "the checkout was kept; make that path readable, then run the release again"
             ) from exc
         raise Refused(
             "a path that a record names, and that was absent when the records were read, exists now; "
-            "the checkout was kept"
+            "the checkout was kept; run the release again: it reads the records afresh and says what uses it"
         )
 
 
@@ -617,12 +617,12 @@ class RemovalGuard:
     on those lanes through everything that follows (a work-in-progress commit, the removal). `final_window()` is the
     last look, made at the removal itself.
 
-    `closed_window` is for the sweep. A release takes the lane writers' lock only when a lane named a checkout at the
-    first look, and reads the records once under it: a lane that names the checkout only after that read (a record
-    written by a program that does not take the lock, a session on a lane it did not name) is not seen. With
-    `closed_window` the lock is taken whenever the store exists, and `reread()`, called last, reads the records again
-    and takes a claim on every lane that names a checkout now and did not before, kept until the block ends. A release
-    is left as it was; its window is the one between its last read and Git's removal."""
+    The last look (`reread()`) is the whole first look again, for a release and for the sweep: every record, ended
+    lanes and their retained occupancy paths included (a session can outlive its lane, #853), a claim on every lane
+    that names a checkout now and did not before, kept until the block ends, and a second look at every name that was
+    read as absent. `closed_window` is for the sweep and decides only the lock: a release takes the lane writers' lock
+    only when a lane named a checkout at the first look, so a record written after its last read by a program that
+    does not take the lock is not seen; with `closed_window` the lock is taken whenever the store exists."""
 
     def __init__(self, cfg: janitor.JanitorConfig, targets: list[Path], *, closed_window: bool = False):
         self.cfg = cfg
@@ -656,8 +656,9 @@ class RemovalGuard:
         self._claims.close()
 
     def reread(self) -> None:
-        """The last look before the removal (`closed_window`): every record again, a claim on any lane that names a
-        checkout now, and a second look at the names that were read as absent (`_still_absent`)."""
+        """The last look before the removal: every record again (ended lanes and their retained occupancy paths too), a
+        claim on any lane that names a checkout now, and a second look at the names that were read as absent
+        (`_still_absent`)."""
         with _watching_absent() as seen:
             self._take_claims()
         _still_absent(seen)
@@ -673,13 +674,7 @@ class RemovalGuard:
         else:
             locked = self.closed_window and (self.cfg.repo / ".agenttalk").is_dir()  # no store, no lane writers
         with store_mod.Store(self.cfg.repo)._config_lock() if locked else contextlib.nullcontext():
-            if self.closed_window:
-                self.reread()
-            else:
-                with _watching_absent() as seen:
-                    for target in self.targets:
-                        _activity(self.cfg, target)
-                _still_absent(seen)
+            self.reread()  # never `_activity` alone: it skips ended lanes, whose sessions can still use a checkout
             yield
 
 
