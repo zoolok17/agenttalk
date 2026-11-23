@@ -116,8 +116,9 @@ def test_copy_resolved_after_advice_is_not_reopened(tmp_path, monkeypatch, capsy
     assert cli.main([*resolve, "--id", original.id, "--reason", "original handled"]) == 0
     capsys.readouterr()
     assert _requeue(store, original, "--force-resolved", "--from", "lead", "--reason", "original reason") == 2
-    line = next(line.strip() for line in capsys.readouterr().err.splitlines()
-                if line.strip().startswith("agenttalk --root "))
+    line = next(
+        line.strip() for line in capsys.readouterr().err.splitlines() if line.strip().startswith("agenttalk --root ")
+    )
     argv = shlex.split(line)
     assert argv[argv.index("--id") + 1] == copy.id
     assert all(flag not in argv for flag in ("--again", "--force-resolved", "--from", "--reason"))
