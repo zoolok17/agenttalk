@@ -23,6 +23,7 @@ security = [
 [tool.pytest.ini_options]
 markers = [
     "subprocess: tests that spawn real subprocesses (e.g. the enforcement canary's stub CLI); deselect with -m 'not subprocess'",
+    "windows_capability: host checks (is Git startable paused in a Windows job here?); run with -s to see the facts they record",
 ]
 
 [tool.ruff]
