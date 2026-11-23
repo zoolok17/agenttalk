@@ -68,7 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   When a changing Git command runs past its time limit, agenttalk stops the Git launcher and does not
   stop the programs Git started (for example a content filter), so on Windows the error now always adds
   that Git or a program it started may still be running and that you should wait before retrying or
-  cleaning up. It no longer says the command "was killed" on Windows, because only the launcher was.
+  cleaning up. It no longer says the command "was killed" on Windows, because only the launcher was. The
+  same warned timeout error is raised when stopping or collecting the launcher itself fails after the
+  timeout (for example a broken pipe), so lane setup still recognises the timeout and keeps its checkout.
   No program (such as `taskkill.exe`) is launched while this is handled, and pressing Ctrl-C at any point
   still kills and reaps the launcher and raises the original interruption, even if a clean-up step fails
   or a second Ctrl-C arrives. A partial checkout or lock may still need recovery. Stopping the programs

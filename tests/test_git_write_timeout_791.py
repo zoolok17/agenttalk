@@ -112,9 +112,21 @@ class _Launcher:
 
     pid = 100
 
-    def __init__(self, *, interrupt=False, reap_times_out=False, interrupt_in_wait=False, fail=None):
+    def __init__(
+        self,
+        *,
+        interrupt=False,
+        reap_times_out=False,
+        interrupt_in_wait=False,
+        fail=None,
+        reap_error=None,
+        wait_error=None,
+        kill_error=None,
+    ):
         self.interrupt, self.interrupt_in_wait = interrupt, interrupt_in_wait
-        self.reap_times_out = reap_times_out or interrupt_in_wait
+        # An ordinary error (not an interruption) raised after the timeout, by the reap, the wait or the kill.
+        self.reap_error, self.wait_error, self.kill_error = reap_error, wait_error, kill_error
+        self.reap_times_out = reap_times_out or interrupt_in_wait or wait_error is not None
         self.fail = fail or {}
         self.communicates = self.killed = self.waited = 0
         self.cleanup = False
@@ -130,6 +142,8 @@ class _Launcher:
 
     def kill(self):
         self.killed += 1
+        if self.kill_error is not None and self.killed == 1:
+            raise self.kill_error
         self._maybe_fail("kill")
 
     def communicate(self, timeout=None):
@@ -140,6 +154,8 @@ class _Launcher:
             if self.interrupt:
                 self.cleanup = True
                 raise _FIRST
+            if self.reap_error is not None:
+                raise self.reap_error
             if self.reap_times_out:
                 raise subprocess.TimeoutExpired("git", timeout)
             return "", ""
@@ -151,6 +167,8 @@ class _Launcher:
         if self.interrupt_in_wait and self.waited == 1:
             self.cleanup = True
             raise _FIRST
+        if self.wait_error is not None and self.waited == 1:
+            raise self.wait_error
         self._maybe_fail("wait")
         return 0
 
@@ -204,6 +222,33 @@ def test_a_windows_reap_that_times_out_keeps_the_warning_and_waits(tmp_path, mon
     message = _timeout_error(tmp_path, monkeypatch, launcher)
     assert "could not be reaped" in message and _WARNING in message
     assert launcher.killed == 1 and launcher.waited == 1
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    [
+        _Launcher(reap_error=OSError("simulated pipe failure")),
+        _Launcher(wait_error=OSError("simulated wait failure")),
+        _Launcher(kill_error=RuntimeError("simulated kill failure")),
+    ],
+    ids=["reap-oserror", "wait-oserror", "kill-error"],
+)
+def test_an_ordinary_error_after_the_timeout_becomes_the_warned_timeout_error(tmp_path, monkeypatch, launcher):
+    """Once the write has timed out, a failing kill, reap or wait is still the timeout: the error warns that Git or a
+    program it started may still be running and keeps the original TimeoutExpired as its cause (the lane assignment's
+    timeout recovery is keyed on that), and the launcher is still killed and reaped on a best-effort basis."""
+    with pytest.raises(cli.GitWriteError) as error:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert _WARNING in str(error.value) and "and was killed" not in str(error.value)
+    assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
+    assert launcher.communicates >= 2
+
+
+def test_an_ordinary_error_after_the_timeout_on_another_platform_is_still_the_timeout_error(tmp_path, monkeypatch):
+    launcher = _Launcher(reap_error=OSError("simulated pipe failure"))
+    with pytest.raises(cli.GitWriteError) as error:
+        _timeout(tmp_path, monkeypatch, launcher, windows=False)
+    assert "timed out" in str(error.value) and isinstance(error.value.__cause__, subprocess.TimeoutExpired)
 
 
 def test_an_interruption_during_the_reap_kills_and_reaps_the_launcher_and_is_raised_again(tmp_path, monkeypatch):

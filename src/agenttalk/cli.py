@@ -3413,7 +3413,10 @@ def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.Timeout
     The launcher is killed (through Popen's own handle on Windows) and reaped. The programs Git started are NOT
     stopped, so on Windows the error always says they may still be running. No program is launched here. The whole
     handling sits inside the interruption boundary: Ctrl-C anywhere in it kills and reaps the launcher through
-    best-effort steps, and the original interruption is the one raised.
+    best-effort steps, and the original interruption is the one raised. Once the write has timed out, any ordinary
+    error (an Exception) from the kill, the reap or the wait is still the timeout: it becomes the same warned
+    ``GitWriteError`` with the original ``TimeoutExpired`` as its cause, which the lane assignment's timeout recovery
+    is keyed on. Only a real interruption propagates as such.
     """
     try:
         # kill() can itself raise (PermissionError on Windows,
@@ -3439,6 +3442,12 @@ def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.Timeout
         raise GitWriteError(f"{result}: {err or out or timed_out}" + warning) from timed_out
     except GitWriteError:
         raise
+    except Exception as failure:  # the kill, the reap or the wait failed after the timeout: still the timeout
+        _kill_and_reap(proc)
+        raise GitWriteError(
+            "mutating git timed out and could not be reaped; git/config lock may be stranded"
+            f" ({failure})" + (_GIT_STILL_RUNNING if os.name == "nt" else "")
+        ) from timed_out
     except BaseException:
         _kill_and_reap(proc)
         raise
