@@ -3377,35 +3377,50 @@ def _best_effort(step) -> None:
         pass
 
 
-def _kill_and_reap(proc) -> None:
-    """Try to kill the launcher and reap it. Every step is its own best effort and none can raise.
+def _best_effort_interruptible(step) -> None:
+    """Like `_best_effort`, but only an ordinary error is swallowed: an interruption (KeyboardInterrupt or SystemExit)
+    escapes at once, so a Ctrl-C is not lost while no other interruption is being handled."""
+    try:
+        step()
+    except Exception:  # noqa: BLE001, S110  # nosec B110
+        pass
+
+
+def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
+    """Try to kill the launcher and reap it. Every step is its own best effort; no ordinary error escapes.
 
     A failing poll never skips the kill, a failing kill never skips the reap, and a failing or
     timed-out reap is followed by wait(), which does not touch the pipes. Each step is bounded.
     Nothing here confirms that the launcher stopped: with a kill and a reap that keep failing it is left running.
+
+    While an interruption is already being handled (the default) nothing escapes, a second Ctrl-C included: the
+    first one must be the one that is raised. With ``interruptible`` (the caller has no interruption in flight) an
+    interruption that arrives during a step stops the cleanup at once and propagates, so the caller can do its own
+    bounded cleanup and raise it.
     """
+    run = _best_effort_interruptible if interruptible else _best_effort
     running = [True]  # cannot tell when poll() fails, so act as if it were still running
 
     def poll() -> None:
         running[0] = proc.poll() is None
 
-    _best_effort(poll)
+    run(poll)
     if not running[0]:
         return
-    _best_effort(proc.kill)
+    run(proc.kill)
     reaped = []
 
     def reap() -> None:
         proc.communicate(timeout=5)
         reaped.append(True)
 
-    _best_effort(reap)
+    run(reap)
     if not reaped:
         # A hook or descendant holding the captured stdout/stderr pipe handles open can keep
         # communicate() blocked past this retry even though the killed process is already
         # dead - wait() does not touch the pipes at all, so it still completes once the
         # process is actually gone. A second timeout leaves the launcher's reap unconfirmed.
-        _best_effort(lambda: proc.wait(timeout=25))
+        run(lambda: proc.wait(timeout=25))
 
 
 def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired):
@@ -3445,7 +3460,11 @@ def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.Timeout
     except GitWriteError:
         raise
     except Exception as failure:  # the kill, the reap or the wait failed after the timeout: still the timeout
-        _kill_and_reap(proc)
+        try:
+            _kill_and_reap(proc, interruptible=True)  # no interruption is in flight: one that arrives now wins
+        except BaseException:
+            _kill_and_reap(proc)  # the same bounded best-effort cleanup as for any interruption, then re-raise it
+            raise
         raise GitWriteError(
             "mutating git timed out and could not be reaped; git/config lock may be stranded"
             f" ({failure})" + (_GIT_STILL_RUNNING if os.name == "nt" else "")

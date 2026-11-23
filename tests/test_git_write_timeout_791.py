@@ -122,6 +122,7 @@ class _Launcher:
         reap_error=None,
         wait_error=None,
         kill_error=None,
+        fallback=None,
     ):
         self.interrupt, self.interrupt_in_wait = interrupt, interrupt_in_wait
         # An ordinary error (not an interruption) raised after the timeout, by the reap, the wait or the kill.
@@ -131,6 +132,9 @@ class _Launcher:
         self.communicates = self.killed = self.waited = 0
         self.first_timeout = None
         self.cleanup = False
+        # (step, error): after the reap failed with an ordinary error, the fallback's first attempt is interrupted
+        # at that step ("communicate" or "wait"); the cleanup that follows then works normally.
+        self.fallback, self.phase = fallback, "normal"
 
     def _maybe_fail(self, step):
         error = self.fail.get(step) if self.cleanup else None
@@ -157,10 +161,17 @@ class _Launcher:
                 self.cleanup = True
                 raise _FIRST
             if self.reap_error is not None:
+                self.phase = "fallback"
                 raise self.reap_error
             if self.reap_times_out:
                 raise subprocess.TimeoutExpired("git", timeout)
             return "", ""
+        if self.phase == "fallback":
+            step, error = self.fallback
+            if step == "communicate":
+                self.phase = "cleanup"
+                raise error
+            raise OSError("simulated reap failure")  # the fallback's reap fails, so its wait() runs
         self._maybe_fail("communicate")
         return "", ""
 
@@ -169,6 +180,9 @@ class _Launcher:
         if self.interrupt_in_wait and self.waited == 1:
             self.cleanup = True
             raise _FIRST
+        if self.phase == "fallback" and self.fallback[0] == "wait":
+            self.phase = "cleanup"
+            raise self.fallback[1]
         if self.wait_error is not None and self.waited == 1:
             raise self.wait_error
         self._maybe_fail("wait")
@@ -244,6 +258,25 @@ def test_an_ordinary_error_after_the_timeout_becomes_the_warned_timeout_error(tm
     assert _WARNING in str(error.value) and "and was killed" not in str(error.value)
     assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
     assert launcher.communicates >= 2
+
+
+@pytest.mark.parametrize(
+    "interruption", [KeyboardInterrupt("fallback"), SystemExit("fallback")], ids=["ctrl-c", "exit"]
+)
+@pytest.mark.parametrize("step", ["communicate", "wait"])
+def test_an_interruption_in_the_fallback_after_an_ordinary_error_wins_over_the_timeout_error(
+    tmp_path, monkeypatch, step, interruption
+):
+    """No interruption is in flight yet when the ordinary error is handled, so a Ctrl-C (or an exit request) that
+    arrives while the fallback reaps or waits stops the waiting, gets the bounded best-effort launcher cleanup, and is
+    what is raised: not the timeout error."""
+    launcher = _Launcher(reap_error=OSError("simulated pipe failure"), fallback=(step, interruption))
+    with pytest.raises(BaseException) as raised:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert raised.value is interruption and not isinstance(raised.value, cli.GitWriteError)
+    # the timeout path's kill, the fallback's kill, and the cleanup's kill; the cleanup reaps the launcher again
+    assert launcher.killed == 3 and launcher.communicates == 4
+    assert launcher.waited == (1 if step == "wait" else 0)
 
 
 def test_an_ordinary_error_after_the_timeout_on_another_platform_is_still_the_timeout_error(tmp_path, monkeypatch):
