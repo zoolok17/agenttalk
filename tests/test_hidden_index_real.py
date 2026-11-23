@@ -8,7 +8,7 @@ import subprocess
 
 import pytest
 
-from agenttalk import cli, close, janitor, lanes
+from agenttalk import acceptance, cli, close, janitor, lanes
 from test_git_index_safety import safety as _safety
 from agenttalk.store import Store
 from test_lanes import (
@@ -197,6 +197,10 @@ def test_real_sparse_absence_is_not_hidden_work(tmp_path, mode, record_property,
         == 0
     )
     assert close.load_close(store, "sparse")["revision_clean"] is True
+    # The store made above lives inside the checkout, and a removal now refuses a checkout that holds a store (Git
+    # ignores it, so it would be deleted unseen). This test is about sparse absence, so the store goes first.
+    assert cli._git_write(root, ["worktree", "remove", "--", str(wt)])[0] == 1
+    shutil.rmtree(wt / ".agenttalk")
     assert cli._git_write(root, ["worktree", "remove", "--", str(wt)])[0] == 0
 
 
@@ -231,6 +235,182 @@ def test_unpopulated_gitlink_content_survives_abandon(tmp_path, capsys, monkeypa
     assert file.read_bytes() == b"work without submodule metadata"
     saved = lanes.load_lanes(Store(root))["lanes"]["lwt"]
     assert _safety().SUBMODULE in saved["worktree_cleanup_error"] and _lane_branch_present(root, "lwt")
+
+
+@pytest.mark.parametrize("consumer", ["close", "acceptance"])
+@pytest.mark.parametrize(
+    "case", ["clean", "tracked", "untracked", "head", "assume", "skip", "uninitialized", "missing"]
+)
+def test_close_submodule_cleanliness_real(tmp_path, case, consumer, capsys):
+    root = tmp_path / "parent"
+    root.mkdir()
+    root, _ = _repo(root)
+    source = tmp_path / "source"
+    source.mkdir()
+    _repo(source)
+
+    def checked(repo, *args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
+
+    checked(root, "-c", "protocol.file.allow=always", "submodule", "add", str(source), "module")
+    checked(root, "commit", "-qam", "local submodule")
+    revision = _git(root, "rev-parse", "HEAD").strip()
+    module = root / "module"
+    _git(root, "config", "submodule.module.ignore", "all")
+    if case == "missing":
+        shutil.rmtree(module)
+    elif case == "untracked":
+        (module / "new-file").write_text("untracked", encoding="utf-8")
+    elif case == "head":
+        checked(module, "config", "user.name", "test")
+        checked(module, "config", "user.email", "test@example.invalid")
+        _commit(module, "src/core/a.py", "new commit\n")
+        assert checked(module, "rev-parse", "HEAD").strip() != checked(root, "rev-parse", "HEAD:module").strip()
+    elif case == "uninitialized":
+        (module / ".git").unlink()
+    elif case != "clean":
+        if case in {"assume", "skip"}:
+            flag = "--assume-unchanged" if case == "assume" else "--skip-worktree"
+            _git(module, "update-index", flag, "src/core/a.py")
+        (module / "src/core/a.py").write_text("uncommitted", encoding="utf-8")
+    if consumer == "acceptance":
+        if case == "clean":
+            assert acceptance.verify_project(root, revision)["revision"] == revision
+        else:
+            with pytest.raises(acceptance.AcceptanceError, match="clean|dirty"):
+                acceptance.verify_project(root, revision)
+    else:
+        store = Store(root)
+        assert (
+            cli.main(
+                [
+                    "--root",
+                    str(root),
+                    "close",
+                    "open",
+                    "--id",
+                    "sub",
+                    "--from",
+                    "lead",
+                    "--scope",
+                    "docs",
+                    "--revision",
+                    revision,
+                ]
+            )
+            == 0
+        )
+        assert close.load_close(store, "sub")["revision_clean"] is (case == "clean")
+        if case == "missing":
+            output = capsys.readouterr()
+            assert "HOLD" in output.err
+            assert cli.main(["--root", str(root), "close", "check", "--id", "sub"]) == 3
+            assert "HOLD" in capsys.readouterr().out
+        if case == "assume":
+            with close.close_transaction(store, "sub") as transaction:
+                transaction.record["revision_clean"] = True
+                transaction.commit()
+            assert (
+                cli.main(
+                    ["--root", str(root), "close", "reopen", "--id", "sub", "--from", "lead", "--revision", revision]
+                )
+                == 0
+            )
+            assert close.load_close(store, "sub")["revision_clean"] is False
+
+
+def test_nested_submodule_hidden_index_is_not_clean(tmp_path):
+    parent = tmp_path / "parent"
+    source = tmp_path / "source"
+    nested_source = tmp_path / "nested-source"
+    for path in (parent, source, nested_source):
+        path.mkdir()
+        _repo(path)
+
+    def checked(repo, *args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
+
+    checked(parent, "-c", "protocol.file.allow=always", "submodule", "add", str(source), "module")
+    module = parent / "module"
+    checked(module, "config", "user.name", "test")
+    checked(module, "config", "user.email", "test@example.invalid")
+    checked(module, "-c", "protocol.file.allow=always", "submodule", "add", str(nested_source), "nested")
+    checked(module, "commit", "-qam", "nested submodule")
+    checked(parent, "add", "module")
+    checked(parent, "commit", "-qm", "record nested submodule")
+    revision = checked(parent, "rev-parse", "HEAD").strip()
+    nested = module / "nested"
+    checked(nested, "update-index", "--assume-unchanged", "src/core/a.py")
+    (nested / "src/core/a.py").write_text("hidden nested work", encoding="utf-8")
+    assert checked(parent, *_safety().STATUS_ARGS).strip() == ""
+    assert cli._close_clean_detail(parent)[0] is False
+    with pytest.raises(acceptance.AcceptanceError, match="clean"):
+        acceptance.verify_project(parent, revision)
+
+
+def test_submodule_status_failure_is_not_clean(tmp_path, monkeypatch):
+    root = tmp_path / "parent"
+    source = tmp_path / "source"
+    root.mkdir()
+    source.mkdir()
+    _repo(root)
+    _repo(source)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "protocol.file.allow=always", "submodule", "add", str(source), "module"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "-C", str(root), "commit", "-qam", "submodule"], check=True, capture_output=True)
+    revision = _git(root, "rev-parse", "HEAD").strip()
+    original = subprocess.run
+    calls = []
+
+    def fail_child_status(argv, **kwargs):
+        if argv[:3] == ["git", "-C", str(root / "module")] and argv[3:] == _safety().STATUS_ARGS:
+            calls.append(True)
+            return subprocess.CompletedProcess(argv, 1, b"", b"")
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fail_child_status)
+    assert cli._close_clean_detail(root)[0] is False
+    with pytest.raises(acceptance.AcceptanceError, match="clean"):
+        acceptance.verify_project(root, revision)
+    assert len(calls) == 2
+
+
+def test_acceptance_submodule_checks_ignore_ambient_git_redirect(tmp_path, monkeypatch):
+    root = tmp_path / "parent"
+    source = tmp_path / "source"
+    root.mkdir()
+    source.mkdir()
+    _repo(root)
+    _repo(source)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "protocol.file.allow=always", "submodule", "add", str(source), "module"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "-C", str(root), "commit", "-qam", "submodule"], check=True, capture_output=True)
+    revision = _git(root, "rev-parse", "HEAD").strip()
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "not-a-git-dir"))
+    assert acceptance.verify_project(root, revision)["revision"] == revision
+
+
+def test_acceptance_refuses_hidden_parent_index(tmp_path):
+    root, revision = _repo(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(root), "update-index", "--assume-unchanged", "src/core/a.py"], check=True, capture_output=True
+    )
+    (root / "src/core/a.py").write_text("hidden parent work", encoding="utf-8")
+    with pytest.raises(acceptance.AcceptanceError, match="index.*clean"):
+        acceptance.verify_project(root, revision)
+
+
+def test_close_submodule_malformed_index_listing_fails_closed(tmp_path, monkeypatch):
+    from test_git_index_safety import git_reads
+
+    git_reads(monkeypatch, stage=b"not a staged record\0")
+    assert _safety().check_close_submodules(tmp_path).state == "unverifiable"
 
 
 @pytest.mark.parametrize("ignore", ["dirty", "all", "untracked"])

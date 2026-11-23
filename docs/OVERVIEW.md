@@ -405,7 +405,7 @@ Rules at init: soft stop < cutoff <= ceiling, and opening balance + cutoff + one
 ## 10. Platforms and tested Python versions
 
 - **Supported Python:** 3.10 or newer (`requires-python = ">=3.10"`), with no runtime dependencies.
-- **What CI tests today** (the `tests` workflow, `dev-gate` legs): **Python 3.10, 3.11, 3.12 and 3.13, on Linux, Windows and macOS**, twelve legs. A change runs a lighter path (the docs and safety checks, on 3.12) when every file it touches is `README.md`, `CHANGELOG.md`, `SECURITY.md` or a page under `docs/`, and no test names that file. `README.md` and `CHANGELOG.md` are named by tests, so a change to either (this page's own PR included) runs the full set, and so does a change to any other file, such as `CONTRIBUTING.md`. Python 3.14 is not in the CI matrix.
+- **What CI tests today** (the `tests` workflow, `dev-gate` legs): **Python 3.10, 3.11, 3.12 and 3.13, on Linux, Windows and macOS**, twelve legs. Each Windows leg runs as four jobs, so no job comes near GitHub's six-hour limit. A change runs a lighter path (the docs and safety checks, on 3.12) when every file it touches is `README.md`, `CHANGELOG.md`, `SECURITY.md` or a page under `docs/`, and no test names that file. `README.md` and `CHANGELOG.md` are named by tests, so a change to either (this page's own PR included) runs the full set, and so does a change to any other file, such as `CONTRIBUTING.md`. Python 3.14 is not in the CI matrix.
 - **Windows-only parts:** the generated supervisor and its Scheduled Task (PowerShell 7). The command line, wrapper, bus, console and planner run on all three systems. The gateway runner has a Windows Scheduled Task and a Linux `systemd --user` form.
 
 ---

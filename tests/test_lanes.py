@@ -953,7 +953,7 @@ def test_m6_assign_provisions_worktree_by_default_and_workspace(tmp_path: Path, 
 def test_m1_m3_canonical_paths_and_common_git_dir_match(tmp_path: Path) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "canon")
-    prov = cli._verify_lane_worktree(Store(root), lane, expected_base=base)
+    prov = cli._verify_lane_worktree(Store(root), lane, lane_id="canon", expected_base=base)
     wt = Path(lane["worktree_path"])
     assert prov["worktree_toplevel_canonical"] == lanes.canonical_host_path(wt)
     assert prov["common_git_dir_canonical"] == cli._common_git_dir(root)
@@ -970,7 +970,7 @@ def test_s_p2_verify_lane_worktree_rejects_primary_checkout_tamper(tmp_path: Pat
     lane["worktree_common_git_dir_canonical"] = cli._common_git_dir(root)
 
     with pytest.raises(lanes.LaneError, match="primary checkout"):
-        cli._verify_lane_worktree(Store(root), lane, expected_base=base)
+        cli._verify_lane_worktree(Store(root), lane, lane_id=lane["lane_id"], expected_base=base)
 
 
 def test_m5_git_write_worktree_add_uses_separator_and_rejects_evil_id(
@@ -3289,6 +3289,124 @@ def test_delivery_does_not_record_the_cleanup_as_done_when_the_worktree_cannot_b
     assert wt.exists() and fired
 
 
+def _checkout_cannot_be_resolved(
+        monkeypatch: pytest.MonkeyPatch, *folders: Path, only_during: str | None = None) -> list[str]:
+    """`os.path.realpath(..., strict=True)` of exactly these folders fails with an access-denied error, on every system
+    (`_hidden_error` reaches it only where `realpath` is built on `os.lstat`, which is not Windows: there it asks the
+    system for the final path name instead). Without `strict` the answer is unchanged. With `only_during`, the fault is
+    armed only while that `cli` function runs (as in `_hidden_error`). Returns the calls it fired on."""
+    bad = {os.path.normcase(os.path.abspath(folder)) for folder in folders}
+    bad |= {os.path.normcase(os.path.realpath(folder)) for folder in folders}
+    real = os.path.realpath
+    fired: list[str] = []
+    armed = {"on": only_during is None}
+
+    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if armed["on"] and strict and os.path.normcase(os.path.abspath(os.fspath(path))) in bad:
+            fired.append(os.fspath(path))
+            raise PermissionError(13, "injected: access denied")
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    if only_during is not None:
+        real_fn = getattr(cli, only_during)
+
+        def armed_fn(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            armed["on"] = True
+            try:
+                return real_fn(*args, **kwargs)
+            finally:
+                armed["on"] = False
+
+        monkeypatch.setattr(cli, only_during, armed_fn)
+    return fired
+
+
+def test_delivery_is_published_when_the_checkout_cannot_be_examined_and_the_cleanup_keeps_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Round 29 (CI red on Linux), as changed in round 30: the same scenario as the test above (which breaks the look
+    only from `_lane_finalize_delivery` on), made to run on Windows too. The fresh evaluation proved the checkout is
+    this store's; when it can no longer be examined at the terminal recheck, the same command's earlier proof stands
+    (the checkout is the same one by Git's own account), so the delivery is published; the cleanup that follows is a
+    removal, so it keeps the checkout and says why, and the lane stays cleanup pending. (Round 29 broke the look for
+    the whole command, which let a checkout nobody had examined be published: that is refused now, see below.)"""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "unexam")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nunexamined\n")
+    fired = _checkout_cannot_be_resolved(monkeypatch, wt, only_during="_lane_finalize_delivery")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "deliver", "--id", "unexam", "--from", "dev"], root) == 0
+
+    captured = capsys.readouterr()
+    saved = lanes.load_lanes(Store(root))["lanes"]["unexam"]
+    assert saved["status"] == lanes.STATUS_DELIVERED and saved.get("cleanup_pending") is True
+    assert Path(saved["delivery_artifact"]).is_file()
+    # The cleanup stops at the first removal-side look it cannot make (whether a launch uses the folder, then the
+    # check that it is this lane's own): either way the folder is kept and the reason is "could not be ...".
+    assert "cleanup pending" in captured.out and "could not be" in captured.err
+    assert "is not inside this store's folder" not in captured.err           # it is not claimed to be somewhere else
+    assert wt.exists() and fired
+
+
+def test_an_unexaminable_checkout_is_never_removed_by_abandon(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Round 29: the removal side stays strict. A checkout that cannot be examined is kept and nothing is changed (the
+    first look it cannot make is whether a launch uses it; the check that it is the lane's own is covered in
+    `test_the_worktree_check_tells_proven_outside_from_could_not_be_examined`)."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "unexrm")
+    wt = Path(lane["worktree_path"])
+    fired = _checkout_cannot_be_resolved(monkeypatch, wt)
+    capsys.readouterr()
+
+    before = lanes.load_lanes(Store(root))
+    assert _run_raw(["lane", "abandon", "--id", "unexrm"], root) == 3
+
+    err = capsys.readouterr().err
+    monkeypatch.undo()                                                  # look at the folder with the fault gone
+    assert wt.exists() and fired
+    assert "could not be established" in err and "was not removed" in err and "nothing was changed" in err
+    assert "is not inside this store's folder" not in err
+    assert lanes.load_lanes(Store(root)) == before
+
+
+def test_the_worktree_check_tells_proven_outside_from_could_not_be_examined(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 29: three answers, three results. Inside: nothing. Proven outside: refused for a delivery and a removal.
+    Could not be examined: refused for a removal only, in words that say so."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "place")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    outside = tmp_path.parent / (tmp_path.name + "-elsewhere")
+    outside.mkdir()
+
+    assert cli._lane_checkout_place(store, str(wt)) is None
+    kind, folder, _detail = cli._lane_checkout_place(store, str(outside))
+    assert (kind, folder) == ("outside", str(outside))
+    fired = _checkout_cannot_be_resolved(monkeypatch, wt)
+    kind, folder, detail = cli._lane_checkout_place(store, str(wt))
+    assert (kind, folder) == ("unknown", str(wt)) and "access denied" in detail and fired
+    assert cli._lane_checkout_outside_store(store, str(wt)) == str(wt)          # a removal-style caller: not proven
+
+    with pytest.raises(lanes.LaneError, match="could not be examined") as removal:
+        cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True, for_removal=True)
+    assert "is not inside this store's folder" not in str(removal.value)
+    # Round 30: a fresh delivery evaluation refuses too (nothing is published on a checkout nobody could look at), and
+    # so does a terminal recheck that has no earlier proof from this command; with the proof it goes on.
+    with pytest.raises(lanes.LaneError, match="could not be examined"):
+        cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True)
+    with pytest.raises(lanes.LaneError, match="nothing earlier in this delivery proved"):
+        cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True, terminal=True)
+    monkeypatch.undo()
+    cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True)       # a fresh evaluation proves it
+    _checkout_cannot_be_resolved(monkeypatch, wt)
+    provenance = cli._verify_lane_worktree(store, lane, lane_id="place", store_owned=True, terminal=True)
+    assert provenance["tracked_tree_clean"] is True
+
+
 def test_the_acknowledgement_does_not_accept_a_folder_it_cannot_look_at(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
     """Round 21 (4): `os.path.lexists(wt)` answered False for a hidden lstat error, so the acknowledgement was
@@ -3962,6 +4080,9 @@ def test_the_acknowledgement_is_refused_for_a_relative_stored_path(
     (r"C:repo\worktree", False), ("repo/worktree", False),
     (r"C:\repo\worktree", True), ("C:/repo/worktree", True),
     (r"\\server\share\worktree", True), ("//server/share/worktree", True),
+    # a share root is absolute with or without a trailing separator; an incomplete one names no share
+    (r"\\server\share", True), ("//server/share", True), ("\\\\server\\share\\", True), ("//server/share/", True),
+    (r"\\server", False), (r"C:", False),
 ])
 def test_windows_absolute_worktree_paths_need_a_drive_and_a_root(path, expected):
     assert lanes._windows_path_is_absolute(path) is expected
@@ -4065,7 +4186,9 @@ def test_an_older_record_without_any_new_field_can_be_acknowledged_and_keeps_wor
 def test_gc_never_removes_a_worktree_that_turns_up_for_an_acknowledged_lane(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """The person was wrong: the lane's branch is checked out in a worktree that was only moved. gc must not treat the
-    acknowledgement as leave to remove it, even for an older record that has no canonical path to compare."""
+    acknowledgement as leave to remove it, even for an older record that has no canonical path to compare. The moved
+    checkout now lies outside this store's folder, which gc reports as the reason (it only removes what this store
+    made)."""
     (tmp_path / "store").mkdir()
     root, base = _repo(tmp_path / "store")
     lane = _assign_worktree(root, base, "wrong")
@@ -4083,7 +4206,7 @@ def test_gc_never_removes_a_worktree_that_turns_up_for_an_acknowledged_lane(
     assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
 
     item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "wrong")
-    assert item["worktree_remove_safe"] is False and "acknowledged" in item["worktree_reason"]
+    assert item["worktree_remove_safe"] is False and "did not make" in item["worktree_reason"]
     assert item["branch_delete_safe"] is False
     assert live.exists() and _branch_exists(root, "lane/wrong")
 

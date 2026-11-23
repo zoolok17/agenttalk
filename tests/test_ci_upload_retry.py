@@ -157,7 +157,9 @@ def test_the_first_upload_is_unchanged_apart_from_its_id_its_cap_and_its_outcome
     assert field(first, "if") == "always()"  # a failed gate still leaves its evidence
     assert field(first, "continue-on-error") == "true" and field(first, "timeout-minutes") == "3"
     assert inputs(first) == {
-        "name": "dev-gate-leg-${{ matrix.os.id }}-${{ matrix.python-version }}",
+        # #378: a Windows part's artifact name ends with its part; other legs keep the leg name.
+        "name": "dev-gate-leg-${{ matrix.os.id }}-${{ matrix.python-version }}"
+        "${{ matrix.os.part && format('-{0}', matrix.os.part) || '' }}",
         "path": "${{ runner.temp }}/dev-gate-evidence/",
         "if-no-files-found": "error",
         "retention-days": "14",

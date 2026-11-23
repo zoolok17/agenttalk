@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk import dev_gate as gate
-from test_dev_gate import _binding, _gate_repo, _leg_artifact, _manifest
+from test_dev_gate import _binding, _ci_inputs, _gate_repo, _leg_artifact, _manifest
 
 
 GROUP_A = [
@@ -70,12 +70,17 @@ def test_378_windows_evidence_requires_group_runs():
 )
 def test_378_aggregate_refuses_incomplete_or_changed_group_selection(damage, tmp_path):
     manifest = _manifest()
-    artifacts = [_leg_artifact(manifest, leg) for leg in gate.expected_ci_legs(manifest)]
-    windows = next(a for a in artifacts if a["ci_leg"] == "windows/3.10")
-    check = next(c for c in windows["checks"] if c["id"].startswith("pytest-source-"))
-    groups = check["group_runs"]
+    artifacts = _ci_inputs(manifest)
+
+    def source_check(part):
+        artifact = next(a for a in artifacts if (a["ci_leg"], a.get("part")) == ("windows/3.10", part))
+        return next(c for c in artifact["checks"] if c["id"].startswith("pytest-source-"))
+
+    # #378: group A runs in the source-a part and group B in the source-b part.
+    check, other = source_check("source-a"), source_check("source-b")
+    groups = [check["group_runs"][0], other["group_runs"][0]]
     if damage == "missing-group":
-        groups.pop()
+        other["group_runs"].pop()
     elif damage == "renamed-file":
         old = groups[0]["selection"][0]
         renamed = old.replace("test_acceptance.py", "test_renamed.py")
@@ -104,14 +109,16 @@ def test_378_aggregate_refuses_incomplete_or_changed_group_selection(damage, tmp
 
 def test_378_aggregate_reports_each_group_time(tmp_path):
     manifest = _manifest()
-    artifacts = [_leg_artifact(manifest, leg) for leg in gate.expected_ci_legs(manifest)]
+    artifacts = _ci_inputs(manifest)
     aggregate = gate.aggregate_leg_artifacts(
         manifest, "release", artifacts, _binding(manifest, root=_gate_repo(tmp_path))
     )
-    leg = next(row for row in aggregate["legs"] if row["ci_leg"] == "windows/3.10")
-    assert leg["pytest_group_times_ms"] == {
-        "pytest-source-py310": {"A": 10, "B": 15},
-        "pytest-wheel-py310": {"A": 10, "B": 15},
+    parts = {row["part"]: row for row in aggregate["legs"] if row["ci_leg"] == "windows/3.10"}
+    assert {part: row["pytest_group_times_ms"] for part, row in parts.items()} == {
+        "source-a": {"pytest-source-py310": {"A": 10}},
+        "source-b": {"pytest-source-py310": {"B": 15}},
+        "wheel-a": {"pytest-wheel-py310": {"A": 10}},
+        "wheel-b": {"pytest-wheel-py310": {"B": 15}},
     }
     gate.validate_aggregate_artifact(aggregate, manifest)
 
@@ -254,14 +261,16 @@ def test_681_each_group_guard_reports_its_own_violation(two_tests_in_a_file, fau
 
 def test_681_aggregate_reports_full_and_group_collection_times(tmp_path):
     manifest = _manifest()
-    artifacts = [_leg_artifact(manifest, leg) for leg in gate.expected_ci_legs(manifest)]
+    artifacts = _ci_inputs(manifest)
     aggregate = gate.aggregate_leg_artifacts(
         manifest, "release", artifacts, _binding(manifest, root=_gate_repo(tmp_path))
     )
-    leg = next(row for row in aggregate["legs"] if row["ci_leg"] == "windows/3.10")
-    assert leg["pytest_collection_times_ms"] == {
-        "pytest-source-py310": {"full": 5, "A": 3, "B": 4},
-        "pytest-wheel-py310": {"full": 5, "A": 3, "B": 4},
+    parts = {row["part"]: row for row in aggregate["legs"] if row["ci_leg"] == "windows/3.10"}
+    assert {part: row["pytest_collection_times_ms"] for part, row in parts.items()} == {
+        "source-a": {"pytest-source-py310": {"full": 5, "A": 3}},
+        "source-b": {"pytest-source-py310": {"full": 5, "B": 4}},
+        "wheel-a": {"pytest-wheel-py310": {"full": 5, "A": 3}},
+        "wheel-b": {"pytest-wheel-py310": {"full": 5, "B": 4}},
     }
     gate.validate_aggregate_artifact(aggregate, manifest)
 
@@ -374,7 +383,7 @@ def test_681_launcher_measures_only_the_collection_hook(tmp_path, monkeypatch):
 )
 def test_681_aggregate_refuses_invalid_collection_times(tmp_path, damage):
     manifest = _manifest()
-    artifacts = [_leg_artifact(manifest, leg) for leg in gate.expected_ci_legs(manifest)]
+    artifacts = _ci_inputs(manifest)
     aggregate = gate.aggregate_leg_artifacts(
         manifest, "release", artifacts, _binding(manifest, root=_gate_repo(tmp_path))
     )
@@ -437,14 +446,14 @@ def test_681_collected_group_logs_require_bundle_reference(tmp_path, monkeypatch
     monkeypatch.setattr(gate, "_committed_version", lambda root: "0.78.1")
     inputs = tmp_path / "inputs"
     selected = None
-    for leg in gate.expected_ci_legs(manifest):
-        artifact = _leg_artifact(manifest, leg)
-        directory = inputs / leg.replace("/", "-")
+    for leg, part in gate.expected_ci_inputs(manifest):
+        artifact = _leg_artifact(manifest, leg, part=part)
+        directory = inputs / gate.ci_input_label(leg, part).replace("/", "-")
         directory.mkdir(parents=True)
         _write_check_logs(artifact, directory / "runner")
         evidence = directory / "evidence.json"
         gate.write_run_evidence(evidence, artifact, manifest)
-        if leg == "windows/3.10":
+        if (leg, part) == ("windows/3.10", f"source-{group_name.lower()}"):
             selected = artifact, evidence
     artifact, evidence = selected
     check = next(c for c in artifact["checks"] if c["id"].startswith("pytest-source-"))

@@ -309,6 +309,87 @@ def test_cli_no_devkit_skips_pack(tmp_path: Path) -> None:
     assert not cl.exists() and not cx.exists()  # devkit skipped
 
 
+_ONE_SIDE_NOTE = (" covers only the agenttalk bus skills: the dev-discipline pack still goes to both "
+                  "the Claude and the Codex skills folders. Add --no-devkit to leave it out.\n")
+
+
+@pytest.mark.parametrize("flags,noted", [
+    (["--claude-only"], "--claude-only"),
+    (["--claude-only", "--dry-run"], "--claude-only"),
+    (["--codex-only"], "--codex-only"),
+    (["--codex-only", "--dry-run"], "--codex-only"),
+    (["--claude-only", "--no-devkit"], None),
+    (["--codex-only", "--no-devkit"], None),
+    ([], None),
+])
+def test_cli_one_side_flags_say_the_devkit_still_goes_to_both_folders(
+    tmp_path: Path, capsys, flags: list[str], noted: str | None,
+) -> None:
+    """#824: a one-side flag suggests nothing for the other assistant; the note says what still goes there, and
+    the install itself is unchanged."""
+    bus_cl, bus_cx, cl, cx = (tmp_path / name for name in ("buscl", "buscx", "cl", "cx"))
+    rc = cli.main([
+        "install-skills", *flags,
+        "--claude-dir", str(bus_cl), "--codex-dir", str(bus_cx),
+        "--claude-skills-dir", str(cl), "--codex-skills-dir", str(cx),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert out.count(_ONE_SIDE_NOTE) == (1 if noted else 0)
+    if noted:
+        assert f"{noted}{_ONE_SIDE_NOTE}" in out
+    if noted and "--dry-run" not in flags:
+        other_bus, other_devkit = (bus_cx, cx) if noted == "--claude-only" else (bus_cl, cl)
+        assert (other_devkit / "craft-code" / "SKILL.md").is_file() and not other_bus.exists()
+
+
+@pytest.mark.parametrize("flag,side", [("--claude-only", "Claude"), ("--codex-only", "Codex")])
+def test_one_side_flag_help_names_the_devkit_folders(flag: str, side: str) -> None:
+    # The option's own help string, not the printed --help: argparse wraps that to the terminal width, also
+    # right after a hyphen, so the printed text depends on COLUMNS.
+    commands = next(action for action in cli.build_parser()._actions if action.dest == "cmd")
+    option = next(action for action in commands.choices["install-skills"]._actions if flag in action.option_strings)
+    assert option.help == (f"Install only {side}-side bus skills (the dev-discipline pack still goes to both "
+                           "the Claude and the Codex skills folders unless --no-devkit; no effect with "
+                           "--devkit-only)")
+
+
+def test_devkit_only_conflicts_with_no_devkit_suggestion(tmp_path: Path, capsys) -> None:
+    """#829 read: `--devkit-only` used to win over `--no-devkit` silently, so the printed advice "Add --no-devkit"
+    installed the pack anyway. The two are now refused together, before anything is written."""
+    dirs = [tmp_path / name for name in ("buscl", "buscx", "cl", "cx")]
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "install-skills", "--devkit-only", "--claude-only", "--no-devkit",
+            "--claude-dir", str(dirs[0]), "--codex-dir", str(dirs[1]),
+            "--claude-skills-dir", str(dirs[2]), "--codex-skills-dir", str(dirs[3]),
+        ])
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--no-devkit" in err and "--devkit-only" in err and "not allowed with" in err
+    assert not any(folder.exists() for folder in dirs)
+
+
+@pytest.mark.parametrize("flag", ["--claude-only", "--codex-only"])
+def test_devkit_only_with_a_one_side_flag_suggests_no_refused_flag(tmp_path: Path, capsys, flag: str) -> None:
+    bus_cl, bus_cx, cl, cx = (tmp_path / name for name in ("buscl", "buscx", "cl", "cx"))
+    rc = cli.main([
+        "install-skills", "--devkit-only", flag,
+        "--claude-dir", str(bus_cl), "--codex-dir", str(bus_cx),
+        "--claude-skills-dir", str(cl), "--codex-skills-dir", str(cx),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert (f"{flag} has no effect with --devkit-only: the dev-discipline pack goes to both the Claude and the "
+            "Codex skills folders.\n") in out
+    assert "--no-devkit" not in out and _ONE_SIDE_NOTE not in out
+    assert (cl / "craft-code" / "SKILL.md").is_file() and (cx / "craft-code" / "SKILL.md").is_file()
+    assert not bus_cl.exists() and not bus_cx.exists()
+
+
 # ---------------------------------------------------- retired skills (sk-loop)
 #
 # Warning-only (PR #224 fix round 2): install-skills never deletes a

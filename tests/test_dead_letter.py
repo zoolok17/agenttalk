@@ -1843,6 +1843,31 @@ def test_requeue_fanout_lookup_and_board(tmp_path, monkeypatch, kind, signed, re
 
 @_DL_KINDS
 @_DL_SIGNED
+def test_requeue_again_fanout_lookup_and_board(tmp_path, monkeypatch, kind, signed):
+    from agenttalk import work_tags
+
+    store = _requeue_store(tmp_path, monkeypatch, signed)
+    original, other = _dispatch_copies(store, kind)
+    _dead_payload(store, original)
+    assert _requeue(store, original) == 0
+    first = store.messages_for("beta")[-1]
+    _dead_payload(store, first)
+    assert _requeue(store, original, "--again", "--reason", "retry") == 0
+    assert len(work_tags._opener(store.valid_messages(), "tk-fan")) == 2
+    assert not _board_request(store)["issues"]
+    store.send(
+        sender="gamma",
+        recipient="lead",
+        kind="task-response" if kind == "task" else "review-result",
+        body="ok",
+        meta={"request_id": "tk-fan", "in_reply_to": other.id,
+              "status": "done" if kind == "task" else "approved", "verdict": "GO"},
+    )
+    assert not _board_request(store)["issues"]
+
+
+@_DL_KINDS
+@_DL_SIGNED
 @pytest.mark.parametrize("field", ["work_head", "key_id", "body", "signature", "signed_at"])
 def test_requeue_comparison_boundary(tmp_path, monkeypatch, kind, signed, field):
     from agenttalk import work_tags
@@ -2189,34 +2214,40 @@ def test_requeue_allowed_again_after_live_copy_is_dead_lettered(tmp_path, monkey
 
 @_DL_KINDS
 @_DL_SIGNED
-def test_requeue_without_request_id_keeps_legacy_repeat_behavior(tmp_path, monkeypatch, kind, signed):
+def test_requeue_without_request_id_refuses_repeat(tmp_path, monkeypatch, kind, signed):
     s = _requeue_store(tmp_path, monkeypatch, signed)
     original = _send(s, "legacy", kind=kind)
     assert "request_id" not in original.meta
     _dead_payload(s, original)
 
     assert _requeue(s, original) == 0
-    assert _requeue(s, original) == 0
+    assert _requeue(s, original) == 2
 
-    assert len(s.messages_for("beta")) == 2
+    assert len(s.messages_for("beta")) == 1
 
 
 @_DL_SIGNED
-def test_requeue_plain_message_keeps_repeat_behavior(tmp_path, monkeypatch, signed):
+def test_requeue_plain_message_refuses_repeat(tmp_path, monkeypatch, signed):
     s = _requeue_store(tmp_path, monkeypatch, signed)
     original = _send(s, "plain", meta={"request_id": "tk-plain"})
     _dead_payload(s, original)
 
     assert _requeue(s, original) == 0
-    assert _requeue(s, original) == 0
+    assert _requeue(s, original) == 2
 
-    assert len(s.messages_for("beta")) == 2
+    assert len(s.messages_for("beta")) == 1
 
 
 def test_requeue_copy_only_metadata_is_exact():
     from agenttalk import work_tags
 
-    assert work_tags.COPY_ONLY_META == {"requeued_from", "signature", "signed_at"}
+    assert work_tags.COPY_ONLY_META == {
+        "requeued_from",
+        "signature",
+        "signed_at",
+        "requeued_again",
+        "requeued_again_after",
+    }
 
 
 @_DL_ALL_KINDS
@@ -2529,6 +2560,7 @@ def test_706_retry_is_not_replay(tmp_path, monkeypatch, capsys):
     assert first.id in err and f"dead-letter requeue --agent beta --id {first.id}" in err
 
     assert _requeue(s, first) == 0  # the later copy that itself failed: a retry
+    assert _requeue(s, first) == 2  # the printed command refuses a second use
     second = _706_copy_of(s, first)
     _dead_payload(s, second)
     assert _requeue(s, second) == 0  # and again: no chain of failures gets stuck
