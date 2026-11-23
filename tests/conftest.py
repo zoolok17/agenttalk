@@ -435,9 +435,9 @@ def _git_jobs_off_unless_asked(request: pytest.FixtureRequest, monkeypatch: pyte
     """#907: in the product a changing Git command on Windows runs in a Windows job of its own. Every other test is
     about its own subject, and many stand in for `subprocess.Popen`, so no job is made for them (the layer refuses to
     create one, which is the path without a job). The tests of the job itself install a fake layer of their own, or
-    carry the marker `real_git_job` and use the real one."""
-    if request.node.get_closest_marker("real_git_job"):
-        return
+    carry the marker `real_git_job` and use the real one. The host check (`windows_capability`) uses no product code."""
+    if request.node.get_closest_marker("real_git_job") or request.node.get_closest_marker("windows_capability"):
+        return  # the host check tests the operating system and imports nothing of the product
     from agenttalk import git_job
 
     monkeypatch.setattr(git_job, "_load_native", _NoJobNative)

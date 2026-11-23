@@ -77,7 +77,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raises the original interruption; a failing clean-up step or a second Ctrl-C from the keyboard is not
   meant to replace it (best effort, with limits stated in the code); this stronger clean-up applies on
   every platform, while the timeout message itself is unchanged outside Windows. A partial checkout or lock may still need recovery. Stopping the programs Git started, by making
-  them members of a job that ends with the launcher, is a planned follow-up (#907).
+  them members of a job that ends with the launcher, is done in the next entry (#907).
+
+- **On Windows, a Git write that runs out of time now stops the programs Git started too (#907).**
+  A changing Git command is now started inside a Windows job of its own: a group that Windows keeps the
+  list of itself, which every program Git starts (hooks, content filters and their children) joins. If the
+  command runs past its time limit, agenttalk stops the whole group in one step, collects the launcher, checks
+  that nothing in the group is left, closes the group, and only then says that Git and the programs in its
+  Windows job were stopped. If the group could not be made or used, or could not be shown empty, the error
+  keeps the earlier warning that a program may still be running. A normal run is never stopped: nothing in the
+  group ends with it, so a helper that Git starts on purpose, such as its file-system monitor, keeps running.
+  A program in the group that asks to break away from it stays in it. Nothing is launched while the time-out is
+  handled, and no process list, process id or start time is read to decide whom to stop. All of the time-out
+  clean-up now shares one 30 second limit. A program that another process starts on Git's behalf (a
+  service or a scheduled task) was never in the group and is not covered. A partial checkout or a Git lock may
+  still need recovery.
 
 - **The release checklist now names the README as the only install pin.** Since the user manuals
   stopped carrying their own install line (#835), step 1 of the release ritual in
