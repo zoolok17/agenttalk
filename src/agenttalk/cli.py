@@ -14774,8 +14774,9 @@ def _dead_letter_notifier(store, agent: str):
                     + "Inspect: " + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=ag, i=mid))
             if disposed:
                 body += ("  If it still makes sense to send it again (the requeue command refuses, and says why, "
-                         "when the message cannot be retried): "
-                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid))
+                         "when the message cannot be retried), requeue it once: "
+                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid)
+                         + ". To resend it deliberately when allowed, add --again --reason TEXT.")
             store.send(sender=agent, recipient=target, kind="question",
                        subject="dead-letter notice", body=body,
                        meta={"needs_operator": "true", "dead_letter": "true",
@@ -16881,6 +16882,11 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):
             sys.stderr.write("agenttalk dead-letter requeue: --agent and --id are required.\n")
             return 2
+        again = bool(getattr(args, "again", False))
+        reason = getattr(args, "reason", None)
+        if again and (not reason or not reason.strip()):
+            sys.stderr.write("agenttalk dead-letter requeue: --again needs a non-empty --reason.\n")
+            return 2
         if not _is_listed_dead_letter(store, args.agent, args.id):   # F5 traversal/typo guard
             sys.stderr.write(
                 "agenttalk dead-letter requeue: no dead-letter "
@@ -16945,13 +16951,16 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         rid = meta.get("request_id")
         # A live copy is a valid task or review request with this request id and recipient still in the
         # message store, even after it was answered or rescinded; dead-lettering or compaction removes it.
-        if rid and orig.get("kind") in _dl_tags.OPENERS and any(
-                m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
-                for m in store.valid_messages()):
+        live_copy = next((
+            m for m in store.valid_messages()
+            if m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
+        ), None) if rid and orig.get("kind") in _dl_tags.OPENERS else None
+        if live_copy is not None:
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {pc.line(orig.get('to'))} already has a live copy "
-                f"of request {pc.meta_text(rid)}; "
-                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n"
+                f"of request {pc.meta_text(rid)}; nothing was published. "
+                f"Existing copy: {pc.meta_text(live_copy.id)}. "
+                "Use the existing copy, or resend by hand with a new request id.\n"
             )
             return 2
         if not shape_ok:
@@ -16964,38 +16973,14 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             new = store.send(
                 **sendargs,
                 _refuse_live_request=True,
-                _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
+                _requeue_source=(args.agent, args.id),
+                _requeue_again=reason if again else None,
             )
         except PreparedMessageRefused as e:
-            template = "agenttalk"
-            values = {"agent": args.agent, "id": args.id}
-            if getattr(args, "root", None) is not None:
-                template += " --root {root}"
-                values["root"] = str(store.root)
-            template += " dead-letter requeue --agent {agent} --id {id}"
-            if reopen_event is not None:
-                reason_flag = "--reason={reason}" if reopen_event["reason"].startswith("-") else "--reason {reason}"
-                template += " --force-resolved --from {actor} " + reason_flag
-                values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
-            # Single-quoted plain paths and phrases work in POSIX shells and PowerShell. Values with shell
-            # metacharacters keep the printed-command placeholder convention: cmd.exe does not honor single quotes.
-            rendered = {}
-            unsafe = []
-            for name, value in values.items():
-                if pc.is_plain(value):
-                    rendered[name] = value
-                elif (isinstance(value, str) and (name == "reason" or not value.startswith("-"))
-                      and re.fullmatch(r"[A-Za-z0-9_./:\\ -]+", value)):
-                    rendered[name] = shlex.quote(value)
-                else:
-                    rendered[name] = f"<{name}>"
-                    source = "is the resolved store folder named by --root" if name == "root" else pc.SUPPLIED_SOURCE
-                    unsafe.append(f"<{name}> is {pc.shown(value, pc.PATH_SHOWN_MAX_CHARACTERS, source=source)}")
-            note = ("Not a ready command: " + ", ".join(unsafe) + "; replace the placeholders safely.\n"
-                    if unsafe else "")
+            note, command = _requeue_retry_command(store, args, reason, reopen_event)
             route = (
-                "After the reset has finished, retry the same dead letter in PowerShell or a POSIX shell "
-                "to keep its original correlation.\n" + note + "  " + template.format(**rendered)
+                "After the reset has finished, retry the same dead letter: run this command once in PowerShell "
+                "or a POSIX shell to keep the dead letter's original correlation.\n" + note + "  " + command
             )
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {pc.line(str(e))} "
@@ -17015,17 +17000,27 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 if problem
                 else ""
             )
-            sys.stderr.write(
-                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
-                + (
-                    "Retry that copy instead: "
-                    + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=args.agent, i=retry)
-                    + "."
-                    if retry and not problem
-                    else attention + _requeue_route(args, orig)
-                )
-                + "\n"
-            )
+            if (orig.get("kind") not in _dl_tags.OPENERS
+                    and (e.again_allowed or isinstance(e, store_mod.RequeueStateDamaged))):
+                advice = "If the earlier requeue is why it was refused, pass --again --reason TEXT."
+            elif orig.get("kind") not in _dl_tags.OPENERS:
+                note, command = _requeue_retry_command(store, args, reason, reopen_event)
+                if isinstance(e, store_mod.RequeueStateReadError):
+                    record = pc.shown(
+                        str(store._requeue_state_path(args.agent, args.id)), pc.PATH_SHOWN_MAX_CHARACTERS,
+                        source="is the requeue record beside this dead letter in the store",
+                    )
+                    fix = f"Resolve the reported access problem first; the requeue record is {record}. "
+                else:
+                    fix = attention + "Resolve the refusal above first. "
+                advice = fix + "Then retry the same dead letter once:\n" + note + "  " + command
+            else:
+                if retry and not problem:
+                    note, command = _requeue_retry_command(store, args, reason, reopen_event, message_id=retry)
+                    advice = "Retry that copy instead:\n" + note + "  " + command
+                else:
+                    advice = attention + _requeue_route(args, orig)
+            sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))} {advice}\n")
             return 2
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))}\n")
@@ -17041,6 +17036,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 f"{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} again "
                 f"while the copy is in the store.\n"
             )
+        if again:
+            print(f"requeued again as {pc.meta_text(new.id)} after {pc.meta_text(new.meta['requeued_again_after'])}: "
+                  f"{pc.line(reason)}")
         print(f"requeued dead-letter {pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
@@ -17112,6 +17110,39 @@ def _retry_problem(store: Store, agent: str, copy_id: str) -> str | None:
     except (ValueError, FileNotFoundError) as e:
         return str(e)
     return None
+
+
+def _requeue_retry_command(store, args, reason, reopen_event, *, message_id=None):
+    """Render a retry for the selected store; an override applies only to its original item."""
+    template = "agenttalk --root {root} dead-letter requeue --agent {agent} --id {id}"
+    values = {"root": str(store.root), "agent": args.agent, "id": message_id or args.id}
+    again = message_id is None and getattr(args, "again", False)
+    if message_id is not None:
+        reopen_event = None
+    if again:
+        template += " --again"
+    if reopen_event is not None:
+        template += " --force-resolved --from {actor}"
+        values["actor"] = reopen_event["actor"]
+    if reopen_event is not None or again:
+        retry_reason = reopen_event["reason"] if reopen_event is not None else reason
+        template += " --reason={reason}" if retry_reason.startswith("-") else " --reason {reason}"
+        values["reason"] = retry_reason
+    rendered = {}
+    unsafe = []
+    for name, value in values.items():
+        if pc.is_plain(value):
+            rendered[name] = value
+        elif (isinstance(value, str) and (name == "reason" or not value.startswith("-"))
+              and re.fullmatch(r"[A-Za-z0-9_./:\\ -]+", value)):
+            rendered[name] = shlex.quote(value)
+        else:
+            rendered[name] = f"<{name}>"
+            source = "is the resolved store folder named by --root" if name == "root" else pc.SUPPLIED_SOURCE
+            unsafe.append(f"<{name}> is {pc.shown(value, pc.PATH_SHOWN_MAX_CHARACTERS, source=source)}")
+    note = ("Not a ready command: " + ", ".join(unsafe) + "; replace the placeholders safely.\n"
+            if unsafe else "")
+    return note, template.format(**rendered)
 
 
 def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
@@ -20501,13 +20532,18 @@ def build_parser() -> argparse.ArgumentParser:
     dls.add_argument("--json", action="store_true")
     dls.set_defaults(func=cmd_dead_letter)
     dlr = dlsub.add_parser("requeue",
-                           help="Re-inject as a FRESH message (new id, own fresh attempt "
-                                "count); original evidence preserved. No cursor rewind.")
+                           description="Requeue any kind of dead letter once. Repeating it is refused unless "
+                                       "--again and a non-empty --reason are given. A live task or review request "
+                                       "with the same request ID still blocks requeue.",
+                           help="Requeue any dead-letter kind once as a fresh message; the original is preserved. "
+                                "Use --again --reason to send again; live task/review request copies still block.")
     dlr.add_argument("--agent", required=True)
     dlr.add_argument("--id", required=True, help="The dead-lettered message id.")
     dlr.add_argument("--force-resolved", dest="force_resolved", action="store_true",
                      help="Requeue an item that was RESOLVED (requires --reason).")
-    dlr.add_argument("--reason", help="Reason (required with --force-resolved).")
+    dlr.add_argument("--again", action="store_true", help="Send again intentionally; requires --reason and records it. "
+                     "A live task or review request with the same request id still blocks requeue.")
+    dlr.add_argument("--reason", help="Non-empty reason required with --force-resolved or --again.")
     dlr.add_argument("--from", dest="sender", help="Actor for the audit event.")
     dlr.set_defaults(func=cmd_dead_letter)
     dlres = dlsub.add_parser("resolve",
