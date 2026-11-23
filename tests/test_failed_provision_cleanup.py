@@ -702,7 +702,10 @@ def test_unregistered_path_with_lstat_error_keeps_branch(tmp_path, monkeypatch, 
     assert writes == [] and "branch kept:" in note and "ownership" in note
 
 
-@pytest.mark.parametrize("failure", ["timeout", "unreaped-timeout", "fast", "timeout-text", "verify-timeout"])
+@pytest.mark.parametrize(
+    "failure",
+    ["timeout", "unreaped-timeout", "reap-oserror", "wait-oserror", "fast", "timeout-text", "verify-timeout"],
+)
 def test_assignment_add_timeout_keeps_checkout_and_branch(tmp_path, monkeypatch, capsys, failure):
     import contextlib
     import subprocess
@@ -747,14 +750,18 @@ def test_assignment_add_timeout_keeps_checkout_and_branch(tmp_path, monkeypatch,
 
         def communicate(self, timeout=None):
             self.calls += 1
-            if self.calls == 1 or failure == "unreaped-timeout":
+            if self.calls == 1 or failure in {"unreaped-timeout", "wait-oserror"}:
                 raise subprocess.TimeoutExpired("git", timeout)
+            if failure == "reap-oserror":
+                raise OSError("simulated pipe failure")
             return "", ""
 
         def kill(self):
             pass
 
         def wait(self, timeout=None):
+            if failure == "wait-oserror":
+                raise OSError("simulated wait failure")
             return -9
 
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: TimedOutGit())
@@ -807,7 +814,7 @@ def test_assignment_add_timeout_keeps_checkout_and_branch(tmp_path, monkeypatch,
     assert cli.cmd_lane(args) == 2
     error = capsys.readouterr().err
     assert saved == []
-    if failure in {"timeout", "unreaped-timeout"}:
+    if failure in {"timeout", "unreaped-timeout", "reap-oserror", "wait-oserror"}:
         assert len(writes) == 1
         assert state == {"branch": True, "registered": True}
         assert (target / "tracked.txt").read_bytes() == b"base\n"

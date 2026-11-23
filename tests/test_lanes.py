@@ -8438,6 +8438,18 @@ def _786_run_timeout_recovery(root, wt, lane_id, captured, saved, *, base_sha, c
         assert result.returncode == 0, result.stderr
         if any(line.startswith("D ") and (wt / line[3:]).exists() for line in result.stdout.splitlines()):
             repaired = run(reset)
+            if repaired.returncode != 0:
+                match = re.search(r"(?m)^fatal: Unable to create '([^'\r\n]+)': File exists\.\r?$", repaired.stderr)
+                assert match is not None, repaired.stderr
+                git_dir = run(["git", "-C", str(wt), "rev-parse", "--absolute-git-dir"])
+                assert git_dir.returncode == 0, git_dir.stderr
+                lock = Path(match.group(1))
+                assert lock.is_absolute() and lock.name == "index.lock"
+                own_git_dir = git_dir.stdout.strip()
+                assert cli._same_folder(str(lock.parent), own_git_dir), "refusing a different checkout's lock"
+                assert lock.is_file() and not lock.is_symlink()
+                lock.unlink()
+                repaired = run(reset)
             assert repaired.returncode == 0, repaired.stderr
             reset_used = True
             for rel, data in original.items():
@@ -8490,8 +8502,9 @@ def _786_run_timeout_recovery(root, wt, lane_id, captured, saved, *, base_sha, c
 
 @pytest.mark.parametrize("index_state", ["missing", "empty"])
 @pytest.mark.parametrize("content", ["missing-only", "edited-and-untracked"])
+@pytest.mark.parametrize("stale_lock", [False, True, "foreign"], ids=["no-lock", "stale-lock", "foreign-lock"])
 def test_786_planted_half_initialized_checkout_recovery_preserves_content_and_retries(
-    tmp_path, monkeypatch, index_state, content
+    tmp_path, monkeypatch, index_state, content, stale_lock
 ):
     root, _base = _repo(tmp_path)
     base = _commit(root, "src/core/b.py", "file not written during checkout\n")
@@ -8532,18 +8545,46 @@ def test_786_planted_half_initialized_checkout_recovery_preserves_content_and_re
     )
     assert "if it shows staged deletions of files that are present" in note
     assert "mixed reset does not recreate missing files" in note
+    assert "remove only that index.lock file named in the error" in note
     assert "only after you explicitly confirm all work is saved and this folder may be deleted" in note
     original_a = (wt / "src/core/a.py").read_bytes()
     if content == "edited-and-untracked":
         assert original_a == b"user work must survive the repair\n"
     saved = root / "saved-half-initialized-work"
+    lock = Path(_git(wt, "rev-parse", "--absolute-git-dir").strip()) / "index.lock"
+    if stale_lock is True:
+        lock.write_bytes(b"test stale lock")
+    other = root / "unrelated.lock"
+    other.write_bytes(b"must remain")
+    foreign = root / "other-git" / "index.lock"
+    if stale_lock == "foreign":
+        foreign.parent.mkdir()
+        foreign.write_bytes(b"must remain")
     with monkeypatch.context() as recovery:
         # Assignment after recovery uses real writes again; the timeout itself used none.
         recovery.setattr(cli, "_git_write", real_write)
+        if stale_lock == "foreign":
+            real_run = subprocess.run
+
+            def foreign_lock_error(argv, **kwargs):
+                if argv[3:] == ["reset", "--mixed", "HEAD"]:
+                    return subprocess.CompletedProcess(
+                        argv, 128, "", f"fatal: Unable to create '{foreign.as_posix()}': File exists.\n"
+                    )
+                return real_run(argv, **kwargs)
+
+            recovery.setattr(subprocess, "run", foreign_lock_error)
+            with pytest.raises(AssertionError, match="refusing a different checkout's lock"):
+                _786_run_timeout_recovery(
+                    root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True
+                )
+            assert foreign.read_bytes() == b"must remain" and other.read_bytes() == b"must remain"
+            return
         reset_used, restore_used, force_used, status = _786_run_timeout_recovery(
             root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True, missing=("src/core/b.py",)
         )
         assert reset_used and " D src/core/b.py" in status
+        assert not lock.exists() and other.read_bytes() == b"must remain"
         assert restore_used == (content == "missing-only")
         assert force_used == (content == "edited-and-untracked")
         recovered = _assign_worktree(root, base, lane_id)
@@ -8595,6 +8636,7 @@ def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(
     if timed_out:
         assert "injected add timeout" in error and "setup timed out" in error
         assert "if Git still lists the checkout as locked once nothing is running, first run" in error
+        assert "remove only that index.lock file named in the error" in error
         assert "worktree cleanup failed:" not in error
     else:
         assert "injected non-timeout add failure" in error
@@ -8799,6 +8841,7 @@ def test_786_content_filter_timeout_printed_steps_unlock_remove_and_retry(tmp_pa
         assert ready.exists(), "content filter must start before the add limit"
         assert len(planned) == 1 and mutations == []
         assert "if Git still lists the checkout as locked once nothing is running, first run" in error
+        assert "remove only that index.lock file named in the error" in error
         assert "setup timed out" in error and _lane_branch_present(root, lane_id)
         listing = _git(root, "worktree", "list", "--porcelain", "-z")
         assert "locked initializing" in listing
@@ -8811,8 +8854,10 @@ def test_786_content_filter_timeout_printed_steps_unlock_remove_and_retry(tmp_pa
     assert completed in {1, 2}, "at least the started filter must finish"
     wt = planned[0]
     assert len(captured) == 1
+    missing = tuple(rel for rel in ("src/core/a.py", "src/core/b.py") if not (wt / rel).exists())
+    saved = root / "saved-filter-work"
     reset_used, restore_used, force_used, _status = _786_run_timeout_recovery(
-        root, wt, lane_id, captured[0], root / "saved-filter-work", base_sha=base, confirmed_delete=True
+        root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True, missing=missing
     )
     if completed == 1:
         assert reset_used and restore_used and not force_used, (
