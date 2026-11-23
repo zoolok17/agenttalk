@@ -161,7 +161,8 @@ class _Launcher:
                 self.cleanup = True
                 raise _FIRST
             if self.reap_error is not None:
-                self.phase = "fallback"
+                if self.fallback is not None:
+                    self.phase = "fallback"
                 raise self.reap_error
             if self.reap_times_out:
                 raise subprocess.TimeoutExpired("git", timeout)
@@ -241,15 +242,20 @@ def test_a_windows_reap_that_times_out_keeps_the_warning_and_waits(tmp_path, mon
 
 
 @pytest.mark.parametrize(
-    "launcher",
+    "launcher, kills, reaps, waits",
     [
-        _Launcher(reap_error=OSError("simulated pipe failure")),
-        _Launcher(wait_error=OSError("simulated wait failure")),
-        _Launcher(kill_error=RuntimeError("simulated kill failure")),
+        # the timeout path's kill and reap, then the fallback's own kill and a second reap that works
+        (_Launcher(reap_error=OSError("simulated pipe failure")), 2, 3, 0),
+        # the reap timed out, so wait() ran and failed; the fallback kills and reaps again
+        (_Launcher(wait_error=OSError("simulated wait failure")), 2, 3, 1),
+        # the first kill failed with a non-OSError; the fallback kills again and its reap is the second communicate
+        (_Launcher(kill_error=RuntimeError("simulated kill failure")), 2, 2, 0),
     ],
     ids=["reap-oserror", "wait-oserror", "kill-error"],
 )
-def test_an_ordinary_error_after_the_timeout_becomes_the_warned_timeout_error(tmp_path, monkeypatch, launcher):
+def test_an_ordinary_error_after_the_timeout_becomes_the_warned_timeout_error(
+    tmp_path, monkeypatch, launcher, kills, reaps, waits
+):
     """Once the write has timed out, a failing kill, reap or wait is still the timeout: the error warns that Git or a
     program it started may still be running and keeps the original TimeoutExpired as its cause (the lane assignment's
     timeout recovery is keyed on that), and the launcher is still killed and reaped on a best-effort basis."""
@@ -257,7 +263,18 @@ def test_an_ordinary_error_after_the_timeout_becomes_the_warned_timeout_error(tm
         _timeout(tmp_path, monkeypatch, launcher)
     assert _WARNING in str(error.value) and "and was killed" not in str(error.value)
     assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
-    assert launcher.communicates >= 2
+    assert (launcher.killed, launcher.communicates, launcher.waited) == (kills, reaps, waits)  # the fallback ran
+
+
+def test_the_stand_in_launcher_recovers_after_a_single_reap_error():
+    """The stand-in itself: without a fallback it fails once and then reaps normally."""
+    launcher = _Launcher(reap_error=OSError("one pipe failure"))
+    with pytest.raises(subprocess.TimeoutExpired):
+        launcher.communicate(timeout=0.01)
+    with pytest.raises(OSError):
+        launcher.communicate(timeout=5)
+    assert launcher.communicate(timeout=5) == ("", "")
+    assert launcher.wait(5) == 0
 
 
 @pytest.mark.parametrize(
@@ -277,6 +294,55 @@ def test_an_interruption_in_the_fallback_after_an_ordinary_error_wins_over_the_t
     # the timeout path's kill, the fallback's kill, and the cleanup's kill; the cleanup reaps the launcher again
     assert launcher.killed == 3 and launcher.communicates == 4
     assert launcher.waited == (1 if step == "wait" else 0)
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt("gap"), SystemExit("gap")], ids=["ctrl-c", "exit"])
+@pytest.mark.parametrize("reap_fails", [False, True], ids=["reap-works", "reap-fails-so-wait-runs"])
+def test_an_interruption_between_two_cleanup_steps_never_replaces_the_first_or_skips_a_step(
+    tmp_path, monkeypatch, interruption, reap_fails
+):
+    """A second Ctrl-C can land after one wrapped step returned and before the next starts, outside any step's own
+    guard. While an interruption is being handled that must not escape, and the remaining steps still run."""
+    real = cli._best_effort
+
+    def with_a_gap(step):
+        real(step)
+        raise interruption  # raised in the code between two steps
+
+    monkeypatch.setattr(cli, "_best_effort", with_a_gap)
+    launcher = _Launcher(interrupt=True, fail={"communicate": _REAP_TIMEOUT} if reap_fails else None)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert raised.value is _FIRST
+    assert launcher.killed == 2 and launcher.communicates == 3  # the kill and the reap still ran
+    assert launcher.waited == (1 if reap_fails else 0)
+
+
+def test_a_real_ctrl_c_during_the_interruption_cleanup_is_deferred_and_the_handler_restored(tmp_path, monkeypatch):
+    """A SIGINT delivered while the cleanup runs does not interrupt it (a temporary handler takes it), and the
+    previous handler is back afterwards."""
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("signal handlers can only be changed from the main thread")
+    before = signal.getsignal(signal.SIGINT)
+    launcher = _Launcher(interrupt=True)
+    seen = {}
+
+    def kill_with_a_ctrl_c():
+        launcher.killed += 1
+        if launcher.cleanup and "handler" not in seen:  # the cleanup's own kill
+            seen["handler"] = signal.getsignal(signal.SIGINT)
+            signal.raise_signal(signal.SIGINT)
+            seen["finished"] = True  # the kill was not interrupted by the Ctrl-C
+
+    launcher.kill = kill_with_a_ctrl_c
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert raised.value is _FIRST
+    assert seen.get("finished") and seen["handler"] is not before
+    assert signal.getsignal(signal.SIGINT) is before
+    assert launcher.communicates == 3  # the reap after the Ctrl-C still ran
 
 
 def test_an_ordinary_error_after_the_timeout_on_another_platform_is_still_the_timeout_error(tmp_path, monkeypatch):

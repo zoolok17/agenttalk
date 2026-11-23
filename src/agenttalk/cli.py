@@ -3386,6 +3386,42 @@ def _best_effort_interruptible(step) -> None:
         pass
 
 
+@contextlib.contextmanager
+def _sigint_deferred():
+    """While the cleanup of an interruption already being handled runs, a new Ctrl-C is taken by a temporary handler
+    and dropped: the first interruption is the one being raised, and a second must not replace it or cut the bounded
+    cleanup short. The previous handler is restored afterwards. Limits: Python can only change handlers from the
+    main thread (elsewhere nothing is deferred, but a Ctrl-C is only delivered to the main thread anyway), and one
+    that lands between the call that installs the handler and its return cannot be deferred."""
+    import signal
+
+    try:
+        previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
+    except (ValueError, OSError):  # not the main thread
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
+
+
+def _run_swallowing(steps) -> None:
+    """Run every cleanup step even if an interruption lands between two of them (outside the steps' own guards).
+
+    The position is advanced before a step runs, so a step is never repeated and none is skipped: whatever is raised
+    in the gaps is dropped and the loop goes on with the next step."""
+    index = 0
+    while index < len(steps):
+        try:
+            while index < len(steps):
+                step = steps[index]
+                index += 1
+                _best_effort(step)
+        except BaseException:  # noqa: BLE001, S110  # nosec B110
+            pass
+
+
 def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
     """Try to kill the launcher and reap it. Every step is its own best effort; no ordinary error escapes.
 
@@ -3398,29 +3434,35 @@ def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
     interruption that arrives during a step stops the cleanup at once and propagates, so the caller can do its own
     bounded cleanup and raise it.
     """
-    run = _best_effort_interruptible if interruptible else _best_effort
-    running = [True]  # cannot tell when poll() fails, so act as if it were still running
+    state = {"running": True, "reaped": False}  # running stays True when poll() fails: cannot tell, so act
 
     def poll() -> None:
-        running[0] = proc.poll() is None
+        state["running"] = proc.poll() is None
 
-    run(poll)
-    if not running[0]:
-        return
-    run(proc.kill)
-    reaped = []
+    def kill() -> None:
+        if state["running"]:
+            proc.kill()
 
     def reap() -> None:
-        proc.communicate(timeout=5)
-        reaped.append(True)
+        if state["running"]:
+            proc.communicate(timeout=5)
+            state["reaped"] = True
 
-    run(reap)
-    if not reaped:
+    def wait() -> None:
         # A hook or descendant holding the captured stdout/stderr pipe handles open can keep
         # communicate() blocked past this retry even though the killed process is already
         # dead - wait() does not touch the pipes at all, so it still completes once the
         # process is actually gone. A second timeout leaves the launcher's reap unconfirmed.
-        run(lambda: proc.wait(timeout=25))
+        if state["running"] and not state["reaped"]:
+            proc.wait(timeout=25)
+
+    steps = [poll, kill, reap, wait]
+    if interruptible:
+        for step in steps:
+            _best_effort_interruptible(step)
+    else:
+        with _sigint_deferred():
+            _run_swallowing(steps)
 
 
 def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired):
