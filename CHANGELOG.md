@@ -151,6 +151,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Opening a close no longer records a checkout as clean when Git cannot check it (#862).**
   Teams whose store is outside a Git checkout will see ordinary closes hold until they record a diff artifact.
 
+- **A dead letter can no longer be requeued twice by accident (#891).** Previously, rerunning the command for a message, review result or other reply, rescind, end, or task or review request without a request ID exited 0 and sent another copy; now a repeat for every kind exits 2 and names the first copy. When that copy is still found, the refusal says the dead letter was “already requeued as” the copy and says where it is. When the record says the copy was published but it is no longer found, the refusal names the record and copy, says it “was published,” and says the copy is no longer in the places the store keeps; this also exits 2. An incomplete claim from an earlier store session has different wording. A live task or review request with the same request ID, or an unreadable record, also causes exit 2. Scripts should account for these forms rather than matching only “already requeued.” To send deliberately again, pass `--again --reason TEXT`; the reason is recorded. A task or review request with a live copy of the same request ID remains blocked even with `--again`. An older non-opener dead letter, or a dead letter of any kind with no request ID, requeued before this change has no record, so its next requeue is accepted once before later repeats are refused. Scripts that deliberately repeat the command need the new flags.
+
+  An interrupted deliberate repeat keeps its earlier copy and reason in the requeue record, so a plain retry is refused when an earlier copy exists. Older versions ignore these optional record fields and cannot provide that protection. Retry advice after a reset keeps `--again` and its reason. Printed retry commands name the store with `--root`, even if the original command did not; refusal advice puts the command on its own indented line without a trailing full stop. A retry suggested for a different copy does not carry the original item's override.
+
 - **Three first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
   line for every seat; now it names the seat and the change, for example "roster: worker model vendor
   set to openai (operator-configured, not provider attestation)." or "... cleared ...", so a script
@@ -232,7 +236,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the submodule or record a truthful dirty artifact. Scratch release keeps its
   existing stricter rules.
 
-- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for dead-letter replies and control messages, retry the same requeue command to keep their original correlation.
+- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for any dead-letter kind, retry the same requeue command to keep its original correlation; the advice preserves an explicit store root and prints the command separately. A refused prepared send ends with these codes (already so since 0.105.0, now documented and tested): `send_rejected` for a web-intent send, and HTTP 409 `lead_chat_send_rejected` for a lead-chat send.
 
 - **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
   Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail

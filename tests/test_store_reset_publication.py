@@ -137,6 +137,29 @@ def test_replacement_is_refused_and_preserved(store, waiting_send, replacement):
     assert not list(store.messages_dir.glob("*.json"))
 
 
+def test_same_size_and_time_replacement_is_refused(store, waiting_send):
+    start, finish = waiting_send
+    staged = start()
+    path = staged["path"]
+    original = path.stat()
+    kept = path.with_suffix(".kept")
+    os.replace(path, kept)
+    path.write_bytes(kept.read_bytes())
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    replacement = path.stat()
+    assert original.st_ino and replacement.st_ino
+    assert (original.st_dev, original.st_ino) != (replacement.st_dev, replacement.st_ino)
+    assert (original.st_size, original.st_mtime_ns) == (replacement.st_size, replacement.st_mtime_ns)
+    before = publication_snapshot(store)
+    payload = path.read_bytes()
+    result = finish()
+    assert isinstance(result.get("error"), storage.PreparedMessageRefused)
+    assert path.read_bytes() == payload
+    assert publication_snapshot(store) == before
+    assert str(result["error"]) == refusal()
+    assert not list(store.messages_dir.glob("*.json"))
+
+
 @pytest.mark.parametrize("replace", [False, True])
 def test_lost_requeue_preparation_makes_no_claim(store, waiting_send, monkeypatch, replace):
     calls = []
@@ -272,11 +295,12 @@ def test_cli_reset_refusal_has_no_success(store, waiting_send, capsys):
     assert not output.out
 
 
-def test_requeue_cli_refusal_includes_route(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("kind", ["task", "review-request"])
+def test_requeue_cli_refusal_includes_route(tmp_path, monkeypatch, capsys, kind):
     from test_dead_letter import _dead_payload, _requeue, _requeue_store, _send
 
     store = _requeue_store(tmp_path, monkeypatch, False)
-    original = _send(store, "work", kind="task", meta={"request_id": "tk-772"})
+    original = _send(store, "work", kind=kind, meta={"request_id": "tk-772"})
     _dead_payload(store, original)
     capsys.readouterr()
     write = storage._write_text_exclusive
@@ -292,6 +316,41 @@ def test_requeue_cli_refusal_includes_route(tmp_path, monkeypatch, capsys):
     assert _requeue(store, original) == 2
     output = capsys.readouterr()
     assert "agenttalk dead-letter requeue: " + refusal() in output.err
-    assert "new request" in output.err
+    assert "retry the same dead letter" in output.err
     assert publication_snapshot(store) == before
     assert not store._requeue_state_path("beta", original.id).exists()
+
+
+@pytest.mark.parametrize("kind", ["task", "review-request"])
+@pytest.mark.parametrize("reset", ["none", "plain", "archive"])
+def test_opener_requeue_refusal_can_retry_once(tmp_path, monkeypatch, capsys, kind, reset):
+    from test_dead_letter import _dead_payload, _requeue, _requeue_store, _send
+
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "work", kind=kind, meta={"request_id": "tk-815"})
+    dead = _dead_payload(store, original)
+    evidence = dead.read_bytes()
+    write = storage._write_text_exclusive
+
+    def lose_preparation(path, text):
+        identity = write(path, text)
+        if path.suffix == ".pending":
+            path.unlink()
+        return identity
+
+    before = publication_snapshot(store)
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "_write_text_exclusive", lose_preparation)
+        assert _requeue(store, original) == 2
+    assert "retry the same dead letter" in capsys.readouterr().err
+    assert dead.read_bytes() == evidence
+    assert publication_snapshot(store) == before
+    assert not store._requeue_state_path("beta", original.id).exists()
+    if reset != "none":
+        store.reset(archive=reset == "archive")
+    assert _requeue(store, original) == 0
+    copies = [m for m in store.messages_for("beta") if (m.meta or {}).get("request_id") == "tk-815"]
+    assert len(copies) == 1
+    assert _requeue(store, original) == 2
+    assert len([m for m in store.messages_for("beta") if (m.meta or {}).get("request_id") == "tk-815"]) == 1
+    assert dead.read_bytes() == evidence

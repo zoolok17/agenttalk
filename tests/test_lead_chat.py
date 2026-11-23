@@ -630,3 +630,28 @@ def test_operator_principal_is_not_in_agent_only_walks(
     assert "operator" not in report["agents"]
     obs = sup.build_supervisor_observation(s, now_epoch=time.time())
     assert "operator" not in [a["name"] for a in obs["agents"]]
+
+
+def test_lead_chat_store_refusal_reports_conflict(tmp_path, monkeypatch):
+    from agenttalk.store import PreparedMessageRefused
+
+    store = _store(tmp_path)
+    _available(store)
+
+    def refuse(**kwargs):
+        raise PreparedMessageRefused("nothing was published")
+
+    monkeypatch.setattr(store, "send", refuse)
+    server, _thread, base = web.serve_in_thread(store, port=0, enable_actions=True)
+    try:
+        token = _session(base)
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_lead_chat(base, token, {"body": "hello"})
+        assert exc.value.code == 409
+        error = json.loads(exc.value.read())
+        assert error["error"] == "lead_chat_send_rejected"
+        assert "nothing was published" in error["detail"]
+        assert not store.messages_for("lead")
+    finally:
+        server.shutdown()
+        server.server_close()
