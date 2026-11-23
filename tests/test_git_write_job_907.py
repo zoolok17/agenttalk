@@ -239,7 +239,9 @@ SCRIPTS = {
     "ordinary_error": (("raise", RuntimeError("simulated pipe failure")),),
     "fallback_error": (("timeout",), ("raise", RuntimeError("simulated pipe failure"))),
 }
-INTERRUPTING = {"interrupt_after_timeout", "interrupt_before_timeout"}
+# A tuple, never a set: a parameter list must come out in the same order in every process (pytest-xdist workers each
+# collect on their own and refuse the run when the lists differ; a set's order changes with the hash seed).
+INTERRUPTING = ("interrupt_after_timeout", "interrupt_before_timeout")
 BASE_STOPS = {
     "normal": 0,
     "timeout": 1,
