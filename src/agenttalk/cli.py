@@ -3290,8 +3290,9 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     """Run a narrowly allowlisted mutating git command.
 
     This is intentionally separate from `_git`: callers must opt into mutating git,
-    every positional path/ref remains an argv element, and timeouts kill+reap before
-    returning so a lane is never persisted after an unknown write state.
+    every positional path/ref remains an argv element. On Windows, a timeout attempts
+    to kill the launcher and warn: the programs Git started are not stopped and may still
+    be running, and a partial checkout or lock may still need recovery.
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
@@ -3355,6 +3356,164 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
+        _raise_git_write_timeout(proc, timeout, e)  # looks after its own interruptions
+    except Exception:  # an ordinary error before any timeout: no interruption is in flight, so a new one wins
+        try:
+            _kill_and_reap(proc, interruptible=True)
+        except BaseException:
+            _kill_and_reap(proc)
+            raise
+        raise
+    except BaseException:
+        _kill_and_reap(proc)
+        raise
+    return proc.returncode, out or "", err or ""
+
+
+_GIT_STILL_RUNNING = (
+    " Git or a program it started may still be running; wait for it to finish before retrying or cleaning up."
+)
+
+
+def _best_effort(step) -> None:
+    """Run one cleanup step. Nothing it raises, a second Ctrl-C or SystemExit included, is passed on: the caller is
+    already handling an interruption and that original one is the one that should be raised. See `_run_swallowing`
+    and `_sigint_deferred` for the limits."""
+    try:
+        step()
+    except BaseException:  # noqa: BLE001, S110  # nosec B110
+        pass
+
+
+def _best_effort_interruptible(step) -> None:
+    """Like `_best_effort`, but only an ordinary error is swallowed: an interruption (KeyboardInterrupt or SystemExit)
+    escapes at once, so a Ctrl-C is not lost while no other interruption is being handled."""
+    try:
+        step()
+    except Exception:  # noqa: BLE001, S110  # nosec B110
+        pass
+
+
+@contextlib.contextmanager
+def _sigint_deferred():
+    """While the cleanup of an interruption already being handled runs, a new Ctrl-C is taken by a temporary handler
+    and dropped: the first interruption is the one being raised, and a second must not replace it or cut the bounded
+    cleanup short. The previous handler is read before anything is installed and put back in a finally.
+
+    Limits, plainly: a main-thread OS Ctrl-C is suppressed while the temporary handler is installed. Installation
+    failures still let cleanup continue; a partly installed handler can stay active until restoration. Python can
+    only change handlers on the main thread, so nothing is deferred elsewhere (a Ctrl-C is only delivered to the
+    main thread anyway). Entry, exit and handler transitions are not an arbitrary-exception guarantee."""
+    import signal
+
+    previous = signal.getsignal(signal.SIGINT)
+    try:
+        try:
+            signal.signal(signal.SIGINT, lambda signum, frame: None)
+        except BaseException:  # noqa: BLE001, S110  # nosec B110
+            # Not the main thread, the install failed, or it was itself interrupted: the cleanup still continues (a
+            # partly installed handler can stay active until the finally restores the previous one), and the original
+            # interruption is still the one raised by the caller.
+            pass
+        yield
+    finally:
+        if signal.getsignal(signal.SIGINT) is not previous:  # also covers an install that failed after it took effect
+            signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
+
+
+def _run_swallowing(steps) -> None:
+    """Run the cleanup steps through one guarded dispatcher, so that an exception raised between two of them (outside
+    the steps' own guards) does not replace the interruption being handled.
+
+    All of the loop control (the condition, the choice of the step, the call) is inside one try. A step is marked as
+    started by its own first action, inside `_best_effort`; a step that was not started is run on the next pass and
+    one that was started is not run again. Steps are safe to repeat (a kill, a reap and a wait can all be asked
+    twice). The passes are limited.
+
+    Limits, plainly: one-off failures in the guarded dispatcher are retried while the budget permits. Arbitrary
+    injected exceptions at step marking or entry can leave an operation unattempted; recurring dispatcher failures
+    can exhaust the budget; faults that stop the counter or limit check progressing can defeat that bound. Entry,
+    exit and handler transitions are not an arbitrary-exception guarantee: the few lines that set the loop up, the
+    `try` that starts a pass and the `return` that ends it are outside any guard, and Python offers no way to guard
+    them."""
+    started, passes = set(), 0
+    while True:
+        try:
+            passes += 1
+            if passes > 2 * len(steps) + 2:
+                return
+            for position, step in enumerate(steps):
+                if position not in started:
+                    _best_effort(_marking(started, position, step))
+            return
+        except BaseException:  # noqa: BLE001, S110  # nosec B110
+            pass
+
+
+def _marking(started, position, step):
+    def run() -> None:
+        started.add(position)
+        step()
+
+    return run
+
+
+def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
+    """Try to kill the launcher and reap it. Every step is its own best effort; no ordinary error escapes.
+
+    A failing poll never skips the kill, a failing kill never skips the reap, and a failing or
+    timed-out reap is followed by wait(), which does not touch the pipes. Each step is bounded.
+    Nothing here confirms that the launcher stopped: with a kill and a reap that keep failing it is left running.
+
+    While an interruption is already being handled (the default) a second Ctrl-C is swallowed so that the first one
+    is the one that is raised (see `_run_swallowing` and `_sigint_deferred` for the limits). With ``interruptible``
+    (the caller has no interruption in flight) an interruption that arrives during a step stops the cleanup at
+    once and propagates, so the caller can do its own bounded cleanup and raise it.
+    """
+    state = {"running": True, "reaped": False}  # running stays True when poll() fails: cannot tell, so act
+
+    def poll() -> None:
+        state["running"] = proc.poll() is None
+
+    def kill() -> None:
+        if state["running"]:
+            proc.kill()
+
+    def reap() -> None:
+        if state["running"]:
+            proc.communicate(timeout=5)
+            state["reaped"] = True
+
+    def wait() -> None:
+        # A hook or descendant holding the captured stdout/stderr pipe handles open can keep
+        # communicate() blocked past this retry even though the killed process is already
+        # dead - wait() does not touch the pipes at all, so it still completes once the
+        # process is actually gone. A second timeout leaves the launcher's reap unconfirmed.
+        if state["running"] and not state["reaped"]:
+            proc.wait(timeout=25)
+
+    steps = [poll, kill, reap, wait]
+    if interruptible:
+        for step in steps:
+            _best_effort_interruptible(step)
+    else:
+        with _sigint_deferred():
+            _run_swallowing(steps)
+
+
+def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired):
+    """Stop a timed-out Git command and raise ``GitWriteError`` (never returns).
+
+    An attempt is made to kill the launcher (through Popen's own handle on Windows) and to reap it; neither is
+    confirmed. The programs Git started are NOT stopped, so on Windows the error always says they may still be
+    running. No program is launched here. The whole handling sits inside the interruption boundary: Ctrl-C anywhere
+    in it makes a best-effort attempt to kill and reap the launcher (it may not succeed), and the original
+    interruption is the one raised. Once the write has timed out, any ordinary error (an Exception) from the kill,
+    the reap or the wait is still the timeout: it becomes the same warned ``GitWriteError`` with the original
+    ``TimeoutExpired`` of the write as its cause (a timeout of the reap itself stays as its context), which the
+    lane assignment's timeout recovery is keyed on. Only a real interruption propagates as such.
+    """
+    try:
         # kill() can itself raise (PermissionError on Windows,
         # ProcessLookupError if the child already exited) - guarded so it
         # can never pre-empt the GitWriteError raised below.
@@ -3362,48 +3521,35 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
             proc.kill()
         try:
             out, err = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired as reap:
-            # A third exit from this function's timeout handling that used
-            # to raise immediately without ever calling wait() - a killed
-            # git could still go unreaped while this function returned
-            # (via raising), contradicting the docstring's own kill+REAP
-            # contract and leaving a lane mutation's lock state uncertain.
-            # Same fallback as the BaseException branch below: wait() does
-            # not touch the pipes, so it still completes once the process
-            # is actually gone.
+        except subprocess.TimeoutExpired:  # the reap's own timeout becomes the context of the error below
+            # A child can hold the pipes open after the launcher exits. wait()
+            # reaps the launcher without waiting for those pipes to close.
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=25)
             raise GitWriteError(
                 "mutating git timed out and could not be reaped; git/config lock may be stranded"
-            ) from reap
-        raise GitWriteError(
-            f"mutating git timed out after {timeout:g}s and was killed: {err or out or e}"
-        ) from e
-    except BaseException:
-        if proc.poll() is None:
-            # kill() can itself raise - unguarded, that secondary error
-            # would replace the owner BaseException being handled here and
-            # skip the reap fallback below entirely.
-            with contextlib.suppress(OSError):
-                proc.kill()
-            try:
-                proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                # A hook or descendant holding the captured stdout/stderr
-                # pipe handles open can keep communicate() blocked past
-                # this retry even though the killed process is already
-                # dead - wait() does not touch the pipes at all, so it
-                # still completes once the process is actually gone.
-                # This function's own contract (kill+REAP before
-                # returning, so a lane is never persisted after an
-                # unknown write state) applies on this path too, not
-                # just the routine-timeout branch above; silently
-                # swallowing a second TimeoutExpired here left the reap
-                # unconfirmed.
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=25)
+                + (_GIT_STILL_RUNNING if os.name == "nt" else "")
+            ) from timed_out  # the write's own timeout is the cause
+        result = f"mutating git timed out after {timeout:g}s"
+        if os.name != "nt":
+            result += " and was killed"
+        warning = _GIT_STILL_RUNNING if os.name == "nt" else ""
+        raise GitWriteError(f"{result}: {err or out or timed_out}" + warning) from timed_out
+    except GitWriteError:
         raise
-    return proc.returncode, out or "", err or ""
+    except Exception as failure:  # the kill, the reap or the wait failed after the timeout: still the timeout
+        try:
+            _kill_and_reap(proc, interruptible=True)  # no interruption is in flight: one that arrives now wins
+        except BaseException:
+            _kill_and_reap(proc)  # the same bounded best-effort cleanup as for any interruption, then re-raise it
+            raise
+        raise GitWriteError(
+            "mutating git timed out and could not be reaped; git/config lock may be stranded"
+            f" ({failure})" + (_GIT_STILL_RUNNING if os.name == "nt" else "")
+        ) from timed_out
+    except BaseException:
+        _kill_and_reap(proc)
+        raise
 
 
 def _resolve_revision(root, ref: str) -> tuple[str, str]:

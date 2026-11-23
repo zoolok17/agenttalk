@@ -63,6 +63,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the close lock is taken, so a checkout moved in that gap is not caught.
   The close record also distinguishes unknown cleanliness from a checkout not
   shown clean, and the hold message no longer calls an unchecked checkout dirty.
+
+- **A Windows Git write timeout now always says that Git's own programs may still be running (#791).**
+  When a changing Git command runs past its time limit, agenttalk tries to stop the Git launcher and does
+  not stop the programs Git started (for example a content filter), so on Windows the error now always adds
+  that Git or a program it started may still be running and that you should wait before retrying or
+  cleaning up. It no longer says the command "was killed" on Windows, because at most the launcher was
+  stopped and even that is not confirmed. The same warned timeout error is raised when stopping or
+  collecting the launcher itself fails after the timeout (for example a broken pipe), so lane setup still
+  recognises the timeout and keeps its checkout. No program (such as `taskkill.exe`) is launched while this
+  is handled. Pressing Ctrl-C at any point during the timeout handling now makes a best-effort attempt to
+  kill and reap the launcher, step by step (it may not succeed if the kill and the reap keep failing), and
+  raises the original interruption; a failing clean-up step or a second Ctrl-C from the keyboard is not
+  meant to replace it (best effort, with limits stated in the code); this stronger clean-up applies on
+  every platform, while the timeout message itself is unchanged outside Windows. A partial checkout or lock may still need recovery. Stopping the programs Git started, by making
+  them members of a job that ends with the launcher, is a planned follow-up (#907).
+
 - **The release checklist now names the README as the only install pin.** Since the user manuals
   stopped carrying their own install line (#835), step 1 of the release ritual in
   `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
