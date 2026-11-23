@@ -3378,10 +3378,11 @@ def _best_effort(step) -> None:
 
 
 def _kill_and_reap(proc) -> None:
-    """Kill the launcher and reap it. Every step is its own best effort and none can raise.
+    """Try to kill the launcher and reap it. Every step is its own best effort and none can raise.
 
     A failing poll never skips the kill, a failing kill never skips the reap, and a failing or
     timed-out reap is followed by wait(), which does not touch the pipes. Each step is bounded.
+    Nothing here confirms that the launcher stopped: with a kill and a reap that keep failing it is left running.
     """
     running = [True]  # cannot tell when poll() fails, so act as if it were still running
 
@@ -3410,13 +3411,14 @@ def _kill_and_reap(proc) -> None:
 def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired):
     """Stop a timed-out Git command and raise ``GitWriteError`` (never returns).
 
-    The launcher is killed (through Popen's own handle on Windows) and reaped. The programs Git started are NOT
-    stopped, so on Windows the error always says they may still be running. No program is launched here. The whole
-    handling sits inside the interruption boundary: Ctrl-C anywhere in it kills and reaps the launcher through
-    best-effort steps, and the original interruption is the one raised. Once the write has timed out, any ordinary
-    error (an Exception) from the kill, the reap or the wait is still the timeout: it becomes the same warned
-    ``GitWriteError`` with the original ``TimeoutExpired`` as its cause, which the lane assignment's timeout recovery
-    is keyed on. Only a real interruption propagates as such.
+    An attempt is made to kill the launcher (through Popen's own handle on Windows) and to reap it; neither is
+    confirmed. The programs Git started are NOT stopped, so on Windows the error always says they may still be
+    running. No program is launched here. The whole handling sits inside the interruption boundary: Ctrl-C anywhere
+    in it makes a best-effort attempt to kill and reap the launcher (it may not succeed), and the original
+    interruption is the one raised. Once the write has timed out, any ordinary error (an Exception) from the kill,
+    the reap or the wait is still the timeout: it becomes the same warned ``GitWriteError`` with the original
+    ``TimeoutExpired`` of the write as its cause (a timeout of the reap itself stays as its context), which the
+    lane assignment's timeout recovery is keyed on. Only a real interruption propagates as such.
     """
     try:
         # kill() can itself raise (PermissionError on Windows,
@@ -3426,7 +3428,7 @@ def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.Timeout
             proc.kill()
         try:
             out, err = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired as reap:
+        except subprocess.TimeoutExpired:  # the reap's own timeout becomes the context of the error below
             # A child can hold the pipes open after the launcher exits. wait()
             # reaps the launcher without waiting for those pipes to close.
             with contextlib.suppress(subprocess.TimeoutExpired):
@@ -3434,7 +3436,7 @@ def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.Timeout
             raise GitWriteError(
                 "mutating git timed out and could not be reaped; git/config lock may be stranded"
                 + (_GIT_STILL_RUNNING if os.name == "nt" else "")
-            ) from reap
+            ) from timed_out  # the write's own timeout is the cause
         result = f"mutating git timed out after {timeout:g}s"
         if os.name != "nt":
             result += " and was killed"

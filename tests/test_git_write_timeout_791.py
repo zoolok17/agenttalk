@@ -129,6 +129,7 @@ class _Launcher:
         self.reap_times_out = reap_times_out or interrupt_in_wait or wait_error is not None
         self.fail = fail or {}
         self.communicates = self.killed = self.waited = 0
+        self.first_timeout = None
         self.cleanup = False
 
     def _maybe_fail(self, step):
@@ -149,7 +150,8 @@ class _Launcher:
     def communicate(self, timeout=None):
         self.communicates += 1
         if self.communicates == 1:
-            raise subprocess.TimeoutExpired("git", timeout)
+            self.first_timeout = subprocess.TimeoutExpired("git", timeout)
+            raise self.first_timeout
         if self.communicates == 2:
             if self.interrupt:
                 self.cleanup = True
@@ -249,6 +251,17 @@ def test_an_ordinary_error_after_the_timeout_on_another_platform_is_still_the_ti
     with pytest.raises(cli.GitWriteError) as error:
         _timeout(tmp_path, monkeypatch, launcher, windows=False)
     assert "timed out" in str(error.value) and isinstance(error.value.__cause__, subprocess.TimeoutExpired)
+
+
+def test_a_reap_that_times_out_keeps_the_original_write_timeout_as_the_cause(tmp_path, monkeypatch):
+    """The cause is the timeout of the write itself, not the later timeout of the reap, which stays as context."""
+    launcher = _Launcher(reap_times_out=True)
+    with pytest.raises(cli.GitWriteError) as error:
+        _timeout(tmp_path, monkeypatch, launcher)
+    assert error.value.__cause__ is launcher.first_timeout
+    assert isinstance(error.value.__context__, subprocess.TimeoutExpired)
+    assert error.value.__context__ is not launcher.first_timeout
+    assert "could not be reaped" in str(error.value) and _WARNING in str(error.value)
 
 
 def test_an_interruption_during_the_reap_kills_and_reaps_the_launcher_and_is_raised_again(tmp_path, monkeypatch):
@@ -387,6 +400,7 @@ def test_a_git_filter_keeps_running_after_a_windows_timeout_and_the_error_warns(
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     handles = []
+    held = {}  # "launcher" and "filter": the handles of those two processes
     real_popen = subprocess.Popen
     process = None
     fired = []
@@ -427,6 +441,7 @@ def test_a_git_filter_keeps_running_after_a_windows_timeout_and_the_error_warns(
         assert proc.poll() is None, "launcher exited before process capture"
         found = _capture_snapshot_tree(proc.pid, parents, observe, kernel.CloseHandle)
         handles.extend(handle for handle, _ in found.values())
+        held["launcher"], held["filter"] = found[proc.pid][0], found[filter_pid][0]
         assert filter_pid in found and len(found) >= 3, "expected launcher, Git and filter descendants"
 
     def popen(cmd, *args, **kwargs):
@@ -463,9 +478,10 @@ def test_a_git_filter_keeps_running_after_a_windows_timeout_and_the_error_warns(
         assert handles, "the filter tree must have been captured"
         assert fired, "the timeout must have fired"
         assert launched == [[]], "no program may be launched in the timeout path"
-        states = [kernel.WaitForSingleObject(handle, 0) for handle in handles]
-        # The launcher is stopped, the programs Git started are not: a child is still running, and the error says so.
-        assert 0x102 in states, "a child must still be alive: the programs Git started are not stopped"
+        # The launcher is stopped (checked on its own handle); the programs Git started are not: the content filter's
+        # own process, held by its own handle, is still running, and the error says so.
+        assert kernel.WaitForSingleObject(held["launcher"], 5000) == 0, "the launcher must have been stopped"
+        assert kernel.WaitForSingleObject(held["filter"], 0) == 0x102, "the content filter must still be running"
         assert "may still be running" in str(error.value) and "and was killed" not in str(error.value)
         # Whatever the audit hook cannot see: no process created after the timeout fired is a child of ours.
         snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
