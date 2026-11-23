@@ -24,7 +24,7 @@ never used again: its value could already belong to something else.
 from __future__ import annotations
 
 import contextlib
-import subprocess
+import subprocess  # nosec B404
 import time
 from collections.abc import Callable
 from typing import Any
