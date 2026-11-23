@@ -6,15 +6,17 @@ import pytest
 
 from agenttalk import cli
 from agenttalk import store as storage
-from test_dead_letter import _rec, _requeue, _requeue_store, _send
+from test_dead_letter import _dead_payload, _rec, _requeue, _requeue_store, _send
 
 
 def dead_letter(store, kind):
     correlation = {"in_reply_to": "20200101-000000-000000-Abcd"}
-    if kind in {"task", "review-request", "review-result"}:
+    if kind in {"task", "review-request", "review-result", "proposal-response"}:
         correlation["request_id"] = "tk-original"
     if kind == "review-result":
         correlation["status"] = "approved"
+    if kind == "proposal-response":
+        correlation["status"] = "accepted"
     original = _send(store, "original body", kind=kind, meta=correlation)
     record = _rec(store)
     assert record["id"] == original.id
@@ -36,6 +38,48 @@ def refuse_lost_preparation(monkeypatch, action):
     with monkeypatch.context() as patch:
         patch.setattr(storage, "_write_text_exclusive", lose)
         assert action() == 2
+
+
+@pytest.mark.parametrize("kind", ["message", "review-result", "task", "review-request", "proposal-response"])
+@pytest.mark.parametrize("resolved", [False, True])
+def test_prepared_replay_retry_line_preserves_again_reason(tmp_path, monkeypatch, capsys, kind, resolved):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = dead_letter(store, kind)
+    assert _requeue(store, original) == 0
+    earlier = store.messages_for("beta")[-1]
+    if kind in {"task", "review-request"}:
+        _dead_payload(store, earlier)
+    if resolved:
+        assert cli.main(["--root", str(store.root), "dead-letter", "resolve", "--from", "lead",
+                         "--agent", "beta", "--id", original.id, "--reason", "handled"]) == 0
+    flags = ["--force-resolved", "--from", "lead"] if resolved else []
+    capsys.readouterr()
+    refuse_lost_preparation(monkeypatch, lambda: _requeue(
+        store, original, *flags, "--again", "--reason", "try again"
+    ))
+    error = capsys.readouterr().err
+    line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
+    argv = shlex.split(line)
+    assert "--again" in argv and argv[argv.index("--reason") + 1] == "try again"
+    if resolved:
+        assert "--force-resolved" in argv and argv[argv.index("--from") + 1] == "lead"
+    store.reset()
+    assert cli.main(argv[1:]) == 0
+    assert store.messages_for("beta")[-1].meta["requeued_again_after"] == earlier.id
+
+
+def test_prepared_replay_unsafe_reason_uses_placeholder(tmp_path, monkeypatch, capsys):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = dead_letter(store, "message")
+    assert _requeue(store, original) == 0
+    capsys.readouterr()
+    refuse_lost_preparation(monkeypatch, lambda: _requeue(
+        store, original, "--again", "--reason", "unsafe; command"
+    ))
+    error = capsys.readouterr().err
+    line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
+    assert "--again" in line and "<reason>" in line
+    assert "unsafe; command" not in error and "Not a ready command:" in error
 
 
 @pytest.mark.parametrize("kind", ["review-request", "review-result", "rescind", "end"])

@@ -5,6 +5,89 @@ import pytest
 from test_dead_letter import _dead_payload, _requeue, _requeue_store, _send
 
 
+def test_failed_explicit_replay_keeps_plain_requeue_refused(tmp_path, monkeypatch):
+    from agenttalk.store import Store
+
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body")
+    _dead_payload(store, original)
+    assert _requeue(store, original) == 0
+    earlier = store.messages_for("beta")[-1]
+    with monkeypatch.context() as patch:
+        def fail(*args, **kwargs):
+            raise ValueError("injected publication failure")
+
+        patch.setattr(Store, "_reserve_message_publication_sequence", fail)
+        assert _requeue(store, original, "--again", "--reason", "repeat") == 2
+    claim = store._read_requeue_state("beta", original.id)
+    assert claim["state"] == "claimed"
+    assert claim["requeued_again"] == "repeat" and claim["requeued_again_after"] == earlier.id
+    assert _requeue(store, original) == 2
+    assert [message.id for message in store.messages_for("beta")] == [earlier.id]
+
+
+@pytest.mark.parametrize("fields", [
+    {"requeued_again": "reason"},
+    {"requeued_again_after": "none"},
+    {"requeued_again": " ", "requeued_again_after": "none"},
+    {"requeued_again": False, "requeued_again_after": "none"},
+    {"requeued_again": "reason", "requeued_again_after": []},
+    {"requeued_again": "reason", "requeued_again_after": "bad-id"},
+])
+def test_invalid_replay_claim_is_not_a_first_publication(tmp_path, monkeypatch, capsys, fields):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body")
+    _dead_payload(store, original)
+    record = {
+        "schema_version": 1,
+        "requeued_as": "20200101-000000-000000-Abcd",
+        "session_id": store.load_config()["session_id"],
+        "state": "claimed",
+        **fields,
+    }
+    store._requeue_state_path("beta", original.id).write_text(json.dumps(record), encoding="utf-8")
+    assert _requeue(store, original) == 2
+    assert "damaged" in capsys.readouterr().err
+    assert not store.messages_for("beta")
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_claim_reader_accepts_old_and_new_records(tmp_path, monkeypatch, replay):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body")
+    _dead_payload(store, original)
+    record = {
+        "schema_version": 1,
+        "requeued_as": "20200101-000000-000000-Abcd",
+        "session_id": store.load_config()["session_id"],
+        "state": "claimed",
+    }
+    if replay:
+        record.update(requeued_again="repeat", requeued_again_after="none")
+    store._requeue_state_path("beta", original.id).write_text(json.dumps(record), encoding="utf-8")
+    assert store._read_requeue_state("beta", original.id) == record
+    assert store._requeue_previous("beta", original.id) == record["requeued_as"]
+    assert (store._requeue_block("beta", original.id, record["session_id"]) is not None) is replay
+
+
+@pytest.mark.parametrize("previous", ["none", "unreadable"])
+def test_unpublished_explicit_replay_without_readable_predecessor_is_refused(tmp_path, monkeypatch, previous):
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body")
+    _dead_payload(store, original)
+    record = {
+        "schema_version": 1,
+        "requeued_as": "20200101-000000-000000-Abcd",
+        "session_id": store.load_config()["session_id"],
+        "state": "claimed",
+        "requeued_again": "reason",
+        "requeued_again_after": previous,
+    }
+    store._requeue_state_path("beta", original.id).write_text(json.dumps(record), encoding="utf-8")
+    assert _requeue(store, original) == 2
+    assert not store.messages_for("beta")
+
+
 @pytest.mark.parametrize("kind", ["message", "review-result", "rescind", "end"])
 def test_each_non_opener_is_requeued_once(tmp_path, monkeypatch, kind, capsys):
     store = _requeue_store(tmp_path, monkeypatch, False)
@@ -46,7 +129,9 @@ def test_again_publishes_audited_copy(tmp_path, monkeypatch, capsys, signed):
     assert new.meta["requeued_again"] == "retry"
     assert new.meta["requeued_again_after"] == previous.id
     record = json.loads(store._requeue_state_path("beta", original.id).read_text(encoding="utf-8"))
-    assert set(record) == {"schema_version", "requeued_as", "session_id", "state"}
+    assert set(record) == {"schema_version", "requeued_as", "session_id", "state",
+                           "requeued_again", "requeued_again_after"}
+    assert record["requeued_again"] == "retry" and record["requeued_again_after"] == previous.id
     if signed:
         from agenttalk import signing
 

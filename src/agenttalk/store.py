@@ -4085,7 +4085,8 @@ class Store:
                 if _requeue_source is not None:
                     claimed = self._claim_requeue(
                         _requeue_source, msg.id, str(cfg.get("session_id") or ""),
-                        **({"again_after": previous_requeue} if _requeue_again is not None else {}),
+                        **({"again_after": previous_requeue, "again_reason": _requeue_again}
+                           if _requeue_again is not None else {}),
                     )
                 self._reserve_message_publication_sequence(
                     msg.id,
@@ -5208,7 +5209,8 @@ class Store:
     # the publish, so a pause before that point cannot go stale (#706), and marked published right after it, under the
     # same lock. A published record always refuses a repeat, wherever the copy has gone. A claimed one lets the repeat
     # through only in the store session it was made in and with the copy found nowhere (quarantine included): then
-    # the publish never happened. In every other case nothing can tell, and the work is sent again as new work.
+    # the first publish never happened. An intentional repeat also keeps its previous copy and reason in the claim,
+    # so an interrupted repeat cannot be mistaken for an unpublished first attempt.
     def _requeue_state_path(self, agent: str, message_id: str) -> Path:
         return self.dead_letter_dir / validate_agent_name(agent) / f"{message_id}.requeue-state"
 
@@ -5250,6 +5252,16 @@ class Store:
             and state.get("state") in ("claimed", "published")
             and isinstance(state.get("session_id"), str)
             and _SESSION_ID_RE.match(state["session_id"])
+            and (
+                ("requeued_again" not in state and "requeued_again_after" not in state)
+                or (
+                    isinstance(state.get("requeued_again"), str)
+                    and bool(state["requeued_again"].strip())
+                    and isinstance(state.get("requeued_again_after"), str)
+                    and (state["requeued_again_after"] in ("none", "unreadable")
+                         or bool(_ID_RE.fullmatch(state["requeued_again_after"])))
+                )
+            )
         ):
             raise RequeueStateDamaged(
                 f"{escape_controls(path)} is damaged or not supported by this version; nothing was published."
@@ -5313,9 +5325,17 @@ class Store:
         earlier = state["requeued_as"]
         where = self._find_message(agent, earlier)
         if where is None:
-            if state["state"] == "claimed" and state["session_id"] == session_id:
+            if (state["state"] == "claimed" and state["session_id"] == session_id
+                    and "requeued_again" not in state):
                 return None  # claimed, never marked published, and nowhere: the publish never happened
             record = escape_controls(self._requeue_state_path(agent, dead_letter_id))
+            if state["state"] == "claimed" and "requeued_again" in state:
+                previous = escape_controls(state["requeued_again_after"])
+                return (
+                    f"{record} says an intentional requeue as {earlier} was started after {previous}; "
+                    "that copy is not anywhere the store keeps and the store cannot confirm publication",
+                    None,
+                )
             if state["state"] == "published":
                 return (
                     f"{record} names {earlier} as the copy this dead letter was requeued as, which the record says "
@@ -5347,7 +5367,7 @@ class Store:
         return state["requeued_as"] if state else "none"
 
     def _claim_requeue(self, source: tuple[str, str], new_id: str, session_id: str,
-                       *, again_after: str | None = None) -> tuple[str, str, dict]:
+                       *, again_after: str | None = None, again_reason: str | None = None) -> tuple[str, str, dict]:
         """Refuse a replay, else record this requeue as claimed before it is published."""
         agent, dead_letter_id = source
         self.requeue_mark_failure = None
@@ -5363,6 +5383,8 @@ class Store:
                 if block is not None and again_after is None:
                     raise RequeueRefused(f"{block[0]}; nothing was published.", block[1], again_allowed=True)
             claim = {"requeued_as": new_id, "session_id": session_id, "state": "claimed"}
+            if again_after is not None:
+                claim.update(requeued_again=again_reason, requeued_again_after=again_after)
             self._write_requeue_state(agent, dead_letter_id, claim)
         except OSError as exc:
             hint = (

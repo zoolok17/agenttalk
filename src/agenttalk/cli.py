@@ -16983,10 +16983,16 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 template += " --root {root}"
                 values["root"] = str(store.root)
             template += " dead-letter requeue --agent {agent} --id {id}"
+            if again:
+                template += " --again"
             if reopen_event is not None:
                 reason_flag = "--reason={reason}" if reopen_event["reason"].startswith("-") else "--reason {reason}"
                 template += " --force-resolved --from {actor} " + reason_flag
                 values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
+            elif again:
+                reason_flag = "--reason={reason}" if reason.startswith("-") else "--reason {reason}"
+                template += " " + reason_flag
+                values["reason"] = reason
             # Single-quoted plain paths and phrases work in POSIX shells and PowerShell. Values with shell
             # metacharacters keep the printed-command placeholder convention: cmd.exe does not honor single quotes.
             rendered = {}
