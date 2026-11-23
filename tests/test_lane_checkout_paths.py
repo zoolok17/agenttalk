@@ -5574,6 +5574,15 @@ def test_a_delivery_is_still_refused_when_the_prefixed_record_names_another_fold
 # happen at an exact step instead of relying on timing.
 
 
+def _hook_unlink(monkeypatch, wrapper):
+    """Replace `os.unlink` by `wrapper`, which passes everything on (`dir_fd` included). The held-folder delete is only
+    made when `os.unlink` is listed in `os.supports_dir_fd`, a set of the original function objects; a plain wrapper is
+    not in it, the delete was refused before it was reached, and the seam never ran (Linux, Python 3.10 and 3.11, in
+    CI). So the wrapper is listed too: it does take `dir_fd`."""
+    monkeypatch.setattr(os, "unlink", wrapper)
+    monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) | {wrapper})
+
+
 def _prepared_copy_with_a_swap_ready(tmp_path, monkeypatch, seam):
     """A committed delivery whose own prepared copy exists, an unrelated file with the same name in another folder,
     and a `swap()` that moves the real `.prepared` folder aside and puts a link to the other folder in its place at
@@ -5615,7 +5624,7 @@ def _prepared_copy_with_a_swap_ready(tmp_path, monkeypatch, seam):
                 swap()
             return real_path_unlink(self, *args, **kwargs)
 
-        monkeypatch.setattr(os, "unlink", unlink)
+        _hook_unlink(monkeypatch, unlink)
         monkeypatch.setattr(Path, "unlink", path_unlink)
     else:
         real_is_link = lanes._is_link
@@ -5794,6 +5803,62 @@ def test_the_posix_helper_closes_every_descriptor_it_opened_on_an_early_return(t
 
     assert answer == "absent"
     assert opened and sorted(closed) == sorted(opened), (opened, closed)
+
+
+def _hold_stand_ins(monkeypatch):
+    """Stand-ins for the folder-relative calls (so this runs on every host): returns the list of `(name, dir_fd)`
+    that the held-folder delete made, and the list of folders it opened as `(path, dir_fd)`."""
+    opened, deleted = [], []
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        opened.append((path, dir_fd))
+        return 1000 + len(opened)
+
+    def fake_unlink(name, *, dir_fd=None):
+        deleted.append((name, dir_fd))
+
+    monkeypatch.setattr(os, "O_DIRECTORY", 0o200000, raising=False)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0o400000, raising=False)
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "close", lambda descriptor: None)
+    monkeypatch.setattr(os, "unlink", fake_unlink)
+    monkeypatch.setattr(os, "supports_dir_fd", {fake_open, fake_unlink})
+    return opened, deleted
+
+
+def test_a_plain_replacement_of_os_unlink_is_refused_before_it_is_reached(tmp_path, monkeypatch):
+    """The cause of the CI failure on Linux (Python 3.10 and 3.11): the held-folder delete only runs when `os.unlink` is
+    one of the functions the platform lists in `os.supports_dir_fd` (that set holds the original function objects).
+    A test that swaps in its own `os.unlink` without listing it is refused before the delete is made, so a hook inside
+    the delete call is never reached, and the copy is left in place. That refusal is the product being careful, and
+    stays."""
+    opened, deleted = _hold_stand_ins(monkeypatch)
+    reached = []
+    monkeypatch.setattr(os, "unlink", lambda name, **kwargs: reached.append(name))  # not listed in supports_dir_fd
+
+    assert lanes._remove_held_posix(str(tmp_path / "lane-deliveries"), ".prepared", "x.prepared.json") == "refused"
+    assert reached == [] and deleted == []
+
+
+def test_a_hook_in_the_delete_call_is_reached_and_the_delete_is_made_in_the_held_folder(tmp_path, monkeypatch):
+    """With the hook listed (`_hook_unlink`, the one the swap seam uses), the held-folder delete reaches it, and the
+    real delete behind it is made relative to the second folder that was opened (the `.prepared` folder), never by
+    name: the swap inside the call cannot redirect it."""
+    opened, deleted = _hold_stand_ins(monkeypatch)
+    real_unlink, reached = os.unlink, []
+
+    def hook(name, *args, **kwargs):
+        reached.append(name)  # a swap of `.prepared` for a link would happen here
+        return real_unlink(name, *args, **kwargs)
+
+    _hook_unlink(monkeypatch, hook)
+
+    answer = lanes._remove_held_posix(str(tmp_path / "lane-deliveries"), ".prepared", "x.prepared.json")
+
+    assert answer == "removed" and reached == ["x.prepared.json"]
+    prepared_descriptor = 1002  # the second folder opened: the first is `lane-deliveries`, the second `.prepared`
+    assert opened[1][0] == ".prepared" and opened[1][1] == 1001
+    assert deleted == [("x.prepared.json", prepared_descriptor)]
 
 
 def test_the_posix_helper_closes_a_descriptor_when_the_second_open_is_refused(tmp_path, monkeypatch):
