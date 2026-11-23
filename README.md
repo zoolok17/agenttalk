@@ -1304,6 +1304,22 @@ command for the full set.
 | `knowledge {publish,curate,pull,search,onboard}` | Durable pointer notes and lessons hung off the domain registry. |
 | `dev-gate` | Build + test evidence a `review-request`/`review-result` can point to: source and wheel, per Python minor, aggregated across CI legs. |
 
+Ordinary `close reopen` checks the Git checkout enclosing the store. Git must
+resolve the requested revision and the checkout's HEAD must match it; when
+`--revision` is omitted, the recorded revision is checked. If Git or the
+checkout is unavailable, the revision cannot be resolved, or HEAD differs,
+reopen stops without changing the record. Check out the revision in the checkout
+that holds the store, or pass `--revision` with its current HEAD. A store outside
+a Git checkout can open a close with a full revision pin, but cannot reopen it.
+The HEAD check runs just before the close lock is taken, so a checkout moved in that gap is not caught.
+Reopen checks cleanliness again even when `--revision` is omitted, so a close
+previously recorded clean can go on HOLD if the checkout has changed. Reopen
+records an unchecked worktree as not clean; without a recorded diff artifact the
+close remains on HOLD. Ordinary open and reopen records use
+`revision_clean_state` to distinguish `unknown`, `not_clean`, and `clean`;
+older records may lack that field. Acceptance successors check their explicitly
+named project checkout separately.
+
 A `review-request` (`send --kind review-request`) is an ordinary
 message with `base_sha`/`head_sha` meta and a body naming what changed,
 how to verify, and where to focus. A `review-result` with `--meta
@@ -1381,7 +1397,8 @@ in agenttalk waits for it or is held back by it.
 
 **What you will see**
 
-- `agenttalk capacity` lists the seats that share an account under one line naming that account.
+- `agenttalk capacity` lists the seats that share an account under a provider heading.
+  Add `--show-personal` to include the operating-system login name and home-folder fingerprint.
   Below it, each seat shows its own reading, newest first, with how long ago it was seen. Readings
   are never merged across seats: to judge the account, read the newest seat's row.
 - `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or
@@ -1389,6 +1406,24 @@ in agenttalk waits for it or is held back by it.
   none, such as a newly set-up seat, shows no `capacity=` field. When a Claude seat's reading has
   no figures yet (reason `claude_source_not_configured`), the field reads
   `capacity=unknown(no reading yet)`; `status --json` keeps the reason code.
+  `status --json` shows `account_group` as the sorted seats in this status output sharing an account;
+  the capacity text display also counts a retired seat's old reading.
+  Both group only well-formed Claude, Codex and OVH-Qwen account keys; other readings stand alone.
+  Use `--show-personal` to include the login and folder fingerprint instead.
+  The store itself records the login, so review it before sharing the store.
+  `status` and `status --json` also hide the project folder (`root`), signing-key path
+  (`hmac_key.path`) and `project_id`. They can contain or confirm your login. Text says
+  when these are hidden; add `--show-personal` to show them and the account text.
+  The `powershell:` line hides its host path. In JSON, `powershell_host.path`,
+  `.identity`, `.project_id` and fields outside the host allowlist are omitted.
+  Home paths in free text are replaced with `<home>`, local app-data paths outside home
+  with `<localappdata>`, and the project root outside home with `<root>`. The project ID
+  is replaced with `<project_id>`. This does not cover other paths outside those folders or a login
+  appearing in free text outside a path. Other spellings of the same folders are not recognised either:
+  a Windows 8.3 short name (`ANNEXA~1`), a junction or WSL path to it, or a URL-encoded path.
+  Other commands can still show paths or project
+  IDs: `whoami --json`, `hmac-init`, `backup --json`, `doctor`, `supervisor --json` and
+  the web console.
 - The web console and `agenttalk attention` show and warn only on figures that are still current.
 
 **Where the figures come from**

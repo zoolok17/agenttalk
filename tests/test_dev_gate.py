@@ -228,7 +228,45 @@ def group_proof(check, manifest):
     return check
 
 
-def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
+def _ci_inputs(manifest: dict, *, status: str = "pass") -> list[dict]:
+    """One passing artifact per declared aggregate input: each leg, and each part of a Windows leg (#378)."""
+    return [
+        _leg_artifact(manifest, leg, status=status, part=part)
+        for leg, part in dev_gate.expected_ci_inputs(manifest, "release")
+    ]
+
+
+def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass", part: str | None = None) -> dict:
+    artifact = _whole_leg_artifact(manifest, leg, status=status)
+    return artifact if part is None else _as_part(artifact, manifest, part)
+
+
+def _as_part(artifact: dict, manifest: dict, part: str) -> dict:
+    """Keep only the checks one Windows part runs, and only that part's test group."""
+    mode, group = dev_gate.parse_ci_part(part, manifest, artifact["ci_leg"])
+    required = dev_gate.required_check_ids(
+        manifest, "release", execution_scope="ci-leg", ci_leg=artifact["ci_leg"], part=part
+    )
+    checks = [check for check in artifact["checks"] if check["id"] in required]
+    for check in checks:
+        if "group_runs" in check:
+            check["group_runs"] = [run for run in check["group_runs"] if run["group"] == group]
+    failed = [check["id"] for check in checks if check["status"] != "pass"]
+    artifact.update(
+        part=part,
+        run_id=f"{artifact['run_id']}-{part}",
+        required_check_ids=required,
+        checks=checks,
+        artifacts={} if mode == "source" else artifact["artifacts"],
+        external_inputs=[item for item in artifact["external_inputs"] if item["check_id"] in required],
+        blockers=[{"code": "check_failed", "check_id": check_id, "detail": "x"} for check_id in failed],
+        summary={"required": len(checks), "passed": len(checks) - len(failed), "blocked": len(failed)},
+        verdict="block" if failed else "pass",
+    )
+    return artifact
+
+
+def _whole_leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
     profile = manifest["profiles"]["release"]
     common_digest = dev_gate.logical_plan_digest(manifest, "release")
     required = dev_gate.required_check_ids(manifest, "release", execution_scope="ci-leg", ci_leg=leg)
@@ -847,13 +885,13 @@ def test_canonical_external_input_types_cannot_crash_validation() -> None:
 
 def test_aggregate_requires_exact_unique_matrix_and_common_binding(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
-    artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest, "release")]
+    artifacts = _ci_inputs(manifest)
     binding = _binding(manifest, root=_gate_repo(tmp_path))
 
     aggregate = dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding)
     assert aggregate["complete"] is True
     assert aggregate["verdict"] == "pass"
-    assert len(aggregate["legs"]) == 12
+    assert len(aggregate["legs"]) == 24  # 8 legs, and 4 parts for each Windows leg (#378)
 
     with pytest.raises(dev_gate.GateBlock, match="missing"):
         dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts[:-1], binding)
@@ -871,7 +909,7 @@ def test_aggregate_requires_exact_unique_matrix_and_common_binding(tmp_path: Pat
 
 def test_aggregate_is_complete_but_blocked_when_one_leg_failed(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
-    artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest, "release")]
+    artifacts = _ci_inputs(manifest)
     artifacts[0] = _leg_artifact(manifest, artifacts[0]["ci_leg"], status="fail")
 
     aggregate = dev_gate.aggregate_leg_artifacts(
@@ -887,7 +925,7 @@ def test_aggregate_is_complete_but_blocked_when_one_leg_failed(tmp_path: Path) -
 
 def test_malformed_aggregate_header_blocks_without_type_error(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
-    artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest)]
+    artifacts = _ci_inputs(manifest)
     aggregate = dev_gate.aggregate_leg_artifacts(
         manifest,
         "release",
@@ -902,7 +940,7 @@ def test_malformed_aggregate_header_blocks_without_type_error(tmp_path: Path) ->
 
 def test_aggregate_rejects_leg_set_not_bound_to_current_checkout(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
-    artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest)]
+    artifacts = _ci_inputs(manifest)
     root = _gate_repo(tmp_path)
     current = _binding(manifest, root=root)
     current = dev_gate.CandidateBinding(
@@ -1450,13 +1488,13 @@ def test_aggregate_reverifies_collected_logs(tmp_path: Path, damage: str) -> Non
     binding = _binding(manifest, root=_gate_repo(tmp_path))
     artifacts = []
     roots = {}
-    for index, leg in enumerate(dev_gate.expected_ci_legs(manifest)):
-        artifact = _leg_artifact(manifest, leg)
+    for index, (leg, part) in enumerate(dev_gate.expected_ci_inputs(manifest)):
+        artifact = _leg_artifact(manifest, leg, part=part)
         _write_check_logs(artifact, tmp_path / f"runner-{index}")
         evidence = tmp_path / f"leg-{index}" / "evidence.json"
         dev_gate.write_run_evidence(evidence, artifact, manifest)
         artifacts.append(json.loads(evidence.read_text(encoding="utf-8")))
-        roots[leg] = evidence.parent
+        roots[dev_gate.ci_input_label(leg, part)] = evidence.parent
     dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding, bundle_roots=roots)
     with pytest.raises(dev_gate.GateBlock, match="bundle root required"):
         dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding)
@@ -1585,9 +1623,9 @@ def test_collected_pytest_log_preserves_full_output(
 def test_aggregate_evidence_roundtrips_with_exact_leg_input_digests(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     binding = _binding(manifest, root=_gate_repo(tmp_path))
-    artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest)]
+    artifacts = _ci_inputs(manifest)
     input_digests = {
-        artifact["ci_leg"]: format(index + 1, "x") * 64
+        dev_gate.ci_input_label(artifact["ci_leg"], artifact.get("part")): format(index % 15 + 1, "x") * 64
         for index, artifact in enumerate(artifacts)
     }
     aggregate = dev_gate.aggregate_leg_artifacts(
@@ -1830,7 +1868,8 @@ def test_committed_pytest_time_limits_are_pinned_per_os() -> None:
     for observed in ("3962 s (44%)", "4 h 18 min (78%)", "72 minutes", "A and B balanced on every leg",
                      "234", "240", "five recent ungrouped runs", "41-65 s", "42306971465", "42419154846",
                      "+17.5%", "retain 9000 seconds", "330-minute", "360 minutes", "44264760386",
-                     "no failing test"):
+                     "no failing test", "four jobs", "165-minute", "37 master runs", "sample maximum", "6449 s",
+                     "4566 s", "1.95 times", "214 minutes", "44956093100", "116.4 minutes", "119.75 minutes"):
         assert observed in reason, observed
 
 

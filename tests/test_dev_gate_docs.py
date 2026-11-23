@@ -16,6 +16,7 @@ def test_dev_gate_reference_tracks_the_public_command_surface() -> None:
     documented = {
         "--profile",
         "--ci-leg",
+        "--part",
         "--aggregate",
         "--evidence",
         "--temp-root",
@@ -44,7 +45,8 @@ def test_dev_gate_reference_tracks_the_committed_authority_split() -> None:
     assert profile["ci"]["canonical_static_leg"] == "linux/3.12"
     assert "Python 3.10 and 3.14" in reference
     assert "Python 3.10 through 3.13" in reference
-    assert "exact 12-leg set" in " ".join(reference.split())
+    flat = " ".join(reference.split())
+    assert "one for each part of each Windows leg, 24 in all" in flat
     assert "`linux/3.12`" in reference
 
 
@@ -64,14 +66,17 @@ def test_378_reference_describes_groups_selection_proof_times_and_retained_limit
     spec = json.loads(Path("dev-gate.json").read_text())["checks"]["pytest"]
     assert all(f"`{path}`" in reference for path in spec["windows_group_a"])
     for phrase in (
-        "source A, source B, wheel A and wheel B",
+        "`source-a`, `source-b`, `wheel-a` and `wheel-b`",
+        "`checks.pytest.windows_parts`",
+        "a missing half never passes",
+        "the same SHA-256",
         "New test files land",
         "with no overlap",
         "group_runs",
         "pytest_group_times_ms",
         "9,000 seconds per group",
-        "Windows: 360 minutes",
-        "raised from 330 on 2026-11-18",
+        "Each Windows part: 165 minutes",
+        "330-minute ceiling with no failing test",
         "two hosted runs",
         "collection_duration_ms",
         "pytest_collection_times_ms",
