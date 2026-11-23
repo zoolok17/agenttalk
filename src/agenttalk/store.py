@@ -5325,14 +5325,20 @@ class Store:
         earlier = state["requeued_as"]
         where = self._find_message(agent, earlier)
         if where is None:
-            if (state["state"] == "claimed" and state["session_id"] == session_id
-                    and "requeued_again" not in state):
-                return None  # claimed, never marked published, and nowhere: the publish never happened
+            if state["state"] == "claimed" and state["session_id"] == session_id:
+                previous = state.get("requeued_again_after", "none")
+                if previous == "none":
+                    return None  # No earlier copy, and this attempt was never published.
+                if previous == "unreadable":
+                    return ("the last attempt was not sent, but the earlier record could not be read; "
+                            "check the earlier work before sending again", None)
+                if self._find_message(agent, previous) is not None:
+                    return (f"the last attempt was not sent; an earlier copy {previous} was already sent", None)
+                return (f"the last attempt was not sent; an earlier copy {previous} may have been sent", None)
             record = escape_controls(self._requeue_state_path(agent, dead_letter_id))
             if state["state"] == "claimed" and "requeued_again" in state:
-                previous = escape_controls(state["requeued_again_after"])
                 return (
-                    f"{record} says an intentional requeue as {earlier} was started after {previous}; "
+                    f"{record} says an intentional requeue as {earlier} was started in an earlier session; "
                     "that copy is not anywhere the store keeps and the store cannot confirm publication",
                     None,
                 )
@@ -5364,7 +5370,18 @@ class Store:
             state = self._read_requeue_state(agent, dead_letter_id)
         except RequeueStateDamaged:
             return "unreadable"
-        return state["requeued_as"] if state else "none"
+        if state is None:
+            return "none"
+        try:
+            if (state["state"] == "claimed" and "requeued_again_after" in state
+                    and state["session_id"] == str(self.load_config().get("session_id") or "")
+                    and self._find_message(agent, state["requeued_as"]) is None):
+                return state["requeued_again_after"]
+        except OSError as exc:
+            raise RequeueStateReadError(
+                f"could not check the earlier copy ({escape_controls(exc)}); nothing was published."
+            ) from exc
+        return state["requeued_as"]
 
     def _claim_requeue(self, source: tuple[str, str], new_id: str, session_id: str,
                        *, again_after: str | None = None, again_reason: str | None = None) -> tuple[str, str, dict]:

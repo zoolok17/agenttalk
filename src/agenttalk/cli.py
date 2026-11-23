@@ -16977,41 +16977,10 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 _requeue_again=reason if again else None,
             )
         except PreparedMessageRefused as e:
-            template = "agenttalk"
-            values = {"agent": args.agent, "id": args.id}
-            if getattr(args, "root", None) is not None:
-                template += " --root {root}"
-                values["root"] = str(store.root)
-            template += " dead-letter requeue --agent {agent} --id {id}"
-            if again:
-                template += " --again"
-            if reopen_event is not None:
-                reason_flag = "--reason={reason}" if reopen_event["reason"].startswith("-") else "--reason {reason}"
-                template += " --force-resolved --from {actor} " + reason_flag
-                values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
-            elif again:
-                reason_flag = "--reason={reason}" if reason.startswith("-") else "--reason {reason}"
-                template += " " + reason_flag
-                values["reason"] = reason
-            # Single-quoted plain paths and phrases work in POSIX shells and PowerShell. Values with shell
-            # metacharacters keep the printed-command placeholder convention: cmd.exe does not honor single quotes.
-            rendered = {}
-            unsafe = []
-            for name, value in values.items():
-                if pc.is_plain(value):
-                    rendered[name] = value
-                elif (isinstance(value, str) and (name == "reason" or not value.startswith("-"))
-                      and re.fullmatch(r"[A-Za-z0-9_./:\\ -]+", value)):
-                    rendered[name] = shlex.quote(value)
-                else:
-                    rendered[name] = f"<{name}>"
-                    source = "is the resolved store folder named by --root" if name == "root" else pc.SUPPLIED_SOURCE
-                    unsafe.append(f"<{name}> is {pc.shown(value, pc.PATH_SHOWN_MAX_CHARACTERS, source=source)}")
-            note = ("Not a ready command: " + ", ".join(unsafe) + "; replace the placeholders safely.\n"
-                    if unsafe else "")
+            note, command = _requeue_retry_command(store, args, reason, reopen_event)
             route = (
-                "After the reset has finished, retry the same dead letter in PowerShell or a POSIX shell "
-                "to keep its original correlation.\n" + note + "  " + template.format(**rendered)
+                "After the reset has finished, retry the same dead letter: run this command once in PowerShell or a POSIX shell "
+                "to keep the dead letter's original correlation.\n" + note + "  " + command
             )
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {pc.line(str(e))} "
@@ -17035,11 +17004,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                     and (e.again_allowed or isinstance(e, store_mod.RequeueStateDamaged))):
                 advice = "If the earlier requeue is why it was refused, pass --again --reason TEXT."
             elif orig.get("kind") not in _dl_tags.OPENERS:
-                template = "agenttalk dead-letter requeue --agent {agent} --id {id}"
-                values = {"agent": args.agent, "id": args.id}
-                if reopen_event is not None:
-                    template += " --force-resolved --from {actor} --reason {reason}"
-                    values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
+                note, command = _requeue_retry_command(store, args, reason, reopen_event)
                 if isinstance(e, store_mod.RequeueStateReadError):
                     record = pc.shown(
                         str(store._requeue_state_path(args.agent, args.id)), pc.PATH_SHOWN_MAX_CHARACTERS,
@@ -17048,15 +17013,13 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                     fix = f"Resolve the reported access problem first; the requeue record is {record}. "
                 else:
                     fix = attention + "Resolve the refusal above first. "
-                advice = fix + "Then retry the same dead letter: " + pc.cmd(template, **values) + "."
+                advice = fix + "Then retry the same dead letter:\n" + note + "  " + command
             else:
-                advice = (
-                    "Retry that copy instead: "
-                    + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=args.agent, i=retry)
-                    + "."
-                    if retry and not problem
-                    else attention + _requeue_route(args, orig)
-                )
+                if retry and not problem:
+                    note, command = _requeue_retry_command(store, args, reason, reopen_event, message_id=retry)
+                    advice = "Retry that copy instead:\n" + note + "  " + command
+                else:
+                    advice = attention + _requeue_route(args, orig)
             sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))} {advice}\n")
             return 2
         except (ValueError, FileNotFoundError) as e:
@@ -17147,6 +17110,36 @@ def _retry_problem(store: Store, agent: str, copy_id: str) -> str | None:
     except (ValueError, FileNotFoundError) as e:
         return str(e)
     return None
+
+
+def _requeue_retry_command(store, args, reason, reopen_event, *, message_id=None):
+    """Render the same retry for every refusal, including its selected store."""
+    template = "agenttalk --root {root} dead-letter requeue --agent {agent} --id {id}"
+    values = {"root": str(store.root), "agent": args.agent, "id": message_id or args.id}
+    if getattr(args, "again", False):
+        template += " --again"
+    if reopen_event is not None:
+        template += " --force-resolved --from {actor}"
+        values["actor"] = reopen_event["actor"]
+    if reopen_event is not None or getattr(args, "again", False):
+        retry_reason = reopen_event["reason"] if reopen_event is not None else reason
+        template += " --reason={reason}" if retry_reason.startswith("-") else " --reason {reason}"
+        values["reason"] = retry_reason
+    rendered = {}
+    unsafe = []
+    for name, value in values.items():
+        if pc.is_plain(value):
+            rendered[name] = value
+        elif (isinstance(value, str) and (name == "reason" or not value.startswith("-"))
+              and re.fullmatch(r"[A-Za-z0-9_./:\\ -]+", value)):
+            rendered[name] = shlex.quote(value)
+        else:
+            rendered[name] = f"<{name}>"
+            source = "is the resolved store folder named by --root" if name == "root" else pc.SUPPLIED_SOURCE
+            unsafe.append(f"<{name}> is {pc.shown(value, pc.PATH_SHOWN_MAX_CHARACTERS, source=source)}")
+    note = ("Not a ready command: " + ", ".join(unsafe) + "; replace the placeholders safely.\n"
+            if unsafe else "")
+    return note, template.format(**rendered)
 
 
 def _requeue_route(args: argparse.Namespace, orig: dict) -> str:

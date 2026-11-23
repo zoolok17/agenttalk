@@ -5,7 +5,7 @@ import pytest
 from test_dead_letter import _dead_payload, _requeue, _requeue_store, _send
 
 
-def test_failed_explicit_replay_keeps_plain_requeue_refused(tmp_path, monkeypatch):
+def test_failed_explicit_replay_keeps_plain_requeue_refused(tmp_path, monkeypatch, capsys):
     from agenttalk.store import Store
 
     store = _requeue_store(tmp_path, monkeypatch, False)
@@ -23,7 +23,56 @@ def test_failed_explicit_replay_keeps_plain_requeue_refused(tmp_path, monkeypatc
     assert claim["state"] == "claimed"
     assert claim["requeued_again"] == "repeat" and claim["requeued_again_after"] == earlier.id
     assert _requeue(store, original) == 2
+    assert f"an earlier copy {earlier.id} was already sent" in capsys.readouterr().err
     assert [message.id for message in store.messages_for("beta")] == [earlier.id]
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_replay_after_interruption_names_the_known_predecessor(tmp_path, monkeypatch, reset):
+    from agenttalk.store import Store
+
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body")
+    _dead_payload(store, original)
+    assert _requeue(store, original) == 0
+    earlier = store.messages_for("beta")[-1]
+    with monkeypatch.context() as patch:
+        def fail(*args, **kwargs):
+            raise ValueError("injected publication failure")
+
+        patch.setattr(Store, "_reserve_message_publication_sequence", fail)
+        assert _requeue(store, original, "--again", "--reason", "repeat") == 2
+    claim = store._read_requeue_state("beta", original.id)
+    if reset:
+        store.reset()
+    assert _requeue(store, original, "--again", "--reason", "retry") == 0
+    assert store.messages_for("beta")[-1].meta["requeued_again_after"] == (
+        claim["requeued_as"] if reset else earlier.id
+    )
+
+
+def test_replay_predecessor_lookup_error_refuses(tmp_path, monkeypatch, capsys):
+    from agenttalk.store import Store
+
+    store = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(store, "body")
+    _dead_payload(store, original)
+    assert _requeue(store, original) == 0
+    with monkeypatch.context() as patch:
+        def fail(*args, **kwargs):
+            raise ValueError("injected publication failure")
+
+        patch.setattr(Store, "_reserve_message_publication_sequence", fail)
+        assert _requeue(store, original, "--again", "--reason", "repeat") == 2
+    with monkeypatch.context() as patch:
+        def unreadable(*args, **kwargs):
+            raise PermissionError("synthetic lookup failure")
+
+        patch.setattr(Store, "_find_message", unreadable)
+        capsys.readouterr()
+        assert _requeue(store, original, "--again", "--reason", "repeat") == 2
+        error = capsys.readouterr().err
+    assert "could not check the earlier copy" in error and "Traceback" not in error
 
 
 @pytest.mark.parametrize("fields", [
@@ -66,12 +115,12 @@ def test_claim_reader_accepts_old_and_new_records(tmp_path, monkeypatch, replay)
         record.update(requeued_again="repeat", requeued_again_after="none")
     store._requeue_state_path("beta", original.id).write_text(json.dumps(record), encoding="utf-8")
     assert store._read_requeue_state("beta", original.id) == record
-    assert store._requeue_previous("beta", original.id) == record["requeued_as"]
-    assert (store._requeue_block("beta", original.id, record["session_id"]) is not None) is replay
+    assert store._requeue_previous("beta", original.id) == ("none" if replay else record["requeued_as"])
+    assert store._requeue_block("beta", original.id, record["session_id"]) is None
 
 
 @pytest.mark.parametrize("previous", ["none", "unreadable"])
-def test_unpublished_explicit_replay_without_readable_predecessor_is_refused(tmp_path, monkeypatch, previous):
+def test_unpublished_explicit_replay_checks_predecessor(tmp_path, monkeypatch, previous):
     store = _requeue_store(tmp_path, monkeypatch, False)
     original = _send(store, "body")
     _dead_payload(store, original)
@@ -84,8 +133,8 @@ def test_unpublished_explicit_replay_without_readable_predecessor_is_refused(tmp
         "requeued_again_after": previous,
     }
     store._requeue_state_path("beta", original.id).write_text(json.dumps(record), encoding="utf-8")
-    assert _requeue(store, original) == 2
-    assert not store.messages_for("beta")
+    assert _requeue(store, original) == (0 if previous == "none" else 2)
+    assert len(store.messages_for("beta")) == (1 if previous == "none" else 0)
 
 
 @pytest.mark.parametrize("kind", ["message", "review-result", "rescind", "end"])
@@ -437,7 +486,7 @@ def test_again_cannot_waive_requeue_record_read_error(tmp_path, monkeypatch, cap
     assert _requeue(store, original, "--again", "--reason", "retry") == 2
     output = capsys.readouterr()
     assert "cannot be read" in output.err
-    assert "--again" not in output.err
+    assert "--again --reason retry" in output.err
     assert record.read_bytes() == previous
     assert {message.id for message in store.valid_messages()} == before
 
@@ -447,8 +496,8 @@ def test_again_cannot_waive_requeue_record_read_error(tmp_path, monkeypatch, cap
 def test_non_opener_read_error_names_record_and_retry_without_fresh_send(tmp_path, monkeypatch, capsys, kind, again):
     import shlex
     from pathlib import Path
+    from agenttalk import cli
     from agenttalk import printed_commands as pc
-    from test_dead_letter import _run
 
     store = _requeue_store(tmp_path, monkeypatch, False)
     original = _send(store, "body", kind=kind)
@@ -473,13 +522,15 @@ def test_non_opener_read_error_names_record_and_retry_without_fresh_send(tmp_pat
     assert pc.shown(str(record), pc.PATH_SHOWN_MAX_CHARACTERS,
                     source="is the requeue record beside this dead letter in the store") in error
     assert "access" in error and "retry" in error.lower()
-    assert f"agenttalk dead-letter requeue --agent beta --id {original.id}" in error
+    assert f"dead-letter requeue --agent beta --id {original.id}" in error
     assert record.read_bytes() == previous
     assert {message.id for message in store.valid_messages()} == before
-    printed = error.split("Then retry the same dead letter: ", 1)[1].strip().removesuffix(".")
+    printed = next(line.strip() for line in error.splitlines() if line.strip().startswith("agenttalk --root "))
     monkeypatch.setattr(Path, "read_text", read_text)
-    assert _run(shlex.split(printed)[1:], store.root) == 2
-    assert "--again --reason TEXT" in capsys.readouterr().err
+    result = cli.main(shlex.split(printed)[1:])
+    assert result == (0 if again else 2)
+    if not again:
+        assert "--again --reason TEXT" in capsys.readouterr().err
 
 
 def test_non_opener_read_error_retry_retains_resolved_options(tmp_path, monkeypatch, capsys):
@@ -504,6 +555,6 @@ def test_non_opener_read_error_retry_retains_resolved_options(tmp_path, monkeypa
     monkeypatch.setattr(Path, "read_text", unreadable)
     assert _requeue(store, original, "--force-resolved", "--from", "lead", "--reason", "retry") == 2
     error = capsys.readouterr().err
-    assert f"agenttalk dead-letter requeue --agent beta --id {original.id}" in error
+    assert f"dead-letter requeue --agent beta --id {original.id}" in error
     assert "--force-resolved --from lead --reason retry" in error
     assert "new request id" not in error and "agenttalk send" not in error

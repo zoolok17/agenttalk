@@ -334,7 +334,7 @@ def test_retry_advice_uses_current_folder_when_root_is_implicit(tmp_path, monkey
     error = capsys.readouterr().err
     line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
     argv = shlex.split(line)
-    assert "--root" not in argv
+    assert argv[argv.index("--root") + 1] == str(store.root)
     store.reset()
     assert cli.main(argv[1:]) == 0
 
