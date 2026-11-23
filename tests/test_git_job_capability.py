@@ -44,10 +44,17 @@ class _BasicLimits(ctypes.Structure):
 
 
 class _IoCounters(ctypes.Structure):
-    _fields_ = [(name, ctypes.c_uint64) for name in (
-        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
-        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
-    )]
+    _fields_ = [
+        (name, ctypes.c_uint64)
+        for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )
+    ]
 
 
 class _ExtendedLimits(ctypes.Structure):
@@ -71,7 +78,11 @@ def _libraries():
     kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
     kernel.IsProcessInJob.restype = wintypes.BOOL
     kernel.QueryInformationJobObject.argtypes = [
-        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
     ]
     kernel.QueryInformationJobObject.restype = wintypes.BOOL
     kernel.GetCurrentProcess.restype = wintypes.HANDLE
@@ -104,7 +115,10 @@ def host_facts(kernel) -> dict:
     if facts["pytest_process_in_a_job"] is True:
         limits, returned = _ExtendedLimits(), wintypes.DWORD(0)
         if kernel.QueryInformationJobObject(
-            None, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits), ctypes.sizeof(limits),
+            None,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
             ctypes.byref(returned),
         ):
             facts["outer_job_limit_flags"] = int(limits.BasicLimitInformation.LimitFlags)
@@ -125,7 +139,10 @@ def run_capability_check(git: str) -> dict:
     proc = None
     try:
         proc = subprocess.Popen(  # noqa: S603  # nosec B603
-            [git, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            [git, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             creationflags=CREATE_SUSPENDED,
         )
         handle = int(proc._handle)  # the handle Popen holds
@@ -161,7 +178,10 @@ def run_inside_an_outer_job(git: str) -> dict:
     )
     child = subprocess.Popen(  # noqa: S603  # nosec B603
         [sys.executable, "-c", code, str(Path(__file__).resolve().parent), git],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=CREATE_SUSPENDED,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=CREATE_SUSPENDED,
     )
     try:
         handle = int(child._handle)
