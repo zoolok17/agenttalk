@@ -5861,6 +5861,38 @@ def test_a_hook_in_the_delete_call_is_reached_and_the_delete_is_made_in_the_held
     assert deleted == [("x.prepared.json", prepared_descriptor)]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="the held-folder delete is the POSIX route; Windows holds the folders open")
+def test_the_real_os_takes_the_held_folder_route_on_this_platform():
+    """Recorded on every Linux and macOS run: the guard of the POSIX route, asked of the REAL `os` (no stand-in, no
+    patch): both open flags exist and `os.open` and `os.unlink` are listed in `os.supports_dir_fd`. If this fails, the
+    prepared copy is left in place on that platform and the seam tests above cannot reach the delete."""
+    assert lanes._held_folder_delete_available(), (
+        f"O_DIRECTORY={hasattr(os, 'O_DIRECTORY')} O_NOFOLLOW={hasattr(os, 'O_NOFOLLOW')} "
+        f"open_in_supports_dir_fd={os.open in os.supports_dir_fd} "
+        f"unlink_in_supports_dir_fd={os.unlink in os.supports_dir_fd}"
+    )
+
+
+def test_the_seam_s_change_to_os_is_undone_when_its_patch_is_undone():
+    """`_hook_unlink` lists its wrapper in `os.supports_dir_fd` and replaces `os.unlink`; both go back, to the very same
+    objects, when the monkeypatch is undone (the seam tests use the `monkeypatch` fixture, which undoes it after each
+    test)."""
+    original_unlink, original_set = os.unlink, os.supports_dir_fd
+    listed_before = set(original_set)
+
+    def wrapper(name, *args, **kwargs):
+        return original_unlink(name, *args, **kwargs)
+
+    patch = pytest.MonkeyPatch()
+    try:
+        _hook_unlink(patch, wrapper)
+        assert os.unlink is wrapper and wrapper in os.supports_dir_fd and os.supports_dir_fd is not original_set
+    finally:
+        patch.undo()
+    assert os.unlink is original_unlink and os.supports_dir_fd is original_set
+    assert set(os.supports_dir_fd) == listed_before and wrapper not in os.supports_dir_fd
+
+
 def test_the_posix_helper_closes_a_descriptor_when_the_second_open_is_refused(tmp_path, monkeypatch):
     """The refusal branch (a link, or not a folder) closes what was opened too."""
     opened, closed = [], []

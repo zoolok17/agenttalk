@@ -1368,11 +1368,23 @@ def _remove_in_managed_folders(deliveries, own) -> str:
     return _remove_held_posix(deliveries, prepared_name, name)
 
 
+def _held_folder_delete_available() -> bool:
+    """Whether this platform can open a folder without following a link and delete relative to a folder that is held
+    open: the two open flags exist, and `os.open` and `os.unlink` are among the functions the platform lists as taking
+    `dir_fd` (`os.supports_dir_fd`, a set of the original function objects). The one guard of the POSIX route, shared
+    with the test that records on every Linux and macOS run that this is the route taken."""
+    return (
+        getattr(os, "O_DIRECTORY", None) is not None
+        and getattr(os, "O_NOFOLLOW", None) is not None
+        and os.open in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+    )
+
+
 def _remove_held_posix(deliveries: str, prepared_name: str, name: str) -> str:
-    flags = getattr(os, "O_DIRECTORY", None), getattr(os, "O_NOFOLLOW", None)
-    if None in flags or os.open not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd:
+    if not _held_folder_delete_available():
         return "refused"
-    mode = os.O_RDONLY | flags[0] | flags[1] | getattr(os, "O_CLOEXEC", 0)
+    mode = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     held: list[int] = []
     opening = True
     try:  # every descriptor opened is closed on every way out, the early returns included
