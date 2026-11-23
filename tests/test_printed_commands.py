@@ -1436,7 +1436,7 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
                 note, retry = cli._requeue_retry_command(s, SimpleNamespace(agent="beta", id=rid, again=False), None, None)
                 err = (
                     f"agenttalk dead-letter requeue: record {escaped} missing; nothing was published. "
-                    "Resolve the refusal above first. Then retry the same dead letter:\n"
+                    "Resolve the refusal above first. Then retry the same dead letter once:\n"
                     + note
                     + "  "
                     + retry

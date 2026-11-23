@@ -65,7 +65,7 @@ def test_unretryable_copy_advice_shows_the_stored_id_without_publishing(
     assert captured.err.startswith(
         "agenttalk dead-letter requeue: previous copy needs attention; nothing was published. "
         f'The copy "copy{escaped}FORGED" cannot be retried as it is (saved payload{escaped}FORGED_REASON); '
-        "it needs attention. Resolve the refusal above first. Then retry the same dead letter:\n"
+        "it needs attention. Resolve the refusal above first. Then retry the same dead letter once:\n"
     )
     assert f"dead-letter requeue --agent beta --id {original.id}" in captured.err
     assert separator not in captured.err.splitlines()[0] and len(captured.err.splitlines()) == 2

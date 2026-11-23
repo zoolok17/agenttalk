@@ -17013,7 +17013,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                     fix = f"Resolve the reported access problem first; the requeue record is {record}. "
                 else:
                     fix = attention + "Resolve the refusal above first. "
-                advice = fix + "Then retry the same dead letter:\n" + note + "  " + command
+                advice = fix + "Then retry the same dead letter once:\n" + note + "  " + command
             else:
                 if retry and not problem:
                     note, command = _requeue_retry_command(store, args, reason, reopen_event, message_id=retry)
