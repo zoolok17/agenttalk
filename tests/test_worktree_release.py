@@ -2874,6 +2874,15 @@ _CHECKOUT_CASES = [
     ("/w/co", "/w/co/gone", ["/w", "/w/co"], True),  # the ordinary name: unchanged
     ("/w/co\\", "/w/other/gone", ["/w", "/w/co\\", "/w/other"], False),  # unrelated
     ("/w/co\\", "/w/co/gone", ["/w", "/w/co\\", "/w/co"], False),  # a different folder `co`, not `co\`
+    # round 13: a checkout at the filesystem root. Its token is "/" (it already ends in the one separator), so the
+    # prefix a child starts with is "/" and not "//".
+    ("/", "/gone", ["/"], True),  # a missing child of the root
+    ("/", "/a/b", ["/", "/a"], True),  # an existing folder, then a missing one
+    ("/", "/", ["/"], True),  # the root itself
+    ("/", "/w/co\\/gone", ["/", "/w", "/w/co\\"], True),  # below the root, through a name ending in a backslash
+    ("/w/co\\", "/", ["/", "/w", "/w/co\\"], False),  # the other way round: a record naming the parent
+    ("/w/co", "/w/co2/gone", ["/w", "/w/co", "/w/co2"], False),  # a sibling that only starts with the same letters
+    ("/w/co", "/w/co/gone", ["/w", "/w/co"], True),  # the ordinary name: unchanged
 ]
 
 
@@ -2888,6 +2897,45 @@ def test_a_missing_child_of_a_backslash_named_checkout_is_judged_as_master_judge
     world = _FakePosixFolders(monkeypatch, tmp_path, folders)
     assert world.master_names(checkout, recorded) is expected
     assert world.names(checkout, recorded) is expected
+
+
+# --- #858 fix round 13: a checkout registered at a drive root --------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive root with a letter is a Windows thing")
+@pytest.mark.parametrize(
+    "where",
+    ["existing-child", "missing-child", "two-missing", "forward-slashes", "the-root-itself", "just-below-the-root"],
+)
+def test_a_record_naming_a_folder_inside_a_checkout_at_a_drive_root_names_it(tmp_path, where):
+    """A checkout registered at a drive root has the token `c:/`, which already ends in a slash. Looking for children
+    under `c://` found none, so a record naming a folder inside the drive read as unrelated and release could remove a
+    checkout that was in use. This reads the real root of the drive the test folder is on and only compares paths:
+    nothing is created or removed at the root. (A `subst` letter does not make this shape: Windows resolves it to
+    the folder it points at.)"""
+    root = Path(tmp_path.anchor)
+    path = {
+        "existing-child": tmp_path,  # a folder that is there, some levels down
+        "missing-child": tmp_path / "gone",
+        "two-missing": tmp_path / "gone" / "deeper",
+        "forward-slashes": tmp_path.as_posix() + "/gone",
+        "the-root-itself": root,
+        "just-below-the-root": root / "agenttalk-858-no-such-folder",
+    }[where]
+    assert worktree_release._names_checkout({"worktree_path": str(path)}, root, tmp_path, lane_id=None) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive letters are a Windows thing")
+def test_a_record_on_a_sibling_of_a_checkout_that_only_starts_with_its_name_is_unrelated_on_windows(tmp_path):
+    """The control that the fix must not break: with an ordinary checkout `co`, `co/gone` is inside it, and `co2/gone`,
+    which only starts with the same letters, is not."""
+    (tmp_path / "co").mkdir()
+    (tmp_path / "co2").mkdir()
+    checkout = tmp_path / "co"
+    inside = {"worktree_path": str(tmp_path / "co" / "gone")}
+    beside = {"worktree_path": str(tmp_path / "co2" / "gone")}
+    assert worktree_release._names_checkout(inside, checkout, tmp_path, lane_id=None) is True
+    assert worktree_release._names_checkout(beside, checkout, tmp_path, lane_id=None) is False
 
 
 def test_a_recorded_path_that_stays_absent_through_the_final_check_still_lets_release_go_on(estate):

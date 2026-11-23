@@ -515,7 +515,12 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
                         raise Refused(
                             f"{source}: could not establish where the checkout is ({_why(exc)}); the checkout was kept"
                         ) from exc
-                    if where == mine or where.startswith(mine + "/"):
+                    # A child's token starts with the checkout's token and exactly one "/". The token of a root (`c:/`
+                    # on a drive, `/` on Linux and macOS) already ends in that "/", so it is not added a second time
+                    # (`mine + "/"` looked for `c://` and judged every folder in the drive unrelated). A token that
+                    # ends in a backslash (a POSIX name) is not touched: only "/" is stripped, as `_placed` joins.
+                    prefix = mine.rstrip("/") + "/"
+                    if where == mine or where.startswith(prefix):
                         return True
             elif key in fields and item is not None:
                 if not isinstance(item, str):
