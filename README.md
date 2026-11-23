@@ -1395,7 +1395,8 @@ in agenttalk waits for it or is held back by it.
 
 **What you will see**
 
-- `agenttalk capacity` lists the seats that share an account under one line naming that account.
+- `agenttalk capacity` lists the seats that share an account under a provider heading.
+  Add `--show-personal` to include the operating-system login name and home-folder fingerprint.
   Below it, each seat shows its own reading, newest first, with how long ago it was seen. Readings
   are never merged across seats: to judge the account, read the newest seat's row.
 - `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or
@@ -1403,6 +1404,24 @@ in agenttalk waits for it or is held back by it.
   none, such as a newly set-up seat, shows no `capacity=` field. When a Claude seat's reading has
   no figures yet (reason `claude_source_not_configured`), the field reads
   `capacity=unknown(no reading yet)`; `status --json` keeps the reason code.
+  `status --json` shows `account_group` as the sorted seats in this status output sharing an account;
+  the capacity text display also counts a retired seat's old reading.
+  Both group only well-formed Claude, Codex and OVH-Qwen account keys; other readings stand alone.
+  Use `--show-personal` to include the login and folder fingerprint instead.
+  The store itself records the login, so review it before sharing the store.
+  `status` and `status --json` also hide the project folder (`root`), signing-key path
+  (`hmac_key.path`) and `project_id`. They can contain or confirm your login. Text says
+  when these are hidden; add `--show-personal` to show them and the account text.
+  The `powershell:` line hides its host path. In JSON, `powershell_host.path`,
+  `.identity`, `.project_id` and fields outside the host allowlist are omitted.
+  Home paths in free text are replaced with `<home>`, local app-data paths outside home
+  with `<localappdata>`, and the project root outside home with `<root>`. The project ID
+  is replaced with `<project_id>`. This does not cover other paths outside those folders or a login
+  appearing in free text outside a path. Other spellings of the same folders are not recognised either:
+  a Windows 8.3 short name (`ANNEXA~1`), a junction or WSL path to it, or a URL-encoded path.
+  Other commands can still show paths or project
+  IDs: `whoami --json`, `hmac-init`, `backup --json`, `doctor`, `supervisor --json` and
+  the web console.
 - The web console and `agenttalk attention` show and warn only on figures that are still current.
 
 **Where the figures come from**

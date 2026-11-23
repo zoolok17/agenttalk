@@ -35,6 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Status hides personal paths and project ID by default (#870).** `status --json`
+  omits `root`, `project_id` and `hmac_key.path`, so scripts reading those keys must
+  use `--show-personal` to recover them. Text marks them hidden. The option also
+  replaces the unreleased `--show-account` on status and capacity. Home and external
+  local app-data paths in status free text are replaced by placeholders by default.
+  The text `powershell:` line hides its path; JSON omits `powershell_host.path`,
+  `.identity`, `.project_id` and fields outside its allowlist. The project root outside
+  home and the project ID are replaced in free text as well.
+- **Capacity headings now omit account identifiers by default.** This makes routine
+  output safer to share. To see the operating-system login and home-folder fingerprint
+  as before, run `agenttalk capacity --show-personal`. The same protection now covers
+  `agenttalk status --json` (#867). A malformed account is not shown in the default capacity heading.
+- **Status JSON no longer exposes account text by default (#867).** Each capacity
+  reading with an account now has `account_group`, the sorted seats sharing it,
+  instead of `account`; a script reading `account` now finds the key missing. To keep the old account text, use `status --json
+  --show-personal`; to group seats, compare `account_group`. Budget readers need
+  no change. The store itself records the login, so review it before sharing it.
 - **Reopening a close now checks the revision against the checkout.** Git must
   resolve the requested revision and show it as HEAD, including when the close
   keeps its existing revision. A missing checkout, unavailable Git, unresolved
