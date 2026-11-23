@@ -271,14 +271,17 @@ def test_printed_reset_retry_runs_once_then_refuses(tmp_path, monkeypatch, capsy
     capsys.readouterr()
     refuse_lost_preparation(monkeypatch, lambda: _requeue(store, original, *flags))
     output = capsys.readouterr().err
-    command = f"agenttalk dead-letter requeue --agent beta --id {original.id}"
+    expected = ["dead-letter", "requeue", "--agent", "beta", "--id", original.id]
     if resolved:
-        command += " --force-resolved --from lead --reason retry"
-    assert command in output
+        expected += ["--force-resolved", "--from", "lead", "--reason", "retry"]
+    # The printed retry names this store (#889): agenttalk --root <store> <the command>.
+    line = next(line.strip() for line in output.splitlines() if line.strip().startswith("agenttalk --root "))
+    argv = shlex.split(line)
+    assert argv[:3] == ["agenttalk", "--root", str(store.root)]
+    assert argv[3:] == expected
     store.reset()
-    args = ["--root", str(store.root), *shlex.split(command)[1:]]
-    assert cli.main(args) == 0
-    assert cli.main(args) == 2
+    assert cli.main(argv[1:]) == 0
+    assert cli.main(argv[1:]) == 2
 
 
 @pytest.mark.parametrize("kind", ["task", "review-request", "review-result", "rescind", "end", "message"])
