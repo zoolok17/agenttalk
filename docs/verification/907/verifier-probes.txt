@@ -1,0 +1,30 @@
+verifier probes: scripts/check_git_job_scheduled_task.ps1 -Mode Verify on made-up logs (run id run-0123456789ab); nothing is registered
+exit codes: 0 accepted, 2 no completion evidence, 3 finished but rejected
+
+Windows PowerShell 5.1
+  good                           exit 0  OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  missing                        exit 2  NO COMPLETION EVIDENCE: the log is 'missing' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  empty                          exit 2  NO COMPLETION EVIDENCE: the log is 'empty' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  another-runs-log               exit 2  NO COMPLETION EVIDENCE: the log is 'other-run' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  partial-no-exit-line           exit 2  NO COMPLETION EVIDENCE: the log is 'partial' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  exit-line-not-last             exit 2  NO COMPLETION EVIDENCE: the log is 'partial' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  non-zero-exit                  exit 3  REJECT: pytest exit code was 1, not 0
+  exit-0-without-the-facts-line  exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
+  facts-line-of-the-old-form     exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
+  facts-without-a-session-id     exit 3  REJECT: the host facts do not name "session_id"
+
+PowerShell 7
+  good                           exit 0  OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  missing                        exit 2  NO COMPLETION EVIDENCE: the log is 'missing' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  empty                          exit 2  NO COMPLETION EVIDENCE: the log is 'empty' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  another-runs-log               exit 2  NO COMPLETION EVIDENCE: the log is 'other-run' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  partial-no-exit-line           exit 2  NO COMPLETION EVIDENCE: the log is 'partial' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  exit-line-not-last             exit 2  NO COMPLETION EVIDENCE: the log is 'partial' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  non-zero-exit                  exit 3  REJECT: pytest exit code was 1, not 0
+  exit-0-without-the-facts-line  exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
+  facts-line-of-the-old-form     exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
+  facts-without-a-session-id     exit 3  REJECT: the host facts do not name "session_id"
+
+dry run (nothing registered): the two registrations it would make
+  [interactive] would run: schtasks /Create /TN agenttalk-git-job-check /SC ONCE /ST 23:59 /IT /RU "example-user" /RL LIMITED /TR "<command: this script -Mode Task -ArgsFile <file>>"
+  [background] would run: schtasks /Create /TN agenttalk-git-job-check /SC ONCE /ST 23:59 /RU "example-user" /RP * /RL LIMITED /TR "<command: this script -Mode Task -ArgsFile <file>>"

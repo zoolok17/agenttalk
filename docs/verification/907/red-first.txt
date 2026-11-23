@@ -1,0 +1,58 @@
+red first: the new tests run against the OLD time-out code (the write code of the base commit put back, the new job module kept)
+command: python -m pytest tests/test_git_job.py tests/test_git_write_job_907.py tests/test_git_job_windows.py tests/test_git_job_capability.py -q -rf
+result: 53 failed, 63 passed, 1 skipped, 1 warning in 30.82s
+the nine 'unrelated process' guards on the old code (they pass there by design): 9 passed, 59 deselected in 0.33s
+failing tests (53):
+    tests/test_git_job.py::test_the_job_code_never_names_a_call_that_walks_processes
+    tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[reuse_at_genuine_descendant]
+    tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[cancelled_steps_during_command]
+    tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[below_tolerance_step_during_command]
+    tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[step_after_stop_sample]
+    tests/test_git_write_job_907.py::test_job_members_are_stopped[git]
+    tests/test_git_write_job_907.py::test_job_members_are_stopped[hook_grandchild]
+    tests/test_git_write_job_907.py::test_job_members_are_stopped[member_whose_parent_exited]
+    tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it
+    tests/test_git_write_job_907.py::test_a_nonzero_git_exit_closes_without_stopping
+    tests/test_git_write_job_907.py::test_an_ordinary_communicate_error_closes_without_stopping
+    tests/test_git_write_job_907.py::test_an_interruption_before_any_timeout_closes_without_stopping
+    tests/test_git_write_job_907.py::test_a_missing_resume_symbol_is_a_start_failure_of_the_write
+    tests/test_git_write_job_907.py::test_a_popen_failure_closes_the_job_and_is_a_start_failure_of_the_write
+    tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[1]
+    tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[-1073741790]
+    tests/test_git_write_job_907.py::test_an_interruption_right_after_the_resume_stops_the_job_git_already_runs_in
+    tests/test_git_write_job_907.py::test_the_close[normal-before-ordinary]
+    tests/test_git_write_job_907.py::test_the_close[timeout-before-ordinary]
+    tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-ordinary]
+    tests/test_git_write_job_907.py::test_the_close[fallback_error-before-ordinary]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_before_timeout-before-ordinary]
+    tests/test_git_write_job_907.py::test_the_close[normal-before-first]
+    tests/test_git_write_job_907.py::test_the_close[normal-after-first]
+    tests/test_git_write_job_907.py::test_the_close[timeout-before-first]
+    tests/test_git_write_job_907.py::test_the_close[timeout-after-first]
+    tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-first]
+    tests/test_git_write_job_907.py::test_the_close[ordinary_error-after-first]
+    tests/test_git_write_job_907.py::test_the_close[fallback_error-before-first]
+    tests/test_git_write_job_907.py::test_the_close[fallback_error-after-first]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-second]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-after-second]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_before_timeout-after-second]
+    tests/test_git_write_job_907.py::test_normal_timeout_stops_the_job_then_kills_reaps_and_counts
+    tests/test_git_write_job_907.py::test_reap_timeout_after_a_job_stop
+    tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
+    tests/test_git_write_job_907.py::test_ordinary_error_fallback_counts_before_it_closes
+    tests/test_git_write_job_907.py::test_interruption_fallback_stops_the_job
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[stop]
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[reap]
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[count]
+    tests/test_git_write_job_907.py::test_an_exhausted_deadline_skips_waits_and_the_count_and_keeps_the_warning
+    tests/test_git_write_job_907.py::test_no_wait_runs_past_the_deadline
+    tests/test_git_write_job_907.py::test_a_count_above_zero_keeps_the_warning
+    tests/test_git_write_job_907.py::test_a_count_that_goes_from_above_zero_to_zero_within_the_deadline_gives_the_success_wording
+    tests/test_git_write_job_907.py::test_success_wording_keeps_output_and_recovery_advice
+    tests/test_git_write_job_907.py::test_the_no_job_and_posix_timings_are_unchanged
+    tests/test_git_write_job_907.py::test_fallback_rows[refused_assignment_keeps_the_warning]
+    tests/test_git_write_job_907.py::test_a_failed_resume_runs_the_bounded_launcher_cleanup
+    tests/test_git_job_windows.py::test_a_ready_hook_is_stopped_with_git_on_a_timeout
+    tests/test_git_job_windows.py::test_a_git_filter_is_stopped_with_git_on_a_windows_timeout
+    tests/test_git_job_windows.py::test_a_plain_write_through_the_product_runs_in_a_job_and_ends_with_it_closed

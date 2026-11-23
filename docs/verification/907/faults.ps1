@@ -1,0 +1,178 @@
+<#
+.SYNOPSIS
+  Plants one fault at a time in the #907 sources, runs the tests that should catch it, and records which tests failed.
+
+.DESCRIPTION
+  A fault that no test notices is a hole in the tests. For each planted fault this script changes one place in
+  src/agenttalk/cli.py or src/agenttalk/git_job.py, checks that the changed file still compiles, runs the tests that
+  must catch it, writes one result line, and puts the file back with `git checkout`. A fault counts as caught when at
+  least one test FAILS (an ERROR, such as a file that no longer compiles, is reported separately and is not a catch).
+
+  It edits tracked files in place. Run it on a clone you can throw away: it refuses to start when the two source files
+  have uncommitted changes, so nothing of yours is lost, and it leaves them as they were committed.
+
+  Paths: every path is a parameter or relative to the repository. The results file holds only the fault name, the
+  pytest summary line and the ids of the failing tests; no path, user name or temporary folder.
+
+.PARAMETER Repo      The repository (default: three levels above this script, docs/verification/907).
+.PARAMETER Python    The interpreter that runs pytest (default: python).
+.PARAMETER Out       The results file (default: faults-results.txt next to this script).
+.PARAMETER BaseTemp  pytest's temporary folder (default: a new folder under the system temporary folder).
+.PARAMETER Only      Run only the fault with exactly this id.
+#>
+param(
+    [string]$Repo = '',
+    [string]$Python = 'python',
+    [string]$Out = '',
+    [string]$BaseTemp = '',
+    [string]$Only = ''
+)
+$ErrorActionPreference = 'Stop'
+if (-not $Repo) { $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path }
+if (-not $Out) { $Out = Join-Path $PSScriptRoot 'faults-results.txt' }
+if (-not $BaseTemp) { $BaseTemp = Join-Path ([IO.Path]::GetTempPath()) ('faults907-' + [guid]::NewGuid().ToString('N').Substring(0, 8)) }
+
+# a run that is polite to the machine; nothing of the environment is printed
+$me = Get-Process -Id $PID
+$me.PriorityClass = 'BelowNormal'
+foreach ($n in @([Environment]::GetEnvironmentVariables().Keys)) { if ("$n" -like 'AGENTTALK*') { Remove-Item -LiteralPath "Env:$n" } }
+$env:PYTHONPATH = 'src'
+Set-Location -LiteralPath $Repo
+
+$CLI = 'src/agenttalk/cli.py'
+$JOB = 'src/agenttalk/git_job.py'
+$dirty = @(git status --porcelain -- $CLI $JOB)
+if ($dirty.Count -gt 0) { throw "Refusing to start: $CLI or $JOB has uncommitted changes. Commit or stash them first." }
+
+$fake = @('tests/test_git_write_job_907.py', 'tests/test_git_job.py')
+$real = @('tests/test_git_job_windows.py', '-k', 'limits or monitor')
+$static = @('tests/test_git_job.py')
+
+$setlimit = @'
+        handle = self._kernel.CreateJobObjectW(None, None)
+        if handle:
+            buffer = (self._ctypes.c_char * 144)()
+            self._ctypes.c_uint32.from_buffer(buffer, 16).value = FLAGS
+            self._kernel.SetInformationJobObject(self._ctypes.c_void_p(handle), 9, buffer, 144)
+        return int(handle) if handle else None
+'@
+$createOld = @'
+        handle = self._kernel.CreateJobObjectW(None, None)
+        return int(handle) if handle else None
+'@
+
+$faults = @(
+  @{ id = 'F01-kill-on-close-set'; tests = $real; edits = @(, @($JOB, $createOld, $setlimit.Replace('FLAGS', '0x2000'))) },
+  @{ id = 'F02-job-stopped-after-a-normal-run'; tests = $fake; edits = @(, @($CLI,
+      "        if job is not None:`n            job.close()  # a normal end, whatever the exit code: the job is closed and never stopped",
+      "        if job is not None:`n            job.stop()`n            job.close()  # a normal end, whatever the exit code: the job is closed and never stopped")) },
+  @{ id = 'F03-count-before-stop'; tests = $fake; edits = @(, @($CLI,
+      "            job.stop()  # the first step; it can be repeated safely",
+      "            job.live_count()`n            job.stop()  # the first step; it can be repeated safely")) },
+  @{ id = 'F04-count-above-zero-drops-the-warning'; tests = $fake; edits = @(, @($CLI,
+      "    return job.stop_succeeded and count == 0", "    return job.stop_succeeded and count is not None")) },
+  @{ id = 'F05-breakaway-ok-set'; tests = $real; edits = @(, @($JOB, $createOld, $setlimit.Replace('FLAGS', '0x800'))) },
+  @{ id = 'F06-resume-before-assignment'; tests = $fake; edits = @(, @($JOB,
+      "            assigned = bool(native.assign(handle, process))  # step 3",
+      "            native.resume(process)`n            assigned = bool(native.assign(handle, process))  # step 3")) },
+  @{ id = 'F07-assignment-skipped-and-reported-as-done'; tests = $fake; edits = @(, @($JOB,
+      "            assigned = bool(native.assign(handle, process))  # step 3", "            assigned = True  # step 3")) },
+  @{ id = 'F08-stop-through-the-wrong-handle'; tests = $fake; edits = @(, @($JOB,
+      "ok = bool(self._native.terminate(handle, 1))", "ok = bool(self._native.terminate(handle + 1, 1))")) },
+  @{ id = 'F09-close-skipped-on-an-ordinary-error'; tests = $fake; edits = @(, @($CLI,
+      "_kill_and_reap(proc, interruptible=True, job=job)  # closes the job, never stops it",
+      "_kill_and_reap(proc, interruptible=True, job=None)  # closes the job, never stops it")) },
+  @{ id = 'F10-first-interruption-lost-in-the-time-out-handler'; tests = $fake; edits = @(, @($CLI,
+      "        _kill_and_reap(proc, job=job, stop_job=True, deadline=deadline)`n        raise`n`n`ndef _resolve_revision",
+      "        _kill_and_reap(proc, job=job, stop_job=True, deadline=deadline)`n        raise RuntimeError('replaced')`n`n`ndef _resolve_revision")) },
+  @{ id = 'F11-failed-query-read-as-zero'; tests = $fake; edits = @(, @($JOB,
+      "        except Exception:  # noqa: BLE001`n            return None`n        return None if count is None else int(count)",
+      "        except Exception:  # noqa: BLE001`n            return 0`n        return 0 if count is None else int(count)")) },
+  @{ id = 'F12-failed-stop-with-zero-count-no-warning'; tests = $fake; edits = @(, @($CLI,
+      "    return job.stop_succeeded and count == 0", "    return count == 0")) },
+  @{ id = 'F13-timeout-cause-lost'; tests = $fake; edits = @(, @($CLI,
+      "        _close_job(job)`n        raise error from timed_out", "        _close_job(job)`n        raise error")) },
+  @{ id = 'F14-count-polling-past-the-deadline'; tests = $fake; edits = @(, @($JOB,
+      "        limit = deadline.cut(COUNT_SECONDS)", "        limit = COUNT_SECONDS")) },
+  @{ id = 'F15-stop-missing-from-the-ordinary-error-fallback'; tests = $fake; edits = @(, @($CLI,
+      "_kill_and_reap(proc, interruptible=True, job=job, stop_job=True, close_job=False, deadline=deadline)",
+      "_kill_and_reap(proc, interruptible=True, job=job, stop_job=False, close_job=False, deadline=deadline)")) },
+  @{ id = 'F16-stop-missing-from-the-interruption-fallback'; tests = $fake; edits = @(, @($CLI,
+      "        _kill_and_reap(proc, job=job, stop_job=True, deadline=deadline)`n        raise`n`n`ndef _resolve_revision",
+      "        _kill_and_reap(proc, job=job, stop_job=False, deadline=deadline)`n        raise`n`n`ndef _resolve_revision")) },
+  @{ id = 'F16b-stop-missing-from-the-interruption-branch-of-the-error-fallback'; tests = $fake; edits = @(, @($CLI,
+      "            _kill_and_reap(proc, job=job, stop_job=True, deadline=deadline)`n            raise",
+      "            _kill_and_reap(proc, job=job, stop_job=False, deadline=deadline)`n            raise")) },
+  @{ id = 'F17-call-through-a-handle-after-a-successful-close'; tests = $fake; edits = @(, @($JOB,
+      "        if closed:`n            self._handle = None", "        if closed:`n            pass")) },
+  @{ id = 'F18-close-moved-to-a-bare-outer-finally'; tests = $fake; edits = @(
+      @($CLI, "        if job is not None:`n            job.close()  # a normal end, whatever the exit code: the job is closed and never stopped`n", ""),
+      @($CLI, "        _kill_and_reap(proc, job=job)`n        raise`n    return proc.returncode, out or `"`", err or `"`"",
+              "        _kill_and_reap(proc, job=job)`n        raise`n    finally:`n        if job is not None:`n            job.close()`n    return proc.returncode, out or `"`", err or `"`"")) },
+  @{ id = 'F19-nonzero-resume-status-taken-as-success'; tests = $fake; edits = @(, @($JOB,
+      "    if status != 0:", "    if status < 0:")) },
+  @{ id = 'F20-process-list-call-added'; tests = $fake; edits = @(, @($JOB,
+      "            ok = bool(self._native.terminate(handle, 1))",
+      "            with contextlib.suppress(Exception):`n                self._native.snapshot()`n            ok = bool(self._native.terminate(handle, 1))")) },
+  @{ id = 'F21-count-after-the-close-in-the-ordinary-error-fallback'; tests = $fake; edits = @(, @($CLI,
+      "            confirmed = _job_confirmed(job, deadline)`n            _close_job(job)",
+      "            _close_job(job)`n            confirmed = _job_confirmed(job, deadline)")) },
+  @{ id = 'F22-wall-clock-read'; tests = $fake; edits = @(, @($JOB,
+      "        self._end = _monotonic() + seconds", "        time.time()`n        self._end = _monotonic() + seconds")) },
+  @{ id = 'F23-close-skipped-after-a-confirmed-time-out'; tests = $fake; edits = @(, @($CLI,
+      "        _close_job(job)`n        raise error from timed_out", "        raise error from timed_out")) },
+  @{ id = 'F24-handle-kept-after-an-interruption-in-the-native-close'; tests = $fake; edits = @(, @($JOB,
+      "        except BaseException:`n            self._handle = None`n            raise", "        except BaseException:`n            raise")) },
+  @{ id = 'F25-reap-not-cut-to-the-deadline'; tests = $fake; edits = @(, @($CLI,
+      "out, err = proc.communicate(timeout=5 if deadline is None else deadline.cut(5))",
+      "out, err = proc.communicate(timeout=5)")) },
+  @{ id = 'F26-wait-not-cut-to-the-deadline'; tests = $fake; edits = @(, @($CLI,
+      "                    proc.wait(timeout=25 if deadline is None else deadline.cut(25))",
+      "                    proc.wait(timeout=25)")) },
+  @{ id = 'F27-hand-over-cleanup-does-not-stop-the-job'; tests = $fake; edits = @(, @($CLI,
+      "    _kill_and_reap(proc, job=job, stop_job=True)", "    _kill_and_reap(proc, job=job)")) },
+  @{ id = 'F28-process-listing-call-named-in-the-job-code-only-the-static-guard-sees'; tests = $static; edits = @(, @($JOB,
+      "        return bool(self._kernel.CloseHandle(handle))",
+      "        self._kernel.OpenProcess(0x1000, False, 0)  # planted`n        return bool(self._kernel.CloseHandle(handle))")) },
+  @{ id = 'F29-default-cleanup-does-not-stop-the-job'; tests = $fake; edits = @(, @($JOB,
+      "            job.stop()`n    with contextlib.suppress(BaseException):`n        proc.kill()", "            pass`n    with contextlib.suppress(BaseException):`n        proc.kill()")) }
+)
+
+$lines = @("planted faults of #907: one result line each (caught = at least one test failed)")
+foreach ($f in $faults) {
+  if ($Only -and $f.id -ne $Only) { continue }
+  $files = @{}
+  $planted = $true
+  foreach ($e in $f.edits) {
+    $path = Join-Path $Repo $e[0]
+    if (-not $files.ContainsKey($path)) { $files[$path] = [IO.File]::ReadAllText($path) }
+    $text = $files[$path]
+    $crlf = $text.Contains("`r`n")
+    $oldText = if ($crlf) { $e[1].Replace("`n", "`r`n") } else { $e[1] }
+    $newText = if ($crlf) { $e[2].Replace("`n", "`r`n") } else { $e[2] }
+    $first = $text.IndexOf($oldText)
+    if ($first -lt 0 -or $text.IndexOf($oldText, $first + 1) -ge 0) { $planted = $false; break }
+    $files[$path] = $text.Substring(0, $first) + $newText + $text.Substring($first + $oldText.Length)
+  }
+  if (-not $planted) { $lines += "$($f.id): NOT PLANTED (the text to change was not found exactly once)"; continue }
+  try {
+    foreach ($p in $files.Keys) { [IO.File]::WriteAllText($p, $files[$p]) }
+    $compiled = $true
+    foreach ($p in $files.Keys) { & $Python -m py_compile $p 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { $compiled = $false } }
+    if (-not $compiled) { $lines += "$($f.id): DOES NOT COMPILE"; continue }
+    $log = & $Python -m pytest @($f.tests) -q --no-header --tb=no -rfE -p no:cacheprovider "--basetemp=$BaseTemp" 2>&1
+    $failed = @($log | Where-Object { $_ -match '^(FAILED|ERROR) ' })
+    $errors = @($failed | Where-Object { $_ -match '^ERROR ' }).Count
+    $summary = ($log | Where-Object { $_ -match ' (passed|failed|error)' } | Select-Object -Last 1)
+    $verdict = if ($failed.Count -gt 0 -and $errors -eq 0) { 'CAUGHT' } elseif ($errors -gt 0) { 'ERROR (not a catch)' } else { 'NOT CAUGHT' }
+    $lines += "$($f.id): $verdict -- $summary"
+    foreach ($line in ($failed | Select-Object -First 4)) {
+      $id = ($line -replace '^(FAILED|ERROR) ', '') -replace ' - .*$', ''
+      $lines += "    $id"
+    }
+  } finally {
+    foreach ($p in $files.Keys) { git checkout -- ($p.Substring($Repo.Length).TrimStart('\', '/')) 2>&1 | Out-Null }
+  }
+}
+$lines += 'done; the source files were put back with git checkout'
+Set-Content -LiteralPath $Out -Value $lines -Encoding utf8

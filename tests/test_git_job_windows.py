@@ -400,3 +400,24 @@ def test_a_short_git_command_runs_in_a_job_and_the_job_is_closed_after_it(tmp_pa
     assert job is not None
     out, _err = proc.communicate(timeout=60)
     assert out.startswith("git version") and job.close() and job.handle is None
+
+
+def test_a_plain_write_through_the_product_runs_in_a_job_and_ends_with_it_closed(tmp_path, monkeypatch):
+    """The product's default path with nothing replaced: real Git, the real job layer, `cli._git_write` as other code
+    calls it. The write is started in a job (the job exists), Git's own result comes back, and the job is closed when
+    the write ends. This is the path the rest of the suite does not take (see the fixture in conftest.py)."""
+    root = make_repo(tmp_path)
+    started = []
+    real = git_job.start_in_job
+
+    def watching(cmd, **kwargs):
+        proc, job = real(cmd, **kwargs)
+        started.append(job)
+        return proc, job
+
+    monkeypatch.setattr(git_job, "start_in_job", watching)
+    code, _out, err = cli._git_write(root, worktree_args(tmp_path, root), timeout=60)
+    assert code == 0, err
+    assert (tmp_path / "wt" / "file.txt").exists()
+    assert len(started) == 1 and started[0] is not None, "the write was not started in a job"
+    assert started[0].handle is None, "the job was not closed when the write ended"

@@ -1,0 +1,7 @@
+host facts of the machine the evidence was produced on (the capability check, run without -s; the line is in pytest's warnings summary)
+command: python -m pytest tests/test_git_job_capability.py -m windows_capability -q
+result: 1 passed, 1 deselected, 1 warning in 0.38s
+
+GitJobHostFacts: git-job-capability: {"direct": {"assigned": true, "git_exit_code": 0, "git_in_our_job": true, "git_output": "git version 2.56.0.windows.2", "job_created": true, "outer_job_limit_flags": 12288, "pytest_process_in_a_job": true, "python": "3.14.7", "resume_status": 0, "session_id": 1, "windows": "Windows-11-10.0.26300-SP0", "windows_build": 26300}, "host": {"outer_job_limit_flags": 12288, "pytest_process_in_a_job": true, "python": "3.14.7", "session_id": 1, "windows": "Windows-11-10.0.26300-SP0", "windows_build": 26300}}
+
+in plain words: Windows 11 build 26300, Python 3.14.7, Git 2.56.0; the test process was already inside another job (limit flags 12288 = kill-on-close and silent-breakaway-ok); session 1 (a user session, not a service session); a new job was created, Git was started paused, assigned to it (it was a member), resumed through the same process handle (status 0) and exited 0. The same check, started inside an outer job of its own, also passed.
