@@ -50,13 +50,28 @@ def test_prepared_replay_retry_line_preserves_again_reason(tmp_path, monkeypatch
     if kind in {"task", "review-request"}:
         _dead_payload(store, earlier)
     if resolved:
-        assert cli.main(["--root", str(store.root), "dead-letter", "resolve", "--from", "lead",
-                         "--agent", "beta", "--id", original.id, "--reason", "handled"]) == 0
+        assert (
+            cli.main(
+                [
+                    "--root",
+                    str(store.root),
+                    "dead-letter",
+                    "resolve",
+                    "--from",
+                    "lead",
+                    "--agent",
+                    "beta",
+                    "--id",
+                    original.id,
+                    "--reason",
+                    "handled",
+                ]
+            )
+            == 0
+        )
     flags = ["--force-resolved", "--from", "lead"] if resolved else []
     capsys.readouterr()
-    refuse_lost_preparation(monkeypatch, lambda: _requeue(
-        store, original, *flags, "--again", "--reason", "try again"
-    ))
+    refuse_lost_preparation(monkeypatch, lambda: _requeue(store, original, *flags, "--again", "--reason", "try again"))
     error = capsys.readouterr().err
     line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
     argv = shlex.split(line)
@@ -73,9 +88,7 @@ def test_prepared_replay_unsafe_reason_uses_placeholder(tmp_path, monkeypatch, c
     original = dead_letter(store, "message")
     assert _requeue(store, original) == 0
     capsys.readouterr()
-    refuse_lost_preparation(monkeypatch, lambda: _requeue(
-        store, original, "--again", "--reason", "unsafe; command"
-    ))
+    refuse_lost_preparation(monkeypatch, lambda: _requeue(store, original, "--again", "--reason", "unsafe; command"))
     error = capsys.readouterr().err
     line = next(line.strip() for line in error.splitlines() if line.startswith("  agenttalk "))
     assert "--again" in line and "<reason>" in line

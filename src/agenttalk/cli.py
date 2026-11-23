@@ -16979,8 +16979,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         except PreparedMessageRefused as e:
             note, command = _requeue_retry_command(store, args, reason, reopen_event)
             route = (
-                "After the reset has finished, retry the same dead letter: run this command once in PowerShell or a POSIX shell "
-                "to keep the dead letter's original correlation.\n" + note + "  " + command
+                "After the reset has finished, retry the same dead letter: run this command once in PowerShell "
+                "or a POSIX shell to keep the dead letter's original correlation.\n" + note + "  " + command
             )
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {pc.line(str(e))} "

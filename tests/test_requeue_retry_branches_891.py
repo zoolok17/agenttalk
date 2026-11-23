@@ -25,8 +25,25 @@ def test_every_printed_retry_runs_from_another_store(tmp_path, monkeypatch, caps
     if branch == "failed_copy":
         _dead_payload(store, earlier)
     if resolved:
-        assert cli.main(["--root", str(store.root), "dead-letter", "resolve", "--from", "lead",
-                         "--agent", "beta", "--id", original.id, "--reason", "handled"]) == 0
+        assert (
+            cli.main(
+                [
+                    "--root",
+                    str(store.root),
+                    "dead-letter",
+                    "resolve",
+                    "--from",
+                    "lead",
+                    "--agent",
+                    "beta",
+                    "--id",
+                    original.id,
+                    "--reason",
+                    "handled",
+                ]
+            )
+            == 0
+        )
     capsys.readouterr()
     flags = [] if branch == "failed_copy" else ["--again", "--reason", "retry reason"]
     if resolved:
