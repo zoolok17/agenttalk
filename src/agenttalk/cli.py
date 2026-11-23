@@ -3381,23 +3381,28 @@ def _kill_and_reap_quietly(proc, tree=None) -> None:
 
 
 def _kill_and_reap(proc) -> None:
-    if proc.poll() is None:
-        # kill() can itself raise - unguarded, that secondary error
-        # would replace the owner BaseException being handled and
-        # skip the reap fallback below entirely.
-        with contextlib.suppress(OSError):
-            proc.kill()
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            # A hook or descendant holding the captured stdout/stderr
-            # pipe handles open can keep communicate() blocked past
-            # this retry even though the killed process is already
-            # dead - wait() does not touch the pipes at all, so it
-            # still completes once the process is actually gone.
-            # A second timeout leaves the launcher's reap unconfirmed.
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=25)
+    """Kill the launcher and reap it. Every step is its own best effort and none can raise.
+
+    A failing poll never skips the kill, a failing kill never skips the reap, and a failing or
+    timed-out reap is followed by wait(), which does not touch the pipes. Each step is bounded.
+    """
+    try:
+        running = proc.poll() is None
+    except Exception:
+        running = True  # cannot tell, so act as if it were still running
+    if not running:
+        return
+    with contextlib.suppress(Exception):
+        proc.kill()
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        # A hook or descendant holding the captured stdout/stderr pipe handles open can keep
+        # communicate() blocked past this retry even though the killed process is already
+        # dead - wait() does not touch the pipes at all, so it still completes once the
+        # process is actually gone. A second timeout leaves the launcher's reap unconfirmed.
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=25)
 
 
 def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired):

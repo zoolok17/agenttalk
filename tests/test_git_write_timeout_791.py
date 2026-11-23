@@ -218,6 +218,61 @@ def test_an_interruption_during_the_reap_stops_the_verified_processes_that_survi
     world.assert_handles_closed()
 
 
+class _LauncherWithBrokenStep:
+    """A launcher where exactly one cleanup call fails, so each step must stand on its own."""
+
+    def __init__(self, broken):
+        self.broken, self.killed, self.communicates, self.waited = broken, False, 0, 0
+
+    def poll(self):
+        if self.broken == "poll":
+            raise OSError("simulated poll failure")
+        return None
+
+    def kill(self):
+        self.killed = True
+        if self.broken == "kill":
+            raise OSError("simulated kill failure")
+
+    def communicate(self, timeout=None):
+        self.communicates += 1
+        if self.communicates == 1:
+            raise subprocess.TimeoutExpired("git", timeout)
+        if self.broken == "communicate":
+            raise OSError("simulated communicate failure")
+        if self.broken in ("communicate-timeout", "wait"):
+            raise subprocess.TimeoutExpired("git", timeout)
+        return "", ""
+
+    def wait(self, timeout=None):
+        self.waited += 1
+        if self.broken == "wait":
+            raise OSError("simulated wait failure")
+        return 0
+
+
+@pytest.mark.parametrize("broken", ["poll", "kill", "communicate", "communicate-timeout", "wait"])
+def test_each_launcher_cleanup_step_is_best_effort_and_the_interruption_is_raised(tmp_path, monkeypatch, broken):
+    from agenttalk import windows_tree_stop as wts
+
+    launcher = _LauncherWithBrokenStep(broken)  # "wait": the reap times out, so wait() runs and then fails
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: launcher)
+
+    def interrupted(self):  # before any tree handle exists: only the launcher can be stopped
+        raise KeyboardInterrupt("original")
+
+    monkeypatch.setattr(wts.TreeStop, "run", interrupted)
+    monkeypatch.setattr(cli, "os", _NtOS())
+    with pytest.raises(KeyboardInterrupt, match="original"):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--", str(tmp_path / "wt"), "a" * 40], timeout=0.01
+        )
+    assert launcher.killed, "a failing poll must not skip the kill"
+    assert launcher.communicates == 2, "a failing kill must not skip the reap"
+    if broken in ("communicate", "communicate-timeout", "wait"):
+        assert launcher.waited == 1, "a failed or timed-out reap is followed by wait()"
+
+
 def test_posix_timeout_keeps_direct_kill_and_original_message(tmp_path, monkeypatch):
     class PosixOS:
         name = "posix"
