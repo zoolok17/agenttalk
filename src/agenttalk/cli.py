@@ -3391,7 +3391,7 @@ def _sigint_deferred():
     """While the cleanup of an interruption already being handled runs, a new Ctrl-C is taken by a temporary handler
     and dropped: the first interruption is the one being raised, and a second must not replace it or cut the bounded
     cleanup short. The previous handler is read before anything is installed and put back in a finally, also when
-    the install failed part-way.
+    the install failed or was interrupted part-way; then the cleanup simply goes on without the deferral.
 
     The limit, plainly: a new Ctrl-C delivered by the operating system during the cleanup is deferred on the main
     thread. Python can only change handlers there, so off the main thread nothing is deferred (a Ctrl-C is only
@@ -3404,7 +3404,9 @@ def _sigint_deferred():
     try:
         try:
             signal.signal(signal.SIGINT, lambda signum, frame: None)
-        except (ValueError, OSError):  # not the main thread, or the install failed
+        except BaseException:  # noqa: BLE001, S110  # nosec B110
+            # Not the main thread, the install failed, or it was itself interrupted: the cleanup goes on without the
+            # deferral, and the original interruption is still the one raised by the caller.
             pass
         yield
     finally:
@@ -3415,10 +3417,11 @@ def _sigint_deferred():
 def _run_swallowing(steps) -> None:
     """Run every cleanup step even if an exception is raised between two of them (outside the steps' own guards).
 
-    All of the loop control (the condition, the choice of the step, the call) is inside one try. A step is marked as
-    started by its own first action, inside `_best_effort`, so an exception on any line of the loop keeps the
-    original interruption and no step is skipped: a step that was not started is run on the next pass, one that was
-    is not repeated. The passes are limited, so a fault that keeps coming cannot loop for ever.
+    All of the loop control (the condition, the choice of the step, the call) is inside one try. A step may repeat,
+    never be skipped: it is marked as started by its own first action, inside `_best_effort`, so an exception on any
+    line of the loop keeps the original interruption, a step that was not started (or whose start was interrupted) is
+    run on the next pass, and one that was started is not run again. Steps are safe to repeat (a kill, a reap and a
+    wait can all be asked twice). The passes are limited, so a fault that keeps coming cannot loop for ever.
 
     The limit, plainly: the few lines that set the loop up, the `try` that starts a pass and the `return` that ends
     it are outside any guard, and Python offers no way to guard them; an exception that code raises there by itself

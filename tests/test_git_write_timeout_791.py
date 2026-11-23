@@ -437,6 +437,79 @@ def test_the_previous_sigint_handler_is_restored_after_a_partial_install_failure
     assert state["handler"] is previous
 
 
+@pytest.mark.parametrize("partial", [False, True], ids=["install-fails", "install-fails-after-taking-effect"])
+@pytest.mark.parametrize(
+    "failure",
+    [KeyboardInterrupt("install"), SystemExit("install"), OSError("install"), ValueError("install")],
+    ids=["ctrl-c", "exit", "oserror", "valueerror"],
+)
+def test_an_install_that_raises_or_is_interrupted_goes_on_to_the_cleanup_without_deferral(
+    tmp_path, monkeypatch, failure, partial
+):
+    """If installing the temporary handler raises, or is itself interrupted, the cleanup still runs (without the
+    deferral), the original interruption is what is raised, and the previous handler is back."""
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("signal handlers can only be changed from the main thread")
+    before = signal.getsignal(signal.SIGINT)
+    real, calls = signal.signal, []
+
+    def install(signum, handler):
+        calls.append(handler)
+        if len(calls) == 1:
+            if partial:
+                real(signum, handler)  # the handler took effect, and then the call still failed
+            raise failure
+        return real(signum, handler)
+
+    monkeypatch.setattr(signal, "signal", install)
+    launcher = _Launcher(interrupt=True)
+    try:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            _timeout(tmp_path, monkeypatch, launcher)
+    finally:
+        monkeypatch.setattr(signal, "signal", real)
+        restored = signal.getsignal(signal.SIGINT)
+        real(signal.SIGINT, before)
+    assert raised.value is _FIRST
+    assert launcher.killed == 2 and launcher.communicates == 3  # the cleanup ran, undeferred
+    assert restored is before
+
+
+@pytest.mark.parametrize("reap_fails", [False, True], ids=["reap-works", "reap-fails-so-wait-runs"])
+@pytest.mark.parametrize("line, n", _GUARDED_LINES)
+def test_the_cleanup_counts_hold_at_every_guarded_line_through_the_whole_timeout_path(
+    tmp_path, monkeypatch, line, n, reap_fails
+):
+    """The same injection as above, but through the whole timeout path and its stand-in launcher: wherever a second
+    exception lands in the loop, the kill (2 with the one of the timeout path), the reap (3) and the wait (1 when the
+    reap fails, else 0) are all done; a step may repeat, never be skipped, so none comes out lower."""
+    launcher = _Launcher(interrupt=True, fail={"communicate": _REAP_TIMEOUT} if reap_fails else None)
+    code, hits, fired = cli._run_swallowing.__code__, [], []
+
+    def tracer(frame, event, arg):
+        return line_tracer if frame.f_code is code else None
+
+    def line_tracer(frame, event, arg):
+        if event == "line" and frame.f_lineno == line:
+            hits.append(line)
+            if len(hits) == n:
+                fired.append(line)
+                raise SystemExit("second")
+        return line_tracer
+
+    prior = sys.gettrace()
+    try:
+        sys.settrace(tracer)
+        with pytest.raises(KeyboardInterrupt) as raised:
+            _timeout(tmp_path, monkeypatch, launcher)
+    finally:
+        sys.settrace(prior)
+    assert raised.value is _FIRST and fired == [line]
+    assert (launcher.killed, launcher.communicates, launcher.waited) == (2, 3, 1 if reap_fails else 0)
+
+
 def test_a_failed_install_that_changed_nothing_is_not_followed_by_a_restore(monkeypatch):
     """Off the main thread the install is refused outright: nothing was changed, so nothing is put back."""
     import signal
