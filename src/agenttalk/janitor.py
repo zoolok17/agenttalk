@@ -738,20 +738,25 @@ def find_foreign_kept(cfg: JanitorConfig) -> list[Path]:
     ]
 
 
-def build_report(cfg: JanitorConfig) -> JanitorReport:
+def build_report(cfg: JanitorConfig, listing: tuple[list[Path] | None, str] | None = None) -> JanitorReport:
+    """`listing` is a strict listing that was already read (and, under a store fence, fenced): the probes below then go
+    to exactly the paths that were checked, not to a second reading that could differ."""
     ancestor_ids, ancestor_errors = _ancestor_ids(cfg)
     if ancestor_errors:
         return JanitorReport([], [], [], [], ancestor_errors)
-    listing = _strict_listing(cfg.repo)  # the same reading as the comparison at the delete, and as discovery's
+    if listing is None:
+        listing = _strict_listing(cfg.repo)  # the same reading as the comparison at the delete, and as discovery's
     candidates, access_errors = find_candidates(cfg, listing)
     strict = listing[0] is not None
     # When it failed: best effort, for the counts and the preview only. Discovery has refused what it cannot trust, and
     # the old reader turns a name with an accent or U+2028 into a path that does not exist. `apply` decides nothing
     # on it.
     registered = listing[0] if strict else get_registered_worktrees(cfg.repo)
+    # Under a store fence, only a strict list is probed: the old reader's paths were never the ones the fence checked.
+    may_probe = strict or not os.environ.get(store_mod.STORE_FENCE_ENV)
     dirty = [
         w for w in registered
-        if not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
+        if may_probe and not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
     ]
     foreign = find_foreign_kept(cfg)
     in_use = {}

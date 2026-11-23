@@ -1349,6 +1349,211 @@ def test_janitor_release_with_an_origin_inside_the_fence_still_works(
         assert f"WOULD RELEASE {checkout}" in capsys.readouterr().out
 
 
+# --- #858 fix round 14: the fence checks the EXACT registered paths that the probes use ---------------------------
+
+LINE_SEPARATOR = " "  # a legal file name character; Python's splitlines() treats it as a line break
+
+_MODES = {"report": [], "apply": ["--apply"], "release-report": ["--release-report"],
+          "release": ["--release", "{done}"]}
+_JANITOR_MODES = [pytest.param(args, id=name) for name, args in _MODES.items()]
+# Which list is made to fail, in which modes: the sweep's strict listing is held by all four (one preflight serves every
+# mode); release's own list is read by the two release modes only.
+_LIST_CASES = [
+    pytest.param(which, _MODES[name], id=f"{name}-{which}")
+    for which, names in (("janitor-list", list(_MODES)), ("release-list", ["release-report", "release"]))
+    for name in names
+]
+
+
+def _outside_clone(tmp_path: Path) -> Path:
+    """A plain repository OUTSIDE the fence; a `git status` there rewrites its index (a file has another time)."""
+    clone = tmp_path / "outside-clone"
+    clone.mkdir()
+    _git(clone, "init", "-b", "main")
+    for key, value in (("user.name", "Test Author"), ("user.email", "test@example.invalid")):
+        _git(clone, "config", key, value)
+    (clone / "tracked.txt").write_text("content\n", encoding="utf-8")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-qm", "base")
+    os.utime(clone / "tracked.txt", (1_000_000_000, 1_000_000_000))  # so that status must rewrite the index
+    return clone
+
+
+def _janitor_args(mode: list[str], done: Path) -> list[str]:
+    return [part.format(done=done) for part in mode]
+
+
+def _spy_on_probes(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Every checkout the janitor asks `git status` about, in order."""
+    from agenttalk import janitor
+
+    asked: list[Path] = []
+    real = janitor.is_dirty_worktree
+    monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: asked.append(Path(path)) or real(path))
+    return asked
+
+
+def _linked_registered_checkout(fence: Path, tmp_path: Path, name: str) -> tuple[Path, Path, Path, Path]:
+    """(repo, an ordinary in-fence checkout `done`, the registered checkout `link`, the outside clone).
+
+    `link` is registered under `name` inside the fence, and is a link (a junction on Windows, which needs no rights; a
+    symlink elsewhere) to the outside clone: Git still lists the name, and a `git status` run there would run in, and
+    rewrite the index of, the clone that is outside the fence."""
+    scratch = fence / "scratch"
+    done = scratch / "done"
+    repo = _merged_checkout(fence, done, scratch)
+    link = scratch / name
+    _git(repo, "worktree", "add", "-b", "lane-linked", str(link))
+    shutil.rmtree(link)
+    clone = _outside_clone(tmp_path)
+    _dir_link(link, clone)
+    return repo, done, link, clone
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+def test_a_registered_link_whose_name_holds_a_line_separator_is_fenced_before_any_probe(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],
+) -> None:
+    """The review bot's P1. The fence checked the registered checkouts as the old text reader lists them, which cuts a
+    name with U+2028 short, to a path that does not exist. A registered checkout with such a name that is a link to a
+    checkout outside the fence therefore passed, and the report, which probes the exact registered path, ran `git
+    status` in the outside checkout and rewrote its index. The fence now checks the exact paths the probes use, so the
+    link is refused first, in every mode (the report, the sweep, release-report and release), and nothing outside is
+    touched: no probe is made there and its index is byte for byte the same."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done, link, clone = _linked_registered_checkout(fence, tmp_path, f"a{LINE_SEPARATOR}b")
+    index = clone / ".git" / "index"
+    before_index, before_clone = index.read_bytes(), _snapshot(clone / ".git")
+    asked = _spy_on_probes(monkeypatch)
+    try:
+        rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+    finally:
+        _unlink_dir(link)
+    outside = clone.resolve()
+    assert rc == 2
+    reached = [Path(os.path.realpath(path)) for path in asked]
+    assert all(path != outside and outside not in path.parents for path in reached), f"a probe went outside: {asked}"
+    assert index.read_bytes() == before_index and _snapshot(clone / ".git") == before_clone
+    assert (done / ".git").exists() and (done / "source.txt").exists()      # nothing was released or swept
+    refused = report.read_text(encoding="utf-8").split("\n")[:-1]
+    assert len(refused) == 1 and refused[0].endswith(f" -> {outside}"), refused
+
+
+@pytest.mark.parametrize("which, mode", _LIST_CASES)
+def test_a_registered_list_that_cannot_be_read_reliably_under_the_fence_refuses(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str, mode: list[str],
+) -> None:
+    """With no list of exact paths that the fence can check, nothing is probed. The sweep's strict listing failing
+    refuses all four modes (the release modes hold it too, so one preflight serves every mode); release's own list
+    failing refuses the two release modes, which are the ones that read it."""
+    from agenttalk import janitor, worktree_release
+
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+
+    def broken_janitor_list(_repo):
+        raise janitor._UseCheckFailed("could not list the registered checkouts (test)")
+
+    def broken_release_list(_repo):
+        raise worktree_release.Refused("git worktree list failed (test)")
+
+    if which == "janitor-list":
+        monkeypatch.setattr(janitor, "_registered_worktrees_listed", broken_janitor_list)
+    else:
+        monkeypatch.setattr(worktree_release, "_registered", broken_release_list)
+    asked = _spy_on_probes(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    assert rc == 2 and asked == []
+    assert (done / ".git").exists() and (done / "source.txt").exists()
+    lines = report.read_text(encoding="utf-8").split("\n")[:-1]
+    assert len(lines) == 1 and "registered checkouts" in lines[0] and lines[0].endswith(_UNPLACED), lines
+
+
+@pytest.mark.parametrize("mode", [
+    pytest.param([], id="report"),
+    pytest.param(["--apply"], id="apply"),
+    pytest.param(["--release-report"], id="release-report"),
+])
+def test_ordinary_in_fence_checkouts_are_still_probed_under_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: list[str],
+) -> None:
+    """The control: an ordinary registered checkout inside the fence passes the preflight and is handled as before (the
+    report and the sweep probe it; release-report reads it), with no refusal."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    asked = _spy_on_probes(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", *mode])
+
+    assert rc == 0, capsys.readouterr().out
+    assert not report.exists()
+    if "--release-report" in mode:
+        assert f"WOULD RELEASE {done}" in capsys.readouterr().out
+    else:
+        assert [Path(os.path.realpath(path)) for path in asked] == [Path(os.path.realpath(done))]
+
+
+@pytest.mark.parametrize("fence_set", [True, False], ids=["fenced", "no-fence"])
+def test_the_report_probes_only_a_strict_list_under_a_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fence_set: bool,
+) -> None:
+    """`build_report` can be called without the command around it. When the strict list failed it falls back to the old
+    reader for the counts and the preview; under a fence it must not probe those paths (they were never the ones the
+    fence checked). Without a fence the old best-effort probe is unchanged."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    if not fence_set:
+        monkeypatch.delenv("AGENTTALK_STORE_FENCE")
+    cfg = janitor.JanitorConfig.load(repo)
+    monkeypatch.setattr(janitor, "_registered_worktrees_listed",
+                        lambda _repo: (_ for _ in ()).throw(janitor._UseCheckFailed("could not list (test)")))
+    asked = _spy_on_probes(monkeypatch)
+
+    report = janitor.build_report(cfg)
+
+    assert not report.registered_strict
+    assert [Path(os.path.realpath(path)) for path in asked] == ([] if fence_set else [Path(os.path.realpath(done))])
+
+
+@pytest.mark.parametrize("mode", [
+    pytest.param(["--release-report"], id="release-report"),
+    pytest.param(["--release", "{done}"], id="release"),
+])
+def test_a_release_fences_its_own_list_of_registered_checkouts_too(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],
+) -> None:
+    """A release probes the paths of ITS OWN NUL-framed list, not the sweep's. They are the same on any ordinary
+    repository, so this makes release's list hold a checkout outside the fence that the sweep's list does not: the
+    fence still refuses it, before release asks anything of Git."""
+    from agenttalk import worktree_release
+
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    real = worktree_release._registered
+    monkeypatch.setattr(worktree_release, "_registered", lambda repo_: {**real(repo_), stranger: set()})
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    assert rc == 2
+    assert (done / ".git").exists() and (done / "source.txt").exists()
+    assert report.read_text(encoding="utf-8").split("\n")[:-1] == [str(stranger)]
+
+
 @pytest.mark.parametrize("reader", [
     "promisor-remote", "partial-clone-extension", "alternates-here", "alternates-chain", "alternates-in-origin",
     "origin-gitfile", "origin-dotgit-link", "origin-dot-git-link",

@@ -13533,13 +13533,30 @@ def cmd_janitor(args: argparse.Namespace) -> int:
     cfg = janitormod.JanitorConfig.load(root)
     releasing = getattr(args, "release", None) is not None or getattr(args, "release_report", False)
     origin = "origin"
+    listing = None
     if os.environ.get(store_mod.STORE_FENCE_ENV):
         # In every mode, nothing is listed, read, removed or asked of git outside the fence.
-        folders = [cfg.scratch_root, cfg.tmp_root, cfg.repo / ".worktrees",
-                   *janitormod.get_registered_worktrees(cfg.repo)]
+        # The checkouts fenced are the EXACT paths the probes below use, read the way the probes read them (#858):
+        # the report and the sweep probe the strict list (bytes, NUL boundaries) and are handed this very reading; a
+        # release probes its own NUL-framed list, so that one is fenced too. The older text reader cuts a name with
+        # U+2028 short, to a path that does not exist, so a link with such a name would pass a fence it must fail.
+        # No list that can be read: nothing is probed. The folders that need no listing are checked first.
+        folders = [cfg.scratch_root, cfg.tmp_root, cfg.repo / ".worktrees"]
         if getattr(args, "release", None) is not None:
             folders.append(Path(args.release).absolute())     # the checkout --release would remove
         for folder in folders:
+            store_mod.check_folder_fence(folder)
+        listing = janitormod._strict_listing(cfg.repo)
+        if listing[0] is None:
+            store_mod.refuse_unplaced("the registered checkouts, which Git could not list reliably")
+        registered = list(listing[0])
+        if releasing:
+            from .worktree_release import Refused, _registered as release_inventory
+            try:
+                registered += [path for path in release_inventory(cfg.repo) if path not in registered]
+            except (Refused, OSError, ValueError):
+                store_mod.refuse_unplaced("the registered checkouts, which Git could not list for a release")
+        for folder in registered:
             store_mod.check_folder_fence(folder)
         if releasing:
             from .worktree_release import check_fence
@@ -13551,7 +13568,7 @@ def cmd_janitor(args: argparse.Namespace) -> int:
         return code
     if args.keep_days is not None:
         cfg.keep_days = args.keep_days
-    report = janitormod.build_report(cfg)
+    report = janitormod.build_report(cfg, listing)  # under a fence: the list that was just fenced
     if args.apply:
         print(janitormod.apply(cfg, report))
     else:
