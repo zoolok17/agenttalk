@@ -423,6 +423,26 @@ def _clear_agenttalk_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
+class _NoJobNative:
+    """The native layer of `agenttalk.git_job` with job creation refused: a write then runs as it did before #907."""
+
+    def create_job(self):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _git_jobs_off_unless_asked(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#907: in the product a changing Git command on Windows runs in a Windows job of its own. Every other test is
+    about its own subject, and many stand in for `subprocess.Popen`, so no job is made for them (the layer refuses to
+    create one, which is the path without a job). The tests of the job itself install a fake layer of their own, or
+    carry the marker `real_git_job` and use the real one."""
+    if request.node.get_closest_marker("real_git_job"):
+        return
+    from agenttalk import git_job
+
+    monkeypatch.setattr(git_job, "_load_native", _NoJobNative)
+
+
 # --- #50: wheel-isolation test scoping ------------------------------------
 def _running_against_installed_wheel() -> bool:
     """True when agenttalk is imported from OUTSIDE this checkout (an installed

@@ -3290,9 +3290,12 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     """Run a narrowly allowlisted mutating git command.
 
     This is intentionally separate from `_git`: callers must opt into mutating git,
-    every positional path/ref remains an argv element. On Windows, a timeout attempts
-    to kill the launcher and warn: the programs Git started are not stopped and may still
-    be running, and a partial checkout or lock may still need recovery.
+    every positional path/ref remains an argv element. On Windows, Git is started paused in a Windows
+    job of its own and then let go, so every program it starts is a member of the job. A time-out
+    stops the whole job (hooks, filters and their children); a normal run never stops it. If the job
+    cannot be used, a time-out attempts to kill the launcher and warns: the programs Git started are
+    not stopped and may still be running. Either way a partial checkout or a Git lock may still need
+    recovery.
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
@@ -3347,27 +3350,44 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     for key in ("GIT_ASKPASS", "SSH_ASKPASS", "GIT_EDITOR"):
         env.pop(key, None)
     cmd = ["git", "-c", "core.editor=false", "-C", str(root), *execution_argv]
+    popen_kwargs = {
+        "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True, "encoding": "utf-8", "errors": "replace",
+        "env": env,
+    }
     try:
-        proc = subprocess.Popen(  # noqa: S603,S607  # nosec B603 B607
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env
-        )
+        if os.name == "nt":
+            from agenttalk import git_job
+
+            # Git is started paused, put in a job of its own, and then let go (#907); job is None when that cannot be
+            # done, and the write then runs as it did before.
+            proc, job = git_job.start_in_job(cmd, reap=_reap_after_failed_start, **popen_kwargs)
+        else:
+            proc, job = subprocess.Popen(cmd, **popen_kwargs), None  # noqa: S603,S607  # nosec B603 B607
     except OSError as e:
         raise GitWriteError(f"mutating git failed to start: {e}") from e
     try:
         out, err = proc.communicate(timeout=timeout)
+        if job is not None:
+            job.close()  # a normal end, whatever the exit code: the job is closed and never stopped
     except subprocess.TimeoutExpired as e:
-        _raise_git_write_timeout(proc, timeout, e)  # looks after its own interruptions
+        _raise_git_write_timeout(proc, timeout, e, job)  # looks after its own interruptions
     except Exception:  # an ordinary error before any timeout: no interruption is in flight, so a new one wins
         try:
-            _kill_and_reap(proc, interruptible=True)
+            _kill_and_reap(proc, interruptible=True, job=job)  # closes the job, never stops it
         except BaseException:
-            _kill_and_reap(proc)
+            _kill_and_reap(proc, job=job)
             raise
         raise
     except BaseException:
-        _kill_and_reap(proc)
+        _kill_and_reap(proc, job=job)
         raise
     return proc.returncode, out or "", err or ""
+
+
+def _reap_after_failed_start(proc, job) -> None:
+    """The bounded cleanup of a launcher that was started paused and could not be resumed (or was interrupted on
+    the way): kill and reap it, then close the job. Nothing escapes; the caller raises the original error."""
+    _kill_and_reap(proc, job=job)
 
 
 _GIT_STILL_RUNNING = (
@@ -3458,8 +3478,15 @@ def _marking(started, position, step):
     return run
 
 
-def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
+def _kill_and_reap(
+    proc, *, interruptible: bool = False, job=None, stop_job: bool = False, close_job: bool = True, deadline=None
+) -> None:
     """Try to kill the launcher and reap it. Every step is its own best effort; no ordinary error escapes.
+
+    With a Windows `job` (#907) the steps are: the job stop first (only with ``stop_job``: a time-out), then the
+    launcher steps below, then the job close last (unless ``close_job`` is False: the caller still has to read the job's
+    live count while it owns the handle, and closes it afterwards). With a `deadline`, the reap and the wait are cut to
+    what is left and skipped when none is.
 
     A failing poll never skips the kill, a failing kill never skips the reap, and a failing or
     timed-out reap is followed by wait(), which does not touch the pipes. Each step is bounded.
@@ -3479,9 +3506,12 @@ def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
         if state["running"]:
             proc.kill()
 
+    def stop() -> None:
+        job.stop()
+
     def reap() -> None:
-        if state["running"]:
-            proc.communicate(timeout=5)
+        if state["running"] and (deadline is None or deadline.left() > 0):
+            proc.communicate(timeout=5 if deadline is None else deadline.cut(5))
             state["reaped"] = True
 
     def wait() -> None:
@@ -3489,10 +3519,17 @@ def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
         # communicate() blocked past this retry even though the killed process is already
         # dead - wait() does not touch the pipes at all, so it still completes once the
         # process is actually gone. A second timeout leaves the launcher's reap unconfirmed.
-        if state["running"] and not state["reaped"]:
-            proc.wait(timeout=25)
+        if state["running"] and not state["reaped"] and (deadline is None or deadline.left() > 0):
+            proc.wait(timeout=25 if deadline is None else deadline.cut(25))
+
+    def close() -> None:
+        job.close()
 
     steps = [poll, kill, reap, wait]
+    if job is not None and stop_job:
+        steps.insert(0, stop)
+    if job is not None and close_job:
+        steps.append(close)
     if interruptible:
         for step in steps:
             _best_effort_interruptible(step)
@@ -3501,54 +3538,105 @@ def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
             _run_swallowing(steps)
 
 
-def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired):
+_GIT_JOB_STOPPED = "Git and the programs in its Windows job were stopped"
+
+
+def _job_confirmed(job, deadline) -> bool:
+    """Whether the job's stop is confirmed: a stop reported success AND the job's live count reached 0 within the
+    deadline. The count is read only now, after the stop and the launcher's reap (before that a non-empty job proves
+    nothing). A count that could not be read is not 0, and a failed stop followed by a 0 count is not a confirmation."""
+    if job is None:
+        return False
+    count = job.count_after_stop(deadline)
+    return job.stop_succeeded and count == 0
+
+
+def _close_job(job) -> None:
+    if job is not None:
+        job.close()  # an ordinary failure is swallowed inside; an interruption goes to the caller's fallback
+
+
+def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired, job=None):
     """Stop a timed-out Git command and raise ``GitWriteError`` (never returns).
 
+    With a Windows job (#907) the whole job is stopped first (`TerminateJobObject`: Git, its hooks and filters, and
+    their children), then the launcher is killed and reaped as without a job, then the job's live count is read, and
+    only then is the job closed. A count of 0 after a successful stop is a confirmed stop: the error says "Git and the
+    programs in its Windows job were stopped". In every other case (no job, a failed stop or query, a count above 0, or
+    no time left) the error carries the warning that Git or a program it started may still be running, as without a
+    job. From the time-out on a job-enabled write has one cleanup deadline of 30 seconds; no wait runs past it, and it
+    never decides whom to stop. Without a job the timings are unchanged.
+
     An attempt is made to kill the launcher (through Popen's own handle on Windows) and to reap it; neither is
-    confirmed. The programs Git started are NOT stopped, so on Windows the error always says they may still be
-    running. No program is launched here. The whole handling sits inside the interruption boundary: Ctrl-C anywhere
-    in it makes a best-effort attempt to kill and reap the launcher (it may not succeed), and the original
-    interruption is the one raised. Once the write has timed out, any ordinary error (an Exception) from the kill,
-    the reap or the wait is still the timeout: it becomes the same warned ``GitWriteError`` with the original
-    ``TimeoutExpired`` of the write as its cause (a timeout of the reap itself stays as its context), which the
-    lane assignment's timeout recovery is keyed on. Only a real interruption propagates as such.
+    confirmed. No program is launched here. The whole handling sits inside the interruption boundary: Ctrl-C anywhere
+    in it makes a best-effort attempt to stop the job, and to kill and reap the launcher (it may not succeed), and the
+    original interruption is the one raised; the job is closed as the last step of that cleanup. Once the write has
+    timed out, any ordinary error (an Exception) from the stop, the kill, the reap, the count or the wait is still the
+    timeout: it becomes the same ``GitWriteError`` with the original ``TimeoutExpired`` of the write as its cause (a
+    timeout of the reap itself stays as its context), which the lane assignment's timeout recovery is keyed on. Only a
+    real interruption propagates as such.
     """
+    deadline = None
+    if job is not None:
+        from agenttalk import git_job
+
+        deadline = git_job.Deadline()
     try:
+        if job is not None:
+            job.stop()  # the first step; it can be repeated safely
         # kill() can itself raise (PermissionError on Windows,
         # ProcessLookupError if the child already exited) - guarded so it
         # can never pre-empt the GitWriteError raised below.
         with contextlib.suppress(OSError):
             proc.kill()
         try:
-            out, err = proc.communicate(timeout=5)
+            out, err = proc.communicate(timeout=5 if deadline is None else deadline.cut(5))
         except subprocess.TimeoutExpired:  # the reap's own timeout becomes the context of the error below
             # A child can hold the pipes open after the launcher exits. wait()
             # reaps the launcher without waiting for those pipes to close.
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=25)
-            raise GitWriteError(
-                "mutating git timed out and could not be reaped; git/config lock may be stranded"
-                + (_GIT_STILL_RUNNING if os.name == "nt" else "")
-            ) from timed_out  # the write's own timeout is the cause
+            if deadline is None or deadline.left() > 0:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=25 if deadline is None else deadline.cut(25))
+            unreaped = "mutating git timed out and could not be reaped; git/config lock may be stranded"
+            if _job_confirmed(job, deadline):
+                error = GitWriteError(f"{unreaped}; {_GIT_JOB_STOPPED}")
+            else:
+                error = GitWriteError(unreaped + (_GIT_STILL_RUNNING if os.name == "nt" else ""))
+            _close_job(job)  # the last step, after the count
+            raise error from timed_out  # the write's own timeout is the cause
         result = f"mutating git timed out after {timeout:g}s"
-        if os.name != "nt":
-            result += " and was killed"
-        warning = _GIT_STILL_RUNNING if os.name == "nt" else ""
-        raise GitWriteError(f"{result}: {err or out or timed_out}" + warning) from timed_out
+        if _job_confirmed(job, deadline):
+            error = GitWriteError(
+                f"{result}; {_GIT_JOB_STOPPED}: {err or out or timed_out}; "
+                "a partial checkout or a Git lock may still need recovery"
+            )
+        else:
+            if os.name != "nt":
+                result += " and was killed"
+            warning = _GIT_STILL_RUNNING if os.name == "nt" else ""
+            error = GitWriteError(f"{result}: {err or out or timed_out}" + warning)
+        _close_job(job)
+        raise error from timed_out
     except GitWriteError:
         raise
-    except Exception as failure:  # the kill, the reap or the wait failed after the timeout: still the timeout
+    except Exception as failure:  # the stop, the kill, the reap or the wait failed after the timeout: still the timeout
         try:
-            _kill_and_reap(proc, interruptible=True)  # no interruption is in flight: one that arrives now wins
+            # No interruption is in flight: one that arrives now wins. The job stays owned through the stop, the
+            # launcher cleanup and the count, and is closed only afterwards, all inside this handler.
+            _kill_and_reap(proc, interruptible=True, job=job, stop_job=True, close_job=False, deadline=deadline)
+            confirmed = _job_confirmed(job, deadline)
+            _close_job(job)
         except BaseException:
-            _kill_and_reap(proc)  # the same bounded best-effort cleanup as for any interruption, then re-raise it
+            # The same bounded best-effort cleanup as for any interruption (the job is stopped again while it is still
+            # owned and closed last), then the interruption is raised.
+            _kill_and_reap(proc, job=job, stop_job=True, deadline=deadline)
             raise
-        raise GitWriteError(
-            "mutating git timed out and could not be reaped; git/config lock may be stranded"
-            f" ({failure})" + (_GIT_STILL_RUNNING if os.name == "nt" else "")
-        ) from timed_out
+        detail = "mutating git timed out and could not be reaped; git/config lock may be stranded" f" ({failure})"
+        if confirmed:
+            raise GitWriteError(f"{detail}; {_GIT_JOB_STOPPED}") from timed_out
+        raise GitWriteError(detail + (_GIT_STILL_RUNNING if os.name == "nt" else "")) from timed_out
     except BaseException:
-        _kill_and_reap(proc)
+        _kill_and_reap(proc, job=job, stop_job=True, deadline=deadline)
         raise
 
 
