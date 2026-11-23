@@ -1018,3 +1018,93 @@ def test_the_preview_says_when_the_list_of_checkouts_could_not_be_trusted(estate
 
     assert not report.registered_strict and "could not list the registered checkouts reliably" in text, text
     assert "could not list the registered checkouts reliably" not in healthy, healthy
+
+
+# ------------------------------------- discovery decides ownership on the same strict list as the report and apply
+
+
+COLLISION_NAMES = pytest.mark.parametrize(
+    "name", ["plain", "café", "a b"], ids=["ordinary", "accent", "line-separator"]
+)
+
+
+def clone_at_the_misdecoded_name(repo, name):
+    """A separate repository (a real `git init`, not a registered checkout) with an unsaved file, at the path the old
+    text reader of `git worktree list` produces for the registered checkout `.worktrees/<name>`: `cafÃ©` for `café`
+    (the console's encoding), the part before the U+2028 for a name with one. An ordinary name is read correctly, so
+    its control gets a twin with another name."""
+    strict = janitor._registered_worktrees_listed(repo)
+    wrong = [p for p in janitor.get_registered_worktrees(repo) if p not in strict]
+    if not wrong:
+        if name != "plain":
+            pytest.skip("this platform's text reader reads the name correctly")
+        wrong = [repo / ".worktrees" / "plain-twin"]
+    clone = wrong[0]
+    assert clone.parent == repo / ".worktrees" and not clone.exists(), clone
+    clone.mkdir()
+    git(clone, "init", "-q")
+    (clone / "unsaved.txt").write_text("only copy")
+    return clone
+
+
+@COLLISION_NAMES
+def test_a_separate_clone_at_the_misdecoded_name_of_a_registered_checkout_is_kept_with_its_file(estate, name):
+    """Discovery asked the old text reader which checkouts are registered, so a separate clone sitting at the name that
+    reader made of `café` (or of a name with U+2028) was taken as the registered checkout. The report and apply read the
+    strict list, which does not hold that clone, so apply found no checkout under it and removed it as a plain folder,
+    with its unsaved file, while every Git call succeeded. Ownership is decided on the strict list: the clone is
+    not an owned checkout, so the sweep refuses it and keeps it."""
+    repo, wt, cfg = estate
+    checkout(repo, name, branch="lane/owned")
+    clone = clone_at_the_misdecoded_name(repo, name)
+
+    report, text = sweep(cfg)
+
+    assert clone not in [c.path for c in report.candidates], text
+    assert (clone / "unsaved.txt").read_text() == "only copy" and (clone / ".git").is_dir(), text
+    assert any(path == clone and "not a registered worktree" in why for path, why in report.access_errors), text
+
+
+def test_the_ownership_check_in_discovery_reads_the_strict_list(estate, monkeypatch):
+    """The same property without Git's text: the strict list names the checkouts, the old reader names something else.
+    Discovery must go by the strict one."""
+    repo, wt, cfg = estate
+    owned = checkout(repo, "owned")
+    twin = repo / ".worktrees" / "twin"
+    twin.mkdir()
+    git(twin, "init", "-q")
+    monkeypatch.setattr(janitor, "get_registered_worktrees", lambda _repo: [twin])  # what the old reader would say
+
+    candidates, errors = janitor.find_candidates(cfg)
+
+    assert twin not in [c.path for c in candidates] and any(path == twin for path, _why in errors)
+    assert owned in [c.path for c in candidates]
+
+
+@pytest.mark.parametrize("failure", [(1, b"", b"git list failed"), (None, b"", b"git is not resolvable")])
+def test_a_failed_strict_list_at_discovery_keeps_everything_under_worktrees_as_not_checked(
+    estate, monkeypatch, failure
+):
+    """With no list of checkouts that can be trusted, discovery does not read the failure as 'no checkouts': nothing
+    under `.worktrees` is offered, and the reason is reported. The report is not strict either, so apply keeps the
+    rest."""
+    repo, wt, cfg = estate
+    checkout(repo, "owned")
+    plain = repo / ".worktrees" / "plain-folder"
+    plain.mkdir()
+    (plain / "note.txt").write_text("kept")
+    real = janitor._run_git_checked
+
+    def run_git(repo_, *args, **kwargs):
+        if args[:2] == ("worktree", "list"):
+            return failure
+        return real(repo_, *args, **kwargs)
+
+    monkeypatch.setattr(janitor, "_run_git_checked", run_git)
+
+    candidates, errors = janitor.find_candidates(cfg)
+    report, text = sweep(cfg)
+
+    assert not [c for c in candidates if c.path.parent == repo / ".worktrees"], candidates
+    assert any(path == repo / ".worktrees" for path, _why in errors), errors
+    assert not report.registered_strict and (plain / "note.txt").read_text() == "kept", text

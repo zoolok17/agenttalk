@@ -300,31 +300,14 @@ def get_registered_worktrees(repo: Path) -> list[Path]:
     fails, the same as "no worktrees registered" to THIS function's own
     callers (a dirty-worktree count and doctor's outside-scratch-root
     warning, neither of which removes anything on the strength of this
-    result alone). Candidate discovery under `.worktrees/` does NOT use
-    this function for that reason - see `_worktrees_discovery_ok`."""
+    result alone). Candidate discovery does NOT use this function: it goes by
+    `_registered_worktrees_listed`, which is strict and tells a failure from "none"."""
     _rc, out, _err = _run_git_checked(repo, "worktree", "list", "--porcelain")
     worktrees = []
     for line in out.splitlines():
         if line.startswith("worktree "):
             worktrees.append(Path(line[len("worktree "):]))
     return worktrees
-
-
-def _worktrees_discovery_ok(repo: Path) -> tuple[bool, str]:
-    """Whether candidate discovery under `.worktrees/` can trust git's
-    account of what is registered there. False means git is unresolvable,
-    or `worktree list` itself failed (a damaged `.git`, "detected dubious
-    ownership", etc.) - in either case candidate discovery must leave
-    EVERYTHING under `.worktrees/` alone rather than reading the failure
-    as "zero worktrees registered" and removing every directory there as
-    an ordinary, unregistered candidate with no WIP-commit-or-refuse gate
-    ever applied to it."""
-    rc, _out, err = _run_git_checked(repo, "worktree", "list", "--porcelain")
-    if rc is None:
-        return False, "git is not resolvable"
-    if rc != 0:
-        return False, f"git worktree list failed, rc={rc}: {err.strip()}"
-    return True, ""
 
 
 def _find_git_entries(root: Path) -> tuple[list[Path], bool]:
@@ -360,7 +343,7 @@ def _find_git_entries(root: Path) -> tuple[list[Path], bool]:
 def _tree_contains_git_entry(root: Path) -> bool:
     """True if `root`'s own tree contains a `.git` entry anywhere, OR a
     nested subdirectory could not be listed - see `_find_git_entries`.
-    Used when `_worktrees_discovery_ok` is False: git itself cannot be
+    Used when the strict list of checkouts could not be had: git itself cannot be
     trusted to say what is or isn't a worktree, so this is the fallback
     signal that a directory candidate might be (or contain) one, and must
     be refused rather than silently removed."""
@@ -480,7 +463,18 @@ def worktree_head_reachable(path: Path) -> bool:
     return bool(out.strip())
 
 
-def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Path, str]]]:
+def _strict_listing(repo: Path) -> tuple[list[Path] | None, str]:
+    """(the strict list of registered checkouts, "") or (None, why it could not be had or read reliably). One reading
+    for discovery and the report, so both decide on the same list; `apply` reads it again at the delete."""
+    try:
+        return _registered_worktrees_listed(repo), ""
+    except _UseCheckFailed as failed:
+        return None, getattr(failed, "why", str(failed))
+
+
+def find_candidates(
+    cfg: JanitorConfig, listing: tuple[list[Path] | None, str] | None = None
+) -> tuple[list[Candidate], list[tuple[Path, str]]]:
     _, ancestor_errors = _ancestor_ids(cfg)
     if ancestor_errors:
         return [], ancestor_errors
@@ -496,8 +490,12 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
     # shares one scratch root - Rule 1) or a standalone clone: git being
     # perfectly resolvable for cfg.repo says nothing about whether a
     # tree elsewhere under the shared root belongs to it.
-    discovery_ok, discovery_reason = _worktrees_discovery_ok(cfg.repo)
-    registered_worktrees = get_registered_worktrees(cfg.repo) if discovery_ok else []
+    # The list is the strict one (bytes, NUL boundaries), the same the report and the delete go by: the old text
+    # reader turns a name with an accent or U+2028 into a path that does not exist, and a separate clone sitting at
+    # that path would be taken for an owned checkout and removed as a plain folder. No strict list: nothing is trusted.
+    strict_list, discovery_reason = listing if listing is not None else _strict_listing(cfg.repo)
+    discovery_ok = strict_list is not None
+    registered_worktrees = strict_list if strict_list is not None else []
 
     def add(path: Path, reason: str) -> None:
         # NEVER path.resolve() - that follows symlinks (POSIX) and would
@@ -518,7 +516,7 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
         # there (another clone's worktree dropped in by hand, a
         # standalone clone, or this repo's OWN worktree whose
         # `.git/worktrees/<name>` admin entry was separately lost) is
-        # exactly as invisible to `get_registered_worktrees` as one
+        # exactly as invisible to the list of registered checkouts as one
         # found anywhere else, and the dirty/refuse gate in apply() only
         # ever runs for entries git DOES still recognize as registered.
         if not is_link_like(path) and path.is_dir():
@@ -744,14 +742,13 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
     ancestor_ids, ancestor_errors = _ancestor_ids(cfg)
     if ancestor_errors:
         return JanitorReport([], [], [], [], ancestor_errors)
-    candidates, access_errors = find_candidates(cfg)
-    strict = True
-    try:
-        registered = _registered_worktrees_listed(cfg.repo)  # the same reading as the comparison at the delete
-    except _UseCheckFailed:
-        # Best effort, for the counts and the preview only: discovery has refused what it cannot trust, and this
-        # reader turns a name with an accent or U+2028 into a path that does not exist. `apply` decides nothing on it.
-        registered, strict = get_registered_worktrees(cfg.repo), False
+    listing = _strict_listing(cfg.repo)  # the same reading as the comparison at the delete, and as discovery's
+    candidates, access_errors = find_candidates(cfg, listing)
+    strict = listing[0] is not None
+    # When it failed: best effort, for the counts and the preview only. Discovery has refused what it cannot trust, and
+    # the old reader turns a name with an accent or U+2028 into a path that does not exist. `apply` decides nothing
+    # on it.
+    registered = listing[0] if strict else get_registered_worktrees(cfg.repo)
     dirty = [
         w for w in registered
         if not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
@@ -1334,10 +1331,12 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
 
 
 def _listing_failure(why: str) -> "_UseCheckFailed":
-    return _UseCheckFailed(
+    failed = _UseCheckFailed(
         f"could not list the registered checkouts to compare them before the delete ({why}); it was kept. "
         "Git could not list this repository's checkouts, so nothing shows that this folder holds none: fix Git "
         "for it (`git worktree list` must work there), then run the sweep again")
+    failed.why = why  # discovery reports this plain reason, without the advice about the delete
+    return failed
 
 
 def _parse_worktree_list_z(out) -> list[Path]:

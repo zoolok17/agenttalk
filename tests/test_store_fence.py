@@ -699,6 +699,7 @@ def test_janitor_lists_and_asks_git_nothing_outside_the_fence(
 
     monkeypatch.setattr(janitor, "_safe_iterdir", listing)
     monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside, worktree])
+    monkeypatch.setattr(janitor, "_registered_worktrees_listed", lambda repo: [inside, worktree])  # discovery's list
     monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: asked.append(Path(path)) or False)
     assert cli.main(["--root", str(inside), "janitor", *mode]) == 2
     reached = tmp_path / f"outside-{outside_part}"
@@ -1997,7 +1998,7 @@ def test_janitor_checks_the_worktrees_folder_first(
     real_iterdir = janitor._safe_iterdir
     monkeypatch.setattr(janitor, "_safe_iterdir", lambda path: listed.append(Path(path)) or real_iterdir(path))
     monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside])
-    monkeypatch.setattr(janitor, "_worktrees_discovery_ok", lambda repo: (True, ""))
+    monkeypatch.setattr(janitor, "_registered_worktrees_listed", lambda repo: [inside])  # discovery's list
     monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: False)
     monkeypatch.setattr(janitor, "_run_git", lambda *args, **kwargs: (0, "", ""))   # no real git, on any code
     monkeypatch.setattr(janitor, "_run_git_checked", lambda *args, **kwargs: (0, "", ""))
