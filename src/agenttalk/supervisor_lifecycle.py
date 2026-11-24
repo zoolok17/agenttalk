@@ -319,10 +319,12 @@ def _process_parent_map() -> dict[int, int]:
     try:
         entry = _PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(entry)
+        ctypes.set_last_error(0)
         ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         function = "Process32FirstW"
         while ok:
             parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            ctypes.set_last_error(0)
             ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
             function = "Process32NextW"
         error = ctypes.get_last_error()

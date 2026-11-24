@@ -77,6 +77,7 @@ def _fake_snapshot(monkeypatch, **kwargs):
     kernel = _SnapshotKernel(**kwargs)
     monkeypatch.setattr(ctypes, 'WinDLL', lambda *_args, **_kwargs: kernel, raising=False)
     monkeypatch.setattr(ctypes, 'get_last_error', lambda: kernel.last_error, raising=False)
+    monkeypatch.setattr(ctypes, 'set_last_error', lambda value: setattr(kernel, 'last_error', value), raising=False)
     return kernel
 
 
@@ -99,6 +100,23 @@ def test_snapshot_first_read_failure_raises(monkeypatch):
 def test_snapshot_next_read_failure_discards_partial_map(monkeypatch):
     kernel = _fake_snapshot(monkeypatch, error=6, entries=[(10, 1)])
     with pytest.raises(lifecycle.SupervisorLifecycleError, match=r'Process32NextW.*winerror 6'):
+        lifecycle._process_parent_map()
+    assert kernel.closed == [123]
+
+
+@pytest.mark.parametrize('failed_read', ['first', 'next'])
+def test_snapshot_read_without_error_does_not_use_stale_end(monkeypatch, failed_read):
+    kernel = _fake_snapshot(monkeypatch, entries=[(10, 1)])
+    if failed_read == 'first':
+        kernel.Process32FirstW.function = lambda *_args: 0
+    else:
+        def first(*args):
+            result = kernel.read('first', *args)
+            kernel.last_error = 18
+            return result
+        kernel.Process32FirstW.function = first
+        kernel.Process32NextW.function = lambda *_args: 0
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match=rf'Process32{failed_read.title()}W.*winerror 0'):
         lifecycle._process_parent_map()
     assert kernel.closed == [123]
 
