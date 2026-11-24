@@ -135,7 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A journal cap-removal test now allows a slow writer to finish before checking its events (#906).
+- Three journal tests now allow a slow writer to finish before checking its events, and check the close ended cleanly (#906).
 
 - **Close checks no longer report hidden submodule work as clean (#796).**
   Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.

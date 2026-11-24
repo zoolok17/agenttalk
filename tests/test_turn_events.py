@@ -577,7 +577,7 @@ def test_rotation_with_a_backlog_keeps_numbers_continuous_and_headers_unnumbered
         started(sink, turn="t%d" % index)  # all queued behind the blocked write
     unblock.set()
     sink.close()
-    assert sink.state == "closed" and sink.off_reason is None
+    assert (sink.state, sink.off_reason) == ("closed", None)
     records = read_everything(agent_dir(tmp_path))
     headers = [r for r in records if r["kind"] == "stream_started"]
     events = events_only(records)
@@ -728,7 +728,7 @@ def test_a_cap_smaller_than_one_segment_still_keeps_the_open_segment(tmp_path):
     for index in range(20):
         started(sink, turn="t%d" % index)
     sink.close()
-    assert sink.state == "closed" and sink.off_reason is None
+    assert (sink.state, sink.off_reason) == ("closed", None)
     segments = te.list_segments(agent_dir(tmp_path))
     assert len(segments) == 1
     records = te.read_segment(segments[0][2]).records
@@ -747,7 +747,7 @@ def test_a_cap_removal_that_fails_is_counted_and_does_not_stop_the_journal(tmp_p
     for index in range(30):
         started(sink, turn="t%d" % index)
     sink.close()
-    assert sink.state == "closed" and sink.off_reason is None
+    assert (sink.state, sink.off_reason) == ("closed", None)
     assert len(events_only(read_everything(agent_dir(tmp_path)))) == 30
     assert status_of(sink)["faults"]["remove_failed"] >= 1
     assert b"SENTINEL-EXC-LOCK" not in all_bytes(agent_dir(tmp_path))
