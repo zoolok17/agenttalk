@@ -270,6 +270,11 @@ def check_fence(cfg: janitor.JanitorConfig) -> str:
     path = _local_repository(url, cfg.repo) if url else None
     if path is None:
         store_mod.refuse_unplaced("git remote origin, which is not a local folder")
+    # As written first, before anything resolves it: an origin outside the fence (a network path too) is refused
+    # at once, and neither the resolver below nor the fence's own check (which resolves) is asked about it.
+    for written in (path, Path(f"{path}.git")):
+        if _outside_as_written(written):
+            store_mod._refuse(written, Path(os.path.abspath(written)), store_mod._fence(), why="outside")
     # As configured, and as release hands it on. Git tries path/.git, path, path.git/.git, path.git.
     bases = [form for base in dict.fromkeys((path, path.resolve())) for form in (base, Path(f"{base}.git"))]
     for base in bases:
@@ -448,6 +453,18 @@ def _placed(path: Path) -> str:
     return token
 
 
+def _outside_as_written(path: Path) -> bool:
+    """Under AGENTTALK_STORE_FENCE: is `path`, made absolute as written, outside the fence both as given and as the
+    fence folder itself resolves? No look at `path`: `abspath` is a string operation. (The fence folder, which no record
+    or remote names, is resolved to make the comparison.) Outside a fence: False."""
+    fence = os.environ.get(store_mod.STORE_FENCE_ENV)
+    if not fence:
+        return False
+    written = Path(os.path.abspath(path))
+    allowed = {Path(os.path.abspath(fence)), Path(os.path.realpath(fence))}
+    return not any(written == root or root in written.parents for root in allowed)
+
+
 def _fence_record_path(path: Path, key: str, source: str) -> None:
     """Under AGENTTALK_STORE_FENCE, a path that an activity record names is fenced before anything resolves it:
     `_placed` would `lstat` and `realpath` it, which for a path outside the fence reads (or, for a network path,
@@ -461,13 +478,10 @@ def _fence_record_path(path: Path, key: str, source: str) -> None:
     through another spelling of the fence folder (a link to it) is refused too, which only keeps a checkout. Second, a
     path inside as written goes through the fence's own check, which resolves it and so follows a link before it
     refuses one that leads out (#913)."""
-    fence = os.environ.get(store_mod.STORE_FENCE_ENV)
-    if not fence:
+    if not os.environ.get(store_mod.STORE_FENCE_ENV):
         return
-    written = Path(os.path.abspath(path))
-    allowed = {Path(os.path.abspath(fence)), Path(os.path.realpath(fence))}
     reason = None
-    if not any(written == root or root in written.parents for root in allowed):
+    if _outside_as_written(path):
         reason = "is outside the fence"
     else:
         try:
