@@ -166,3 +166,15 @@ E1. The 18 new scheduler tests (cleanup with an unreadable scheduler after a fai
 E2. The new runner test (a fault that fails six tests must show six rows) against the previous runner (it kept the first four): 2 of 2 fail (both editions); with the change both pass.
 
 E3. Not red first: the CHANGELOG, dossier and PR text (a history correction and a named product change are text, not behaviour).
+
+PART F (round 15). The tests added or changed, against the previous head's script (1eb69ffa put back), two PowerShell editions each
+
+F1. 20 tests (the two-kinds-of-no test with its two new answers, a missing Get-ScheduledTask command before registering and after the delete, the colour test, the normalizer, and the preflight test that now strips colour):
+    result: 10 failed, 9 passed, 1 skipped
+    10 fail because of behaviour: a Get-ScheduledTask that does not exist, answered with the category ObjectNotFound (what PowerShell gives for a missing command or module), was read as a confirmed absence (the two-kinds test, 2), and a call that answers nothing was read as one too (2); a run with that missing command went on to /Create (2); after the delete the same missing command was read as "task deleted: True" and exit 0 instead of exit 4 (4)
+    9 pass on the previous script: the stand-ins that already behaved (a real not-found error with its id, an access-denied error), the normalizer, the preflight test with its unreadable stand-in
+    1 is skipped: the colour test (on the previous script nothing is refused, so there is no error text for the terminal to colour)
+
+F2. The colour of PowerShell 7's error text (a probe, `verifier-probes.txt` part 7): with colour forced on, the previous way of comparing (whitespace and the error frame only) does not find "Nothing was registered" in the text; the new normalization does.
+
+F3. The real scheduler with a made-up task name is checked read-only under both editions (part 7); the reviewer's machine answered `unreadable=true` there. On this machine both editions answer the task-not-found id, so `unreadable=false`; the previous category match gave the same answer, so the new match does not explain the reviewer's result: the scheduler query most likely failed there with another error (a sandbox that denies the query), which is the right answer for it. The test now skips, saying so, when the scheduler cannot be read on a machine; the classification itself is covered by the stand-ins.

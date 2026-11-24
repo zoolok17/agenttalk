@@ -85,6 +85,9 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }  # this script lives in <repo>\scripts
 
+# What Get-ScheduledTask says, in its error id, when the scheduler has no task of that name (the same in Windows
+# PowerShell 5.1 and PowerShell 7, whatever the language of the system).
+$TaskNotFoundId = 'CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask'
 $FactsMarker = 'GitJobHostFacts: git-job-capability: '
 $FactsKeys = @('"windows"', '"session_id"', '"pytest_process_in_a_job"')
 $MaxCommandLength = $CommandLengthLimit  # the longest command schtasks /TR accepts
@@ -141,16 +144,19 @@ function Resolve-Run {
 
 function Get-TaskFacts {
     # What the scheduler says about the task: state (Ready, Running, Queued, ...), logon type and last result.
-    # Two different "no": the scheduler answers that there is no such task (ObjectNotFound: a confirmed absence), or it
-    # could not be asked (access denied, the service not running, any other error): then `unreadable` is true and the
-    # absence is NOT established. A caller never reads an unreadable scheduler as a task that is gone.
+    # Two different "no": the scheduler answers that there is no such task (a confirmed absence), or it could not be asked
+    # (access denied, the service not running, the command or its module missing, any other error): then `unreadable` is
+    # true and the absence is NOT established. A caller never reads an unreadable scheduler as a task that is gone.
+    # The absence is recognised by the scheduler's own error id (`FullyQualifiedErrorId`, a resource key that is the same
+    # in every language), never by the error CATEGORY: ObjectNotFound is also the category of a Get-ScheduledTask that
+    # does not exist at all (CommandNotFoundException), which says nothing about the task.
     $none = @{ exists = $false; unreadable = $false; status = 'unknown'; logon = 'unknown'; result = 'unknown' }
     try { $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
     catch {
-        if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { $none.unreadable = $true }
+        if ($_.FullyQualifiedErrorId -ne $TaskNotFoundId) { $none.unreadable = $true }
         return $none
     }
-    if (-not $task) { return $none }
+    if (-not $task) { $none.unreadable = $true; return $none }  # no error and no answer: not the scheduler saying "no such task"
     $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
     $logon = switch ([string]$task.Principal.LogonType) {
         'Interactive' { 'interactive only' }

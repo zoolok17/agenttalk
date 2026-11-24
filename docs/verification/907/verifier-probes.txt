@@ -100,3 +100,17 @@ PowerShell 7
 The real scheduler, asked read-only about a name that was never registered (agenttalk-no-such-task-907r14):
   Windows PowerShell 5.1: exists=false unreadable=false
   PowerShell 7: exists=false unreadable=false
+
+== part 7 (round 15): the scheduler's own error id, not the error category (read only, nothing is registered; clean environment, a made-up task name)
+
+  pwsh: clean env, default modules                                       facts: 'exists=false unreadable=false'  | direct: 'fqid=CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask category=ObjectNotFound'
+  pwsh: clean env, PSModulePath = an empty folder                        facts: 'exists=false unreadable=true'  | direct: 'fqid=CommandNotFoundException category=ObjectNotFound'
+  powershell: clean env, default modules                                 facts: 'exists=false unreadable=false'  | direct: 'fqid=CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask category=ObjectNotFound'
+  powershell: clean env, PSModulePath = an empty folder                  facts: 'exists=false unreadable=false'  | direct: 'fqid=CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask category=ObjectNotFound'
+
+  (A Windows PowerShell 5.1 whose module path is emptied still finds the module in the system folder, so a missing command cannot be made there for real; the tests use stand-ins in both editions.)
+
+Colour forced on in PowerShell 7 (`$PSStyle.OutputRendering = 'Ansi'`) with a missing scheduler command and no registration:
+  colour codes in the raw error text: True
+  the previous normalization (whitespace and the error frame) finds "Nothing was registered": False
+  the new normalization finds it: True

@@ -186,7 +186,7 @@ $faults = @(
       "    if job is None or deadline is None:  # no shared deadline exists (the clock call failed): nothing can be confirmed`n        return False`n",
       "    if job is None:`n        return False`n")) },
   @{ id = 'F43-every-scheduler-error-read-as-a-task-that-is-gone'; tests = $sched; edits = @(, @($SCRIPT,
-      "        if (`$_.CategoryInfo.Category -ne 'ObjectNotFound') { `$none.unreadable = `$true }", "        if (`$false) { `$none.unreadable = `$true }")) },
+      "        if (`$_.FullyQualifiedErrorId -ne `$TaskNotFoundId) { `$none.unreadable = `$true }", "        if (`$false) { `$none.unreadable = `$true }")) },
   @{ id = 'F44-cleanup-ignores-an-unreadable-scheduler'; tests = $sched; edits = @(, @($SCRIPT,
       "    if (-not `$StillExists -and -not `$Unreadable) { return `$Judged }", "    if (-not `$StillExists) { return `$Judged }")) },
   @{ id = 'F45-task-deleted-printed-for-an-unreadable-scheduler'; tests = $sched; edits = @(, @($SCRIPT,
@@ -196,7 +196,12 @@ $faults = @(
   @{ id = 'F47-a-failed-cleanup-overrides-the-runs-own-code'; tests = $sched; edits = @(, @($SCRIPT,
       "    `$code = if (`$Judged.code -eq 0) { 4 } else { `$Judged.code }", "    `$code = 4")) },
   @{ id = 'F48-fault-runner-keeps-only-four-rows-per-fault'; tests = $runner; edits = @(, @($RUNNERFILE,
-      "    foreach (`$row in `$rows) {", "    foreach (`$row in (`$rows | Select-Object -First 4)) {")) }
+      "    foreach (`$row in `$rows) {", "    foreach (`$row in (`$rows | Select-Object -First 4)) {")) },
+  @{ id = 'F49-task-not-found-recognised-by-the-error-category-again'; tests = $sched; edits = @(, @($SCRIPT,
+      "        if (`$_.FullyQualifiedErrorId -ne `$TaskNotFoundId) { `$none.unreadable = `$true }",
+      "        if (`$_.CategoryInfo.Category -ne 'ObjectNotFound') { `$none.unreadable = `$true }")) },
+  @{ id = 'F50-no-error-and-no-answer-read-as-a-confirmed-absence'; tests = $sched; edits = @(, @($SCRIPT,
+      "    if (-not `$task) { `$none.unreadable = `$true; return `$none }", "    if (-not `$task) { return `$none }")) }
 )
 
 # Preflight: every file that any selected fault changes (and restores with git checkout) must be tracked and clean.

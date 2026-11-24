@@ -8,11 +8,21 @@ PowerShell (Windows PowerShell 5.1 and PowerShell 7 are both tried when both are
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+
+
+def plain(text):
+    """Error text as words only: PowerShell 7 frames and wraps a long error over several lines with a bar in front, and
+    can put colour codes (also inside a word) when it wraps. The codes, the bars and the line breaks are taken out."""
+    return " ".join(ANSI.sub("", text).replace("|", " ").split())
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_git_job_scheduled_task.ps1"
 SHELLS = [found for found in (shutil.which("powershell"), shutil.which("pwsh")) if found]
@@ -387,7 +397,7 @@ def test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup(tmp
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
 def test_a_scheduler_that_cannot_be_read_before_registering_registers_nothing(tmp_path, shell):
     done, out, calls = run_with_a_stand_in_scheduler(tmp_path, shell, query="always")
-    text = " ".join((done.stdout + done.stderr).replace("|", " ").split())  # PowerShell 7 wraps its error text
+    text = plain(done.stdout + done.stderr)  # PowerShell 7 wraps its error text and can colour it
     assert done.returncode != 0 and "could not be read" in text and "Nothing was registered" in text, text
     assert calls == [], calls  # no /Create, no /Run: nothing reached the scheduler
     assert not (out / "interactive-accepted.log").exists()
@@ -431,9 +441,22 @@ def test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_p
 STUB_NO_SUCH_TASK = """
 function Get-ScheduledTask {
     [CmdletBinding()] param([string]$TaskName)
-    $record = New-Object Management.Automation.ErrorRecord (New-Object Exception 'no such task (stand-in)'), 'x',
-        ([Management.Automation.ErrorCategory]::ObjectNotFound), $TaskName
+    $record = New-Object Management.Automation.ErrorRecord (New-Object Exception 'no such task (stand-in)'),
+        'CmdletizationQuery_NotFound_TaskName', ([Management.Automation.ErrorCategory]::ObjectNotFound), $TaskName
     $PSCmdlet.ThrowTerminatingError($record)
+}
+"""
+STUB_COMMAND_MISSING = """
+function Get-ScheduledTask {
+    [CmdletBinding()] param([string]$TaskName)
+    $record = New-Object Management.Automation.ErrorRecord (New-Object Exception 'the term is not recognized'),
+        'CommandNotFoundException', ([Management.Automation.ErrorCategory]::ObjectNotFound), 'Get-ScheduledTask'
+    $PSCmdlet.ThrowTerminatingError($record)
+}
+"""
+STUB_NO_ANSWER = """
+function Get-ScheduledTask {
+    [CmdletBinding()] param([string]$TaskName)
 }
 """
 STUB_CANNOT_ASK = """
@@ -457,8 +480,18 @@ def ask_for_facts(shell, *extra, name="stub-task"):
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
 @pytest.mark.parametrize(
     "stub, expected",
-    [(STUB_NO_SUCH_TASK, "exists=false unreadable=false"), (STUB_CANNOT_ASK, "exists=false unreadable=true")],
-    ids=["no-such-task-is-a-confirmed-absence", "any-other-error-is-unreadable"],
+    [
+        (STUB_NO_SUCH_TASK, "exists=false unreadable=false"),
+        (STUB_CANNOT_ASK, "exists=false unreadable=true"),
+        (STUB_COMMAND_MISSING, "exists=false unreadable=true"),
+        (STUB_NO_ANSWER, "exists=false unreadable=true"),
+    ],
+    ids=[
+        "no-such-task-is-a-confirmed-absence",
+        "any-other-error-is-unreadable",
+        "a-missing-command-has-the-same-category-and-is-unreadable",
+        "no-error-and-no-answer-is-unreadable",
+    ],
 )
 def test_the_two_kinds_of_no_from_the_scheduler_are_told_apart(tmp_path, shell, stub, expected):
     path = tmp_path / "scheduler-answer.ps1"
@@ -472,4 +505,137 @@ def test_the_real_scheduler_confirms_the_absence_of_a_task_that_was_never_regist
     """A read-only question to the real scheduler about a made-up name (nothing is registered): it answers that there is
     no such task, which is a confirmed absence and not an unreadable scheduler."""
     code, text = ask_for_facts(shell, name="agenttalk-no-such-task-907r14")
+    if text == "exists=false unreadable=true":
+        # The scheduler could not be asked at all on this machine (a sandbox that denies the query, say): that is the
+        # right answer for it, and says nothing about the classification, which the stand-in tests above cover.
+        pytest.skip("the scheduler cannot be read on this machine, so a confirmed absence cannot be shown against it")
     assert (code, text) == (0, "exists=false unreadable=false"), text
+
+
+# --- the scheduler command itself missing is not a task that is gone (round 15) --------------------------------
+
+STUB_COMMAND_LEVEL = """
+$script:stub = @{ exists = $false; deleted = $false }
+function Get-ScheduledTask {
+    # Only the command that the real Get-TaskFacts calls is replaced, so the real classification is what runs.
+    # STUB_CMD: "ok" answers truthfully; "missing" is a Get-ScheduledTask that does not exist at all (the error that
+    # PowerShell gives for a missing command or module: category ObjectNotFound, id CommandNotFoundException);
+    # "missing-after-delete" is that, from the first delete on.
+    [CmdletBinding()] param([string]$TaskName)
+    $gone = ($env:STUB_CMD -eq 'missing') -or ($env:STUB_CMD -eq 'missing-after-delete' -and $script:stub.deleted)
+    if ($gone) {
+        $record = New-Object Management.Automation.ErrorRecord (New-Object Exception 'the term is not recognized'),
+            'CommandNotFoundException', ([Management.Automation.ErrorCategory]::ObjectNotFound), 'Get-ScheduledTask'
+        $PSCmdlet.ThrowTerminatingError($record)
+    }
+    if (-not $script:stub.exists) {
+        $record = New-Object Management.Automation.ErrorRecord (New-Object Exception 'no such task (stand-in)'),
+            'CmdletizationQuery_NotFound_TaskName', ([Management.Automation.ErrorCategory]::ObjectNotFound), $TaskName
+        $PSCmdlet.ThrowTerminatingError($record)
+    }
+    return [pscustomobject]@{ State = 'Ready'; Principal = [pscustomobject]@{ LogonType = 'Interactive' } }
+}
+function Get-ScheduledTaskInfo {
+    [CmdletBinding()] param([string]$TaskName)
+    return [pscustomobject]@{ LastTaskResult = 0 }
+}
+function Invoke-Schtasks {
+    param([string]$Line)
+    if ($env:STUB_CALLS) { Add-Content -LiteralPath $env:STUB_CALLS -Value $Line }
+    if ($Line -like '/Create*') { $script:stub.exists = $true; return 0 }
+    if ($Line -like '/Run*') {
+        $file = Get-ChildItem -LiteralPath $OutDir -Filter '*.args.json' |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+        $saved = Read-ArgsFile -Path $file.FullName
+        Set-Content -LiteralPath $saved.Log -Encoding utf8 -Value @(
+            "run-id=$($saved.RunId)",
+            ('  x.py:1: GitJobHostFacts: git-job-capability: {"windows": "made up", "session_id": 1, ' +
+             '"pytest_process_in_a_job": true}'),
+            'exit=0')
+        return 0
+    }
+    if ($Line -like '/Delete*') {
+        $script:stub.deleted = $true
+        if ($env:STUB_DELETE_FAILS -eq '1') { return 1 }
+        $script:stub.exists = $false
+        return 0
+    }
+    return 0
+}
+"""
+
+
+def run_with_a_command_level_stand_in(tmp_path, shell, *, command, delete_fails=False, wrapper=None):
+    """`-Mode Run` against a stand-in that replaces only `Get-ScheduledTask` and `schtasks`: the real `Get-TaskFacts`
+    classifies what the command answers. `command` is "ok", "missing" or "missing-after-delete" (see the stub). Returns
+    (the finished process, the out folder, the schtasks commands the script issued). `wrapper` is PowerShell text
+    that is run before the script, in the same process (used to force colour on)."""
+    stub = tmp_path / "stub-command.ps1"
+    stub.write_text(STUB_COMMAND_LEVEL, encoding="utf-8")
+    out = tmp_path / "out"
+    calls = tmp_path / "schtasks-calls.txt"
+    env = dict(os.environ, STUB_CMD=command, STUB_DELETE_FAILS="1" if delete_fails else "0", STUB_CALLS=str(calls))
+    script_args = [
+        "-Mode", "Run", "-Runs", "Interactive", "-Python", "python", "-OutDir", str(out), "-User", "example-user",
+        "-TaskName", "stub-task", "-TimeoutSeconds", "60", "-CommandLengthLimit", "5000", "-SchedulerStub", str(stub),
+    ]  # fmt: skip
+    if wrapper is None:
+        argv = [shell, "-NoProfile", "-File", str(SCRIPT), *script_args]
+    else:
+        quoted = " ".join(  # the parameter names stay bare, the values are quoted
+            part if part.startswith("-") and part[1:2].isalpha() else "'" + part.replace("'", "''") + "'"
+            for part in script_args
+        )
+        argv = [shell, "-NoProfile", "-Command", f"{wrapper}; & '{SCRIPT}' {quoted}"]
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=180, check=False, env=env)  # noqa: S603
+    return done, out, calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_a_missing_scheduler_command_before_registering_registers_nothing(tmp_path, shell):
+    """PowerShell's own error for a command or module that is not there has the category ObjectNotFound too. It says
+    nothing about the task: the run stops at the preflight, and nothing reaches the scheduler."""
+    done, out, calls = run_with_a_command_level_stand_in(tmp_path, shell, command="missing")
+    text = plain(done.stdout + done.stderr)
+    assert done.returncode != 0 and "could not be read" in text and "Nothing was registered" in text, text
+    assert calls == [], calls  # no /Create, no /Run
+    assert not (out / "interactive-accepted.log").exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+@pytest.mark.parametrize("delete_fails", [True, False], ids=["delete-failed", "delete-said-ok"])
+def test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup(
+    tmp_path, shell, delete_fails
+):
+    """The run is accepted, the task is deleted, and then the command that asks the scheduler is gone: the absence is
+    not established. Exit code 4, TASK NOT CONFIRMED DELETED, the way to delete it by hand, the accepted log kept."""
+    done, out, _ = run_with_a_command_level_stand_in(
+        tmp_path, shell, command="missing-after-delete", delete_fails=delete_fails
+    )
+    text = plain(done.stdout + done.stderr)
+    assert done.returncode == 4, text
+    assert "task deleted: False" in text and "task deleted: True" not in text, text
+    assert "TASK NOT CONFIRMED DELETED" in text and HOW_TO_DELETE in text, text
+    assert (out / "interactive-accepted.log").exists()
+
+
+def test_the_normalizer_removes_terminal_colour_and_the_error_frame():
+    raw = "No\x1b[31;1mthing was\x1b[0m regis\x1b[1mtered\n | here"
+    assert plain(raw) == "Nothing was registered here"
+
+
+def test_the_refusal_is_found_whatever_the_terminal_colour_does_to_the_error_text(tmp_path):
+    """PowerShell 7 wraps its error text and can put colour codes inside a word. Colour is forced on here (the same
+    run as the preflight test): the words are split by codes in the raw text, and found in the normalized text."""
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("PowerShell 7 is not on this machine")
+    done, out, calls = run_with_a_command_level_stand_in(
+        tmp_path, pwsh, command="missing", wrapper="$PSStyle.OutputRendering = 'Ansi'"
+    )
+    raw = done.stdout + done.stderr
+    if "\x1b[" not in raw:
+        pytest.skip("this PowerShell 7 wrote no colour codes even when asked to")
+    text = plain(raw)
+    assert "could not be read" in text and "Nothing was registered" in text, text
+    assert calls == [], calls
