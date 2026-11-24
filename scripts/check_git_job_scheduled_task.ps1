@@ -18,14 +18,19 @@
               Run 2, whether logged on or not: registers it again WITHOUT /IT and WITH /RP *, so schtasks itself asks
               for the password. The password is typed at that prompt and is never read, stored, logged or printed here.
             Add -DryRun to print every command that would run and register nothing.
-            Exit code 0 only when every run was accepted and its task was deleted; otherwise the code of the first run
-            that was not (2 or 3), or 4 when a run was accepted but its task could not be deleted (the accepted log is
-            kept, and the output says how to delete the task by hand).
+            Exit code 0 only when every run was accepted and its task is KNOWN to be gone (the scheduler answered that
+            there is no such task); otherwise the code of the first run that was not (2 or 3: a run that was not
+            accepted keeps its own code even when its task is also still there), or 4 when a run was accepted but its
+            task could not be deleted or the scheduler could not be read to confirm it (the accepted log is kept, and
+            the output says how to look for and delete the task by hand, with the warning printed in every case).
     Decide  Judges ONE log together with a MADE-UP scheduler state (-TaskExists, -TaskState), with no scheduler: the whole
             completion rule that Run applies, so a test can show it. Exit codes as Verify; 2 also when the log is
             finished but the scheduler does not show the task as finished.
     WriteArgs  Writes the small arguments file a registered task reads (the same function Run uses), so a test can show
             that every character of a path survives it. Needs -ArgsFile, -Repo, -Python, -Log, -RunId and -BaseTemp.
+    Facts   Asks the scheduler (read only, nothing is registered) about -TaskName and prints `exists=<bool>
+            unreadable=<bool>`: absent is a confirmed answer (the scheduler says there is no such task), unreadable is a
+            scheduler that could not be asked, which is never read as a task that is gone. Exit code 0.
     Task    What the scheduled task itself runs: writes the run id as the first line of the log, then the output of the
             host check, and pytest's own exit code ("exit=<n>") as the last line.
 
@@ -58,7 +63,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Run', 'Verify', 'Decide', 'WriteArgs', 'Task')] [string]$Mode = 'Run',
+    [ValidateSet('Run', 'Verify', 'Decide', 'WriteArgs', 'Facts', 'Task')] [string]$Mode = 'Run',
     [ValidateSet('Both', 'Interactive', 'Background')] [string]$Runs = 'Both',
     [string]$Repo = '',
     [string]$Python = 'python',
@@ -124,11 +129,11 @@ function Test-SchedulerDone {
 
 function Resolve-Run {
     # The whole rule, both halves. @{ code = 0|2|3; text = <why> }. A finished log alone is never enough.
-    param([string]$Path, [string]$Id, [bool]$Exists, [string]$State)
+    param([string]$Path, [string]$Id, [bool]$Exists, [string]$State, [bool]$Unreadable = $false)
     $evidence = Read-Evidence -Path $Path -Id $Id
     if ($evidence.state -ne 'finished') { return Test-Log -Path $Path -Id $Id }  # the log half is not met: code 2 and why
     if (-not (Test-SchedulerDone -Exists $Exists -State $State)) {
-        $shown = if ($Exists) { "the task is '$State'" } else { 'the scheduler does not show the task' }
+        $shown = if ($Exists) { "the task is '$State'" } elseif ($Unreadable) { 'the scheduler could not be read' } else { 'the scheduler does not show the task' }
         return @{ code = 2; text = "NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but $shown (a run is complete only when the log is finished AND the task is Ready)" }
     }
     return Test-Log -Path $Path -Id $Id
@@ -136,8 +141,16 @@ function Resolve-Run {
 
 function Get-TaskFacts {
     # What the scheduler says about the task: state (Ready, Running, Queued, ...), logon type and last result.
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $task) { return @{ exists = $false; status = 'unknown'; logon = 'unknown'; result = 'unknown' } }
+    # Two different "no": the scheduler answers that there is no such task (ObjectNotFound: a confirmed absence), or it
+    # could not be asked (access denied, the service not running, any other error): then `unreadable` is true and the
+    # absence is NOT established. A caller never reads an unreadable scheduler as a task that is gone.
+    $none = @{ exists = $false; unreadable = $false; status = 'unknown'; logon = 'unknown'; result = 'unknown' }
+    try { $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+    catch {
+        if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { $none.unreadable = $true }
+        return $none
+    }
+    if (-not $task) { return $none }
     $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
     $logon = switch ([string]$task.Principal.LogonType) {
         'Interactive' { 'interactive only' }
@@ -145,7 +158,7 @@ function Get-TaskFacts {
         'Password' { 'whether logged on or not (interactive and background)' }
         default { [string]$task.Principal.LogonType }
     }
-    return @{ exists = $true; status = [string]$task.State; logon = $logon; result = $(if ($info) { [string]$info.LastTaskResult } else { 'unknown' }) }
+    return @{ exists = $true; unreadable = $false; status = [string]$task.State; logon = $logon; result = $(if ($info) { [string]$info.LastTaskResult } else { 'unknown' }) }
 }
 
 function Invoke-Schtasks {
@@ -168,12 +181,18 @@ function Read-ArgsFile {
 }
 
 function Resolve-Cleanup {
-    # A run that was judged is not finished until its task is gone. @{ code; text }. A task that is still there after the
-    # delete is a failed cleanup: the accepted evidence stays, but the exit code is not 0 (4 when the run itself was
-    # accepted, otherwise the run's own code) and the text says how to delete it by hand.
-    param($Judged, [int]$DeleteExit, [bool]$StillExists, [string]$Name)
-    if (-not $StillExists) { return $Judged }
-    $text = "TASK NOT DELETED (schtasks /Delete returned $DeleteExit and the task is still there): delete it yourself with schtasks /Delete /TN $Name /F, and do not run this check again before it is gone"
+    # A run that was judged is not finished until its task is known to be gone. @{ code; text }. A task that is still
+    # there after the delete, or that the scheduler could not be asked about (the absence is not established), is a
+    # failed cleanup: the accepted evidence stays, but the exit code is not 0 (4 when the run itself was accepted,
+    # otherwise the run's own code, which wins) and the text says how to delete the task by hand.
+    param($Judged, [int]$DeleteExit, [bool]$StillExists, [bool]$Unreadable = $false, [string]$Name)
+    if (-not $StillExists -and -not $Unreadable) { return $Judged }
+    $how = "schtasks /Delete /TN $Name /F"
+    $text = if ($StillExists) {
+        "TASK NOT DELETED (schtasks /Delete returned $DeleteExit and the task is still there): delete it yourself with $how, and do not run this check again before it is gone"
+    } else {
+        "TASK NOT CONFIRMED DELETED (schtasks /Delete returned $DeleteExit and the scheduler could not be read to confirm that the task is gone): look with schtasks /Query /TN $Name, delete it yourself with $how if it is there, and do not run this check again before it is gone"
+    }
     $code = if ($Judged.code -eq 0) { 4 } else { $Judged.code }
     return @{ code = $code; text = "$($Judged.text) | $text" }
 }
@@ -213,7 +232,11 @@ function Invoke-OneRun {
         return @{ code = 0 }
     }
 
-    if ((Get-TaskFacts).exists) {
+    $before = Get-TaskFacts
+    if ([bool]$before.unreadable) {
+        throw "The scheduler could not be read, so it is not known whether a task named $TaskName exists. Nothing was registered; fix the access to the scheduler (or pass another -TaskName) and run this again."
+    }
+    if ($before.exists) {
         throw "A scheduled task named $TaskName already exists. Delete it or pass another -TaskName; this script never replaces a task it did not make."
     }
     if (Test-Path -LiteralPath $logPath) { Remove-Item -LiteralPath $logPath -Force }
@@ -236,7 +259,7 @@ function Invoke-OneRun {
         }
         $task = Get-TaskFacts
         Write-Host "[$Label] registered mode: $($task.logon); last result: $($task.result)"
-        $judged = Resolve-Run -Path $logPath -Id $id -Exists $task.exists -State $task.status
+        $judged = Resolve-Run -Path $logPath -Id $id -Exists $task.exists -State $task.status -Unreadable ([bool]$task.unreadable)
         Write-Host "[$Label] $($judged.text)"
         if ($judged.code -eq 0) {
             Copy-Item -LiteralPath $logPath -Destination (Join-Path $OutDir "$Label-accepted.log") -Force
@@ -247,10 +270,13 @@ function Invoke-OneRun {
         if ($registered) {
             [void](Invoke-Schtasks -Line "/End /TN $TaskName")  # a no-op when it is not running
             $deleteExit = Invoke-Schtasks -Line "/Delete /TN $TaskName /F"
-            $stillThere = [bool](Get-TaskFacts).exists
-            Write-Host "[$Label] task deleted: $(-not $stillThere)"
-            $judged = Resolve-Cleanup -Judged $judged -DeleteExit $deleteExit -StillExists $stillThere -Name $TaskName
-            if ($stillThere) { Write-Host "[$Label] $($judged.text)" }
+            $after = Get-TaskFacts
+            $stillThere = [bool]$after.exists
+            $unreadable = [bool]$after.unreadable  # the scheduler could not be asked: the task is NOT known to be gone
+            $gone = -not $stillThere -and -not $unreadable
+            Write-Host "[$Label] task deleted: $gone"
+            $judged = Resolve-Cleanup -Judged $judged -DeleteExit $deleteExit -StillExists $stillThere -Unreadable $unreadable -Name $TaskName
+            if (-not $gone) { Write-Host "[$Label] $($judged.text)" }
         }
     }
     return @{ code = $judged.code }
@@ -276,6 +302,11 @@ switch ($Mode) {
             Write-Output 'WriteArgs needs -ArgsFile, -Repo, -Python, -Log, -RunId and -BaseTemp'; exit 9
         }
         Write-ArgsFile -Path $ArgsFile -Values @{ Repo = $Repo; Python = $Python; Log = $Log; RunId = $RunId; BaseTemp = $BaseTemp }
+        exit 0
+    }
+    'Facts' {
+        $facts = Get-TaskFacts
+        Write-Output ("exists={0} unreadable={1}" -f ([bool]$facts.exists).ToString().ToLower(), ([bool]$facts.unreadable).ToString().ToLower())
         exit 0
     }
     'Task' {

@@ -34,6 +34,14 @@ FILES = {
     "scripts/check_git_job_scheduled_task.ps1": "# the scheduled-task script\n",
     "tests/conftest.py": "# the test configuration\n",
     "docs/verification/907/faults.ps1": "# a stand-in for the runner itself: some faults change the runner\n",
+    # The tests that fault F01 is run against: six of them fail when the fault is planted (it writes a limit value).
+    "tests/test_git_job_windows.py": (
+        "import pathlib\n\nimport pytest\n\n"
+        'SOURCE = pathlib.Path(__file__).resolve().parents[1] / "src" / "agenttalk" / "git_job.py"\n\n\n'
+        '@pytest.mark.parametrize("n", range(6))\n'
+        "def test_limits_hold(n):\n"
+        '    assert "0x2000" not in SOURCE.read_text(encoding="utf-8")\n'
+    ),
 }
 EDIT = "\n# an edit of mine that no one has committed yet\n"
 
@@ -120,3 +128,15 @@ def test_an_edit_in_a_file_that_no_selected_fault_changes_does_not_stop_the_runn
     assert done.returncode == 0, done.stdout + done.stderr
     assert "F01-kill-on-close-set" in (tmp_path / "results.txt").read_text(encoding="utf-8-sig")
     assert script.read_bytes() == mine and module.read_bytes().replace(b"\r\n", b"\n") == committed
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_every_failing_test_of_a_fault_gets_its_own_row_in_the_results(tmp_path, repo, shell):
+    """The results claim that every failing test is kept with the first line of its failure. A fault that fails six
+    tests (F01 against the stand-in tests) must show six rows, not the first four."""
+    done = run_runner(shell, repo, tmp_path, "-Only", "F01-kill-on-close-set")
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = (tmp_path / "results.txt").read_text(encoding="utf-8-sig")
+    assert "CAUGHT (all 6 by an assertion)" in text, text
+    rows = [line.strip() for line in text.splitlines() if line.strip().startswith("tests/test_git_job_windows.py::")]
+    assert sorted(rows) == [f"tests/test_git_job_windows.py::test_limits_hold[{n}]" for n in range(6)], text

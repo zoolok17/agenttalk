@@ -4,7 +4,7 @@ F01-kill-on-close-set: CAUGHT (all 2 by an assertion) -- 2 failed, 7 deselected 
         [assertion] AssertionError: a program Git started was stopped by a normal end
     tests/test_git_job_windows.py::test_our_job_has_no_limits
         [assertion] assert 8192 == 0
-F02-job-stopped-after-a-normal-run: CAUGHT (all 5 by an assertion) -- 5 failed, 111 passed in 1.00s
+F02-job-stopped-after-a-normal-run: CAUGHT (all 5 by an assertion) -- 5 failed, 111 passed in 0.99s
     tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it
         [assertion] AssertionError: assert ['create', 'p...rminate', ...] == ['create', 'p...ate', 'close']
     tests/test_git_write_job_907.py::test_a_nonzero_git_exit_closes_without_stopping
@@ -13,7 +13,9 @@ F02-job-stopped-after-a-normal-run: CAUGHT (all 5 by an assertion) -- 5 failed, 
         [assertion] assert 1 == (0 + 0)
     tests/test_git_write_job_907.py::test_the_close[normal-before-first]
         [assertion] assert 1 == (0 + 0)
-F03-count-before-stop: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 0.98s
+    tests/test_git_write_job_907.py::test_the_close[normal-after-first]
+        [assertion] assert 1 == (0 + 0)
+F03-count-before-stop: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 1.02s
     tests/test_git_write_job_907.py::test_a_late_sleep_in_the_final_count_does_not_say_stopped
         [assertion] assert (' Git or a program it started may still be running; wait for it to finish before retrying or cleaning up.' in "mutating git timed out after 0.01s; Git and the programs in its Windows job were ...
     tests/test_git_write_job_907.py::test_normal_timeout_stops_the_job_then_kills_reaps_and_counts
@@ -22,13 +24,17 @@ F03-count-before-stop: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in
         [assertion] AssertionError: assert ['communicate..., 'wait', ...] == ['communicate... 'query', ...]
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
         [assertion] AssertionError: assert ['communicate...rminate', ...] == ['communicate..., 'poll', ...]
-F04-count-above-zero-drops-the-warning: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 1.02s
+    tests/test_git_write_job_907.py::test_interruption_fallback_stops_the_job
+        [assertion] AssertionError: assert ['communicate...rminate', ...] == ['communicate..., 'poll', ...]
+    tests/test_git_write_job_907.py::test_an_exhausted_deadline_skips_waits_and_the_count_and_keeps_the_warning
+        [assertion] AssertionError: assert ('wait' not in ['create', 'popen', 'assign', 'resume', 'communicate', 'query', ...] and 'query' not in ['create', 'popen', 'assign', 'resume', 'communicate', 'query', ...])
+F04-count-above-zero-drops-the-warning: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 0.98s
     tests/test_git_write_job_907.py::test_a_count_above_zero_keeps_the_warning
         [assertion] assert (' Git or a program it started may still be running; wait for it to finish before retrying or cleaning up.' in "mutating git timed out after 0.01s; Git and the programs in its Windows job were ...
-F05-breakaway-ok-set: CAUGHT (all 1 by an assertion) -- 1 failed, 1 passed, 7 deselected in 6.86s
+F05-breakaway-ok-set: CAUGHT (all 1 by an assertion) -- 1 failed, 1 passed, 7 deselected in 6.67s
     tests/test_git_job_windows.py::test_our_job_has_no_limits
         [assertion] assert 2048 == 0
-F06-resume-before-assignment: CAUGHT (all 8 by an assertion) -- 8 failed, 108 passed in 0.98s
+F06-resume-before-assignment: CAUGHT (all 8 by an assertion) -- 8 failed, 108 passed in 1.01s
     tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it
         [assertion] AssertionError: assert ['create', 'p...unicate', ...] == ['create', 'p...ate', 'close']
     tests/test_git_write_job_907.py::test_fallback_rows[refused_assignment_keeps_the_warning]
@@ -37,7 +43,15 @@ F06-resume-before-assignment: CAUGHT (all 8 by an assertion) -- 8 failed, 108 pa
         [assertion] AssertionError: assert (['resume', 'assign', 'resume'] == ['resume', 't...nate', 'poll']
     tests/test_git_job.py::test_the_launcher_is_started_paused_and_resumed_only_after_the_assignment
         [assertion] AssertionError: assert [('create',),...esume', 5005)] == [('create',),...esume', 5005)]
-F07-assignment-skipped-and-reported-as-done: CAUGHT (all 7 by an assertion) -- 7 failed, 109 passed in 0.98s
+    tests/test_git_job.py::test_a_refused_assignment_closes_the_job_resumes_the_launcher_and_goes_on_with_no_job[refused]
+        [assertion] AssertionError: assert ['create', 'p...se', 'resume'] == ['create', 'p...se', 'resume']
+    tests/test_git_job.py::test_a_refused_assignment_closes_the_job_resumes_the_launcher_and_goes_on_with_no_job[error]
+        [assertion] AssertionError: assert ['create', 'p...se', 'resume'] == ['create', 'p...se', 'resume']
+    tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_assignment[before]
+        [assertion] AssertionError: assert ('resume' not in ['create', 'popen', 'resume', 'assign', 'terminate', 'kill', ...])
+    tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_assignment[after]
+        [assertion] AssertionError: assert ('resume' not in ['create', 'popen', 'resume', 'assign', 'terminate', 'kill', ...])
+F07-assignment-skipped-and-reported-as-done: CAUGHT (all 7 by an assertion) -- 7 failed, 109 passed in 1.04s
     tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it
         [assertion] AssertionError: assert ['create', 'p...ate', 'close'] == ['create', 'p...ate', 'close']
     tests/test_git_write_job_907.py::test_fallback_rows[refused_assignment_keeps_the_warning]
@@ -45,8 +59,14 @@ F07-assignment-skipped-and-reported-as-done: CAUGHT (all 7 by an assertion) -- 7
     tests/test_git_job.py::test_the_launcher_is_started_paused_and_resumed_only_after_the_assignment
         [assertion] AssertionError: assert [('create',),...esume', 5005)] == [('create',),...esume', 5005)]
     tests/test_git_job.py::test_a_refused_assignment_closes_the_job_resumes_the_launcher_and_goes_on_with_no_job[refused]
-        [assertion] assert (<agenttalk.git_job.GitJob object at 0x000002235861D250> is None)
-F08-stop-through-the-wrong-handle: CAUGHT (all 37 by an assertion) -- 37 failed, 79 passed in 1.08s
+        [assertion] assert (<agenttalk.git_job.GitJob object at 0x00000210B6E3D250> is None)
+    tests/test_git_job.py::test_a_refused_assignment_closes_the_job_resumes_the_launcher_and_goes_on_with_no_job[error]
+        [assertion] assert (<agenttalk.git_job.GitJob object at 0x00000210B6E3C470> is None)
+    tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_assignment[before]
+        [assertion] Failed: DID NOT RAISE KeyboardInterrupt
+    tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_assignment[after]
+        [assertion] Failed: DID NOT RAISE KeyboardInterrupt
+F08-stop-through-the-wrong-handle: CAUGHT (all 37 by an assertion) -- 37 failed, 79 passed in 1.03s
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[prelaunch_step_inside_window]
         [assertion] AssertionError: assert [('terminate'... job handle')] == []
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[reuse_at_genuine_descendant]
@@ -55,7 +75,73 @@ F08-stop-through-the-wrong-handle: CAUGHT (all 37 by an assertion) -- 37 failed,
         [assertion] AssertionError: assert [('terminate'... job handle')] == []
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[below_tolerance_step_during_command]
         [assertion] AssertionError: assert [('terminate'... job handle')] == []
-F09-close-skipped-on-an-ordinary-error: CAUGHT (all 4 by an assertion) -- 4 failed, 112 passed in 1.01s
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[step_after_stop_sample]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_future_timestamp]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_visible_step_rejected]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_equal_times_stay_rejected]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_forward_only_old_orphan_stays_rejected]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[1]
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[-1073741790]
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_write_job_907.py::test_an_interruption_right_after_the_resume_stops_the_job_git_already_runs_in
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_write_job_907.py::test_an_interruption_at_the_real_hand_over_through_the_write_stops_the_job_git_runs_in
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_write_job_907.py::test_the_close[timeout-before-ordinary]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_the_close[fallback_error-before-ordinary]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_the_close[timeout-before-first]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_the_close[timeout-after-first]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_the_close[fallback_error-before-first]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_the_close[fallback_error-after-first]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-second]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-after-second]
+        [assertion] AssertionError: assert [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_normal_timeout_stops_the_job_then_kills_reaps_and_counts
+        [assertion] AssertionError: assert ([('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
+        [assertion] AssertionError: assert (1 == 1 and [('terminate'... job handle')] == []
+    tests/test_git_write_job_907.py::test_interruption_fallback_stops_the_job
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[stop]
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[reap]
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[count]
+        [assertion] AssertionError: assert ({7001} == {7001}
+    tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_assignment[before]
+        [assertion] AssertionError: assert ('resume' not in ['create', 'popen', 'assign', 'terminate', 'kill', 'close'] and [('terminate'... job handle')] == []
+    tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_assignment[after]
+        [assertion] AssertionError: assert ('resume' not in ['create', 'popen', 'assign', 'terminate', 'kill', 'close'] and [('terminate'... job handle')] == []
+    tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_resume[before]
+        [assertion] AssertionError: assert (True and {7001} == {7001}
+    tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_resume[after]
+        [assertion] AssertionError: assert (True and {7001} == {7001}
+    tests/test_git_job.py::test_an_interruption_at_the_real_hand_over_return_stops_the_job_and_the_launcher
+        [assertion] AssertionError: assert (1 == 1 and {7001} == {7001}
+    tests/test_git_job.py::test_a_close_that_failed_leaves_the_handle_owned_so_a_later_step_can_stop_and_close_it
+        [assertion] AssertionError: assert (True is True and None is None and [('terminate'... job handle')] == []
+    tests/test_git_job.py::test_the_job_never_uses_a_null_or_the_hosts_job_handle
+        [assertion] assert ({7001, 7002} == {7001}
+F09-close-skipped-on-an-ordinary-error: CAUGHT (all 4 by an assertion) -- 4 failed, 112 passed in 0.98s
     tests/test_git_write_job_907.py::test_an_ordinary_communicate_error_closes_without_stopping
         [assertion] assert (set() == {7001}
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-ordinary]
@@ -64,7 +150,7 @@ F09-close-skipped-on-an-ordinary-error: CAUGHT (all 4 by an assertion) -- 4 fail
         [assertion] AssertionError: assert RuntimeError('simulated pipe failure') is KeyboardInterrupt('new')
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-after-first]
         [assertion] AssertionError: assert RuntimeError('simulated pipe failure') is KeyboardInterrupt('new')
-F10-first-interruption-lost-in-the-time-out-handler: CAUGHT (5 of 10 by an exception at call time, 5 by an assertion) -- 10 failed, 106 passed in 1.00s
+F10-first-interruption-lost-in-the-time-out-handler: CAUGHT (5 of 10 by an exception at call time, 5 by an assertion) -- 10 failed, 106 passed in 1.01s
     tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes
         [exception] RuntimeError: replaced
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
@@ -73,7 +159,19 @@ F10-first-interruption-lost-in-the-time-out-handler: CAUGHT (5 of 10 by an excep
         [assertion] AssertionError: assert RuntimeError('replaced') is KeyboardInterrupt('new')
     tests/test_git_write_job_907.py::test_the_close[timeout-after-first]
         [assertion] AssertionError: assert RuntimeError('replaced') is KeyboardInterrupt('new')
-F11-failed-query-read-as-zero: CAUGHT (all 3 by an assertion) -- 3 failed, 113 passed in 4.05s
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-second]
+        [assertion] AssertionError: assert RuntimeError('replaced') is KeyboardInterrupt('pending')
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-after-second]
+        [assertion] AssertionError: assert RuntimeError('replaced') is KeyboardInterrupt('pending')
+    tests/test_git_write_job_907.py::test_interruption_fallback_stops_the_job
+        [exception] RuntimeError: replaced
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[stop]
+        [exception] RuntimeError: replaced
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[reap]
+        [exception] RuntimeError: replaced
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[count]
+        [exception] RuntimeError: replaced
+F11-failed-query-read-as-zero: CAUGHT (all 3 by an assertion) -- 3 failed, 113 passed in 4.04s
     tests/test_git_write_job_907.py::test_a_failed_query_is_not_zero[query_error]
         [assertion] assert (' Git or a program it started may still be running; wait for it to finish before retrying or cleaning up.' in "mutating git timed out after 0.01s; Git and the programs in its Windows job were ...
     tests/test_git_write_job_907.py::test_a_failed_query_is_not_zero[query_none]
@@ -85,17 +183,17 @@ F12-failed-stop-with-zero-count-no-warning: CAUGHT (all 2 by an assertion) -- 2 
         [assertion] assert (' Git or a program it started may still be running; wait for it to finish before retrying or cleaning up.' in "mutating git timed out after 0.01s; Git and the programs in its Windows job were ...
     tests/test_git_write_job_907.py::test_fallback_rows[failed_stop_still_kills]
         [assertion] assert (' Git or a program it started may still be running; wait for it to finish before retrying or cleaning up.' in "mutating git timed out after 0.01s; Git and the programs in its Windows job were ...
-F13-timeout-cause-lost: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 0.98s
+F13-timeout-cause-lost: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 1.02s
     tests/test_git_write_job_907.py::test_the_close[timeout-before-ordinary]
         [assertion] assert False
     tests/test_git_write_job_907.py::test_the_cause_is_still_the_writes_timeout[reaped]
         [assertion] assert False
-F14-count-polling-window-longer-than-two-seconds: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 4.03s
+F14-count-polling-window-longer-than-two-seconds: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 4.02s
     tests/test_git_write_job_907.py::test_a_count_above_zero_keeps_the_warning
         [assertion] AssertionError: assert (1501 > 1 and (1030.0 - 1000) <= (2.0 + 0.05))
     tests/test_git_job.py::test_a_count_that_stays_above_zero_stops_polling_at_the_window_and_returns_it
         [assertion] AssertionError: assert None == 2
-F15-stop-missing-from-the-ordinary-error-fallback: CAUGHT (all 5 by an assertion) -- 5 failed, 111 passed in 0.97s
+F15-stop-missing-from-the-ordinary-error-fallback: CAUGHT (all 5 by an assertion) -- 5 failed, 111 passed in 1.03s
     tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout
         [assertion] AssertionError: assert (0 == 1)
     tests/test_git_write_job_907.py::test_the_close[fallback_error-before-ordinary]
@@ -104,7 +202,9 @@ F15-stop-missing-from-the-ordinary-error-fallback: CAUGHT (all 5 by an assertion
         [assertion] assert 2 == (2 + 1)
     tests/test_git_write_job_907.py::test_the_close[fallback_error-after-first]
         [assertion] assert 1 == (2 + 0)
-F16-stop-missing-from-the-interruption-fallback: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 1.01s
+    tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
+        [assertion] AssertionError: assert ['communicate... 'query', ...] == ['communicate..., 'poll', ...]
+F16-stop-missing-from-the-interruption-fallback: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 0.98s
     tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes
         [assertion] AssertionError: assert (0 == 1)
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
@@ -113,15 +213,19 @@ F16-stop-missing-from-the-interruption-fallback: CAUGHT (all 6 by an assertion) 
         [assertion] assert 1 == (1 + 1)
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-second]
         [assertion] assert 1 == (2 + 0)
-F16b-stop-missing-from-the-interruption-branch-of-the-error-fallback: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 0.96s
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-after-second]
+        [assertion] assert 1 == (2 + 0)
+    tests/test_git_write_job_907.py::test_interruption_fallback_stops_the_job
+        [assertion] AssertionError: assert ['communicate...oll', 'close'] == ['communicate..., 'poll', ...]
+F16b-stop-missing-from-the-interruption-branch-of-the-error-fallback: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 1.02s
     tests/test_git_write_job_907.py::test_the_close[fallback_error-before-first]
         [assertion] assert 2 == (2 + 1)
-F17-call-through-a-handle-after-a-successful-close: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 4.01s
+F17-call-through-a-handle-after-a-successful-close: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 4.09s
     tests/test_git_job.py::test_after_a_successful_close_every_call_is_a_no_op_and_nothing_goes_through_the_handle
         [assertion] assert (True, 0, True) == (False, None, True)
     tests/test_git_job.py::test_a_close_that_failed_leaves_the_handle_owned_so_a_later_step_can_stop_and_close_it
         [assertion] assert (True is True and 7001 is None)
-F18-close-moved-to-a-bare-outer-finally: CAUGHT (all 8 by an assertion) -- 8 failed, 108 passed in 1.02s
+F18-close-moved-to-a-bare-outer-finally: CAUGHT (all 8 by an assertion) -- 8 failed, 108 passed in 1.01s
     tests/test_git_write_job_907.py::test_the_close[timeout-before-ordinary]
         [assertion] assert 2 == 1
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-ordinary]
@@ -130,7 +234,15 @@ F18-close-moved-to-a-bare-outer-finally: CAUGHT (all 8 by an assertion) -- 8 fai
         [assertion] assert 2 == 1
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
         [assertion] assert 2 == 1
-F19-nonzero-resume-status-taken-as-success: CAUGHT (all 4 by an assertion) -- 4 failed, 112 passed in 4.04s
+    tests/test_git_write_job_907.py::test_the_close[interrupt_before_timeout-before-ordinary]
+        [assertion] assert 2 == 1
+    tests/test_git_write_job_907.py::test_the_close[normal-before-first]
+        [assertion] assert 0 == 1
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-second]
+        [assertion] assert 1 == 0
+    tests/test_git_write_job_907.py::test_the_close[interrupt_before_timeout-before-second]
+        [assertion] assert 1 == 0
+F19-nonzero-resume-status-taken-as-success: CAUGHT (all 4 by an assertion) -- 4 failed, 112 passed in 4.10s
     tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[1]
         [assertion] AssertionError: Regex pattern did not match.
     tests/test_git_write_job_907.py::test_a_failed_resume_runs_the_bounded_launcher_cleanup
@@ -148,12 +260,32 @@ F20-process-list-call-added: CAUGHT (all 14 by an assertion) -- 14 failed, 102 p
         [assertion] AssertionError: assert (['snapshot'] == []
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[below_tolerance_step_during_command]
         [assertion] AssertionError: assert (['snapshot'] == []
-F21-count-after-the-close-in-the-ordinary-error-fallback: CAUGHT (1 of 2 by an exception at call time, 1 by an assertion) -- 2 failed, 114 passed in 1.02s
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[step_after_stop_sample]
+        [assertion] AssertionError: assert (['snapshot'] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_future_timestamp]
+        [assertion] AssertionError: assert (['snapshot'] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_visible_step_rejected]
+        [assertion] AssertionError: assert (['snapshot'] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_equal_times_stay_rejected]
+        [assertion] AssertionError: assert (['snapshot'] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_forward_only_old_orphan_stays_rejected]
+        [assertion] AssertionError: assert (['snapshot'] == []
+    tests/test_git_write_job_907.py::test_job_members_are_stopped[git]
+        [assertion] AssertionError: assert ['snapshot'] == []
+    tests/test_git_write_job_907.py::test_job_members_are_stopped[hook_grandchild]
+        [assertion] AssertionError: assert ['snapshot'] == []
+    tests/test_git_write_job_907.py::test_job_members_are_stopped[member_whose_parent_exited]
+        [assertion] AssertionError: assert ['snapshot'] == []
+    tests/test_git_write_job_907.py::test_normal_timeout_stops_the_job_then_kills_reaps_and_counts
+        [assertion] AssertionError: assert ([] == []
+    tests/test_git_job.py::test_starting_a_job_and_stopping_it_never_asks_for_a_process_list_an_id_or_a_time
+        [assertion] AssertionError: assert (['snapshot'] == []
+F21-count-after-the-close-in-the-ordinary-error-fallback: CAUGHT (1 of 2 by an exception at call time, 1 by an assertion) -- 2 failed, 114 passed in 1.00s
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
         [assertion] AssertionError: assert ['communicate..., 'poll', ...] == ['communicate..., 'poll', ...]
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_counts_before_it_closes
         [exception] ValueError: list.index(x): x not in list
-F22-wall-clock-read: CAUGHT (all 10 by an assertion) -- 10 failed, 106 passed in 4.10s
+F22-wall-clock-read: CAUGHT (all 10 by an assertion) -- 10 failed, 106 passed in 4.14s
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[prelaunch_step_inside_window]
         [assertion] AssertionError: assert ([] == []
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[reuse_at_genuine_descendant]
@@ -162,7 +294,19 @@ F22-wall-clock-read: CAUGHT (all 10 by an assertion) -- 10 failed, 106 passed in
         [assertion] AssertionError: assert ([] == []
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[below_tolerance_step_during_command]
         [assertion] AssertionError: assert ([] == []
-F23-close-skipped-after-a-confirmed-time-out: CAUGHT (all 9 by an assertion) -- 9 failed, 107 passed in 0.97s
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[step_after_stop_sample]
+        [assertion] AssertionError: assert ([] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_future_timestamp]
+        [assertion] AssertionError: assert ([] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_visible_step_rejected]
+        [assertion] AssertionError: assert ([] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_equal_times_stay_rejected]
+        [assertion] AssertionError: assert ([] == []
+    tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[control_forward_only_old_orphan_stays_rejected]
+        [assertion] AssertionError: assert ([] == []
+    tests/test_git_job.py::test_starting_a_job_and_stopping_it_never_asks_for_a_process_list_an_id_or_a_time
+        [assertion] AssertionError: git_job asked the clock for time
+F23-close-skipped-after-a-confirmed-time-out: CAUGHT (all 9 by an assertion) -- 9 failed, 107 passed in 1.02s
     tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[reuse_at_genuine_descendant]
         [assertion] assert set() == {7001}
     tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[cancelled_steps_during_command]
@@ -171,7 +315,17 @@ F23-close-skipped-after-a-confirmed-time-out: CAUGHT (all 9 by an assertion) -- 
         [assertion] assert set() == {7001}
     tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[step_after_stop_sample]
         [assertion] assert set() == {7001}
-F24-handle-kept-after-an-interruption-in-the-native-close: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 4.01s
+    tests/test_git_write_job_907.py::test_a_late_sleep_in_the_final_count_does_not_say_stopped
+        [assertion] AssertionError: assert (1 == 1 and 'query' == 'close'
+    tests/test_git_write_job_907.py::test_the_close[timeout-before-ordinary]
+        [assertion] assert 0 == 1
+    tests/test_git_write_job_907.py::test_the_close[timeout-before-first]
+        [assertion] assert GitWriteError("mutating git timed out after 0.01s; Git and the programs in its Windows job were stopped: Command 'git' timed out after 0.01 seconds; a partial checkout or a Git lock may still n...
+    tests/test_git_write_job_907.py::test_the_close[timeout-after-first]
+        [assertion] assert GitWriteError("mutating git timed out after 0.01s; Git and the programs in its Windows job were stopped: Command 'git' timed out after 0.01 seconds; a partial checkout or a Git lock may still n...
+    tests/test_git_write_job_907.py::test_normal_timeout_stops_the_job_then_kills_reaps_and_counts
+        [assertion] AssertionError: assert ['communicate...ate', 'query'] == ['communicate...ery', 'close']
+F24-handle-kept-after-an-interruption-in-the-native-close: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 4.02s
     tests/test_git_write_job_907.py::test_the_close[normal-after-first]
         [assertion] assert 2 == 1
     tests/test_git_write_job_907.py::test_the_close[timeout-after-first]
@@ -180,13 +334,17 @@ F24-handle-kept-after-an-interruption-in-the-native-close: CAUGHT (all 6 by an a
         [assertion] assert 2 == 1
     tests/test_git_write_job_907.py::test_the_close[fallback_error-after-first]
         [assertion] assert 3 == (2 + 0)
-F25-reap-not-cut-to-the-deadline: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 1.01s
+    tests/test_git_job.py::test_an_interruption_inside_the_native_close_gives_the_handle_up[before]
+        [assertion] AssertionError: assert (KeyboardInterrupt('in the close') is KeyboardInterrupt('in the close') and 7001 is None)
+    tests/test_git_job.py::test_an_interruption_inside_the_native_close_gives_the_handle_up[after]
+        [assertion] AssertionError: assert (KeyboardInterrupt('in the close') is KeyboardInterrupt('in the close') and 7001 is None)
+F25-reap-not-cut-to-the-deadline: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 1.03s
     tests/test_git_write_job_907.py::test_an_exhausted_deadline_skips_waits_and_the_count_and_keeps_the_warning
         [assertion] assert 5 == 0.0
-F26-wait-not-cut-to-the-deadline: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 1.02s
+F26-wait-not-cut-to-the-deadline: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 0.98s
     tests/test_git_write_job_907.py::test_no_wait_runs_past_the_deadline
         [assertion] AssertionError: wait was allowed to run past the cleanup deadline
-F27-hand-over-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at call time, 4 by an assertion) -- 5 failed, 111 passed in 1.03s
+F27-hand-over-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at call time, 4 by an assertion) -- 5 failed, 111 passed in 0.98s
     tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[1]
         [assertion] AssertionError: assert 0 == 1
     tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[-1073741790]
@@ -195,10 +353,12 @@ F27-hand-over-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at c
         [assertion] AssertionError: assert (0 == 1)
     tests/test_git_write_job_907.py::test_an_interruption_at_the_real_hand_over_through_the_write_stops_the_job_git_runs_in
         [exception] ValueError: list.index(x): x not in list
-F28-process-listing-call-named-in-the-job-code-only-the-static-guard-sees: CAUGHT (all 1 by an assertion) -- 1 failed, 42 passed in 3.51s
+    tests/test_git_write_job_907.py::test_a_failed_resume_runs_the_bounded_launcher_cleanup
+        [assertion] AssertionError: assert (['resume', 'poll', 'kill'] == ['resume', 't...nate', 'poll']
+F28-process-listing-call-named-in-the-job-code-only-the-static-guard-sees: CAUGHT (all 1 by an assertion) -- 1 failed, 42 passed in 3.48s
     tests/test_git_job.py::test_the_job_code_never_names_a_call_that_walks_processes
         [assertion] AssertionError: a call that walks processes, ids or start times is named: [('git_job.py', 'OpenProcess')]
-F29-default-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at call time, 4 by an assertion) -- 5 failed, 111 passed in 0.99s
+F29-default-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at call time, 4 by an assertion) -- 5 failed, 111 passed in 1.06s
     tests/test_git_job.py::test_nonzero_status_is_a_resume_failure[positive]
         [assertion] AssertionError: assert 0 == 1
     tests/test_git_job.py::test_nonzero_status_is_a_resume_failure[access-denied]
@@ -207,29 +367,31 @@ F29-default-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at cal
         [assertion] AssertionError: assert 0 == 1
     tests/test_git_job.py::test_interrupt_at_the_hand_over
         [assertion] assert (0 == 1)
-F30-hand-over-return-outside-the-setup-cleanup: CAUGHT (1 of 3 by an exception at call time, 2 by an assertion) -- 3 failed, 113 passed in 0.98s
+    tests/test_git_job.py::test_an_interruption_at_the_real_hand_over_return_stops_the_job_and_the_launcher
+        [exception] ValueError: list.index(x): x not in list
+F30-hand-over-return-outside-the-setup-cleanup: CAUGHT (1 of 3 by an exception at call time, 2 by an assertion) -- 3 failed, 113 passed in 1.02s
     tests/test_git_write_job_907.py::test_an_interruption_at_the_real_hand_over_through_the_write_stops_the_job_git_runs_in
         [exception] ValueError: list.index(x): x not in list
     tests/test_git_job.py::test_an_interruption_at_the_real_hand_over_return_stops_the_job_and_the_launcher
         [assertion] AssertionError: assert ([290] and KeyboardInterrupt('at the return') is KeyboardInterrupt('at the return') and False)
     tests/test_git_job.py::test_a_caller_given_cleanup_is_used_for_an_interruption_at_the_real_hand_over_too
         [assertion] assert (0 == 1)
-F31-cleanup-clock-read-before-the-protected-sequence: CAUGHT (1 of 2 by an exception at call time, 1 by an assertion) -- 2 failed, 114 passed in 1.03s
+F31-cleanup-clock-read-before-the-protected-sequence: CAUGHT (1 of 2 by an exception at call time, 1 by an assertion) -- 2 failed, 114 passed in 1.00s
     tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes
         [assertion] AssertionError: assert (0 == 1)
     tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout
         [exception] RuntimeError: the clock broke
-F32-deadline-not-checked-before-each-count-query: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 4.05s
+F32-deadline-not-checked-before-each-count-query: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 4.04s
     tests/test_git_write_job_907.py::test_a_late_sleep_in_the_final_count_does_not_say_stopped
         [assertion] AssertionError: assert (2 == 1)
     tests/test_git_job.py::test_a_sleep_that_resumes_late_does_not_let_a_count_read_after_the_deadline_say_zero
         [assertion] AssertionError: assert 2 == 1
-F33-late-count-answer-accepted: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 1.03s
+F33-late-count-answer-accepted: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 1.02s
     tests/test_git_write_job_907.py::test_a_query_that_returns_late_in_the_final_count_does_not_say_stopped
         [assertion] assert (' Git or a program it started may still be running; wait for it to finish before retrying or cleaning up.' in "mutating git timed out after 0.01s; Git and the programs in its Windows job were ...
     tests/test_git_job.py::test_a_query_that_returns_after_the_deadline_is_not_accepted
         [assertion] assert 0 is None
-F34-scheduler-half-of-the-completion-rule-skipped: CAUGHT (all 14 by an assertion) -- 14 failed, 48 passed in 54.21s
+F34-scheduler-half-of-the-completion-rule-skipped: CAUGHT (all 16 by an assertion) -- 16 failed, 64 passed in 81.61s (0:01:21)
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[running-powershell]
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[running-pwsh]
@@ -238,7 +400,6 @@ F34-scheduler-half-of-the-completion-rule-skipped: CAUGHT (all 14 by an assertio
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[queued-pwsh]
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
-F35-any-state-but-running-or-queued-taken-as-finished: CAUGHT (all 6 by an assertion) -- 6 failed, 56 passed in 53.81s
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-powershell]
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-pwsh]
@@ -247,15 +408,44 @@ F35-any-state-but-running-or-queued-taken-as-finished: CAUGHT (all 6 by an asser
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[unknown-pwsh]
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
-F36-task-mode-keeps-error-preference-stop: CAUGHT (all 1 by an assertion) -- 1 failed, 61 passed in 53.61s
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[no-state-at-all-powershell]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[no-state-at-all-pwsh]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[the-scheduler-cannot-see-the-task-powershell]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[the-scheduler-cannot-see-the-task-pwsh]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+    tests/test_git_job_scheduled_task_check.py::test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running[powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-12f218c8469d
+    tests/test_git_job_scheduled_task_check.py::test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running[pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-745732aefa60
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-b3fcb998dd62
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-ab0a989cee9e
+F35-any-state-but-running-or-queued-taken-as-finished: CAUGHT (all 6 by an assertion) -- 6 failed, 74 passed in 81.37s (0:01:21)
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-powershell]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-pwsh]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[unknown-powershell]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[unknown-pwsh]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[no-state-at-all-powershell]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[no-state-at-all-pwsh]
+        [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+F36-task-mode-keeps-error-preference-stop: CAUGHT (all 1 by an assertion) -- 1 failed, 79 passed in 80.68s (0:01:20)
     tests/test_git_job_scheduled_task_check.py::test_a_line_on_stderr_does_not_stop_the_task_mode_before_it_writes_its_last_line[powershell]
         [assertion] AssertionError: interpreter.cmd : a warning on stderr 
-F37-marker-ignored-so-real-lane-tests-run-without-a-job: CAUGHT (all 2 by an assertion) -- 2 failed in 6.20s
+F37-marker-ignored-so-real-lane-tests-run-without-a-job: CAUGHT (all 2 by an assertion) -- 2 failed in 6.31s
     tests/test_lanes.py::test_m6_assign_provisions_worktree_by_default_and_workspace
         [assertion] AssertionError: a changing Git command ran without a job
     tests/test_lanes.py::test_786_successful_rollback_removes_worktree_and_branch
         [assertion] AssertionError: a changing Git command ran without a job
-F38-arguments-file-written-as-ascii: CAUGHT (all 4 by an assertion) -- 4 failed, 58 passed in 54.69s
+F38-arguments-file-written-as-ascii: CAUGHT (all 4 by an assertion) -- 4 failed, 76 passed in 81.63s (0:01:21)
     tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[powershell]
         [assertion] AssertionError: UTF-8 with a byte order mark, so Windows PowerShell 5.1 reads it as UTF-8 too
     tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[pwsh]
@@ -264,26 +454,104 @@ F38-arguments-file-written-as-ascii: CAUGHT (all 4 by an assertion) -- 4 failed,
         [assertion] AssertionError: NO COMPLETION EVIDENCE: the log is 'missing' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
     tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[pwsh]
         [assertion] AssertionError: NO COMPLETION EVIDENCE: the log is 'missing' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
-F39-a-failed-deletion-of-the-task-ignored: CAUGHT (all 2 by an assertion) -- 2 failed, 60 passed in 54.43s
+F39-a-failed-deletion-of-the-task-ignored: CAUGHT (all 12 by an assertion) -- 12 failed, 68 passed in 81.00s (0:01:21)
     tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-69a23a668c68
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-d3618a4c94f1
     tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-fda6be68385c
-F40-fault-runner-checks-only-the-product-files: CAUGHT (all 6 by an assertion) -- 6 failed, 6 passed in 23.57s
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-a51245380988
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-bf34e73c89f9
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-ce937d512158
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-b81ee579bc7e
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-1956c7e2f373
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-task-is-still-there-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-6a8a6dc7cecc
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-task-is-still-there-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-3c732ef49202
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9844c2b4a600
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-04772f8081fa
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-622c5faae7bf
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-194631771d61
+F40-fault-runner-checks-only-the-product-files: CAUGHT (all 6 by an assertion) -- 6 failed, 8 passed in 29.16s
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[script-powershell]
         [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Refusing to start: not every file a fault changes is tracked by git: \nAt <path>    + FullyQualifiedErrorId : Refusing to start: not every file a ...
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[script-pwsh]
-        [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Exception: <path> |\n 196 |  . ts...~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n     | Refusing to start: not every file a fault changes is tracked by...
+        [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Exception: <path> |\n 208 |  . ts...~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n     | Refusing to start: not every file a fault changes is tracked by...
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[test-config-powershell]
         [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Refusing to start: not every file a fault changes is tracked by git: \nAt <path>    + FullyQualifiedErrorId : Refusing to start: not every file a ...
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[test-config-pwsh]
-        [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Exception: <path> |\n 196 |  . ts...~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n     | Refusing to start: not every file a fault changes is tracked by...
-F41-fault-runner-does-not-stop-when-git-cannot-be-read: CAUGHT (all 2 by an assertion) -- 2 failed, 10 passed in 19.16s
+        [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Exception: <path> |\n 208 |  . ts...~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n     | Refusing to start: not every file a fault changes is tracked by...
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[all-faults-powershell]
+        [assertion] AssertionError: assert 0 != 0
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[all-faults-pwsh]
+        [assertion] AssertionError: assert 0 != 0
+F41-fault-runner-does-not-stop-when-git-cannot-be-read: CAUGHT (all 2 by an assertion) -- 2 failed, 12 passed in 24.85s
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_git_cannot_be_read[powershell]
         [assertion] AssertionError: it must say that git could not be read, not fall back to another refusal
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_git_cannot_be_read[pwsh]
         [assertion] AssertionError: it must say that git could not be read, not fall back to another refusal
-F42-final-count-does-not-expect-a-missing-deadline: CAUGHT (1 of 1 by an exception at call time, 0 by an assertion) -- 1 failed, 115 passed in 1.01s
+F42-final-count-does-not-expect-a-missing-deadline: CAUGHT (1 of 1 by an exception at call time, 0 by an assertion) -- 1 failed, 115 passed in 0.98s
     tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout
         [exception] AttributeError: 'NoneType' object has no attribute 'cut'
+F43-every-scheduler-error-read-as-a-task-that-is-gone: CAUGHT (all 2 by an assertion) -- 2 failed, 78 passed in 81.14s (0:01:21)
+    tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[any-other-error-is-unreadable-powershell]
+        [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
+    tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[any-other-error-is-unreadable-pwsh]
+        [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
+F44-cleanup-ignores-an-unreadable-scheduler: CAUGHT (all 6 by an assertion) -- 6 failed, 74 passed in 81.78s (0:01:21)
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-2f611d5d25f7
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-17aca8351185
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-8b085d3277bf
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-e799b170a9b9
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-0322f6c7d7f0
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-0851511f2ce9
+F45-task-deleted-printed-for-an-unreadable-scheduler: CAUGHT (all 6 by an assertion) -- 6 failed, 74 passed in 81.34s (0:01:21)
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-41d5089e860d
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-63725533f116
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9015d92a84ed
+    tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-3ba90c5b4fee
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-5ce3e69baaf1
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-a9de09aea654
+F46-preflight-registers-although-the-scheduler-cannot-be-read: CAUGHT (all 2 by an assertion) -- 2 failed, 78 passed in 201.62s (0:03:21)
+    tests/test_git_job_scheduled_task_check.py::test_a_scheduler_that_cannot_be_read_before_registering_registers_nothing[powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9f3496241c1f [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+    tests/test_git_job_scheduled_task_check.py::test_a_scheduler_that_cannot_be_read_before_registering_registers_nothing[pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-d8bc15cab363 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+F47-a-failed-cleanup-overrides-the-runs-own-code: CAUGHT (all 6 by an assertion) -- 6 failed, 74 passed in 81.51s (0:01:21)
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-task-is-still-there-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f624fe9c3b20
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-task-is-still-there-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-5a24fd9c81f9
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-908bc251698e
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-530db7e1df32
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-dfcc39de9a6c
+    tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-065166f96103
+F48-fault-runner-keeps-only-four-rows-per-fault: CAUGHT (all 2 by an assertion) -- 2 failed, 12 passed in 24.77s
+    tests/test_git_job_fault_runner.py::test_every_failing_test_of_a_fault_gets_its_own_row_in_the_results[powershell]
+        [assertion] AssertionError: planted faults of #907: one result line each (caught = at least one test failed; every failing test is kept with the first line of its failure)
+    tests/test_git_job_fault_runner.py::test_every_failing_test_of_a_fault_gets_its_own_row_in_the_results[pwsh]
+        [assertion] AssertionError: planted faults of #907: one result line each (caught = at least one test failed; every failing test is kept with the first line of its failure)
 done; the source files were put back with git checkout

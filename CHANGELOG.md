@@ -93,7 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time-out clean-up shares one 30 second limit (a count read after that limit has passed is not taken as proof,
   and an interruption during the start, right after Git was let go included, or during the time-out handling still
   stops the job); a write without a job keeps
-  the earlier waits. A program that another process starts on Git's behalf (a
+  the earlier waits. If the clock reading that starts that shared limit itself fails with an ordinary error, the write ends
+  with its own time-out error and the earlier warning, as for any other failure of the clean-up, instead of failing with an
+  internal `AttributeError` (the final check was asked for a limit that did not exist; fixed in round 13). A program that another process starts on Git's behalf (a
   service or a scheduled task) was never in the group and is not covered. A partial checkout or a Git lock may
   still need recovery.
 

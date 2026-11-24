@@ -154,3 +154,15 @@ command: python -m pytest tests/test_git_write_job_907.py::test_an_ordinary_erro
   1 failed in 3.31s
 the failure is a behaviour: the write ends with an AttributeError (no deadline to cut) instead of its own time-out error
 command: the same test with the change: 1 passed in 3.29s
+
+PART E (round 14). The new tests against the previous head's tools (fc6c645b put back), two PowerShell editions each
+
+E1. The 18 new scheduler tests (cleanup with an unreadable scheduler after a failed or an accepted delete, an unreadable scheduler before registering, the combined cases, the two kinds of "no" from the scheduler, the real scheduler asked read-only) against the previous script:
+    result: 14 failed, 4 passed
+    8 fail because of behaviour: an unreadable scheduler after the delete read as a task that is gone (4: exit 0 and "task deleted: True" instead of 4 and TASK NOT CONFIRMED DELETED), a run was registered although the scheduler could not be read (2), a rejected run lost the warning about the unreadable scheduler (2)
+    6 fail only because the mode that asks the scheduler (`-Mode Facts`) did not exist there (the two kinds of "no" from a stand-in, 4; the real scheduler asked read-only, 2)
+    4 pass on the previous script and pin a rule that was already right and had no test: a run that failed (3) or has no completion evidence (2) keeps its own code when its task is also still there, and the warning is printed (2 cases x 2 editions)
+
+E2. The new runner test (a fault that fails six tests must show six rows) against the previous runner (it kept the first four): 2 of 2 fail (both editions); with the change both pass.
+
+E3. Not red first: the CHANGELOG, dossier and PR text (a history correction and a named product change are text, not behaviour).

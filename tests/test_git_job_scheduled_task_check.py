@@ -263,16 +263,23 @@ def test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent(tmp_p
 # --- `-Mode Run` against a stand-in scheduler (nothing is registered) -------------------------------------------
 
 STUB_SCHEDULER = """
-$script:stub = @{ exists = $false }
+$script:stub = @{ exists = $false; deleted = $false }
 function Get-TaskFacts {
+    # STUB_QUERY: "ok" answers truthfully; "always" and "after-delete" make the scheduler unreadable (an error, not a
+    # "no such task") from the start, or from the first delete on.
+    $broken = ($env:STUB_QUERY -eq 'always') -or ($env:STUB_QUERY -eq 'after-delete' -and $script:stub.deleted)
+    if ($broken) {
+        return @{ exists = $false; unreadable = $true; status = 'unknown'; logon = 'unknown'; result = 'unknown' }
+    }
     if (-not $script:stub.exists) {
-        return @{ exists = $false; status = 'unknown'; logon = 'unknown'; result = 'unknown' }
+        return @{ exists = $false; unreadable = $false; status = 'unknown'; logon = 'unknown'; result = 'unknown' }
     }
     $state = if ($env:STUB_TASK_STATE) { $env:STUB_TASK_STATE } else { 'Ready' }
-    return @{ exists = $true; status = $state; logon = 'a stand-in'; result = '0' }
+    return @{ exists = $true; unreadable = $false; status = $state; logon = 'a stand-in'; result = '0' }
 }
 function Invoke-Schtasks {
     param([string]$Line)
+    if ($env:STUB_CALLS) { Add-Content -LiteralPath $env:STUB_CALLS -Value $Line }
     if ($Line -like '/Create*') { $script:stub.exists = $true; return 0 }
     if ($Line -like '/Run*') {
         # the task "runs": the finished log that Task mode would have written, for this run's id
@@ -283,10 +290,11 @@ function Invoke-Schtasks {
             "run-id=$($saved.RunId)",
             ('  x.py:1: GitJobHostFacts: git-job-capability: {"windows": "made up", "session_id": 1, ' +
              '"pytest_process_in_a_job": true}'),
-            'exit=0')
+            "exit=$(if ($env:STUB_PYTEST_EXIT) { $env:STUB_PYTEST_EXIT } else { '0' })")
         return 0
     }
     if ($Line -like '/Delete*') {
+        $script:stub.deleted = $true
         if ($env:STUB_DELETE_FAILS -eq '1') { return 1 }
         $script:stub.exists = $false
         return 0
@@ -296,11 +304,24 @@ function Invoke-Schtasks {
 """
 
 
-def run_with_a_stand_in_scheduler(tmp_path, shell, *, state="Ready", delete_fails=False, seconds=60):
+def run_with_a_stand_in_scheduler(
+    tmp_path, shell, *, state="Ready", delete_fails=False, seconds=60, query="ok", pytest_exit=0
+):
+    """Runs `-Mode Run` against the stand-in. `query` is how the scheduler answers: "ok", "always" unreadable, or
+    "after-delete" unreadable once the task has been deleted. Returns (the finished process, the out folder, the
+    schtasks commands the script issued)."""
     stub = tmp_path / "stub-scheduler.ps1"
     stub.write_text(STUB_SCHEDULER, encoding="utf-8")
     out = tmp_path / "out"
-    env = dict(os.environ, STUB_TASK_STATE=state, STUB_DELETE_FAILS="1" if delete_fails else "0")
+    calls = tmp_path / "schtasks-calls.txt"
+    env = dict(
+        os.environ,
+        STUB_TASK_STATE=state,
+        STUB_DELETE_FAILS="1" if delete_fails else "0",
+        STUB_QUERY=query,
+        STUB_PYTEST_EXIT=str(pytest_exit),
+        STUB_CALLS=str(calls),
+    )
     done = subprocess.run(  # noqa: S603
         [
             shell, "-NoProfile", "-File", str(SCRIPT), "-Mode", "Run", "-Runs", "Interactive", "-Python", "python",
@@ -309,12 +330,12 @@ def run_with_a_stand_in_scheduler(tmp_path, shell, *, state="Ready", delete_fail
         ],
         capture_output=True, text=True, timeout=180, check=False, env=env,
     )  # fmt: skip
-    return done, out
+    return done, out, calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
 
 
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
 def test_a_run_whose_task_is_deleted_is_accepted_and_copied(tmp_path, shell):
-    done, out = run_with_a_stand_in_scheduler(tmp_path, shell)
+    done, out, _ = run_with_a_stand_in_scheduler(tmp_path, shell)
     assert done.returncode == 0, done.stdout + done.stderr
     assert (out / "interactive-accepted.log").exists()
     assert "task deleted: True" in done.stdout
@@ -324,7 +345,7 @@ def test_a_run_whose_task_is_deleted_is_accepted_and_copied(tmp_path, shell):
 def test_a_failed_deletion_of_the_task_is_not_a_success(tmp_path, shell):
     """The run is accepted and its log copied, but the task is still there: the exit code is not 0 (it is 4), the output
     says the task was not deleted and how to delete it by hand, and the accepted evidence is kept."""
-    done, out = run_with_a_stand_in_scheduler(tmp_path, shell, delete_fails=True)
+    done, out, _ = run_with_a_stand_in_scheduler(tmp_path, shell, delete_fails=True)
     assert done.returncode == 4, done.stdout + done.stderr
     assert "task deleted: False" in done.stdout and "TASK NOT DELETED" in done.stdout
     assert "schtasks /Delete /TN stub-task /F" in done.stdout
@@ -336,8 +357,119 @@ def test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_r
     """The wait of `-Mode Run`, end to end: the log is finished, but the scheduler keeps showing the task as Running
     until the time limit. The limit must not turn that into an acceptance: exit code 2, no accepted copy, and the task
     is still deleted."""
-    done, out = run_with_a_stand_in_scheduler(tmp_path, shell, state="Running", seconds=1)
+    done, out, _ = run_with_a_stand_in_scheduler(tmp_path, shell, state="Running", seconds=1)
     assert done.returncode == 2, done.stdout + done.stderr
     assert "NO COMPLETION EVIDENCE FROM THE SCHEDULER" in done.stdout
     assert not (out / "interactive-accepted.log").exists()
     assert "task deleted: True" in done.stdout
+
+
+# --- a scheduler that cannot be read is not a task that is gone (round 14) -------------------------------------
+
+HOW_TO_DELETE = "schtasks /Delete /TN stub-task /F"
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+@pytest.mark.parametrize("delete_fails", [True, False], ids=["delete-failed", "delete-said-ok"])
+def test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup(tmp_path, shell, delete_fails):
+    """The delete returned 1 (or even 0), then the query failed with an error: the absence is not established. The run
+    was accepted and its log is kept, but the exit code is 4, the output says the task is NOT CONFIRMED deleted and how
+    to look for it and delete it by hand, and it never prints that the task was deleted."""
+    done, out, _ = run_with_a_stand_in_scheduler(tmp_path, shell, delete_fails=delete_fails, query="after-delete")
+    text = done.stdout + done.stderr
+    assert done.returncode == 4, text
+    assert "task deleted: False" in done.stdout and "task deleted: True" not in done.stdout, text
+    assert "TASK NOT CONFIRMED DELETED" in done.stdout and HOW_TO_DELETE in done.stdout, text
+    assert "schtasks /Query /TN stub-task" in done.stdout, text
+    assert (out / "interactive-accepted.log").exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_a_scheduler_that_cannot_be_read_before_registering_registers_nothing(tmp_path, shell):
+    done, out, calls = run_with_a_stand_in_scheduler(tmp_path, shell, query="always")
+    text = " ".join((done.stdout + done.stderr).replace("|", " ").split())  # PowerShell 7 wraps its error text
+    assert done.returncode != 0 and "could not be read" in text and "Nothing was registered" in text, text
+    assert calls == [], calls  # no /Create, no /Run: nothing reached the scheduler
+    assert not (out / "interactive-accepted.log").exists()
+
+
+# (what the run did and how the scheduler answered, the exit code that must win, the warning that must be printed)
+COMBINED = [
+    pytest.param(
+        {"pytest_exit": 1, "delete_fails": True}, 3, "TASK NOT DELETED", id="rejected-run-and-the-task-is-still-there"
+    ),
+    pytest.param(
+        {"pytest_exit": 1, "delete_fails": True, "query": "after-delete"},
+        3,
+        "TASK NOT CONFIRMED DELETED",
+        id="rejected-run-and-the-scheduler-is-unreadable",
+    ),
+    pytest.param(
+        {"state": "Running", "seconds": 1, "delete_fails": True},
+        2,
+        "TASK NOT DELETED",
+        id="no-completion-evidence-and-the-task-is-still-there",
+    ),
+]
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+@pytest.mark.parametrize("settings, code, warning", COMBINED)
+def test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed(
+    tmp_path, shell, settings, code, warning
+):
+    """A run that is not accepted (3: rejected, 2: no completion evidence) and a task that is also still shown after the
+    delete: the run's own code wins (the cleanup failure does not turn 3 into 4), and the warning about the task is
+    printed anyway, with how to delete it. No accepted copy is made."""
+    done, out, _ = run_with_a_stand_in_scheduler(tmp_path, shell, **settings)
+    text = done.stdout + done.stderr
+    assert done.returncode == code, text
+    assert warning in done.stdout and HOW_TO_DELETE in done.stdout, text
+    assert not (out / "interactive-accepted.log").exists()
+
+
+STUB_NO_SUCH_TASK = """
+function Get-ScheduledTask {
+    [CmdletBinding()] param([string]$TaskName)
+    $record = New-Object Management.Automation.ErrorRecord (New-Object Exception 'no such task (stand-in)'), 'x',
+        ([Management.Automation.ErrorCategory]::ObjectNotFound), $TaskName
+    $PSCmdlet.ThrowTerminatingError($record)
+}
+"""
+STUB_CANNOT_ASK = """
+function Get-ScheduledTask {
+    [CmdletBinding()] param([string]$TaskName)
+    $record = New-Object Management.Automation.ErrorRecord (New-Object Exception 'access is denied (stand-in)'), 'x',
+        ([Management.Automation.ErrorCategory]::PermissionDenied), $TaskName
+    $PSCmdlet.ThrowTerminatingError($record)
+}
+"""
+
+
+def ask_for_facts(shell, *extra, name="stub-task"):
+    done = subprocess.run(  # noqa: S603
+        [shell, "-NoProfile", "-File", str(SCRIPT), "-Mode", "Facts", "-TaskName", name, *extra],
+        capture_output=True, text=True, timeout=120, check=False,
+    )  # fmt: skip
+    return done.returncode, done.stdout.strip()
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+@pytest.mark.parametrize(
+    "stub, expected",
+    [(STUB_NO_SUCH_TASK, "exists=false unreadable=false"), (STUB_CANNOT_ASK, "exists=false unreadable=true")],
+    ids=["no-such-task-is-a-confirmed-absence", "any-other-error-is-unreadable"],
+)
+def test_the_two_kinds_of_no_from_the_scheduler_are_told_apart(tmp_path, shell, stub, expected):
+    path = tmp_path / "scheduler-answer.ps1"
+    path.write_text(stub, encoding="utf-8")
+    assert ask_for_facts(shell, "-SchedulerStub", str(path)) == (0, expected)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the scheduled-task service is a Windows thing")
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_the_real_scheduler_confirms_the_absence_of_a_task_that_was_never_registered(shell):
+    """A read-only question to the real scheduler about a made-up name (nothing is registered): it answers that there is
+    no such task, which is a confirmed absence and not an unreadable scheduler."""
+    code, text = ask_for_facts(shell, name="agenttalk-no-such-task-907r14")
+    assert (code, text) == (0, "exists=false unreadable=false"), text

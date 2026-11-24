@@ -77,3 +77,26 @@ PowerShell 7
   good run, the task cannot be deleted                 exit 4; accepted copy kept: True; [interactive] OK: run <id> finished with exit=0 and shows its host facts
   finished log, task Running until the time limit      exit 2; accepted copy kept: False; [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Running' (a run is complete only when the log is finished AND the task is Ready)
 
+== part 6 (round 14): a scheduler that cannot be read is not a task that is gone (nothing is registered; a tests-only hook replaces the two functions that talk to the scheduler)
+
+Windows PowerShell 5.1
+  good run, task deleted (control)                                   exit 0; "task deleted": True; warning: none; accepted copy: True
+  accepted run, delete failed, scheduler unreadable afterwards       exit 4; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: True
+  accepted run, delete said ok, scheduler unreadable afterwards      exit 4; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: True
+  REJECTED run (pytest exit 1), task still there after the delete    exit 3; "task deleted": False; warning: NOT DELETED; accepted copy: False
+  REJECTED run (pytest exit 1), scheduler unreadable afterwards      exit 3; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: False
+  no completion evidence (Running at the limit), task still there    exit 2; "task deleted": False; warning: NOT DELETED; accepted copy: False
+  scheduler unreadable before anything is registered                 exit 1; "task deleted": not printed; warning: refused before registering; accepted copy: False
+
+PowerShell 7
+  good run, task deleted (control)                                   exit 0; "task deleted": True; warning: none; accepted copy: True
+  accepted run, delete failed, scheduler unreadable afterwards       exit 4; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: True
+  accepted run, delete said ok, scheduler unreadable afterwards      exit 4; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: True
+  REJECTED run (pytest exit 1), task still there after the delete    exit 3; "task deleted": False; warning: NOT DELETED; accepted copy: False
+  REJECTED run (pytest exit 1), scheduler unreadable afterwards      exit 3; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: False
+  no completion evidence (Running at the limit), task still there    exit 2; "task deleted": False; warning: NOT DELETED; accepted copy: False
+  scheduler unreadable before anything is registered                 exit 1; "task deleted": not printed; warning: refused before registering; accepted copy: False
+
+The real scheduler, asked read-only about a name that was never registered (agenttalk-no-such-task-907r14):
+  Windows PowerShell 5.1: exists=false unreadable=false
+  PowerShell 7: exists=false unreadable=false

@@ -12,7 +12,7 @@
   selected fault changes has uncommitted edits (the list is derived from the faults themselves, never written by hand),
   or when `git status` cannot be read, so nothing of yours is lost; it leaves every file as it was committed.
 
-  What is kept for each fault: the pytest summary, the id of each failing test (the first four), and for every one of
+  What is kept for each fault: the pytest summary, the id of each failing test (every one, none left out), and for every one of
   those the first line of its failure (an assertion, or an exception raised at call time, which is flagged: a fault that
   fails a test by an exception is a weaker catch than one that fails an assertion). Paths in those lines are replaced
   by <path>.
@@ -174,7 +174,7 @@ $faults = @(
       "    [IO.File]::WriteAllText(`$Path, (`$Values | ConvertTo-Json), (New-Object Text.UTF8Encoding(`$true)))",
       "    (`$Values | ConvertTo-Json) | Set-Content -LiteralPath `$Path -Encoding ascii")) },
   @{ id = 'F39-a-failed-deletion-of-the-task-ignored'; tests = $sched; edits = @(, @($SCRIPT,
-      "            `$judged = Resolve-Cleanup -Judged `$judged -DeleteExit `$deleteExit -StillExists `$stillThere -Name `$TaskName`n", "")) },
+      "            `$judged = Resolve-Cleanup -Judged `$judged -DeleteExit `$deleteExit -StillExists `$stillThere -Unreadable `$unreadable -Name `$TaskName`n", "")) },
   @{ id = 'F40-fault-runner-checks-only-the-product-files'; tests = $runner; edits = @(, @($RUNNERFILE,
       "ForEach-Object { `$_[0] } | Sort-Object -Unique)",
       "ForEach-Object { `$_[0] } | Where-Object { `$_ -like 'src/*' } | Sort-Object -Unique)")) },
@@ -184,7 +184,19 @@ $faults = @(
       @($RUNNERFILE, "if (`$tracked.Count -ne `$targets.Count) {", "if (`$false) {")) },
   @{ id = 'F42-final-count-does-not-expect-a-missing-deadline'; tests = $fake; edits = @(, @($CLI,
       "    if job is None or deadline is None:  # no shared deadline exists (the clock call failed): nothing can be confirmed`n        return False`n",
-      "    if job is None:`n        return False`n")) }
+      "    if job is None:`n        return False`n")) },
+  @{ id = 'F43-every-scheduler-error-read-as-a-task-that-is-gone'; tests = $sched; edits = @(, @($SCRIPT,
+      "        if (`$_.CategoryInfo.Category -ne 'ObjectNotFound') { `$none.unreadable = `$true }", "        if (`$false) { `$none.unreadable = `$true }")) },
+  @{ id = 'F44-cleanup-ignores-an-unreadable-scheduler'; tests = $sched; edits = @(, @($SCRIPT,
+      "    if (-not `$StillExists -and -not `$Unreadable) { return `$Judged }", "    if (-not `$StillExists) { return `$Judged }")) },
+  @{ id = 'F45-task-deleted-printed-for-an-unreadable-scheduler'; tests = $sched; edits = @(, @($SCRIPT,
+      "            `$gone = -not `$stillThere -and -not `$unreadable", "            `$gone = -not `$stillThere")) },
+  @{ id = 'F46-preflight-registers-although-the-scheduler-cannot-be-read'; tests = $sched; edits = @(, @($SCRIPT,
+      "    if ([bool]`$before.unreadable) {", "    if (`$false) {")) },
+  @{ id = 'F47-a-failed-cleanup-overrides-the-runs-own-code'; tests = $sched; edits = @(, @($SCRIPT,
+      "    `$code = if (`$Judged.code -eq 0) { 4 } else { `$Judged.code }", "    `$code = 4")) },
+  @{ id = 'F48-fault-runner-keeps-only-four-rows-per-fault'; tests = $runner; edits = @(, @($RUNNERFILE,
+      "    foreach (`$row in `$rows) {", "    foreach (`$row in (`$rows | Select-Object -First 4)) {")) }
 )
 
 # Preflight: every file that any selected fault changes (and restores with git checkout) must be tracked and clean.
@@ -255,7 +267,7 @@ foreach ($f in $faults) {
       $verdict += if ($exceptions -eq 0) { " (all $($rows.Count) by an assertion)" } else { " ($exceptions of $($rows.Count) by an exception at call time, $($rows.Count - $exceptions) by an assertion)" }
     }
     $lines += "$($f.id): $verdict -- $summary"
-    foreach ($row in ($rows | Select-Object -First 4)) {
+    foreach ($row in $rows) {
       $lines += "    $($row.id)"
       $lines += "        [$($row.kind)] $($row.message)"
     }
