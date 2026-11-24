@@ -451,11 +451,13 @@ def _fence_record_path(path: Path, key: str, source: str) -> None:
     contacts) what the fence exists to keep out. A path the fence refuses keeps the checkout, with the reason
     (`Refused`): it is never read as unrelated. Outside a fence nothing changes.
 
-    Two steps. First, from the path as written and with no look at it (`abspath` is a string operation): a path that is
-    outside the fence both as given and as the fence resolves to is refused at once, so a path outside is never
-    resolved at all. A path that is inside only through another spelling of the fence folder (a link to it) is refused
-    too, which only keeps a checkout. Second, a path inside as written goes through the fence's own check, which
-    resolves it and so follows a link before it refuses one that leads out (#913)."""
+    Two steps. First, the path as written is compared with the fence without any look at the PATH: `abspath` is a string
+    operation, so a path that is outside the fence both as given and as the fence resolves to is refused at once and is
+    never resolved. (The fence folder itself, which is not named by a record, is resolved with `realpath` to make that
+    comparison: step 1 is not string-only, it is free of any look at the record-named path.) A path that is inside only
+    through another spelling of the fence folder (a link to it) is refused too, which only keeps a checkout. Second, a
+    path inside as written goes through the fence's own check, which resolves it and so follows a link before it
+    refuses one that leads out (#913)."""
     fence = os.environ.get(store_mod.STORE_FENCE_ENV)
     if not fence:
         return
@@ -476,6 +478,37 @@ def _fence_record_path(path: Path, key: str, source: str) -> None:
         )
 
 
+_RECORD_PATH_FIELDS = ("cwd", "launch_cwd", "workspace_path", "worktree_path")
+
+
+def _fence_named_fields(value: dict, repo: Path, source: str, *, lane: bool) -> None:
+    """Under a store fence, fence EVERY absolute path that a record dictionary names in a field that names a folder,
+    before anything else is done with the dictionary. Without this, the code that judges a damaged lane row (and the
+    repair advice it prints, which looks at the row's OTHER saved path to say whether something is still there) ran
+    before the check of each path and looked at a path outside the fence (round 17). One function at the top of the
+    reader means that no later step, advice included, can reach a record-named absolute path that was not fenced. A
+    relative path is not a path outside the fence: the existing rules judge it, and each spelling that is tried for it
+    is fenced where it is placed. Outside a fence nothing is done."""
+    if not os.environ.get(store_mod.STORE_FENCE_ENV):
+        return
+    for key in _RECORD_PATH_FIELDS + (("worktree_toplevel_canonical",) if lane else ()):
+        item = value.get(key)
+        if not isinstance(item, str) or not item.strip():
+            continue
+        text = item.replace("{ROOT}", str(repo))
+        try:
+            absolute = lanes.path_is_absolute(text)
+        except (ValueError, TypeError):
+            absolute = False  # not a path at all: the damage rules below refuse it, and nothing can be looked at
+        if absolute:
+            try:
+                _fence_record_path(Path(text), key, source)
+            except Refused:
+                raise  # the checkout is kept, with the reason
+            except ValueError:
+                continue  # a name with NUL or a lone surrogate cannot be looked at either: the damage rules refuse it
+
+
 def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | None,
                     source: str = "activity record", lane: bool = False, owner: dict | None = None) -> bool:
     """True when `value` names the checkout `target`. `lane_id` is the registry key of the lane row being read (None
@@ -483,6 +516,8 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
     lane, so a recovery hint always names the row that was selected. `owner` is that live row: the first lane-level
     call sets it, and the recursion keeps it, so a saved copy inside the row (the lane snapshot of a pending delivery)
     is judged for its advice by the state of the row that holds it, not by the copy's own old state."""
+    if isinstance(value, dict):
+        _fence_named_fields(value, repo, source, lane=lane)  # before ANYTHING else is done with this dictionary
     if lane and owner is None and isinstance(value, dict):
         owner = value
     if lane and isinstance(value, dict):
@@ -520,7 +555,7 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
             raise Refused(f"{source}: relative activity path {key} is ambiguous; "
                           "record an absolute path first; "
                           f"{recovery}")
-    fields = {"cwd", "launch_cwd", "workspace_path", "worktree_path"}
+    fields = set(_RECORD_PATH_FIELDS)
     if lane:
         fields.add("worktree_toplevel_canonical")
     if isinstance(value, dict):

@@ -2700,3 +2700,285 @@ def test_a_first_listing_that_fails_under_the_fence_is_refused_at_once_even_if_a
     lines = report.read_text(encoding="utf-8").split("\n")[:-1]
     assert len(lines) == 1 and "registered checkouts" in lines[0] and lines[0].endswith(_UNPLACED), lines
     assert str(clone) not in lines[0]
+
+
+# --- #858 fix round 17: no look at a record-named path outside the fence on ANY in-use route, advice code included ----
+
+_GUARD_FOLDER = "zz-guard-outside"  # in the name of the folder outside the fence that records name (lower case)
+_GUARD_HOST = "server-858g"  # in the name of the network host of a UNC value
+
+
+class _OutsideGuard:
+    """What the guard saw. `outside`: every look, by the calls listed in `_install_guard`, at a path that lies outside
+    the fence (a path under the test's folder but not under the fence, or a network path), or any Git run in one. The
+    fence's own resolver is NOT exempt, with one exception that is counted apart: when `check_folder_fence` is handed a
+    path that is inside the fence AS WRITTEN (a link in the fence that leads out, #913), its resolution may look at the
+    link's target: those looks are in `resolved_by_the_fence`, not in `outside`. A path that is outside as written gets
+    no such allowance."""
+
+    def __init__(self) -> None:
+        self.outside: list[tuple[str, str]] = []
+        self.resolved_by_the_fence: list[tuple[str, str]] = []
+        self.fence_checks: list[str] = []
+
+
+def _install_guard(monkeypatch: pytest.MonkeyPatch, fence: Path, world: Path) -> _OutsideGuard:
+    """Replace every call that asks the file system about a path (and the Git runners) with a spy that records a look at
+    a path outside the fence and answers an error instead of making it, so that a network path is never contacted."""
+    import pathlib
+
+    from agenttalk import janitor, worktree_release
+
+    guard = _OutsideGuard()
+    inside_roots = {os.path.normcase(os.path.abspath(fence)), os.path.normcase(os.path.realpath(fence))}
+    world_root = os.path.normcase(os.path.abspath(world))
+    exempt = [0]
+
+    def lexically_inside(text: str) -> bool:
+        norm = os.path.normcase(os.path.abspath(text))
+        return any(norm == root or norm.startswith(root + os.sep) for root in inside_roots)
+
+    def is_outside(text: str) -> bool:
+        norm = os.path.normcase(os.path.abspath(text))
+        if _GUARD_HOST in norm:
+            return True
+        return norm.startswith(world_root + os.sep) and not lexically_inside(text)
+
+    def note(name: str, value) -> bool:
+        try:
+            text = os.fsdecode(os.fspath(value))
+        except TypeError:  # a file descriptor, or no path at all
+            return False
+        if not is_outside(text):
+            return False
+        (guard.resolved_by_the_fence if exempt[0] else guard.outside).append((name, text))
+        return True
+
+    def watch(name: str, real):
+        def spy(path, *args, **kwargs):
+            if note(name, path):
+                raise OSError(errno.EIO, "a path outside the fence was looked at (guard)")
+            return real(path, *args, **kwargs)
+
+        return spy
+
+    calls = [(os, "lstat"), (os, "stat"), (os, "scandir"), (os, "listdir"), (os, "readlink"), (os.path, "realpath"),
+             (os.path, "exists"), (os.path, "lexists"), (os.path, "isdir"), (os.path, "isfile"),
+             (os.path, "samefile")]
+    if os.name == "nt":
+        import nt
+
+        calls.append((nt, "_getfinalpathname"))
+    for owner, name in calls:
+        monkeypatch.setattr(owner, name, watch(f"{owner.__name__}.{name}", getattr(owner, name)))
+    for method in ("resolve", "exists", "is_dir", "stat", "lstat", "iterdir"):
+        real_method = getattr(pathlib.Path, method)
+
+        def path_spy(self, *args, _name=method, _real=real_method, **kwargs):
+            if note(f"Path.{_name}", self):
+                raise OSError(errno.EIO, "a path outside the fence was looked at (guard)")
+            return _real(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, method, path_spy)
+    for owner, name in ((janitor, "_run_git_checked"), (worktree_release, "_read_git"), (worktree_release, "_git")):
+        real_git = getattr(owner, name)
+
+        def git_spy(repo, *args, _name=f"{owner.__name__}.{name}", _real=real_git, **kwargs):
+            if note(_name, repo):
+                raise OSError(errno.EIO, "git was run in a path outside the fence (guard)")
+            return _real(repo, *args, **kwargs)
+
+        monkeypatch.setattr(owner, name, git_spy)
+
+    real_check = cli.store_mod.check_folder_fence
+
+    def check(folder):
+        guard.fence_checks.append(str(folder))
+        if lexically_inside(os.fspath(folder)):
+            exempt[0] += 1  # the fence's own resolution of a path that is inside as written (#913): counted apart
+            try:
+                return real_check(folder)
+            finally:
+                exempt[0] -= 1
+        return real_check(folder)  # outside as written: the resolver gets no allowance
+
+    monkeypatch.setattr(cli.store_mod, "check_folder_fence", check)
+    return guard
+
+
+def _guard_value(kind: str, tmp_path: Path, fence: Path) -> str:
+    """An absolute path a record can name: a folder beside the fence, a network path (UNC), or a link inside the fence
+    that leads to a folder outside it."""
+    if kind == "outside":
+        folder = tmp_path / _GUARD_FOLDER
+        folder.mkdir(exist_ok=True)
+        return str(folder.resolve() / "x")
+    if kind == "network":
+        return f"\\\\{_GUARD_HOST}\\share\\x" if os.name == "nt" else f"//{_GUARD_HOST}/share/x"
+    target = tmp_path / "zz-guard-link-target"
+    target.mkdir(exist_ok=True)
+    _dir_link(fence / "link-to-outside", target)
+    return str(fence / "link-to-outside" / "x")
+
+
+# Every shape of record that the in-use check reads, with every field that names a folder filled with the value `v`, and
+# the neighbours of a damaged row blank or damaged: (where it is written, what is written).
+_GUARD_SHAPES = {
+    "lane-every-field": ("lane", lambda v: {
+        "status": "active", "worktree_path": v, "worktree_toplevel_canonical": v, "cwd": v, "launch_cwd": v,
+        "workspace_path": v}),
+    "lane-worktree-path-blank": ("lane", lambda v: {
+        "status": "active", "worktree_path": "", "worktree_toplevel_canonical": v}),
+    "lane-canonical-blank": ("lane", lambda v: {
+        "status": "active", "worktree_path": v, "worktree_toplevel_canonical": ""}),
+    "lane-worktree-path-relative": ("lane", lambda v: {
+        "status": "active", "worktree_path": "relative/folder", "worktree_toplevel_canonical": v}),
+    "lane-pending-delivery-copy": ("lane", lambda v: {
+        "status": "delivered", "publish_pending": {"lane": {"worktree_path": "", "worktree_toplevel_canonical": v}},
+        "occupancy_worktrees": [v]}),
+    "lane-retained-occupancy": ("lane", lambda v: {"status": "abandoned", "occupancy_worktrees": [v]}),
+    # A saved copy that sits inside a row that is NOT a pending delivery (a hand-edited or damaged record): its advice
+    # is not cut short by "recover the delivery first", so it is the case that reaches the look at the other path.
+    "lane-saved-copy-in-an-active-row": ("lane", lambda v: {
+        "status": "active", "saved": {"worktree_path": "", "worktree_toplevel_canonical": v}}),
+    "launch-request": ("launch", lambda v: {
+        "state": "pending", "cwd": v, "launch_cwd": v, "workspace_path": v, "worktree_path": v}),
+    "supervisor-state": ("supervisor-state", lambda v: {"agents": {"seat": {"cwd": v, "launch_cwd": v}}}),
+    "store-supervisor": ("store-supervisor", lambda v: {"agents": {"seat": {"launch_cwd": v}}}),
+}
+
+
+def _write_guard_record(repo: Path, shape: str, value: str) -> None:
+    where, build = _GUARD_SHAPES[shape]
+    store = repo / ".agenttalk"
+    state = store / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    row = build(value)
+    if where == "lane":
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}), encoding="utf-8")
+    elif where == "launch":
+        (state / "launch-requests").mkdir(exist_ok=True)
+        (state / "launch-requests" / "r.json").write_text(json.dumps(row), encoding="utf-8")
+    elif where == "supervisor-state":
+        (state / "supervisor-state.json").write_text(json.dumps(row), encoding="utf-8")
+    else:
+        (store / "supervisor.json").write_text(json.dumps(row), encoding="utf-8")
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+@pytest.mark.parametrize("kind", ["outside", "network", "link-out"])
+@pytest.mark.parametrize("shape", list(_GUARD_SHAPES))
+def test_no_in_use_route_looks_at_a_record_named_path_outside_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+    shape: str, kind: str, mode: list[str],
+) -> None:
+    """The structural guard (rounds 14 to 17 each found one more unfenced read, one reader at a time). Every in-use
+    route (the report, `--apply`, `--release-report`, `--release`) is driven with each shape of record, every field that
+    names a folder filled with an outside path, a network path or an in-fence link that leads out, and damaged or blank
+    neighbours; the calls that ask the file system about a path, and the two Git runners, are spies that record any look
+    at a path outside the fence. Zero looks outside; the checkout is kept. For the link, the fence's own resolution
+    (#913) is the one allowed look, and it is counted apart."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    value = _guard_value(kind, tmp_path, fence)
+    _write_guard_record(repo, shape, value)
+    guard = _install_guard(monkeypatch, fence, tmp_path)
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert guard.outside == [], f"a path outside the fence was looked at: {guard.outside}"
+    assert (done / ".git").exists() and str(done) in _git(repo, "worktree", "list").replace("/", os.sep), text
+    assert "REFUSED (kept)" in text or "KEPT" in text, text  # the checkout is kept, with a reason
+    if kind != "link-out":
+        assert guard.resolved_by_the_fence == [], guard.resolved_by_the_fence  # the fence resolved nothing outside
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+@pytest.mark.parametrize(
+    "where, advice",
+    [("elsewhere", "names a folder that still exists"), ("missing-folder", "to retire this lane without using")],
+    ids=["a-folder-that-is-there", "a-folder-that-is-gone"],
+)
+def test_a_damaged_record_that_names_an_in_fence_path_still_gets_its_recovery_advice(
+    fenced, tmp_path: Path, capsys: pytest.CaptureFixture, mode: list[str], where: str, advice: str,
+) -> None:
+    """The control: the same damaged row (`worktree_path` blank, an absolute `worktree_toplevel_canonical`) with a path
+    INSIDE the fence is still looked at and still gets the advice that says what is there (the other saved path names a
+    folder that exists, or nothing is there), in every mode, with the checkout kept."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    named = fence / where
+    if where == "elsewhere":
+        named.mkdir()
+    row = {"status": "active", "worktree_path": "", "worktree_toplevel_canonical": str(named)}
+    state = repo / ".agenttalk" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}), encoding="utf-8")
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = " ".join(capsys.readouterr().out.split())
+    assert (done / ".git").exists(), text
+    assert advice in text and "outside the fence" not in text, text
+
+
+@pytest.mark.parametrize("network", [False, True], ids=["local", "network"])
+def test_the_recovery_advice_of_a_damaged_lane_row_does_not_look_at_its_other_outside_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, network: bool,
+) -> None:
+    """The review's probe, kept: a row with `worktree_path` empty and an absolute `worktree_toplevel_canonical` outside
+    the fence reached the advice (which looks at that other path to say whether something is still there) before the
+    path was fenced."""
+    from agenttalk import worktree_release
+
+    fence = tmp_path / "fence"
+    repo = fence / "repo"
+    repo.mkdir(parents=True)
+    value = (f"\\\\{_GUARD_HOST}\\share\\x" if os.name == "nt" else f"//{_GUARD_HOST}/share/x") if network else str(
+        tmp_path / _GUARD_FOLDER / "x")
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
+    guard = _install_guard(monkeypatch, fence, tmp_path)
+    row = {"status": "active", "worktree_path": "", "worktree_toplevel_canonical": value}
+
+    with pytest.raises(worktree_release.Refused, match="outside the fence"):
+        worktree_release._names_checkout(row, repo / "checkout", repo, lane_id="one", lane=True)
+
+    assert guard.outside == [], guard.outside
+
+
+@pytest.mark.parametrize(
+    "mode", [pytest.param(["--apply"], id="apply"), pytest.param(["--release", "{done}"], id="release")]
+)
+@pytest.mark.parametrize("kind", ["outside", "network"])
+@pytest.mark.parametrize("shape", ["lane-worktree-path-blank", "launch-request"])
+def test_a_record_written_after_the_first_look_is_fenced_at_the_last_look_too(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+    shape: str, kind: str, mode: list[str],
+) -> None:
+    """The first look finds nothing; the record that names an outside path appears just before the last look (the
+    re-read under the lane writers' lock, made by the sweep and by a release before the removal). That look goes through
+    the same reader and the same fence: nothing outside is looked at and the checkout is kept, not removed."""
+    from agenttalk import worktree_release
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    value = _guard_value(kind, tmp_path, fence)
+    guard = _install_guard(monkeypatch, fence, tmp_path)
+    real_reread = worktree_release.RemovalGuard.reread
+
+    def late(self):
+        _write_guard_record(repo, shape, value)
+        return real_reread(self)
+
+    monkeypatch.setattr(worktree_release.RemovalGuard, "reread", late)
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert guard.outside == [], f"a path outside the fence was looked at: {guard.outside}"
+    assert (done / ".git").exists() and (done / "source.txt").exists(), text  # kept, not removed
+    assert "REFUSED (kept)" in text or "KEPT" in text, text
