@@ -534,7 +534,7 @@ def test_a_checkout_that_appears_under_an_empty_candidate_is_kept_whatever_the_f
     """The report was made with a working listing and the folder looked empty and plain, then an active checkout was
     registered under it. At the delete the listing works (the folder is kept: it changed) or fails (it is kept and
     reported as FAILED): a failed listing is never read as "no checkout". (When the report's own listing failed, every
-    candidate is kept before this point; see the tests of `registered_strict`.)"""
+    candidate is kept before this point; see the tests of an unknown list.)"""
     repo, wt, cfg = estate
     parent = repo / ".probe-parent"
     parent.mkdir()
@@ -546,7 +546,7 @@ def test_a_checkout_that_appears_under_an_empty_candidate_is_kept_whatever_the_f
         return real_git(repo, *args, **kwargs)
 
     report = janitor.build_report(cfg)
-    assert report.registered_strict and any(c.path == parent for c in report.candidates)
+    assert report.registered_worktrees is not None and any(c.path == parent for c in report.candidates)
     real_changed = janitor._checkouts_changed
     created = []
 
@@ -1030,8 +1030,8 @@ def test_the_preview_says_when_the_list_of_checkouts_could_not_be_trusted(estate
 
     text = janitor.format_report(report, cfg, apply=False)
 
-    assert not report.registered_strict and "could not list the registered checkouts reliably" in text, text
-    assert "could not list the registered checkouts reliably" not in healthy, healthy
+    assert report.registered_worktrees is None and "registered worktrees: unknown (" in text, text
+    assert "git worktree list --porcelain -z" in text and "unknown" not in healthy, healthy
 
 
 # ------------------------------------- discovery decides ownership on the same strict list as the report and apply
@@ -1121,4 +1121,4 @@ def test_a_failed_strict_list_at_discovery_keeps_everything_under_worktrees_as_n
 
     assert not [c for c in candidates if c.path.parent == repo / ".worktrees"], candidates
     assert any(path == repo / ".worktrees" for path, _why in errors), errors
-    assert not report.registered_strict and (plain / "note.txt").read_text() == "kept", text
+    assert report.registered_worktrees is None and (plain / "note.txt").read_text() == "kept", text

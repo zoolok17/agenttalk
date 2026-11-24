@@ -698,7 +698,6 @@ def test_janitor_lists_and_asks_git_nothing_outside_the_fence(
         return real_iterdir(path)
 
     monkeypatch.setattr(janitor, "_safe_iterdir", listing)
-    monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside, worktree])
     monkeypatch.setattr(janitor, "_registered_worktrees_listed", lambda repo: [inside, worktree])  # discovery's list
     monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: asked.append(Path(path)) or False)
     assert cli.main(["--root", str(inside), "janitor", *mode]) == 2
@@ -1504,9 +1503,9 @@ def test_ordinary_in_fence_checkouts_are_still_probed_under_the_fence(
 def test_the_report_probes_only_a_strict_list_under_a_fence(
     fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fence_set: bool,
 ) -> None:
-    """`build_report` can be called without the command around it. When the strict list failed it falls back to the old
-    reader for the counts and the preview; under a fence it must not probe those paths (they were never the ones the
-    fence checked). Without a fence the old best-effort probe is unchanged."""
+    """`build_report` can be called without the command around it. When the strict list failed there is no list: no
+    checkout is probed, under a fence or without one (#901; there used to be a best-effort fallback that was probed
+    when no fence was set)."""
     from agenttalk import janitor
 
     fence, _, _ = fenced
@@ -1522,8 +1521,8 @@ def test_the_report_probes_only_a_strict_list_under_a_fence(
 
     report = janitor.build_report(cfg)
 
-    assert not report.registered_strict
-    assert [Path(os.path.realpath(path)) for path in asked] == ([] if fence_set else [Path(os.path.realpath(done))])
+    assert report.registered_worktrees is None and report.registered_unknown
+    assert asked == []
 
 
 @pytest.mark.parametrize("mode", [
@@ -2435,7 +2434,6 @@ def test_janitor_checks_the_worktrees_folder_first(
     listed: list[Path] = []
     real_iterdir = janitor._safe_iterdir
     monkeypatch.setattr(janitor, "_safe_iterdir", lambda path: listed.append(Path(path)) or real_iterdir(path))
-    monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside])
     monkeypatch.setattr(janitor, "_registered_worktrees_listed", lambda repo: [inside])  # discovery's list
     monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: False)
     monkeypatch.setattr(janitor, "_run_git", lambda *args, **kwargs: (0, "", ""))   # no real git, on any code

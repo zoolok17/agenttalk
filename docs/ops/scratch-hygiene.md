@@ -415,6 +415,28 @@ allow-listed name family.
 candidates exist outside the scratch root, so this doesn't need to be
 checked by hand.
 
+**A list of checkouts that Git could not give is unknown, never zero (#901).**
+The report, the sweep and doctor read one list of the registered checkouts,
+`git worktree list --porcelain -z`, which needs Git 2.36 or newer. If it
+cannot be had or read in full (Git missing or not runnable, a non-zero exit
+whatever it printed, output cut short or not valid text, no checkout named)
+the report prints `registered worktrees: unknown (<reason>)` and an unknown
+dirty count, still lists the candidates it can safely find, and says what to do
+(fix the Git problem for that repository, review `safe.directory` for a
+repository you trust, or upgrade Git). `--apply` then fails and keeps every
+folder, links included, with no commit and no prune, even when there is
+nothing to remove; a count after the prune that cannot be read prints
+`registered worktrees after prune: unknown (<reason>)` and fails the sweep.
+Doctor warns that the checkouts could not be checked, and its JSON reports
+`outside_worktrees` as `null` (not `0`); its other keys do not change. Nothing
+retries the list or falls back to the plain text form.
+
+Two limits remain, because the check made at the delete looks only at the
+checkouts *under* a candidate: a checkout registered after the first list
+whose path *contains* the candidate is not seen, and neither is a
+registration made during the delete itself. Both need someone to register a
+checkout in the middle of a sweep.
+
 **Cost.** The ownership check (the `.git`-in-tree walk above) runs for
 every directory candidate, including every registered worktree under
 `.worktrees/` - a full checkout, not just its metadata - on every

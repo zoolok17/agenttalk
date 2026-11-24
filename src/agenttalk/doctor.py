@@ -2040,21 +2040,27 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
     """
     try:
         cfg = janitormod.JanitorConfig.load(project_root)
-        candidates, access_errors = janitormod.find_candidates(cfg)
-        registered = janitormod.get_registered_worktrees(project_root)
+        # One strict list of the registered checkouts, shared by discovery and the outside-checkout count (#901).
+        listing = janitormod._strict_listing(project_root)
+        candidates, access_errors = janitormod.find_candidates(cfg, listing)
     except OSError:
         return None
-    outside_worktrees = [
+    registered, unknown_why = listing
+    # A list that could not be had is UNKNOWN, not "none outside": the count is None (JSON null), never 0.
+    outside_worktrees = None if registered is None else [
         w for w in registered
         if w != project_root and cfg.scratch_root not in w.parents
     ]
     # "scratch-stale" candidates already live under the scratch root (just
     # past keep_days) - not sprawl outside it, so they don't count here.
     outside_candidates = [c for c in candidates if c.reason != "scratch-stale"]
-    if not outside_worktrees and not outside_candidates and not access_errors:
+    if outside_worktrees is not None and not outside_worktrees and not outside_candidates and not access_errors:
         return None
     parts = []
-    if outside_worktrees:
+    if outside_worktrees is None:
+        parts.append(f"the registered checkouts could not be checked ({unknown_why}), so none outside the scratch "
+                     "root were looked for")
+    elif outside_worktrees:
         parts.append(f"{len(outside_worktrees)} registered worktree(s) outside the scratch root")
     if outside_candidates:
         parts.append(f"{len(outside_candidates)} scratch-family candidate(s) outside the scratch root")
@@ -2067,8 +2073,9 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
         name="scratch_hygiene",
         status="warn",
         details="; ".join(parts) + f" (scratch root: {cfg.scratch_root})",
-        fix="run `agenttalk janitor` to report, `agenttalk janitor --apply` to clean up",
-        data={"outside_worktrees": len(outside_worktrees),
+        fix=("run `agenttalk janitor` to report, `agenttalk janitor --apply` to clean up" if registered is not None
+             else f"{janitormod._listing_next_step(unknown_why)}; then run `agenttalk janitor` to report"),
+        data={"outside_worktrees": None if outside_worktrees is None else len(outside_worktrees),
               "outside_candidates": len(outside_candidates),
               "scratch_root": str(cfg.scratch_root)},
     )
