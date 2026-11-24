@@ -2641,12 +2641,19 @@ _GUARD_HOST = "server-858g"  # in the name of the network host of a UNC value
 
 
 class _OutsideGuard:
-    """What the guard saw. `outside`: every look, by the calls listed in `_install_guard`, at a path that lies outside
-    the fence (a path under the test's folder but not under the fence, or a network path), or any Git run in one. The
-    fence's own resolver is NOT exempt, with one exception that is counted apart: when `check_folder_fence` is handed a
-    path that is inside the fence AS WRITTEN (a link in the fence that leads out, #913), its resolution may look at the
-    link's target: those looks are in `resolved_by_the_fence`, not in `outside`. A path that is outside as written gets
-    no such allowance."""
+    """What the guard saw. Every path is classified by the FENCE itself, never by where a test put things: a path is
+    inside when, made absolute (a string operation), it is the fence or below it, as the fence is written or as it
+    resolves; every other path is OUTSIDE, whatever it is and whichever host a network path names. An outside path is
+    never forwarded to the real call: the guard records it in `outside` and answers an error, so nothing there (or
+    on the network) is read.
+
+    `outside` also holds a resolution of an inside-as-written path that LED outside (`os.path.realpath` answered a path
+    outside the fence: that is a link followed to its target, whether or not the platform's own resolver makes visible
+    calls), and a second resolution inside one fence check.
+
+    The one allowance is the fence's own resolution (#913): when `check_folder_fence` is given a path that is inside as
+    written, ONE `os.path.realpath` of exactly that path is let through, and the calls that resolver makes inside it are
+    not counted. It is recorded in `resolved_by_the_fence`, once per fence check, and a test asserts that list."""
 
     def __init__(self) -> None:
         self.outside: list[tuple[str, str]] = []
@@ -2654,61 +2661,98 @@ class _OutsideGuard:
         self.fence_checks: list[str] = []
 
 
-def _install_guard(monkeypatch: pytest.MonkeyPatch, fence: Path, world: Path) -> _OutsideGuard:
-    """Replace every call that asks the file system about a path (and the Git runners) with a spy that records a look at
-    a path outside the fence and answers an error instead of making it, so that a network path is never contacted."""
+def _install_guard(monkeypatch: pytest.MonkeyPatch, fence: Path) -> _OutsideGuard:
+    """Replace every call that asks the file system about a path, and the Git runners, with a spy that classifies the
+    path by the fence (see `_OutsideGuard`). Git itself is found once, before the spies, so that the search of the
+    program folders is not read as a look outside."""
     import pathlib
 
     from agenttalk import janitor, worktree_release
 
     guard = _OutsideGuard()
+    # The standard library looks for message catalogues of the system's language (`/usr/share/locale/...`) whenever
+    # an error text or help is built, on systems that have one: that is the interpreter's own business, not the code
+    # under test. The plain "C" language has no catalogue to look for, so the guard needs no allowance for them.
+    for name in ("LANG", "LANGUAGE", "LC_MESSAGES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LC_ALL", "C")
     inside_roots = {os.path.normcase(os.path.abspath(fence)), os.path.normcase(os.path.realpath(fence))}
-    world_root = os.path.normcase(os.path.abspath(world))
-    exempt = [0]
+    # The folders ABOVE the fence are looked at (never listed) by the check of the configured roots, which walks every
+    # parent from the drive root down ("a linked parent is refused"): a look at one of them is a look at the way to the
+    # fence, not at a place a record names. Only those exact paths, and only by the calls that ask about one path.
+    roots = (fence, Path(os.path.realpath(fence)))
+    ancestors = {os.path.normcase(str(parent)) for root in roots for parent in root.parents}
+    git_exe = shutil.which("git")
+    real_realpath, real_which = os.path.realpath, shutil.which
+    state = {"approved": 0, "scope": None, "scope_used": False}
 
-    def lexically_inside(text: str) -> bool:
+    def inside(text: str) -> bool:
         norm = os.path.normcase(os.path.abspath(text))
         return any(norm == root or norm.startswith(root + os.sep) for root in inside_roots)
 
-    def is_outside(text: str) -> bool:
-        norm = os.path.normcase(os.path.abspath(text))
-        if _GUARD_HOST in norm:
-            return True
-        return norm.startswith(world_root + os.sep) and not lexically_inside(text)
-
-    def note(name: str, value) -> bool:
+    def text_of(value) -> str | None:
         try:
-            text = os.fsdecode(os.fspath(value))
+            return os.fsdecode(os.fspath(value))
         except TypeError:  # a file descriptor, or no path at all
-            return False
-        if not is_outside(text):
-            return False
-        (guard.resolved_by_the_fence if exempt[0] else guard.outside).append((name, text))
-        return True
+            return None
 
-    def watch(name: str, real):
+    def refuse(name: str, text: str) -> None:
+        guard.outside.append((name, text))
+        raise OSError(errno.EIO, "a path outside the fence was looked at (guard)")
+
+    def on_the_way(text: str) -> bool:
+        return os.path.normcase(os.path.abspath(text)) in ancestors
+
+    def watch(name: str, real, *, way_ok: bool = True):
         def spy(path, *args, **kwargs):
-            if note(name, path):
-                raise OSError(errno.EIO, "a path outside the fence was looked at (guard)")
+            text = text_of(path)
+            if text is not None and not state["approved"] and not inside(text) and not (way_ok and on_the_way(text)):
+                refuse(name, text)
             return real(path, *args, **kwargs)
 
         return spy
 
-    calls = [(os, "lstat"), (os, "stat"), (os, "scandir"), (os, "listdir"), (os, "readlink"), (os.path, "realpath"),
-             (os.path, "exists"), (os.path, "lexists"), (os.path, "isdir"), (os.path, "isfile"),
-             (os.path, "samefile")]
+    def realpath_spy(path, *args, **kwargs):
+        text = text_of(path)
+        if text is None or state["approved"]:
+            return real_realpath(path, *args, **kwargs)
+        if not inside(text) and not on_the_way(text):
+            refuse("os.path.realpath", text)
+        if state["scope"] is not None and os.path.normcase(os.path.abspath(text)) == state["scope"]:
+            if state["scope_used"]:
+                refuse("a second resolution inside one fence check", text)
+            state["scope_used"] = True
+            state["approved"] += 1
+            try:
+                result = real_realpath(path, *args, **kwargs)
+            finally:
+                state["approved"] -= 1
+            if not inside(result):
+                guard.resolved_by_the_fence.append(("os.path.realpath", text))
+            return result
+        result = real_realpath(path, *args, **kwargs)
+        if not inside(result):  # a link inside the fence was followed to a place outside it
+            guard.outside.append(("os.path.realpath led outside", f"{text} -> {result}"))
+        return result
+
+    calls = [(os, "lstat"), (os, "stat"), (os, "scandir"), (os, "listdir"), (os, "readlink"), (os.path, "exists"),
+             (os.path, "lexists"), (os.path, "isdir"), (os.path, "isfile"), (os.path, "samefile")]
     if os.name == "nt":
         import nt
 
         calls.append((nt, "_getfinalpathname"))
     for owner, name in calls:
-        monkeypatch.setattr(owner, name, watch(f"{owner.__name__}.{name}", getattr(owner, name)))
-    for method in ("resolve", "exists", "is_dir", "stat", "lstat", "iterdir"):
+        listing = name in ("scandir", "listdir", "readlink")  # these would show what is NEXT to the way, or beyond it
+        monkeypatch.setattr(owner, name, watch(f"{owner.__name__}.{name}", getattr(owner, name), way_ok=not listing))
+    monkeypatch.setattr(os.path, "realpath", realpath_spy)
+    for method in ("exists", "is_dir", "stat", "lstat", "iterdir"):
         real_method = getattr(pathlib.Path, method)
 
-        def path_spy(self, *args, _name=method, _real=real_method, **kwargs):
-            if note(f"Path.{_name}", self):
-                raise OSError(errno.EIO, "a path outside the fence was looked at (guard)")
+        def path_spy(self, *args, _name=f"Path.{method}", _real=real_method, **kwargs):
+            text = text_of(self)
+            way_ok = _name != "Path.iterdir" and text is not None and on_the_way(text)
+            if text is not None and not state["approved"] and not inside(text) and not way_ok:
+                refuse(_name, text)
             return _real(self, *args, **kwargs)
 
         monkeypatch.setattr(pathlib.Path, method, path_spy)
@@ -2716,23 +2760,25 @@ def _install_guard(monkeypatch: pytest.MonkeyPatch, fence: Path, world: Path) ->
         real_git = getattr(owner, name)
 
         def git_spy(repo, *args, _name=f"{owner.__name__}.{name}", _real=real_git, **kwargs):
-            if note(_name, repo):
-                raise OSError(errno.EIO, "git was run in a path outside the fence (guard)")
+            text = text_of(repo)
+            if text is not None and not inside(text):
+                refuse(_name, text)
             return _real(repo, *args, **kwargs)
 
         monkeypatch.setattr(owner, name, git_spy)
+    monkeypatch.setattr(shutil, "which", lambda cmd, *a, **k: git_exe if cmd == "git" else real_which(cmd, *a, **k))
 
     real_check = cli.store_mod.check_folder_fence
 
     def check(folder):
-        guard.fence_checks.append(str(folder))
-        if lexically_inside(os.fspath(folder)):
-            exempt[0] += 1  # the fence's own resolution of a path that is inside as written (#913): counted apart
-            try:
-                return real_check(folder)
-            finally:
-                exempt[0] -= 1
-        return real_check(folder)  # outside as written: the resolver gets no allowance
+        text = text_of(folder)
+        guard.fence_checks.append(str(text))
+        state["scope"] = os.path.normcase(os.path.abspath(text)) if text is not None and inside(text) else None
+        state["scope_used"] = False
+        try:
+            return real_check(folder)
+        finally:
+            state["scope"] = None
 
     monkeypatch.setattr(cli.store_mod, "check_folder_fence", check)
     return guard
@@ -2808,14 +2854,15 @@ def test_no_in_use_route_looks_at_a_record_named_path_outside_the_fence(
     route (the report, `--apply`, `--release-report`, `--release`) is driven with each shape of record, every field that
     names a folder filled with an outside path, a network path or an in-fence link that leads out, and damaged or blank
     neighbours; the calls that ask the file system about a path, and the two Git runners, are spies that record any look
-    at a path outside the fence. Zero looks outside; the checkout is kept. For the link, the fence's own resolution
-    (#913) is the one allowed look, and it is counted apart."""
+    at a path outside the fence (every path is classified by the fence itself and an outside path is never forwarded;
+    a link followed to a target outside is a look too). Zero looks outside; the checkout is kept. For the link, the
+    fence's own resolution (#913) is the one allowed look: exactly one per fence check, counted and asserted."""
     fence, _, _ = fenced
     fence = fence.resolve()
     repo, done = _swept_checkout(fence)
     value = _guard_value(kind, tmp_path, fence)
     _write_guard_record(repo, shape, value)
-    guard = _install_guard(monkeypatch, fence, tmp_path)
+    guard = _install_guard(monkeypatch, fence)
 
     cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
 
@@ -2823,7 +2870,15 @@ def test_no_in_use_route_looks_at_a_record_named_path_outside_the_fence(
     assert guard.outside == [], f"a path outside the fence was looked at: {guard.outside}"
     assert (done / ".git").exists() and str(done) in _git(repo, "worktree", "list").replace("/", os.sep), text
     assert "REFUSED (kept)" in text or "KEPT" in text, text  # the checkout is kept, with a reason
-    if kind != "link-out":
+    named = os.path.normcase(os.path.abspath(value))
+    given = [c for c in guard.fence_checks if os.path.normcase(os.path.abspath(c)) == named]
+    if kind == "link-out":
+        # The accepted resolution (#913), counted: exactly one `realpath` of the link path per fence check that was
+        # handed it, and nothing else. An extra look outside, or a second resolution, is in `outside` and fails above.
+        assert given, "the fence was never asked about the link"
+        expected = [("os.path.realpath", c) for c in given]
+        assert guard.resolved_by_the_fence == expected, (given, guard.resolved_by_the_fence)
+    else:
         assert guard.resolved_by_the_fence == [], guard.resolved_by_the_fence  # the fence resolved nothing outside
 
 
@@ -2872,7 +2927,7 @@ def test_the_recovery_advice_of_a_damaged_lane_row_does_not_look_at_its_other_ou
     value = (f"\\\\{_GUARD_HOST}\\share\\x" if os.name == "nt" else f"//{_GUARD_HOST}/share/x") if network else str(
         tmp_path / _GUARD_FOLDER / "x")
     monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
-    guard = _install_guard(monkeypatch, fence, tmp_path)
+    guard = _install_guard(monkeypatch, fence)
     row = {"status": "active", "worktree_path": "", "worktree_toplevel_canonical": value}
 
     with pytest.raises(worktree_release.Refused, match="outside the fence"):
@@ -2899,7 +2954,7 @@ def test_a_record_written_after_the_first_look_is_fenced_at_the_last_look_too(
     fence = fence.resolve()
     repo, done = _swept_checkout(fence)
     value = _guard_value(kind, tmp_path, fence)
-    guard = _install_guard(monkeypatch, fence, tmp_path)
+    guard = _install_guard(monkeypatch, fence)
     real_reread = worktree_release.RemovalGuard.reread
 
     def late(self):
@@ -2914,3 +2969,88 @@ def test_a_record_written_after_the_first_look_is_fenced_at_the_last_look_too(
     assert guard.outside == [], f"a path outside the fence was looked at: {guard.outside}"
     assert (done / ".git").exists() and (done / "source.txt").exists(), text  # kept, not removed
     assert "REFUSED (kept)" in text or "KEPT" in text, text
+
+
+def test_the_guard_never_forwards_a_path_outside_the_fence_whatever_it_is(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard answers for ANY path outside the fence, not only for the ones a fixture made: a folder beside the
+    fence, a place on the drive root (beyond the folder of the test), a network path on one host and on ANOTHER host, a
+    relative path (the working folder is outside the fence). Each is recorded and answered with an error (`EIO`, which
+    the real call would never give for these), so the path is never touched and no network host is contacted."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    guard = _install_guard(monkeypatch, fence)
+    anchor = Path(tmp_path.anchor)
+    network = ("\\\\other-host-858\\share\\x", "\\\\" + _GUARD_HOST + "\\share\\x") if os.name == "nt" else (
+        "//other-host-858/share/x", "//" + _GUARD_HOST + "/share/x")
+    outside = [str(tmp_path / "beside-the-fence"), str(anchor / "zz-beyond-the-test-folder"), *network, "relative-name"]
+    looks = [os.lstat, os.stat, os.path.exists, os.path.realpath, os.scandir, lambda place: Path(place).exists()]
+    for place in outside:
+        for look in looks:
+            try:
+                look(place)
+            except OSError as exc:
+                assert exc.errno == errno.EIO, (place, exc)  # the guard's own answer, not the file system's
+            else:
+                raise AssertionError(f"a look was let through for {place}")
+    assert len(guard.outside) == len(outside) * 6, guard.outside
+    inside_place = fence / "inside-the-fence"
+    inside_place.mkdir()
+    assert os.path.exists(inside_place) and os.path.realpath(inside_place) == str(inside_place)  # inside: forwarded
+    assert len(guard.outside) == len(outside) * 6 and guard.resolved_by_the_fence == []
+
+
+def test_the_guard_bounds_what_the_fence_may_resolve(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one allowance is the fence's own resolution of the ONE path it is given. A fence check that also makes an
+    extra read of an outside path, or resolves a second time, is not let through: both are recorded as outside looks."""
+    from agenttalk import store as store_mod
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    target = tmp_path / "zz-guard-self-test-target"
+    target.mkdir()
+    link = fence / "self-test-link"
+    _dir_link(link, target)
+    extra = tmp_path / "zz-guard-self-test-extra"
+
+    def greedy_check(folder):
+        os.path.realpath(folder)  # the accepted resolution
+        for extra_look in (lambda: os.path.realpath(folder), lambda: os.lstat(extra)):
+            try:
+                extra_look()  # a second resolution in the same check; an extra read of another outside path
+            except OSError:
+                pass
+
+    monkeypatch.setattr(store_mod, "check_folder_fence", greedy_check)
+    guard = _install_guard(monkeypatch, fence)
+
+    store_mod.check_folder_fence(link / "x")
+
+    assert guard.resolved_by_the_fence == [("os.path.realpath", str(link / "x"))], guard.resolved_by_the_fence
+    names = [name for name, _ in guard.outside]
+    assert "a second resolution inside one fence check" in names, guard.outside
+    assert ("os.lstat", str(extra)) in guard.outside, guard.outside
+
+
+def test_the_guard_counts_a_link_followed_outside_by_anything_but_the_fence_check(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resolution of an inside-as-written link that ends outside the fence is a look at the target, whether or not the
+    platform's resolver makes calls the guard can see (on Windows it does not): outside a fence check it is recorded."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    target = tmp_path / "zz-guard-self-test-target2"
+    target.mkdir()
+    link = fence / "self-test-link2"
+    _dir_link(link, target)
+    guard = _install_guard(monkeypatch, fence)
+
+    os.path.realpath(link)  # not inside a fence check, as the preflight's walk did
+
+    # Where the resolver is written in Python (Linux, macOS) the outside target is looked at by visible calls as well,
+    # and those are recorded too; where it is not (Windows) the result of the resolution is the only evidence.
+    assert "os.path.realpath led outside" in [name for name, _ in guard.outside], guard.outside
+    assert guard.resolved_by_the_fence == []

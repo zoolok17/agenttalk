@@ -229,7 +229,10 @@ def _refuse_elsewhere(repository: Path) -> None:
     for name in _ELSEWHERE_FILES:
         if os.path.lexists(repository / name):
             store_mod.refuse_unplaced(f"git remote origin: {repository / name}, which sends Git to another folder")
-    store_mod.check_second_names(_refuse_links(repository))
+    # The walk that looks for the other names of a hard-linked file follows the links it meets inside the fence, which
+    # resolves each of them: a link inside the fence that leads to an unrelated place outside was looked at (round 18).
+    # Here the links are not followed (the folders they lead to inside the fence are walked as themselves).
+    store_mod.check_second_names(_refuse_links(repository), follow_links=False)
     for name in ("config", "config.worktree"):
         settings = repository / name
         try:
