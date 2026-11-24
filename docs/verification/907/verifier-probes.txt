@@ -1,5 +1,7 @@
-verifier probes: scripts/check_git_job_scheduled_task.ps1 -Mode Verify on made-up logs (run id run-0123456789ab); nothing is registered
+verifier probes: scripts/check_git_job_scheduled_task.ps1 on made-up logs and made-up scheduler states (run id run-0123456789ab); nothing is registered
 exit codes: 0 accepted, 2 no completion evidence, 3 finished but rejected
+
+== part 1: -Mode Verify (the log half only)
 
 Windows PowerShell 5.1
   good                           exit 0  OK: run run-0123456789ab finished with exit=0 and shows its host facts
@@ -24,6 +26,35 @@ PowerShell 7
   exit-0-without-the-facts-line  exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
   facts-line-of-the-old-form     exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
   facts-without-a-session-id     exit 3  REJECT: the host facts do not name "session_id"
+
+== part 2: -Mode Decide (the whole rule: the log AND a made-up scheduler state)
+
+Windows PowerShell 5.1
+  finished log, task Ready                         exit 0  OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  finished log, task Running                       exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Running' 
+  finished log, task Queued                        exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Queued' 
+  finished log, task Disabled                      exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Disabled' 
+  finished log, task Unknown                       exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Unknown' 
+  finished log, no state                           exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is '' 
+  finished log, task not shown by the scheduler    exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the scheduler does not show the task 
+  partial log, task Ready                          exit 2  NO COMPLETION EVIDENCE: the log is 'partial' 
+  non-zero exit, task Ready                        exit 3  REJECT: pytest exit code was 1, not 0
+
+PowerShell 7
+  finished log, task Ready                         exit 0  OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  finished log, task Running                       exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Running' 
+  finished log, task Queued                        exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Queued' 
+  finished log, task Disabled                      exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Disabled' 
+  finished log, task Unknown                       exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Unknown' 
+  finished log, no state                           exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is '' 
+  finished log, task not shown by the scheduler    exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the scheduler does not show the task 
+  partial log, task Ready                          exit 2  NO COMPLETION EVIDENCE: the log is 'partial' 
+  non-zero exit, task Ready                        exit 3  REJECT: pytest exit code was 1, not 0
+
+== part 3: -Mode Task with a stand-in interpreter that writes one line to stderr (nothing is registered)
+
+  Windows PowerShell 5.1: task mode exit 0; last line of its log: exit=0; verifier exit 0: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  PowerShell 7: task mode exit 0; last line of its log: exit=0; verifier exit 0: OK: run run-0123456789ab finished with exit=0 and shows its host facts
 
 dry run (nothing registered): the two registrations it would make
   [interactive] would run: schtasks /Create /TN agenttalk-git-job-check /SC ONCE /ST 23:59 /IT /RU "example-user" /RL LIMITED /TR "<command: this script -Mode Task -ArgsFile <file>>"

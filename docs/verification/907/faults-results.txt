@@ -1,121 +1,148 @@
 planted faults of #907: one result line each (caught = at least one test failed)
-F01-kill-on-close-set: CAUGHT -- 2 failed, 7 deselected in 3.58s
+F01-kill-on-close-set: CAUGHT -- 2 failed, 7 deselected in 6.64s
     tests/test_git_job_windows.py::test_a_normal_write_leaves_the_monitor_it_started_running
     tests/test_git_job_windows.py::test_our_job_has_no_limits
-F02-job-stopped-after-a-normal-run: CAUGHT -- 5 failed, 101 passed in 0.86s
+F02-job-stopped-after-a-normal-run: CAUGHT -- 5 failed, 110 passed in 0.92s
     tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it
     tests/test_git_write_job_907.py::test_a_nonzero_git_exit_closes_without_stopping
     tests/test_git_write_job_907.py::test_the_close[normal-before-ordinary]
     tests/test_git_write_job_907.py::test_the_close[normal-before-first]
-F03-count-before-stop: CAUGHT -- 5 failed, 101 passed in 0.87s
+F03-count-before-stop: CAUGHT -- 6 failed, 109 passed in 0.88s
+    tests/test_git_write_job_907.py::test_a_late_sleep_in_the_final_count_does_not_say_stopped
     tests/test_git_write_job_907.py::test_normal_timeout_stops_the_job_then_kills_reaps_and_counts
     tests/test_git_write_job_907.py::test_reap_timeout_after_a_job_stop
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
-    tests/test_git_write_job_907.py::test_interruption_fallback_stops_the_job
-F04-count-above-zero-drops-the-warning: CAUGHT -- 1 failed, 105 passed in 0.87s
+F04-count-above-zero-drops-the-warning: CAUGHT -- 1 failed, 114 passed in 0.87s
     tests/test_git_write_job_907.py::test_a_count_above_zero_keeps_the_warning
-F05-breakaway-ok-set: CAUGHT -- 1 failed, 1 passed, 7 deselected in 6.72s
+F05-breakaway-ok-set: CAUGHT -- 1 failed, 1 passed, 7 deselected in 6.69s
     tests/test_git_job_windows.py::test_our_job_has_no_limits
-F06-resume-before-assignment: CAUGHT -- 8 failed, 98 passed in 0.88s
+F06-resume-before-assignment: CAUGHT -- 8 failed, 107 passed in 0.91s
     tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it
     tests/test_git_write_job_907.py::test_fallback_rows[refused_assignment_keeps_the_warning]
     tests/test_git_write_job_907.py::test_a_failed_resume_runs_the_bounded_launcher_cleanup
     tests/test_git_job.py::test_the_launcher_is_started_paused_and_resumed_only_after_the_assignment
-F07-assignment-skipped-and-reported-as-done: CAUGHT -- 7 failed, 99 passed in 0.85s
+F07-assignment-skipped-and-reported-as-done: CAUGHT -- 7 failed, 108 passed in 0.88s
     tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it
     tests/test_git_write_job_907.py::test_fallback_rows[refused_assignment_keeps_the_warning]
     tests/test_git_job.py::test_the_launcher_is_started_paused_and_resumed_only_after_the_assignment
     tests/test_git_job.py::test_a_refused_assignment_closes_the_job_resumes_the_launcher_and_goes_on_with_no_job[refused]
-F08-stop-through-the-wrong-handle: CAUGHT -- 33 failed, 73 passed in 0.92s
+F08-stop-through-the-wrong-handle: CAUGHT -- 36 failed, 79 passed in 0.94s
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[prelaunch_step_inside_window]
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[reuse_at_genuine_descendant]
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[cancelled_steps_during_command]
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[below_tolerance_step_during_command]
-F09-close-skipped-on-an-ordinary-error: CAUGHT -- 4 failed, 102 passed in 0.86s
+F09-close-skipped-on-an-ordinary-error: CAUGHT -- 4 failed, 111 passed in 0.89s
     tests/test_git_write_job_907.py::test_an_ordinary_communicate_error_closes_without_stopping
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-ordinary]
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-first]
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-after-first]
-F10-first-interruption-lost-in-the-time-out-handler: CAUGHT -- 9 failed, 97 passed in 0.87s
+F10-first-interruption-lost-in-the-time-out-handler: CAUGHT -- 10 failed, 105 passed in 0.90s
+    tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
     tests/test_git_write_job_907.py::test_the_close[timeout-before-first]
     tests/test_git_write_job_907.py::test_the_close[timeout-after-first]
-    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-second]
-F11-failed-query-read-as-zero: CAUGHT -- 3 failed, 103 passed in 3.93s
+F11-failed-query-read-as-zero: CAUGHT -- 3 failed, 112 passed in 3.91s
     tests/test_git_write_job_907.py::test_a_failed_query_is_not_zero[query_error]
     tests/test_git_write_job_907.py::test_a_failed_query_is_not_zero[query_none]
     tests/test_git_job.py::test_a_failed_query_is_none_never_zero
-F12-failed-stop-with-zero-count-no-warning: CAUGHT -- 2 failed, 104 passed in 0.88s
+F12-failed-stop-with-zero-count-no-warning: CAUGHT -- 2 failed, 113 passed in 0.88s
     tests/test_git_write_job_907.py::test_a_failed_stop_with_zero_count_still_warns
     tests/test_git_write_job_907.py::test_fallback_rows[failed_stop_still_kills]
-F13-timeout-cause-lost: CAUGHT -- 2 failed, 104 passed in 0.84s
+F13-timeout-cause-lost: CAUGHT -- 2 failed, 113 passed in 0.87s
     tests/test_git_write_job_907.py::test_the_close[timeout-before-ordinary]
     tests/test_git_write_job_907.py::test_the_cause_is_still_the_writes_timeout[reaped]
-F14-count-polling-past-the-deadline: CAUGHT -- 2 failed, 104 passed in 4.00s
-    tests/test_git_write_job_907.py::test_an_exhausted_deadline_skips_waits_and_the_count_and_keeps_the_warning
-    tests/test_git_job.py::test_no_count_is_read_when_no_time_is_left
-F15-stop-missing-from-the-ordinary-error-fallback: CAUGHT -- 4 failed, 102 passed in 0.86s
+F14-count-polling-window-longer-than-two-seconds: CAUGHT -- 2 failed, 113 passed in 3.95s
+    tests/test_git_write_job_907.py::test_a_count_above_zero_keeps_the_warning
+    tests/test_git_job.py::test_a_count_that_stays_above_zero_stops_polling_at_the_window_and_returns_it
+F15-stop-missing-from-the-ordinary-error-fallback: CAUGHT -- 4 failed, 111 passed in 0.86s
     tests/test_git_write_job_907.py::test_the_close[fallback_error-before-ordinary]
     tests/test_git_write_job_907.py::test_the_close[fallback_error-before-first]
     tests/test_git_write_job_907.py::test_the_close[fallback_error-after-first]
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
-F16-stop-missing-from-the-interruption-fallback: CAUGHT -- 5 failed, 101 passed in 0.87s
+F16-stop-missing-from-the-interruption-fallback: CAUGHT -- 6 failed, 109 passed in 0.88s
+    tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
     tests/test_git_write_job_907.py::test_the_close[timeout-before-first]
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-second]
-    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-after-second]
-F16b-stop-missing-from-the-interruption-branch-of-the-error-fallback: CAUGHT -- 1 failed, 105 passed in 0.87s
+F16b-stop-missing-from-the-interruption-branch-of-the-error-fallback: CAUGHT -- 1 failed, 114 passed in 0.96s
     tests/test_git_write_job_907.py::test_the_close[fallback_error-before-first]
-F17-call-through-a-handle-after-a-successful-close: CAUGHT -- 2 failed, 104 passed in 3.93s
+F17-call-through-a-handle-after-a-successful-close: CAUGHT -- 2 failed, 113 passed in 3.89s
     tests/test_git_job.py::test_after_a_successful_close_every_call_is_a_no_op_and_nothing_goes_through_the_handle
     tests/test_git_job.py::test_a_close_that_failed_leaves_the_handle_owned_so_a_later_step_can_stop_and_close_it
-F18-close-moved-to-a-bare-outer-finally: CAUGHT -- 8 failed, 98 passed in 0.86s
+F18-close-moved-to-a-bare-outer-finally: CAUGHT -- 8 failed, 107 passed in 0.88s
     tests/test_git_write_job_907.py::test_the_close[timeout-before-ordinary]
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-ordinary]
     tests/test_git_write_job_907.py::test_the_close[fallback_error-before-ordinary]
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
-F19-nonzero-resume-status-taken-as-success: CAUGHT -- 4 failed, 102 passed in 3.99s
+F19-nonzero-resume-status-taken-as-success: CAUGHT -- 4 failed, 111 passed in 4.00s
     tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[1]
     tests/test_git_write_job_907.py::test_a_failed_resume_runs_the_bounded_launcher_cleanup
     tests/test_git_job.py::test_nonzero_status_is_a_resume_failure[positive]
     tests/test_git_job.py::test_the_setup_cleanup_given_by_the_caller_is_the_one_used
-F20-process-list-call-added: CAUGHT -- 14 failed, 92 passed in 0.88s
+F20-process-list-call-added: CAUGHT -- 14 failed, 101 passed in 0.90s
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[prelaunch_step_inside_window]
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[reuse_at_genuine_descendant]
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[cancelled_steps_during_command]
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[below_tolerance_step_during_command]
-F21-count-after-the-close-in-the-ordinary-error-fallback: CAUGHT -- 2 failed, 104 passed in 0.88s
+F21-count-after-the-close-in-the-ordinary-error-fallback: CAUGHT -- 2 failed, 113 passed in 0.87s
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_counts_before_it_closes
-F22-wall-clock-read: CAUGHT -- 10 failed, 96 passed in 3.95s
+F22-wall-clock-read: CAUGHT -- 10 failed, 105 passed in 4.00s
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[prelaunch_step_inside_window]
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[reuse_at_genuine_descendant]
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[cancelled_steps_during_command]
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[below_tolerance_step_during_command]
-F23-close-skipped-after-a-confirmed-time-out: CAUGHT -- 8 failed, 98 passed in 0.87s
+F23-close-skipped-after-a-confirmed-time-out: CAUGHT -- 9 failed, 106 passed in 0.88s
     tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[reuse_at_genuine_descendant]
     tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[cancelled_steps_during_command]
     tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[below_tolerance_step_during_command]
     tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[step_after_stop_sample]
-F24-handle-kept-after-an-interruption-in-the-native-close: CAUGHT -- 6 failed, 100 passed in 3.93s
+F24-handle-kept-after-an-interruption-in-the-native-close: CAUGHT -- 6 failed, 109 passed in 3.90s
     tests/test_git_write_job_907.py::test_the_close[normal-after-first]
     tests/test_git_write_job_907.py::test_the_close[timeout-after-first]
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-after-first]
     tests/test_git_write_job_907.py::test_the_close[fallback_error-after-first]
-F25-reap-not-cut-to-the-deadline: CAUGHT -- 1 failed, 105 passed in 0.86s
+F25-reap-not-cut-to-the-deadline: CAUGHT -- 1 failed, 114 passed in 0.87s
     tests/test_git_write_job_907.py::test_an_exhausted_deadline_skips_waits_and_the_count_and_keeps_the_warning
-F26-wait-not-cut-to-the-deadline: CAUGHT -- 1 failed, 105 passed in 1.08s
+F26-wait-not-cut-to-the-deadline: CAUGHT -- 1 failed, 114 passed in 0.87s
     tests/test_git_write_job_907.py::test_no_wait_runs_past_the_deadline
-F27-hand-over-cleanup-does-not-stop-the-job: CAUGHT -- 4 failed, 102 passed in 0.90s
+F27-hand-over-cleanup-does-not-stop-the-job: CAUGHT -- 5 failed, 110 passed in 0.86s
     tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[1]
     tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[-1073741790]
     tests/test_git_write_job_907.py::test_an_interruption_right_after_the_resume_stops_the_job_git_already_runs_in
-    tests/test_git_write_job_907.py::test_a_failed_resume_runs_the_bounded_launcher_cleanup
-F28-process-listing-call-named-in-the-job-code-only-the-static-guard-sees: CAUGHT -- 1 failed, 37 passed in 3.52s
+    tests/test_git_write_job_907.py::test_an_interruption_at_the_real_hand_over_through_the_write_stops_the_job_git_runs_in
+F28-process-listing-call-named-in-the-job-code-only-the-static-guard-sees: CAUGHT -- 1 failed, 42 passed in 3.39s
     tests/test_git_job.py::test_the_job_code_never_names_a_call_that_walks_processes
-F29-default-cleanup-does-not-stop-the-job: CAUGHT -- 4 failed, 102 passed in 0.86s
+F29-default-cleanup-does-not-stop-the-job: CAUGHT -- 5 failed, 110 passed in 0.87s
     tests/test_git_job.py::test_nonzero_status_is_a_resume_failure[positive]
     tests/test_git_job.py::test_nonzero_status_is_a_resume_failure[access-denied]
     tests/test_git_job.py::test_nonzero_status_is_a_resume_failure[sign-bit]
     tests/test_git_job.py::test_interrupt_at_the_hand_over
+F30-hand-over-return-outside-the-setup-cleanup: CAUGHT -- 3 failed, 112 passed in 0.86s
+    tests/test_git_write_job_907.py::test_an_interruption_at_the_real_hand_over_through_the_write_stops_the_job_git_runs_in
+    tests/test_git_job.py::test_an_interruption_at_the_real_hand_over_return_stops_the_job_and_the_launcher
+    tests/test_git_job.py::test_a_caller_given_cleanup_is_used_for_an_interruption_at_the_real_hand_over_too
+F31-cleanup-clock-read-before-the-protected-sequence: CAUGHT -- 1 failed, 114 passed in 0.87s
+    tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes
+F32-deadline-not-checked-before-each-count-query: CAUGHT -- 2 failed, 113 passed in 3.93s
+    tests/test_git_write_job_907.py::test_a_late_sleep_in_the_final_count_does_not_say_stopped
+    tests/test_git_job.py::test_a_sleep_that_resumes_late_does_not_let_a_count_read_after_the_deadline_say_zero
+F33-late-count-answer-accepted: CAUGHT -- 2 failed, 113 passed in 0.87s
+    tests/test_git_write_job_907.py::test_a_query_that_returns_late_in_the_final_count_does_not_say_stopped
+    tests/test_git_job.py::test_a_query_that_returns_after_the_deadline_is_not_accepted
+F34-scheduler-half-of-the-completion-rule-skipped: CAUGHT -- 12 failed, 40 passed in 33.74s
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[running-powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[running-pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[queued-powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[queued-pwsh]
+F35-any-state-but-running-or-queued-taken-as-finished: CAUGHT -- 6 failed, 46 passed in 33.36s
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[unknown-powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[unknown-pwsh]
+F36-task-mode-keeps-error-preference-stop: CAUGHT -- 1 failed, 51 passed in 32.74s
+    tests/test_git_job_scheduled_task_check.py::test_a_line_on_stderr_does_not_stop_the_task_mode_before_it_writes_its_last_line[powershell]
+F37-marker-ignored-so-real-lane-tests-run-without-a-job: CAUGHT -- 2 failed in 5.88s
+    tests/test_lanes.py::test_m6_assign_provisions_worktree_by_default_and_workspace
+    tests/test_lanes.py::test_786_successful_rollback_removes_worktree_and_branch
 done; the source files were put back with git checkout
