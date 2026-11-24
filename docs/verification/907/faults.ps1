@@ -201,7 +201,10 @@ $faults = @(
       "        if (`$_.FullyQualifiedErrorId -ne `$TaskNotFoundId) { `$none.unreadable = `$true }",
       "        if (`$_.CategoryInfo.Category -ne 'ObjectNotFound') { `$none.unreadable = `$true }")) },
   @{ id = 'F50-no-error-and-no-answer-read-as-a-confirmed-absence'; tests = $sched; edits = @(, @($SCRIPT,
-      "    if (-not `$task) { `$none.unreadable = `$true; return `$none }", "    if (-not `$task) { return `$none }")) }
+      "    if (-not `$task) { `$none.unreadable = `$true; return `$none }", "    if (-not `$task) { return `$none }")) },
+  @{ id = 'F51-a-wrong-task-not-found-error-id'; tests = $sched; edits = @(, @($SCRIPT,
+      "`$TaskNotFoundId = 'CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask'",
+      "`$TaskNotFoundId = 'CmdletizationQuery_NotFound_TaskNam,Get-ScheduledTask'")) }
 )
 
 # Preflight: every file that any selected fault changes (and restores with git checkout) must be tracked and clean.

@@ -620,4 +620,21 @@ F50-no-error-and-no-answer-read-as-a-confirmed-absence: CAUGHT (all 2 by an asse
         [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[no-error-and-no-answer-is-unreadable-pwsh]
         [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
+F51-a-wrong-task-not-found-error-id: CAUGHT (all 8 by an assertion) -- 8 failed, 90 passed in 89.51s (0:01:29)
+    tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[no-such-task-is-a-confirmed-absence-powershell]
+        [assertion] AssertionError: assert (0, 'exists=f...eadable=true') == (0, 'exists=f...adable=false')
+    tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[no-such-task-is-a-confirmed-absence-pwsh]
+        [assertion] AssertionError: assert (0, 'exists=f...eadable=true') == (0, 'exists=f...adable=false')
+    tests/test_git_job_scheduled_task_check.py::test_the_real_scheduler_confirms_the_absence_of_a_task_that_was_never_registered[powershell]
+        [assertion] AssertionError: the real scheduler's not-found id is 'CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask'; the script expects 'CmdletizationQuery_NotFound_TaskNam,Get-ScheduledTask'
+    tests/test_git_job_scheduled_task_check.py::test_the_real_scheduler_confirms_the_absence_of_a_task_that_was_never_registered[pwsh]
+        [assertion] AssertionError: the real scheduler's not-found id is 'CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask'; the script expects 'CmdletizationQuery_NotFound_TaskNam,Get-ScheduledTask'
+    tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f9927b80183a The scheduler could not be read, so it is not known whether a task named stub-task exists. Nothing was registered; fix the...
+    tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-47bdeebabdd1 Exception: <path> Line 243 throw "The scheduler could not be read, so it is not known wh â€¦ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~...
+    tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-55a9e4d86e81 The scheduler could not be read, so it is not known whether a task named stub-task exists. Nothing was registered; fix the...
+    tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f27927c90fdc Exception: <path> Line 243 throw "The scheduler could not be read, so it is not known wh â€¦ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~...
 done; the source files were put back with git checkout

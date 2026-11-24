@@ -499,17 +499,73 @@ def test_the_two_kinds_of_no_from_the_scheduler_are_told_apart(tmp_path, shell, 
     assert ask_for_facts(shell, "-SchedulerStub", str(path)) == (0, expected)
 
 
+# What the real scheduler says, asked on its own and read only (a task name that was never registered): the category,
+# the thing that was not found and the error id, as PowerShell reports them. Nothing in agenttalk's script is used.
+ASK_THE_SCHEDULER = (
+    "try { Get-ScheduledTask -TaskName '{name}' -ErrorAction Stop | Out-Null; 'answered' } "
+    "catch { 'category=' + $_.CategoryInfo.Category + ' target=' + $_.TargetObject "
+    "+ ' fqid=' + $_.FullyQualifiedErrorId }"
+)
+
+
+def ask_the_real_scheduler(shell, name):
+    done = subprocess.run(  # noqa: S603
+        [shell, "-NoProfile", "-Command", ASK_THE_SCHEDULER.replace("{name}", name)],
+        capture_output=True, text=True, timeout=120, check=False,
+    )  # fmt: skip
+    return done.stdout.strip()
+
+
+def the_scheduler_says_no_such_task(raw, name):
+    """(True, the error id) when the raw answer is the scheduler saying that THIS task does not exist: the thing that
+    was not found is the task (its name is the error's target), and it is not a missing command (whose target is the
+    command). Judged without the id that agenttalk expects, so that a wrong expected id cannot hide itself. (False,
+    why) otherwise."""
+    found = re.fullmatch(r"category=(\S*) target=(.*) fqid=(.*)", raw, flags=re.DOTALL)
+    if found is None:
+        return False, raw or "no answer"
+    category, target, fqid = found.groups()
+    if category == "ObjectNotFound" and target == name:
+        return True, fqid
+    return False, raw
+
+
+@pytest.mark.parametrize(
+    "raw, says_no_such_task",
+    [
+        ("category=ObjectNotFound target=never fqid=CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask", True),
+        ("category=ObjectNotFound target=never fqid=SomeOtherId,Get-ScheduledTask", True),  # whatever its id is
+        ("category=ObjectNotFound target=Get-ScheduledTask fqid=CommandNotFoundException", False),  # a missing command
+        ("category=PermissionDenied target=never fqid=HRESULT 0x80070005,Get-ScheduledTask", False),
+        ("answered", False),
+        ("", False),
+    ],
+    ids=["real-answer", "another-id-is-still-a-no-such-task", "missing-command", "access-denied", "found", "no-answer"],
+)
+def test_the_independent_question_tells_no_such_task_from_a_scheduler_that_cannot_be_read(raw, says_no_such_task):
+    assert the_scheduler_says_no_such_task(raw, "never")[0] is says_no_such_task
+
+
 @pytest.mark.skipif(os.name != "nt", reason="the scheduled-task service is a Windows thing")
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
 def test_the_real_scheduler_confirms_the_absence_of_a_task_that_was_never_registered(shell):
-    """A read-only question to the real scheduler about a made-up name (nothing is registered): it answers that there is
-    no such task, which is a confirmed absence and not an unreadable scheduler."""
-    code, text = ask_for_facts(shell, name="agenttalk-no-such-task-907r14")
-    if text == "exists=false unreadable=true":
-        # The scheduler could not be asked at all on this machine (a sandbox that denies the query, say): that is the
-        # right answer for it, and says nothing about the classification, which the stand-in tests above cover.
-        pytest.skip("the scheduler cannot be read on this machine, so a confirmed absence cannot be shown against it")
-    assert (code, text) == (0, "exists=false unreadable=false"), text
+    """Read only, nothing registered. The real scheduler is asked on its own first (the raw category, target and error
+    id). The test is skipped ONLY when that independent question shows that the scheduler cannot be read on this
+    machine (a sandbox that denies the query, a missing module): then nothing can be shown against it. Whenever the
+    scheduler answers that there is no such task, `-Mode Facts` must say the same: absent, and readable. So a wrong
+    error id, or any change that reads a real not-found answer as unreadable, FAILS here on a machine where the
+    scheduler works."""
+    name = "agenttalk-no-such-task-907r16"
+    raw = ask_the_real_scheduler(shell, name)
+    if raw == "answered":
+        pytest.fail(f"a scheduled task named {name} exists on this machine; delete it or change the name of the test")
+    says_no_such_task, evidence = the_scheduler_says_no_such_task(raw, name)
+    if not says_no_such_task:
+        pytest.skip(f"the scheduler cannot be read on this machine (its raw answer: {evidence})")
+    expected = re.search(r"\$TaskNotFoundId = '([^']+)'", SCRIPT.read_text(encoding="utf-8")).group(1)
+    assert evidence == expected, f"the real scheduler's not-found id is {evidence!r}; the script expects {expected!r}"
+    code, text = ask_for_facts(shell, name=name)
+    assert (code, text) == (0, "exists=false unreadable=false"), (text, raw)
 
 
 # --- the scheduler command itself missing is not a task that is gone (round 15) --------------------------------

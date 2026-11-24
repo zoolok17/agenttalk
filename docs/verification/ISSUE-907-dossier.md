@@ -84,8 +84,8 @@ done, and the claims that depend on them say so.
 | The fault runner and its test | `docs/verification/907/faults.ps1`, `tests/test_git_job_fault_runner.py` |
 | The scheduled-task check and its test | `scripts/check_git_job_scheduled_task.ps1`, `tests/test_git_job_scheduled_task_check.py` |
 
-**Test counts at the time of writing:** 233 new tests (43 on the job module, 73 on the write and its time-out paths,
-9 on real Windows with real Git, 2 on the host check, 92 on the scheduled-task script under two PowerShell editions,
+**Test counts at the time of writing:** 239 new tests (43 on the job module, 73 on the write and its time-out paths,
+9 on real Windows with real Git, 2 on the host check, 98 on the scheduled-task script under two PowerShell editions,
 14 on the fault runner);
 two existing real lane tests also carry the marker `real_git_job` now. Lint (`ruff check src tests`) and the
 security scan (`bandit -r src`) report nothing.
@@ -101,9 +101,9 @@ at its real return, the clock call, the late sleep, the late query, and the stde
 26 because a name, a mode or a wording does not exist there (the `Decide` mode, the fixture of the real lane tests, and
 the dry-run wording). With the change, all pass. Part C (the second delta round): the runner tests against the previous runner: 8 of 12 fail, all because of behaviour (it started and discarded edits, or did not refuse). The five new script tests, run under both editions (10 cases), against the previous script with only a test seam added: 6 of 10 fail, all because of behaviour (the accent was lost; a failed deletion returned 0); against the previous script as it was, all 10 fail because a mode or a parameter did not exist there. Part D (the product change of the second delta round): the test for an ordinary error from the clock call that starts the time-out cleanup fails on the previous `cli.py` with `AttributeError: 'NoneType' object has no attribute 'cut'` and passes with the change. Part E (round 14, `907/red-first.txt`): the 18 new scheduler tests, under both editions, against the previous script: 14 fail, 8 because of behaviour (an unreadable scheduler after the delete, or before registering, was read as a task that is gone or as absent; a failed run with an unreadable scheduler lost its warning) and 6 only because the new `Facts` mode did not exist there; the 4 that pass are the combined cases (a run that failed or has no completion evidence, and a task still shown after the delete), which pin a rule the previous script already followed (the run's own code wins, and the warning is printed); the new runner test (a fault that fails six tests must show six rows) fails on the previous runner under both editions and passes now. Part F (round 15, `907/red-first.txt`): the 12 tests added or changed, against the previous script: 10 fail under both editions (a missing `Get-ScheduledTask` command before registering: the run went on to register; the same after the delete: exit 0 and "task deleted" instead of 4; a stand-in that answers nothing, and the missing-command answer itself, read as a confirmed absence), the others pass (the normalizer, the real-scheduler check, the control answers); the colour test cannot reach its assertion on the previous script (nothing is refused there, so there is no error text to colour) and is skipped there; with forced colour the previous way of comparing the error text does not find the words and the new one does (a probe, `907/verifier-probes.txt`).
 
-**Planted faults.** 51 faults (F01 to F50, with F16b), each planted alone in one place, each shown to compile (a script
-is parsed when its tests run it), to be reached, and to fail at least one test, each then put back: all 51 are caught,
-none only as an error. All 51 ran again after the last change (the results file is that run; F43 had to be re-anchored for the new error-id match and was run alone once after the rest). The results file keeps one row for every failing test (round 13 had kept only the first four; F02 has five rows now), each with the first line of its failure, so each catch can be read: 44 faults fail tests by an assertion only, and 7 (F10, F21, F27, F29, F30, F31, F42) also or only by an exception at call time, which is a weaker catch (F42 only by one: the old code asked for a count with no deadline and failed with an AttributeError, which is exactly the real defect that fault stands for). F14 changed in the fix round: the old fault (polling to the full deadline) became an equivalent
+**Planted faults.** 52 faults (F01 to F51, with F16b), each planted alone in one place, each shown to compile (a script
+is parsed when its tests run it), to be reached, and to fail at least one test, each then put back: all 52 are caught,
+none only as an error. All 52 are in the results file (F01 to F50 ran in one run after the round 15 change, F43 re-anchored and run alone once after it; F51, added in round 16, was run alone). The results file keeps one row for every failing test (round 13 had kept only the first four; F02 has five rows now), each with the first line of its failure, so each catch can be read: 45 faults fail tests by an assertion only, and 7 (F10, F21, F27, F29, F30, F31, F42) also or only by an exception at call time, which is a weaker catch (F42 only by one: the old code asked for a count with no deadline and failed with an AttributeError, which is exactly the real defect that fault stands for). F14 changed in the fix round: the old fault (polling to the full deadline) became an equivalent
 one once the count checks the deadline before each query, so it is now "a polling window longer than two seconds".
 
 ---
@@ -147,7 +147,7 @@ one once the count checks the deadline before each query, so it is now "a pollin
    registering and after the delete, in both editions; the error text of PowerShell 7 is compared without its colour
    codes. A reviewer's real-scheduler test that answered `unreadable=true` on its machine is a scheduler that could not
    be asked there (not a finding, and not explained by the new match: the previous category match gave the same answer).
-   A further read is outstanding at the time of writing.
+   A further read found one test gap (round 16).
 
 ---
 
@@ -261,3 +261,10 @@ The second registers the task twice and needs a person at the console for the pa
 Each run is accepted only on its own completion evidence, and an accepted log is copied next to the others. To judge a
 single log without a scheduler: `-Mode Verify -Log <file> -RunId <id>`; to judge it together with a made-up scheduler state
 (the whole rule): `-Mode Decide -Log <file> -RunId <id> -TaskExists true -TaskState Ready`.
+11. **A fifth delta round** (tests only): the test that asks the real scheduler about a task name that was never
+    registered skipped itself whenever `-Mode Facts` answered "unreadable", so a wrong error id, or a change that read a
+    real "no such task" as unreadable, made it skip on a machine where the scheduler works. It now asks the real scheduler
+    first on its own (a read-only `Get-ScheduledTask` in a child; the raw category, target and error id), skips only when
+    that shows that the scheduler cannot be read on the machine, and otherwise requires that the scheduler's error id is the
+    one the script expects and that `-Mode Facts` says absent and readable. The planted fault F51 (a wrong error id) fails
+    it on this machine, under both editions. A further read is outstanding at the time of writing.
