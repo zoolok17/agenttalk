@@ -455,7 +455,12 @@ The CI job ceilings in `.github/workflows/tests.yml` follow from these limits:
   interrupted. Before the split (#378) one job ran all four groups and needed the hosted
   maximum of 360 minutes; 18 such jobs stopped at the previous
   330-minute ceiling with no failing test (see `windows_timeout_reason`).
-- **Linux and macOS: 90 minutes.**
+- **Linux: 90 minutes. macOS: 120 minutes** (#378): on 23 November 2026, eight macOS jobs were
+  stopped at the earlier 90-minute limit without a failing test, while passing macOS jobs took
+  81 to 89 minutes. These two ceilings come from observed job times, not from the test limit:
+  a Linux or macOS job runs the source and the wheel tests one after the other, each with its
+  own 7,200-second limit, so the job ceiling can stop a run before a test limit is reached, and
+  then the evidence file may not be written.
 
 The margins recorded in `windows_timeout_reason` in `dev-gate.json` come from hosted
 runs, and the group limits were retained; changing them needs new evidence. The parts

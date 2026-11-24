@@ -100,6 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do not add up to the whole suite, or when the two wheel pieces tested different wheels. Linux
   and macOS are unchanged.
   `agenttalk dev-gate --ci-leg windows/<python> --part <part>` runs one piece.
+- **macOS test jobs in CI may now run for 120 minutes instead of 90 (#378).** On 23 November
+  2026, eight macOS jobs on master and three pull requests were stopped at the 90-minute limit
+  without a failing test, while passing macOS jobs took 81 to 89 minutes; these stops caused
+  repeated reruns and held merges. The test run's own limit inside the job (7,200 seconds) is
+  unchanged, and Linux keeps 90 minutes.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
