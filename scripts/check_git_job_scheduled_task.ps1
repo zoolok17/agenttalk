@@ -19,13 +19,18 @@
               for the password. The password is typed at that prompt and is never read, stored, logged or printed here.
             Add -DryRun to print every command that would run and register nothing.
             Exit code 0 only when every run was accepted; otherwise the code of the first run that was not (2 or 3).
+    Decide  Judges ONE log together with a MADE-UP scheduler state (-TaskExists, -TaskState), with no scheduler: the whole
+            completion rule that Run applies, so a test can show it. Exit codes as Verify; 2 also when the log is
+            finished but the scheduler does not show the task as finished.
     Task    What the scheduled task itself runs: writes the run id as the first line of the log, then the output of the
             host check, and pytest's own exit code ("exit=<n>") as the last line.
 
-  Completion evidence for a run needs BOTH: the log begins with this run's id and ends with "exit=<n>", and the
-  scheduler shows the task as neither Running nor Queued. "Not Running" alone is never taken as completion (a task can
-  also be Queued). Seeing "Running" at all is not required: a short run can finish between two polls. The scheduler's
-  state, logon type and last result are read with Get-ScheduledTask, which does not depend on the Windows language.
+  Completion evidence for a run needs BOTH halves: the log begins with this run's id and ends with "exit=<n>", AND the
+  scheduler shows the task as Ready (the state a one-time task is in after it ran). Running, Queued, Disabled, Unknown,
+  any other state, and a task the scheduler cannot show, are all "not complete": "not Running" alone is never taken as
+  completion. If the wait ends by its time limit without both halves, the run is NOT accepted (exit code 2), whatever the
+  log holds. Seeing "Running" at all is not required: a short run can finish between two polls. The scheduler's state,
+  logon type and last result are read with Get-ScheduledTask, which does not depend on the Windows language.
 
   A log is acceptable only when the exit code is 0 and it shows the host facts line
   (GitJobHostFacts: git-job-capability: {...}) with the keys windows, session_id and pytest_process_in_a_job.
@@ -45,7 +50,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Run', 'Verify', 'Task')] [string]$Mode = 'Run',
+    [ValidateSet('Run', 'Verify', 'Decide', 'Task')] [string]$Mode = 'Run',
     [ValidateSet('Both', 'Interactive', 'Background')] [string]$Runs = 'Both',
     [string]$Repo = '',
     [string]$Python = 'python',
@@ -57,6 +62,8 @@ param(
     [string]$Log = '',
     [string]$RunId = '',
     [string]$ArgsFile = '',
+    [string]$TaskExists = 'true',  # Decide only: whether the (made-up) scheduler shows the task
+    [string]$TaskState = '',       # Decide only: the (made-up) state of the task
     [int]$CommandLengthLimit = 261,  # what schtasks /TR accepts; only a test lowers or raises it
     [switch]$DryRun
 )
@@ -95,6 +102,27 @@ function Test-Log {
         if (-not ($facts[0] -like "*$key*")) { return @{ code = 3; text = "REJECT: the host facts do not name $key" } }
     }
     return @{ code = 0; text = "OK: run $Id finished with exit=0 and shows its host facts" }
+}
+
+# The one state in which a one-time task is complete after it ran. Anything else, an unknown or disabled task included,
+# is not complete.
+$FinishedStates = @('Ready')
+
+function Test-SchedulerDone {
+    param([bool]$Exists, [string]$State)
+    return ($Exists -and ($State -in $FinishedStates))
+}
+
+function Resolve-Run {
+    # The whole rule, both halves. @{ code = 0|2|3; text = <why> }. A finished log alone is never enough.
+    param([string]$Path, [string]$Id, [bool]$Exists, [string]$State)
+    $evidence = Read-Evidence -Path $Path -Id $Id
+    if ($evidence.state -ne 'finished') { return Test-Log -Path $Path -Id $Id }  # the log half is not met: code 2 and why
+    if (-not (Test-SchedulerDone -Exists $Exists -State $State)) {
+        $shown = if ($Exists) { "the task is '$State'" } else { 'the scheduler does not show the task' }
+        return @{ code = 2; text = "NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but $shown (a run is complete only when the log is finished AND the task is Ready)" }
+    }
+    return Test-Log -Path $Path -Id $Id
 }
 
 function Get-TaskFacts {
@@ -149,7 +177,7 @@ function Invoke-OneRun {
         Write-Host "[$Label] would write $Label.args.json with the repository, interpreter, log, run id and temporary folder"
         Write-Host "[$Label] would run: schtasks $create"
         Write-Host "[$Label] would run: schtasks /Run /TN $TaskName"
-        Write-Host "[$Label] would wait at most $TimeoutSeconds s for a log that starts with run-id=$id and ends with exit=<n>, and for the task to be neither Running nor Queued"
+        Write-Host "[$Label] would wait at most $TimeoutSeconds s for a log that starts with run-id=$id and ends with exit=<n>, and for the task to be Ready (not Running, Queued, Disabled or unknown)"
         Write-Host "[$Label] would judge the log, copy an accepted one, and run: schtasks /Delete /TN $TaskName /F"
         return @{ code = 0 }
     }
@@ -172,13 +200,13 @@ function Invoke-OneRun {
         while ($true) {
             $evidence = Read-Evidence -Path $logPath -Id $id
             $task = Get-TaskFacts
-            if ($evidence.state -eq 'finished' -and $task.exists -and $task.status -notin @('Running', 'Queued')) { break }
-            if ((Get-Date) -gt $deadline) { break }
+            if ($evidence.state -eq 'finished' -and (Test-SchedulerDone -Exists $task.exists -State $task.status)) { break }
+            if ((Get-Date) -gt $deadline) { break }  # the time limit: what was seen is judged below, and is not enough alone
             Start-Sleep -Seconds 5
         }
         $task = Get-TaskFacts
         Write-Host "[$Label] registered mode: $($task.logon); last result: $($task.result)"
-        $judged = Test-Log -Path $logPath -Id $id
+        $judged = Resolve-Run -Path $logPath -Id $id -Exists $task.exists -State $task.status
         Write-Host "[$Label] $($judged.text)"
         if ($judged.code -eq 0) {
             Copy-Item -LiteralPath $logPath -Destination (Join-Path $OutDir "$Label-accepted.log") -Force
@@ -202,17 +230,26 @@ switch ($Mode) {
         Write-Output $judged.text
         exit $judged.code
     }
+    'Decide' {
+        if (-not $Log -or -not $RunId) { Write-Output 'Decide needs -Log and -RunId'; exit 9 }
+        $judged = Resolve-Run -Path $Log -Id $RunId -Exists ($TaskExists -eq 'true') -State $TaskState
+        Write-Output $judged.text
+        exit $judged.code
+    }
     'Task' {
         if ($ArgsFile) {
             $saved = Get-Content -Raw -LiteralPath $ArgsFile | ConvertFrom-Json
             $Repo = $saved.Repo; $Python = $saved.Python; $Log = $saved.Log; $RunId = $saved.RunId; $BaseTemp = $saved.BaseTemp
         }
         if (-not $Log -or -not $RunId -or -not $BaseTemp) { Write-Output 'Task needs -Log, -RunId and -BaseTemp (or -ArgsFile)'; exit 9 }
+        # Windows PowerShell 5.1 turns a stderr line of a native command (redirected with 2>&1) into a terminating error
+        # while the preference is Stop, which would end this before it wrote "exit=<n>". Native output is only text here.
+        $ErrorActionPreference = 'Continue'
         Set-Location -LiteralPath $Repo
         "run-id=$RunId" | Out-File -LiteralPath $Log -Encoding ascii
-        (& where.exe git 2>&1 | Out-String).Trim() | Out-File -LiteralPath $Log -Append -Encoding ascii  # which Git this user's PATH gives
+        (& where.exe git 2>&1 | ForEach-Object { "$_" } | Out-String).Trim() | Out-File -LiteralPath $Log -Append -Encoding ascii  # which Git this user's PATH gives
         & $Python -m pytest tests/test_git_job_capability.py -m windows_capability -p no:cacheprovider --basetemp $BaseTemp 2>&1 |
-            Out-File -LiteralPath $Log -Append -Encoding utf8
+            ForEach-Object { "$_" } | Out-File -LiteralPath $Log -Append -Encoding utf8
         $code = $LASTEXITCODE
         "exit=$code" | Out-File -LiteralPath $Log -Append -Encoding ascii
         exit $code

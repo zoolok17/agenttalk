@@ -83,12 +83,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list of itself, which every program Git starts (hooks, content filters and their children) joins. If the
   command runs past its time limit, agenttalk stops the whole group in one step, collects the launcher, checks
   that nothing in the group is left, closes the group, and only then says that Git and the programs in its
-  Windows job were stopped. If the group could not be made or used, or could not be shown empty, the error
-  keeps the earlier warning that a program may still be running. A normal run is never stopped: nothing in the
-  group ends with it, so a helper that Git starts on purpose, such as its file-system monitor, keeps running.
+  Windows job were stopped. If the group could not be made, or Windows would not put Git in it, or it could not
+  be shown empty, the error keeps the earlier warning that a program may still be running. If the paused Git cannot
+  be let go (a missing, failing or refused system call to resume it), the write now fails to start instead of running
+  Git as the earlier code did; the paused Git is stopped and nothing is left running. A normal run is never stopped:
+  nothing in the group ends with it, so a helper that Git starts on purpose, such as its file-system monitor, keeps running.
   A program in the group that asks to break away from it stays in it. Nothing is launched while the time-out is
-  handled, and no process list, process id or start time is read to decide whom to stop. All of the time-out
-  clean-up now shares one 30 second limit. A program that another process starts on Git's behalf (a
+  handled, and no process list, process id or start time is read to decide whom to stop. With a job, all of the
+  time-out clean-up shares one 30 second limit (a count read after that limit has passed is not taken as proof,
+  and an interruption during the start, right after Git was let go included, or during the time-out handling still
+  stops the job); a write without a job keeps
+  the earlier waits. A program that another process starts on Git's behalf (a
   service or a scheduled task) was never in the group and is not covered. A partial checkout or a Git lock may
   still need recovery.
 

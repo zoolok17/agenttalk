@@ -6,7 +6,7 @@ import subprocess
 import time
 
 import pytest
-from _git_job_fake import JOB, LAUNCHER_HANDLE, FakeClock, FakeWorld, raising
+from _git_job_fake import JOB, LAUNCHER_HANDLE, FakeClock, FakeWorld, interrupt_at_the_hand_over, raising
 
 from agenttalk import cli, git_job
 
@@ -190,6 +190,34 @@ def test_interrupt_at_the_hand_over(monkeypatch):
     assert world.terminated_jobs == 1 and names(world).index("terminate") < names(world).index("close")
 
 
+def test_an_interruption_at_the_real_hand_over_return_stops_the_job_and_the_launcher(monkeypatch):
+    """After the resume really returned (Git runs in the job), at the return that gives the caller its launcher and job:
+    the setup cleanup still owns both, so it stops the job, kills the launcher and closes the job, and the interruption
+    is the one raised. (The test above raises from the fake resume's after-hook, which is inside the protected call.)"""
+    world = FakeWorld()
+    world.install(monkeypatch, script=[])
+    first = KeyboardInterrupt("at the return")
+    with interrupt_at_the_hand_over(first) as fired:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            git_job.start_in_job(CMD, **KW)
+    log = names(world)
+    assert fired and raised.value is first and world.proc.dead
+    assert (
+        log.index("resume") < log.index("terminate") < log.index("close")
+    )  # Git had been resumed, then it was stopped
+    assert world.terminated_jobs == 1 and world.closed == {JOB} and world.violations == []
+
+
+def test_a_caller_given_cleanup_is_used_for_an_interruption_at_the_real_hand_over_too(monkeypatch):
+    world = FakeWorld()
+    world.install(monkeypatch, script=[])
+    seen = []
+    with interrupt_at_the_hand_over(KeyboardInterrupt("at the return")):
+        with pytest.raises(KeyboardInterrupt):
+            git_job.start_in_job(CMD, reap=lambda proc, job: seen.append((proc, job)), **KW)
+    assert len(seen) == 1 and seen[0][0] is world.proc and seen[0][1] is not None
+
+
 def test_a_second_interruption_during_the_setup_cleanup_is_absorbed_and_the_first_is_raised(monkeypatch):
     world = FakeWorld()
     first = KeyboardInterrupt("first")
@@ -333,6 +361,43 @@ def test_no_count_is_read_when_no_time_is_left(monkeypatch):
     before = names(world).count("query")
     assert job.count_after_stop(deadline) is None
     assert names(world).count("query") == before  # not even one query
+
+
+def count_job(monkeypatch, left):
+    """(clock, world, job, deadline) with `left` seconds of the shared cleanup deadline still to run."""
+    clock = FakeClock()
+    world = FakeWorld(clock=clock)
+    world.install(monkeypatch, script=[])
+    _proc, job = git_job.start_in_job(CMD, **KW)
+    deadline = git_job.Deadline()
+    clock.now += git_job.CLEANUP_SECONDS - left
+    return clock, world, job, deadline
+
+
+def test_a_sleep_that_resumes_late_does_not_let_a_count_read_after_the_deadline_say_zero(monkeypatch):
+    """0.01 s left, counts [1, 0], and a sleep that resumes a second late: the second query would be made a second after
+    the limit and would answer 0. The deadline is checked again before each query, so there is no second query."""
+    clock, world, job, deadline = count_job(monkeypatch, left=0.01)
+    world.counts = [1, 0]
+    monkeypatch.setattr(git_job, "_sleep", lambda seconds: setattr(clock, "now", clock.now + seconds + 1.0))
+    assert job.count_after_stop(deadline) is None
+    assert names(world).count("query") == 1
+
+
+def test_a_query_that_returns_after_the_deadline_is_not_accepted(monkeypatch):
+    """The first query itself runs past the limit and answers 0: an answer that came back late is not a confirmation."""
+    clock, world, job, deadline = count_job(monkeypatch, left=0.5)
+    world.counts = [0]
+    world.hooks["query"] = [lambda: setattr(clock, "now", clock.now + 1.0)]
+    assert job.count_after_stop(deadline) is None
+    assert names(world).count("query") == 1
+
+
+def test_a_count_read_in_time_after_an_exact_sleep_is_still_accepted(monkeypatch):
+    clock, world, job, deadline = count_job(monkeypatch, left=1.0)
+    world.counts = [1, 0]
+    assert job.count_after_stop(deadline) == 0
+    assert names(world).count("query") == 2
 
 
 def test_the_deadline_cuts_a_limit_to_what_is_left_and_never_below_zero(monkeypatch):

@@ -47,6 +47,11 @@ if ($dirty.Count -gt 0) { throw "Refusing to start: $CLI or $JOB has uncommitted
 $fake = @('tests/test_git_write_job_907.py', 'tests/test_git_job.py')
 $real = @('tests/test_git_job_windows.py', '-k', 'limits or monitor')
 $static = @('tests/test_git_job.py')
+$sched = @('tests/test_git_job_scheduled_task_check.py')
+$lane = @('tests/test_lanes.py::test_m6_assign_provisions_worktree_by_default_and_workspace',
+          'tests/test_lanes.py::test_786_successful_rollback_removes_worktree_and_branch')
+$CONF = 'tests/conftest.py'
+$SCRIPT = 'scripts/check_git_job_scheduled_task.ps1'
 
 $setlimit = @'
         handle = self._kernel.CreateJobObjectW(None, None)
@@ -92,8 +97,8 @@ $faults = @(
       "    return job.stop_succeeded and count == 0", "    return count == 0")) },
   @{ id = 'F13-timeout-cause-lost'; tests = $fake; edits = @(, @($CLI,
       "        _close_job(job)`n        raise error from timed_out", "        _close_job(job)`n        raise error")) },
-  @{ id = 'F14-count-polling-past-the-deadline'; tests = $fake; edits = @(, @($JOB,
-      "        limit = deadline.cut(COUNT_SECONDS)", "        limit = COUNT_SECONDS")) },
+  @{ id = 'F14-count-polling-window-longer-than-two-seconds'; tests = $fake; edits = @(, @($JOB,
+      "        limit = deadline.cut(COUNT_SECONDS)", "        limit = deadline.cut(CLEANUP_SECONDS)")) },
   @{ id = 'F15-stop-missing-from-the-ordinary-error-fallback'; tests = $fake; edits = @(, @($CLI,
       "_kill_and_reap(proc, interruptible=True, job=job, stop_job=True, close_job=False, deadline=deadline)",
       "_kill_and_reap(proc, interruptible=True, job=job, stop_job=False, close_job=False, deadline=deadline)")) },
@@ -135,7 +140,27 @@ $faults = @(
       "        return bool(self._kernel.CloseHandle(handle))",
       "        self._kernel.OpenProcess(0x1000, False, 0)  # planted`n        return bool(self._kernel.CloseHandle(handle))")) },
   @{ id = 'F29-default-cleanup-does-not-stop-the-job'; tests = $fake; edits = @(, @($JOB,
-      "            job.stop()`n    with contextlib.suppress(BaseException):`n        proc.kill()", "            pass`n    with contextlib.suppress(BaseException):`n        proc.kill()")) }
+      "            job.stop()`n    with contextlib.suppress(BaseException):`n        proc.kill()", "            pass`n    with contextlib.suppress(BaseException):`n        proc.kill()")) },
+  @{ id = 'F30-hand-over-return-outside-the-setup-cleanup'; tests = $fake; edits = @(, @($JOB,
+      "        return proc, job`n    except BaseException:`n        clean_up()`n        raise`n",
+      "    except BaseException:`n        clean_up()`n        raise`n    return proc, job`n")) },
+  @{ id = 'F31-cleanup-clock-read-before-the-protected-sequence'; tests = $fake; edits = @(
+      @($CLI, "            deadline = git_job.Deadline()`n            job.stop()", "            job.stop()"),
+      @($CLI, "    deadline = None`n    try:`n        if job is not None:`n            from agenttalk import git_job`n",
+              "    deadline = None`n    if job is not None:`n        from agenttalk import git_job`n`n        deadline = git_job.Deadline()`n    try:`n        if job is not None:`n")) },
+  @{ id = 'F32-deadline-not-checked-before-each-count-query'; tests = $fake; edits = @(, @($JOB,
+      "            if deadline.left() <= 0:  # before each query: the absolute limit, whatever the last sleep really took`n                return None`n", "")) },
+  @{ id = 'F33-late-count-answer-accepted'; tests = $fake; edits = @(, @($JOB,
+      "            if deadline.left() <= 0:  # before the answer is accepted: a query that returned late does not count`n                return None`n", "")) },
+  @{ id = 'F34-scheduler-half-of-the-completion-rule-skipped'; tests = $sched; edits = @(, @($SCRIPT,
+      "    if (-not (Test-SchedulerDone -Exists `$Exists -State `$State)) {", "    if (`$false) {")) },
+  @{ id = 'F35-any-state-but-running-or-queued-taken-as-finished'; tests = $sched; edits = @(, @($SCRIPT,
+      "    return (`$Exists -and (`$State -in `$FinishedStates))", "    return (`$Exists -and (`$State -notin @('Running', 'Queued')))")) },
+  @{ id = 'F36-task-mode-keeps-error-preference-stop'; tests = $sched; edits = @(, @($SCRIPT,
+      "        `$ErrorActionPreference = 'Continue'`n", "")) },
+  @{ id = 'F37-marker-ignored-so-real-lane-tests-run-without-a-job'; tests = $lane; edits = @(, @($CONF,
+      "    if request.node.get_closest_marker(`"real_git_job`") or request.node.get_closest_marker(`"windows_capability`"):",
+      "    if request.node.get_closest_marker(`"windows_capability`"):")) }
 )
 
 $lines = @("planted faults of #907: one result line each (caught = at least one test failed)")
@@ -158,7 +183,9 @@ foreach ($f in $faults) {
   try {
     foreach ($p in $files.Keys) { [IO.File]::WriteAllText($p, $files[$p]) }
     $compiled = $true
-    foreach ($p in $files.Keys) { & $Python -m py_compile $p 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { $compiled = $false } }
+    foreach ($p in $files.Keys) {
+      if ($p -like '*.py') { & $Python -m py_compile $p 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { $compiled = $false } }
+    }  # only Python sources are compiled here; a script is parsed when its tests run it
     if (-not $compiled) { $lines += "$($f.id): DOES NOT COMPILE"; continue }
     $log = & $Python -m pytest @($f.tests) -q --no-header --tb=no -rfE -p no:cacheprovider "--basetemp=$BaseTemp" 2>&1
     $failed = @($log | Where-Object { $_ -match '^(FAILED|ERROR) ' })

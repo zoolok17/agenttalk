@@ -3579,12 +3579,13 @@ def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.Timeout
     real interruption propagates as such.
     """
     deadline = None
-    if job is not None:
-        from agenttalk import git_job
-
-        deadline = git_job.Deadline()
     try:
         if job is not None:
+            from agenttalk import git_job
+
+            # Inside the protected sequence: an interruption of the clock call itself still stops the job, kills and
+            # reaps the launcher and closes the job (with the standard waits, as no shared deadline exists yet).
+            deadline = git_job.Deadline()
             job.stop()  # the first step; it can be repeated safely
         # kill() can itself raise (PermissionError on Windows,
         # ProcessLookupError if the child already exited) - guarded so it

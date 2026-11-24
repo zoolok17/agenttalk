@@ -183,13 +183,19 @@ class GitJob:
 
     def count_after_stop(self, deadline: Deadline) -> int | None:
         """The live count after a stop and the launcher's reap, polled until it is 0 or `COUNT_SECONDS` (cut to the
-        deadline) has passed. None: it could not be read, or no time was left; the caller then keeps its warning."""
+        deadline) has passed. None: it could not be read, or the shared deadline had passed before a query or by the
+        time its answer came back (a sleep or a query that runs late is not given the benefit of a count read after
+        the limit); the caller then keeps its warning."""
         limit = deadline.cut(COUNT_SECONDS)
         if limit <= 0:
             return None
         end = _monotonic() + limit
         while True:
+            if deadline.left() <= 0:  # before each query: the absolute limit, whatever the last sleep really took
+                return None
             count = self.live_count()
+            if deadline.left() <= 0:  # before the answer is accepted: a query that returned late does not count
+                return None
             if count is None or count == 0 or _monotonic() >= end:
                 return count
             _sleep(min(_COUNT_POLL_SECONDS, max(0.0, end - _monotonic())))
@@ -273,14 +279,15 @@ def start_in_job(
             status = int(native.resume(process))  # step 4
         except Exception as exc:  # noqa: BLE001
             status, resume_error = -1, str(exc) or type(exc).__name__
+        if status != 0:
+            detail = resume_error or f"status {status & 0xFFFFFFFF:#010x}"
+            raise JobStartError(f"could not resume it ({detail})")  # the cleanup below runs, then this is raised
+        # Step 5, the hand-over, is still inside the boundary: an interruption at this very return, after Git was
+        # resumed, stops the job and the launcher too, because the caller does not own them until the return is done.
+        return proc, job
     except BaseException:
         clean_up()
         raise
-    if status != 0:
-        clean_up()
-        detail = resume_error or f"status {status & 0xFFFFFFFF:#010x}"
-        raise JobStartError(f"could not resume it ({detail})")
-    return proc, job  # step 5
 
 
 def _default_reap(proc: Any, job: GitJob | None) -> None:

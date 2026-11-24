@@ -432,15 +432,49 @@ class _NoJobNative:
 
 @pytest.fixture(autouse=True)
 def _git_jobs_off_unless_asked(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
-    """#907: in the product a changing Git command on Windows runs in a Windows job of its own. Every other test is
-    about its own subject, and many stand in for `subprocess.Popen`, so no job is made for them (the layer refuses to
-    create one, which is the path without a job). The tests of the job itself install a fake layer of their own, or
-    carry the marker `real_git_job` and use the real one. The host check (`windows_capability`) uses no product code."""
+    """#907: in the product a changing Git command on Windows runs in a Windows job of its own. Many tests are about
+    another subject and stand in for `subprocess.Popen` (a stand-in has no process handle), so no job is made for them
+    (the layer refuses to create one, which is the path without a job). The tests of the job itself install a fake
+    layer of their own, or carry the marker `real_git_job` and use the real one. So that the rest of the suite does not
+    lose the default path altogether, representative REAL flows carry the marker too, and end with
+    `job_starts.assert_used()` to show a job was really used: a real lane assignment (the success case) and a real
+    rollback that removes the checkout (the recovery case), in `tests/test_lanes.py`. The host check
+    (`windows_capability`) uses no product code."""
     if request.node.get_closest_marker("real_git_job") or request.node.get_closest_marker("windows_capability"):
         return  # the host check tests the operating system and imports nothing of the product
     from agenttalk import git_job
 
     monkeypatch.setattr(git_job, "_load_native", _NoJobNative)
+
+
+class _JobStarts(list):
+    """The `(command, job)` of every changing Git command that went through `git_job.start_in_job`."""
+
+    def assert_used(self) -> None:
+        """On Windows: the default job path really ran (at least one start, each with a job, each closed). Elsewhere the
+        product never uses a job and nothing is checked."""
+        if os.name == "nt":
+            assert self, "the product's default job path was not used: no changing Git command went through a job"
+            assert all(job is not None for _cmd, job in self), "a changing Git command ran without a job"
+            assert all(job.handle is None for _cmd, job in self), "a job was not closed when its write ended"
+
+
+@pytest.fixture
+def job_starts(monkeypatch: pytest.MonkeyPatch) -> _JobStarts:
+    """For a test that carries `real_git_job` and runs a real flow: it ends with `job_starts.assert_used()`, so the
+    marker cannot hide that the job was silently off."""
+    from agenttalk import git_job
+
+    starts = _JobStarts()
+    real = git_job.start_in_job
+
+    def watching(cmd, **kwargs):
+        proc, job = real(cmd, **kwargs)
+        starts.append((cmd, job))
+        return proc, job
+
+    monkeypatch.setattr(git_job, "start_in_job", watching)
+    return starts
 
 
 # --- #50: wheel-isolation test scoping ------------------------------------

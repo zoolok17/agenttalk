@@ -13,6 +13,7 @@ from _git_job_fake import (
     FakeClock,
     FakeWorld,
     PosixOS,
+    interrupt_at_the_hand_over,
     raising,
     run_write,
 )
@@ -232,6 +233,58 @@ def test_an_interruption_right_after_the_resume_stops_the_job_git_already_runs_i
     log = names(world)
     assert log.count("terminate") == 1 and log.index("resume") < log.index("terminate") < log.index("close")
     assert world.closed == {JOB} and world.violations == []
+
+
+def test_an_interruption_at_the_real_hand_over_through_the_write_stops_the_job_git_runs_in(monkeypatch, tmp_path):
+    """The same point through `cli._git_write`: after the resume returned, at the return of `start_in_job`. The write's
+    own cleanup is the caller-given one: it stops the job, then closes it, and the interruption is the one raised."""
+    world = make(monkeypatch)
+    first = KeyboardInterrupt("at the return")
+    with interrupt_at_the_hand_over(first) as fired:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            run_write(tmp_path)
+    log = names(world)
+    assert fired and raised.value is first
+    assert log.index("resume") < log.index("terminate") < log.index("close")
+    assert world.closed == {JOB} and world.violations == [] and world.proc.dead
+
+
+def test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes(monkeypatch, tmp_path):
+    """`Deadline()` reads the clock before anything else of the time-out handling. An interruption of that call must
+    not escape with no stop, kill, reap or close: the first interruption is raised after the best-effort cleanup (which
+    has no shared deadline yet, so it uses the standard waits)."""
+    world = make(monkeypatch, clock=True)
+    first = KeyboardInterrupt("in the clock")
+    interrupt_once = raising(first)
+    real = git_job._monotonic
+    monkeypatch.setattr(git_job, "_monotonic", lambda: (interrupt_once(), real())[1])
+    with pytest.raises(KeyboardInterrupt) as raised:
+        run_write(tmp_path)
+    log = names(world)
+    assert raised.value is first
+    assert log.count("terminate") == 1 and "kill" in log and log[-1] == "close"
+    assert world.closed == {JOB} and world.violations == []
+
+
+def test_a_late_sleep_in_the_final_count_does_not_say_stopped(monkeypatch, tmp_path):
+    """0.01 s of the shared limit left after the stop, counts [1, 0], and a sleep that resumes a second late: the count
+    that would say 0 is not read, so the error keeps the warning and does not say the job was stopped."""
+    world = make(monkeypatch, clock=True)
+    world.hooks["terminate"] = [lambda: setattr(world.clock, "now", world.clock.now + 29.99)]
+    world.counts = [1, 0]
+    monkeypatch.setattr(git_job, "_sleep", lambda seconds: setattr(world.clock, "now", world.clock.now + seconds + 1.0))
+    error = timeout_error(tmp_path)
+    assert WARNING in str(error) and STOPPED not in str(error)
+    assert names(world).count("query") == 1 and names(world)[-1] == "close"
+
+
+def test_a_query_that_returns_late_in_the_final_count_does_not_say_stopped(monkeypatch, tmp_path):
+    world = make(monkeypatch, clock=True)
+    world.hooks["terminate"] = [lambda: setattr(world.clock, "now", world.clock.now + 29.0)]  # 1 s left
+    world.counts = [0]
+    world.hooks["query"] = [lambda: setattr(world.clock, "now", world.clock.now + 2.0)]  # the query takes 2 s
+    error = timeout_error(tmp_path)
+    assert WARNING in str(error) and STOPPED not in str(error)
 
 
 # --- the close, in every ending -----------------------------------------------------------------------------------

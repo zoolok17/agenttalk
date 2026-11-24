@@ -935,7 +935,8 @@ def test_m8_lane_id_strict_and_branch_derived() -> None:
             lanes.validate_lane_id(bad)
 
 
-def test_m6_assign_provisions_worktree_by_default_and_workspace(tmp_path: Path, capsys) -> None:
+@pytest.mark.real_git_job  # a real assignment: on Windows its changing Git commands run in a job, as in the product
+def test_m6_assign_provisions_worktree_by_default_and_workspace(tmp_path: Path, capsys, job_starts) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base)
     wt = Path(lane["worktree_path"])
@@ -948,6 +949,7 @@ def test_m6_assign_provisions_worktree_by_default_and_workspace(tmp_path: Path, 
     assert _run_raw(["lane", "workspace", "--id", "lwt", "--json"], root) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["worktree_path"] == str(wt)
+    job_starts.assert_used()  # on Windows the add ran in a job, as in the product
 
 
 def test_m1_m3_canonical_paths_and_common_git_dir_match(tmp_path: Path) -> None:
@@ -7818,7 +7820,8 @@ def test_786_failed_setup_keeps_worktree_file_and_branch_then_allows_operator_re
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
 
 
-def test_786_successful_rollback_removes_worktree_and_branch(tmp_path, capsys, monkeypatch):
+@pytest.mark.real_git_job  # a real add and a real removal: on Windows each runs in a job, as in the product
+def test_786_successful_rollback_removes_worktree_and_branch(tmp_path, capsys, monkeypatch, job_starts):
     root, base = _repo(tmp_path)
     lane_id = "clean-setup"
     real_verify, created = cli._verify_lane_worktree, []
@@ -7834,6 +7837,7 @@ def test_786_successful_rollback_removes_worktree_and_branch(tmp_path, capsys, m
     assert len(created) == 1 and not created[0].exists()
     assert not _lane_branch_present(root, lane_id)
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    job_starts.assert_used()  # on Windows the add and the removal each ran in a job, as in the product
 
 
 @pytest.mark.parametrize("failure", ["exception", "return"])

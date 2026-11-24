@@ -13,7 +13,10 @@ The world:
   anything that would walk process ids or times (`snapshot`, `open_process`, `process_times`).
 """
 
+import contextlib
+import inspect
 import subprocess
+import sys
 
 JOB = 7001  # the job handle the fake hands out
 LAUNCHER_HANDLE = 5005  # the handle Popen "holds" for the launcher
@@ -294,6 +297,36 @@ class FakeWorld:
             monkeypatch.setattr(git_job, "_monotonic", self.clock.monotonic)
             monkeypatch.setattr(git_job, "_sleep", self.clock.sleep)
         return self
+
+
+@contextlib.contextmanager
+def interrupt_at_the_hand_over(error):
+    """Raise `error` inside `git_job.start_in_job` at its line `return proc, job`: after Git was resumed, at the point
+    where the caller is about to be given the launcher and the job. A trace hook raises it in that frame at that line,
+    as a Ctrl-C landing there would. (The fake resume's own after-hook is a different point: it is still inside the
+    protected call.) Yields the list that is filled when the interruption was raised."""
+    from agenttalk import git_job
+
+    code = git_job.start_in_job.__code__
+    lines, first = inspect.getsourcelines(git_job.start_in_job)
+    target = first + next(n for n, text in enumerate(lines) if text.strip().startswith("return proc, job"))
+    fired = []
+
+    def local(frame, event, arg):
+        if event == "line" and frame.f_lineno == target and not fired:
+            fired.append(target)
+            raise error
+        return local
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code is code else None
+
+    previous = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        yield fired
+    finally:
+        sys.settrace(previous)
 
 
 def write_args(tmp_path):

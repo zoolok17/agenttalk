@@ -7,6 +7,7 @@ PowerShell (Windows PowerShell 5.1 and PowerShell 7 are both tried when both are
 """
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -113,7 +114,9 @@ def test_the_dry_run_registers_nothing_and_shows_the_two_registrations(tmp_path,
     assert "[background]" in second and " /IT " not in second and "/RP *" in second  # run 2: asks for the password
     assert all("-Mode Task -ArgsFile" in line for line in creates)
     assert all("/RU" in line and "example-user" in line for line in creates)
-    assert "run: schtasks /Delete /TN" in done.stdout and "neither Running nor Queued" in done.stdout
+    assert (
+        "run: schtasks /Delete /TN" in done.stdout and "Ready (not Running, Queued, Disabled or unknown)" in done.stdout
+    )
     assert not out.exists(), "a dry run must not write anything"
 
 
@@ -132,3 +135,71 @@ def test_the_script_never_asks_for_or_records_a_password(shell):
     assert "/RP *" in text and "-Password" not in text and "ConvertTo-SecureString" not in text
     assert "Read-Host" not in text and "Get-Credential" not in text
     assert shell  # run once per shell only to keep the parametrization shape of the file
+
+
+# --- the whole completion rule (both halves), without a scheduler: `-Mode Decide` takes a made-up state ----------
+
+SCHEDULER_NOT_DONE = "NO COMPLETION EVIDENCE FROM THE SCHEDULER"
+
+# (id, the lines of the log, whether the scheduler shows the task, its state, the exit code, the words of the answer)
+DECIDE_CASES = [
+    ("ready-and-a-good-log", log_lines(), "true", "Ready", 0, "OK:"),
+    ("running", log_lines(), "true", "Running", 2, SCHEDULER_NOT_DONE),
+    ("queued", log_lines(), "true", "Queued", 2, SCHEDULER_NOT_DONE),
+    ("disabled", log_lines(), "true", "Disabled", 2, SCHEDULER_NOT_DONE),
+    ("unknown", log_lines(), "true", "Unknown", 2, SCHEDULER_NOT_DONE),
+    ("no-state-at-all", log_lines(), "true", "", 2, SCHEDULER_NOT_DONE),
+    ("the-scheduler-cannot-see-the-task", log_lines(), "false", "Ready", 2, SCHEDULER_NOT_DONE),
+    ("ready-but-the-log-is-partial", log_lines(last=None), "true", "Ready", 2, "NO COMPLETION EVIDENCE: the log is"),
+    ("ready-but-another-runs-log", log_lines(first="run-id=run-ffffffffffff"), "true", "Ready", 2, "'other-run'"),
+    ("ready-but-a-non-zero-exit", log_lines(last="exit=1"), "true", "Ready", 3, "exit code was 1"),
+    ("ready-but-no-facts-line", log_lines(facts=None), "true", "Ready", 3, "no host facts line"),
+]
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+@pytest.mark.parametrize(
+    "name, lines, exists, state, code, words", DECIDE_CASES, ids=[case[0] for case in DECIDE_CASES]
+)
+def test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready(
+    tmp_path, shell, name, lines, exists, state, code, words
+):
+    """A finished log alone is never enough: the wait of `-Mode Run` can end at its time limit with a finished log while
+    the scheduler still shows the task as Running or Queued, or cannot show it at all. That must not be accepted. Only
+    the state Ready counts as finished; Disabled, Unknown, an empty state and anything else do not."""
+    log = tmp_path / "run.log"
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    done = run_script(
+        shell, "-Mode", "Decide", "-Log", str(log), "-RunId", RUN_ID, "-TaskExists", exists, "-TaskState", state
+    )
+    assert done.returncode == code, done.stdout + done.stderr
+    assert words in done.stdout, done.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the stand-in interpreter is a Windows command file")
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_a_line_on_stderr_does_not_stop_the_task_mode_before_it_writes_its_last_line(tmp_path, shell):
+    """Windows PowerShell 5.1 turns a stderr line of a native command (redirected with 2>&1) into a terminating error if
+    `$ErrorActionPreference` is Stop, so the log stopped after the facts line and every run ended as "partial". With a
+    stand-in interpreter that prints the facts line, then one line on stderr, then exits 0, Task mode must still write
+    `exit=0` last, and the verifier must accept the log."""
+    stand_in = tmp_path / "interpreter.cmd"
+    stand_in.write_text(
+        "@echo off\r\n"
+        'echo   x.py:1: GitJobHostFacts: git-job-capability: {"windows": "made up", "session_id": 1, '
+        '"pytest_process_in_a_job": true}\r\n'
+        "echo a warning on stderr 1>&2\r\n"
+        "exit /b 0\r\n",
+        encoding="ascii",
+    )
+    log = tmp_path / "task.log"
+    done = run_script(
+        shell, "-Mode", "Task", "-Repo", str(tmp_path), "-Python", str(stand_in), "-Log", str(log),
+        "-RunId", RUN_ID, "-BaseTemp", str(tmp_path / "bt"),
+    )  # fmt: skip
+    assert done.returncode == 0, done.stdout + done.stderr
+    lines = [line for line in log.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    assert lines[0] == f"run-id={RUN_ID}" and lines[-1] == "exit=0"
+    assert any("a warning on stderr" in line for line in lines)  # the stderr line is in the log as plain text
+    verified = run_script(shell, "-Mode", "Verify", "-Log", str(log), "-RunId", RUN_ID)
+    assert verified.returncode == 0 and "OK:" in verified.stdout, verified.stdout + verified.stderr
