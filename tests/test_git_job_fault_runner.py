@@ -6,6 +6,7 @@ faults themselves), and when `git status` cannot be read at all. These tests run
 stand-in files, on every PowerShell that is installed; the faults are never planted except in the one control run.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -40,7 +41,12 @@ FILES = {
         'SOURCE = pathlib.Path(__file__).resolve().parents[1] / "src" / "agenttalk" / "git_job.py"\n\n\n'
         '@pytest.mark.parametrize("n", range(6))\n'
         "def test_limits_hold(n):\n"
-        '    assert "0x2000" not in SOURCE.read_text(encoding="utf-8")\n'
+        '    assert "0x2000" not in SOURCE.read_text(encoding="utf-8")\n\n\n'
+        "def test_limits_flag_the_file_when_asked():\n"
+        "    import os\n    import subprocess\n\n"
+        '    if os.environ.get("FLAG_THE_FILE"):  # a flag set while the fault is planted, as a person might\n'
+        '        subprocess.run(["git", "-C", str(SOURCE.parents[2]), "update-index", "--skip-worktree", '
+        '"src/agenttalk/git_job.py"], check=True)\n'
     ),
 }
 EDIT = "\n# an edit of mine that no one has committed yet\n"
@@ -68,11 +74,11 @@ def repo(tmp_path):
     return folder
 
 
-def run_runner(shell, repo, tmp_path, *args):
+def run_runner(shell, repo, tmp_path, *args, env=None):
     return subprocess.run(  # noqa: S603
         [shell, "-NoProfile", "-File", str(RUNNER), "-Repo", str(repo), "-Python", sys.executable,
          "-Out", str(tmp_path / "results.txt"), "-BaseTemp", str(tmp_path / "bt"), *args],
-        capture_output=True, text=True, timeout=180, check=False,
+        capture_output=True, text=True, timeout=180, check=False, env=dict(os.environ, **(env or {})),
     )  # fmt: skip
 
 
@@ -140,3 +146,39 @@ def test_every_failing_test_of_a_fault_gets_its_own_row_in_the_results(tmp_path,
     assert "CAUGHT (all 6 by an assertion)" in text, text
     rows = [line.strip() for line in text.splitlines() if line.strip().startswith("tests/test_git_job_windows.py::")]
     assert sorted(rows) == [f"tests/test_git_job_windows.py::test_limits_hold[{n}]" for n in range(6)], text
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+@pytest.mark.parametrize("option", ["--assume-unchanged", "--skip-worktree"])
+def test_the_runner_refuses_a_target_that_git_status_cannot_see(tmp_path, repo, shell, option):
+    """`git status` does not show an edit in a file that is marked assume-unchanged or skip-worktree. With the first a
+    checkout would discard the edit, with the second the planted fault would stay in the file while the runner said that
+    everything was put back. The runner refuses to start, names the files and the way out, and touches nothing."""
+    module = repo / "src" / "agenttalk" / "git_job.py"
+    module.write_text(module.read_text(encoding="utf-8") + EDIT, encoding="utf-8", newline="\n")
+    git(repo, "update-index", option, "src/agenttalk/git_job.py")
+    assert git(repo, "status", "--porcelain").strip() == "", "the flag must hide the edit from git status"
+    mine = module.read_bytes()
+    done = run_runner(shell, repo, tmp_path, "-Only", "F01-kill-on-close-set")
+    text = " ".join((done.stdout + done.stderr).replace("|", " ").split())
+    assert done.returncode != 0 and "Refusing to start" in text and "assume-unchanged or skip-worktree" in text, text
+    assert "src/agenttalk/git_job.py" in text and "no-assume-unchanged" in text, text
+    assert module.read_bytes() == mine, "the runner changed or discarded an edit that was not its own"
+    assert not (tmp_path / "results.txt").exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_the_runner_writes_the_original_back_and_says_so_when_git_checkout_does_not_restore_a_file(
+    tmp_path, repo, shell
+):
+    """While the fault is planted the stand-in test marks the file skip-worktree, so `git checkout` leaves the planted
+    text in it. The runner checks the file against the original bytes it saved, finds it not restored, writes the
+    original back, checks again, and says that it did. It never says that everything was put back without that check."""
+    module = repo / "src" / "agenttalk" / "git_job.py"
+    committed = module.read_bytes()
+    done = run_runner(shell, repo, tmp_path, "-Only", "F01-kill-on-close-set", env={"FLAG_THE_FILE": "1"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert module.read_bytes() == committed, "the planted fault stayed in the file"
+    text = (tmp_path / "results.txt").read_text(encoding="utf-8-sig").replace("\\", "/")
+    assert "git checkout did not restore src/agenttalk/git_job.py" in text, text
+    assert "every source file was put back (checked byte for byte against the original)" in text, text

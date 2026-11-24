@@ -1,5 +1,5 @@
 planted faults of #907: one result line each (caught = at least one test failed; every failing test is kept with the first line of its failure)
-F01-kill-on-close-set: CAUGHT (all 2 by an assertion) -- 2 failed, 7 deselected in 3.67s
+F01-kill-on-close-set: CAUGHT (all 2 by an assertion) -- 2 failed, 7 deselected in 3.63s
     tests/test_git_job_windows.py::test_a_normal_write_leaves_the_monitor_it_started_running
         [assertion] AssertionError: a program Git started was stopped by a normal end
     tests/test_git_job_windows.py::test_our_job_has_no_limits
@@ -28,13 +28,13 @@ F03-count-before-stop: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in
         [assertion] AssertionError: assert ['communicate...rminate', ...] == ['communicate..., 'poll', ...]
     tests/test_git_write_job_907.py::test_an_exhausted_deadline_skips_waits_and_the_count_and_keeps_the_warning
         [assertion] AssertionError: assert ('wait' not in ['create', 'popen', 'assign', 'resume', 'communicate', 'query', ...] and 'query' not in ['create', 'popen', 'assign', 'resume', 'communicate', 'query', ...])
-F04-count-above-zero-drops-the-warning: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 0.98s
+F04-count-above-zero-drops-the-warning: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 0.97s
     tests/test_git_write_job_907.py::test_a_count_above_zero_keeps_the_warning
         [assertion] assert (' Git or a program it started may still be running; wait for it to finish before retrying or cleaning up.' in "mutating git timed out after 0.01s; Git and the programs in its Windows job were ...
-F05-breakaway-ok-set: CAUGHT (all 1 by an assertion) -- 1 failed, 1 passed, 7 deselected in 6.71s
+F05-breakaway-ok-set: CAUGHT (all 1 by an assertion) -- 1 failed, 1 passed, 7 deselected in 6.63s
     tests/test_git_job_windows.py::test_our_job_has_no_limits
         [assertion] assert 2048 == 0
-F06-resume-before-assignment: CAUGHT (all 8 by an assertion) -- 8 failed, 108 passed in 0.99s
+F06-resume-before-assignment: CAUGHT (all 8 by an assertion) -- 8 failed, 108 passed in 1.04s
     tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it
         [assertion] AssertionError: assert ['create', 'p...unicate', ...] == ['create', 'p...ate', 'close']
     tests/test_git_write_job_907.py::test_fallback_rows[refused_assignment_keeps_the_warning]
@@ -51,7 +51,7 @@ F06-resume-before-assignment: CAUGHT (all 8 by an assertion) -- 8 failed, 108 pa
         [assertion] AssertionError: assert ('resume' not in ['create', 'popen', 'resume', 'assign', 'terminate', 'kill', ...])
     tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_assignment[after]
         [assertion] AssertionError: assert ('resume' not in ['create', 'popen', 'resume', 'assign', 'terminate', 'kill', ...])
-F07-assignment-skipped-and-reported-as-done: CAUGHT (all 7 by an assertion) -- 7 failed, 109 passed in 1.01s
+F07-assignment-skipped-and-reported-as-done: CAUGHT (all 7 by an assertion) -- 7 failed, 109 passed in 1.00s
     tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it
         [assertion] AssertionError: assert ['create', 'p...ate', 'close'] == ['create', 'p...ate', 'close']
     tests/test_git_write_job_907.py::test_fallback_rows[refused_assignment_keeps_the_warning]
@@ -59,14 +59,14 @@ F07-assignment-skipped-and-reported-as-done: CAUGHT (all 7 by an assertion) -- 7
     tests/test_git_job.py::test_the_launcher_is_started_paused_and_resumed_only_after_the_assignment
         [assertion] AssertionError: assert [('create',),...esume', 5005)] == [('create',),...esume', 5005)]
     tests/test_git_job.py::test_a_refused_assignment_closes_the_job_resumes_the_launcher_and_goes_on_with_no_job[refused]
-        [assertion] assert (<agenttalk.git_job.GitJob object at 0x000002D4F4501250> is None)
+        [assertion] assert (<agenttalk.git_job.GitJob object at 0x000001D9C3DD5250> is None)
     tests/test_git_job.py::test_a_refused_assignment_closes_the_job_resumes_the_launcher_and_goes_on_with_no_job[error]
-        [assertion] assert (<agenttalk.git_job.GitJob object at 0x000002D4F4500470> is None)
+        [assertion] assert (<agenttalk.git_job.GitJob object at 0x000001D9C3DD4470> is None)
     tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_assignment[before]
         [assertion] Failed: DID NOT RAISE KeyboardInterrupt
     tests/test_git_job.py::test_failure_or_interrupt_just_before_and_after_assignment[after]
         [assertion] Failed: DID NOT RAISE KeyboardInterrupt
-F08-stop-through-the-wrong-handle: CAUGHT (all 37 by an assertion) -- 37 failed, 79 passed in 1.02s
+F08-stop-through-the-wrong-handle: CAUGHT (all 37 by an assertion) -- 37 failed, 79 passed in 1.07s
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[prelaunch_step_inside_window]
         [assertion] AssertionError: assert [('terminate'... job handle')] == []
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[reuse_at_genuine_descendant]
@@ -141,7 +141,7 @@ F08-stop-through-the-wrong-handle: CAUGHT (all 37 by an assertion) -- 37 failed,
         [assertion] AssertionError: assert (True is True and None is None and [('terminate'... job handle')] == []
     tests/test_git_job.py::test_the_job_never_uses_a_null_or_the_hosts_job_handle
         [assertion] assert ({7001, 7002} == {7001}
-F09-close-skipped-on-an-ordinary-error: CAUGHT (all 4 by an assertion) -- 4 failed, 112 passed in 1.03s
+F09-close-skipped-on-an-ordinary-error: CAUGHT (all 4 by an assertion) -- 4 failed, 112 passed in 0.98s
     tests/test_git_write_job_907.py::test_an_ordinary_communicate_error_closes_without_stopping
         [assertion] assert (set() == {7001}
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-ordinary]
@@ -150,7 +150,7 @@ F09-close-skipped-on-an-ordinary-error: CAUGHT (all 4 by an assertion) -- 4 fail
         [assertion] AssertionError: assert RuntimeError('simulated pipe failure') is KeyboardInterrupt('new')
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-after-first]
         [assertion] AssertionError: assert RuntimeError('simulated pipe failure') is KeyboardInterrupt('new')
-F10-first-interruption-lost-in-the-time-out-handler: CAUGHT (5 of 10 by an exception at call time, 5 by an assertion) -- 10 failed, 106 passed in 1.01s
+F10-first-interruption-lost-in-the-time-out-handler: CAUGHT (5 of 10 by an exception at call time, 5 by an assertion) -- 10 failed, 106 passed in 1.08s
     tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes
         [exception] RuntimeError: replaced
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
@@ -171,7 +171,7 @@ F10-first-interruption-lost-in-the-time-out-handler: CAUGHT (5 of 10 by an excep
         [exception] RuntimeError: replaced
     tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[count]
         [exception] RuntimeError: replaced
-F11-failed-query-read-as-zero: CAUGHT (all 3 by an assertion) -- 3 failed, 113 passed in 4.06s
+F11-failed-query-read-as-zero: CAUGHT (all 3 by an assertion) -- 3 failed, 113 passed in 4.12s
     tests/test_git_write_job_907.py::test_a_failed_query_is_not_zero[query_error]
         [assertion] assert (' Git or a program it started may still be running; wait for it to finish before retrying or cleaning up.' in "mutating git timed out after 0.01s; Git and the programs in its Windows job were ...
     tests/test_git_write_job_907.py::test_a_failed_query_is_not_zero[query_none]
@@ -188,12 +188,12 @@ F13-timeout-cause-lost: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed i
         [assertion] assert False
     tests/test_git_write_job_907.py::test_the_cause_is_still_the_writes_timeout[reaped]
         [assertion] assert False
-F14-count-polling-window-longer-than-two-seconds: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 4.18s
+F14-count-polling-window-longer-than-two-seconds: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 4.16s
     tests/test_git_write_job_907.py::test_a_count_above_zero_keeps_the_warning
         [assertion] AssertionError: assert (1501 > 1 and (1030.0 - 1000) <= (2.0 + 0.05))
     tests/test_git_job.py::test_a_count_that_stays_above_zero_stops_polling_at_the_window_and_returns_it
         [assertion] AssertionError: assert None == 2
-F15-stop-missing-from-the-ordinary-error-fallback: CAUGHT (all 5 by an assertion) -- 5 failed, 111 passed in 0.99s
+F15-stop-missing-from-the-ordinary-error-fallback: CAUGHT (all 5 by an assertion) -- 5 failed, 111 passed in 1.01s
     tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout
         [assertion] AssertionError: assert (0 == 1)
     tests/test_git_write_job_907.py::test_the_close[fallback_error-before-ordinary]
@@ -204,7 +204,7 @@ F15-stop-missing-from-the-ordinary-error-fallback: CAUGHT (all 5 by an assertion
         [assertion] assert 1 == (2 + 0)
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
         [assertion] AssertionError: assert ['communicate... 'query', ...] == ['communicate..., 'poll', ...]
-F16-stop-missing-from-the-interruption-fallback: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 1.01s
+F16-stop-missing-from-the-interruption-fallback: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 0.98s
     tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes
         [assertion] AssertionError: assert (0 == 1)
     tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]
@@ -217,7 +217,7 @@ F16-stop-missing-from-the-interruption-fallback: CAUGHT (all 6 by an assertion) 
         [assertion] assert 1 == (2 + 0)
     tests/test_git_write_job_907.py::test_interruption_fallback_stops_the_job
         [assertion] AssertionError: assert ['communicate...oll', 'close'] == ['communicate..., 'poll', ...]
-F16b-stop-missing-from-the-interruption-branch-of-the-error-fallback: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 0.98s
+F16b-stop-missing-from-the-interruption-branch-of-the-error-fallback: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 0.99s
     tests/test_git_write_job_907.py::test_the_close[fallback_error-before-first]
         [assertion] assert 2 == (2 + 1)
 F17-call-through-a-handle-after-a-successful-close: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 4.05s
@@ -225,7 +225,7 @@ F17-call-through-a-handle-after-a-successful-close: CAUGHT (all 2 by an assertio
         [assertion] assert (True, 0, True) == (False, None, True)
     tests/test_git_job.py::test_a_close_that_failed_leaves_the_handle_owned_so_a_later_step_can_stop_and_close_it
         [assertion] assert (True is True and 7001 is None)
-F18-close-moved-to-a-bare-outer-finally: CAUGHT (all 8 by an assertion) -- 8 failed, 108 passed in 0.97s
+F18-close-moved-to-a-bare-outer-finally: CAUGHT (all 8 by an assertion) -- 8 failed, 108 passed in 1.03s
     tests/test_git_write_job_907.py::test_the_close[timeout-before-ordinary]
         [assertion] assert 2 == 1
     tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-ordinary]
@@ -242,7 +242,7 @@ F18-close-moved-to-a-bare-outer-finally: CAUGHT (all 8 by an assertion) -- 8 fai
         [assertion] assert 1 == 0
     tests/test_git_write_job_907.py::test_the_close[interrupt_before_timeout-before-second]
         [assertion] assert 1 == 0
-F19-nonzero-resume-status-taken-as-success: CAUGHT (all 4 by an assertion) -- 4 failed, 112 passed in 4.01s
+F19-nonzero-resume-status-taken-as-success: CAUGHT (all 4 by an assertion) -- 4 failed, 112 passed in 4.05s
     tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[1]
         [assertion] AssertionError: Regex pattern did not match.
     tests/test_git_write_job_907.py::test_a_failed_resume_runs_the_bounded_launcher_cleanup
@@ -251,7 +251,7 @@ F19-nonzero-resume-status-taken-as-success: CAUGHT (all 4 by an assertion) -- 4 
         [assertion] Failed: DID NOT RAISE JobStartError
     tests/test_git_job.py::test_the_setup_cleanup_given_by_the_caller_is_the_one_used
         [assertion] Failed: DID NOT RAISE JobStartError
-F20-process-list-call-added: CAUGHT (all 14 by an assertion) -- 14 failed, 102 passed in 0.97s
+F20-process-list-call-added: CAUGHT (all 14 by an assertion) -- 14 failed, 102 passed in 1.03s
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[prelaunch_step_inside_window]
         [assertion] AssertionError: assert (['snapshot'] == []
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[reuse_at_genuine_descendant]
@@ -280,12 +280,12 @@ F20-process-list-call-added: CAUGHT (all 14 by an assertion) -- 14 failed, 102 p
         [assertion] AssertionError: assert ([] == []
     tests/test_git_job.py::test_starting_a_job_and_stopping_it_never_asks_for_a_process_list_an_id_or_a_time
         [assertion] AssertionError: assert (['snapshot'] == []
-F21-count-after-the-close-in-the-ordinary-error-fallback: CAUGHT (1 of 2 by an exception at call time, 1 by an assertion) -- 2 failed, 114 passed in 0.97s
+F21-count-after-the-close-in-the-ordinary-error-fallback: CAUGHT (1 of 2 by an exception at call time, 1 by an assertion) -- 2 failed, 114 passed in 0.96s
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first
         [assertion] AssertionError: assert ['communicate..., 'poll', ...] == ['communicate..., 'poll', ...]
     tests/test_git_write_job_907.py::test_ordinary_error_fallback_counts_before_it_closes
         [exception] ValueError: list.index(x): x not in list
-F22-wall-clock-read: CAUGHT (all 10 by an assertion) -- 10 failed, 106 passed in 4.05s
+F22-wall-clock-read: CAUGHT (all 10 by an assertion) -- 10 failed, 106 passed in 4.02s
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[prelaunch_step_inside_window]
         [assertion] AssertionError: assert ([] == []
     tests/test_git_write_job_907.py::test_no_unrelated_process_is_stopped_in_history[reuse_at_genuine_descendant]
@@ -306,7 +306,7 @@ F22-wall-clock-read: CAUGHT (all 10 by an assertion) -- 10 failed, 106 passed in
         [assertion] AssertionError: assert ([] == []
     tests/test_git_job.py::test_starting_a_job_and_stopping_it_never_asks_for_a_process_list_an_id_or_a_time
         [assertion] AssertionError: git_job asked the clock for time
-F23-close-skipped-after-a-confirmed-time-out: CAUGHT (all 9 by an assertion) -- 9 failed, 107 passed in 0.97s
+F23-close-skipped-after-a-confirmed-time-out: CAUGHT (all 9 by an assertion) -- 9 failed, 107 passed in 1.01s
     tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[reuse_at_genuine_descendant]
         [assertion] assert set() == {7001}
     tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[cancelled_steps_during_command]
@@ -325,7 +325,7 @@ F23-close-skipped-after-a-confirmed-time-out: CAUGHT (all 9 by an assertion) -- 
         [assertion] assert GitWriteError("mutating git timed out after 0.01s; Git and the programs in its Windows job were stopped: Command 'git' timed out after 0.01 seconds; a partial checkout or a Git lock may still n...
     tests/test_git_write_job_907.py::test_normal_timeout_stops_the_job_then_kills_reaps_and_counts
         [assertion] AssertionError: assert ['communicate...ate', 'query'] == ['communicate...ery', 'close']
-F24-handle-kept-after-an-interruption-in-the-native-close: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 4.05s
+F24-handle-kept-after-an-interruption-in-the-native-close: CAUGHT (all 6 by an assertion) -- 6 failed, 110 passed in 4.07s
     tests/test_git_write_job_907.py::test_the_close[normal-after-first]
         [assertion] assert 2 == 1
     tests/test_git_write_job_907.py::test_the_close[timeout-after-first]
@@ -338,13 +338,13 @@ F24-handle-kept-after-an-interruption-in-the-native-close: CAUGHT (all 6 by an a
         [assertion] AssertionError: assert (KeyboardInterrupt('in the close') is KeyboardInterrupt('in the close') and 7001 is None)
     tests/test_git_job.py::test_an_interruption_inside_the_native_close_gives_the_handle_up[after]
         [assertion] AssertionError: assert (KeyboardInterrupt('in the close') is KeyboardInterrupt('in the close') and 7001 is None)
-F25-reap-not-cut-to-the-deadline: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 0.99s
+F25-reap-not-cut-to-the-deadline: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 1.00s
     tests/test_git_write_job_907.py::test_an_exhausted_deadline_skips_waits_and_the_count_and_keeps_the_warning
         [assertion] assert 5 == 0.0
-F26-wait-not-cut-to-the-deadline: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 0.99s
+F26-wait-not-cut-to-the-deadline: CAUGHT (all 1 by an assertion) -- 1 failed, 115 passed in 1.02s
     tests/test_git_write_job_907.py::test_no_wait_runs_past_the_deadline
         [assertion] AssertionError: wait was allowed to run past the cleanup deadline
-F27-hand-over-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at call time, 4 by an assertion) -- 5 failed, 111 passed in 0.97s
+F27-hand-over-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at call time, 4 by an assertion) -- 5 failed, 111 passed in 0.96s
     tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[1]
         [assertion] AssertionError: assert 0 == 1
     tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[-1073741790]
@@ -355,10 +355,10 @@ F27-hand-over-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at c
         [exception] ValueError: list.index(x): x not in list
     tests/test_git_write_job_907.py::test_a_failed_resume_runs_the_bounded_launcher_cleanup
         [assertion] AssertionError: assert (['resume', 'poll', 'kill'] == ['resume', 't...nate', 'poll']
-F28-process-listing-call-named-in-the-job-code-only-the-static-guard-sees: CAUGHT (all 1 by an assertion) -- 1 failed, 42 passed in 3.53s
+F28-process-listing-call-named-in-the-job-code-only-the-static-guard-sees: CAUGHT (all 1 by an assertion) -- 1 failed, 42 passed in 3.49s
     tests/test_git_job.py::test_the_job_code_never_names_a_call_that_walks_processes
         [assertion] AssertionError: a call that walks processes, ids or start times is named: [('git_job.py', 'OpenProcess')]
-F29-default-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at call time, 4 by an assertion) -- 5 failed, 111 passed in 0.96s
+F29-default-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at call time, 4 by an assertion) -- 5 failed, 111 passed in 0.97s
     tests/test_git_job.py::test_nonzero_status_is_a_resume_failure[positive]
         [assertion] AssertionError: assert 0 == 1
     tests/test_git_job.py::test_nonzero_status_is_a_resume_failure[access-denied]
@@ -369,7 +369,7 @@ F29-default-cleanup-does-not-stop-the-job: CAUGHT (1 of 5 by an exception at cal
         [assertion] assert (0 == 1)
     tests/test_git_job.py::test_an_interruption_at_the_real_hand_over_return_stops_the_job_and_the_launcher
         [exception] ValueError: list.index(x): x not in list
-F30-hand-over-return-outside-the-setup-cleanup: CAUGHT (1 of 3 by an exception at call time, 2 by an assertion) -- 3 failed, 113 passed in 1.01s
+F30-hand-over-return-outside-the-setup-cleanup: CAUGHT (1 of 3 by an exception at call time, 2 by an assertion) -- 3 failed, 113 passed in 1.00s
     tests/test_git_write_job_907.py::test_an_interruption_at_the_real_hand_over_through_the_write_stops_the_job_git_runs_in
         [exception] ValueError: list.index(x): x not in list
     tests/test_git_job.py::test_an_interruption_at_the_real_hand_over_return_stops_the_job_and_the_launcher
@@ -386,12 +386,12 @@ F32-deadline-not-checked-before-each-count-query: CAUGHT (all 2 by an assertion)
         [assertion] AssertionError: assert (2 == 1)
     tests/test_git_job.py::test_a_sleep_that_resumes_late_does_not_let_a_count_read_after_the_deadline_say_zero
         [assertion] AssertionError: assert 2 == 1
-F33-late-count-answer-accepted: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 0.98s
+F33-late-count-answer-accepted: CAUGHT (all 2 by an assertion) -- 2 failed, 114 passed in 0.99s
     tests/test_git_write_job_907.py::test_a_query_that_returns_late_in_the_final_count_does_not_say_stopped
         [assertion] assert (' Git or a program it started may still be running; wait for it to finish before retrying or cleaning up.' in "mutating git timed out after 0.01s; Git and the programs in its Windows job were ...
     tests/test_git_job.py::test_a_query_that_returns_after_the_deadline_is_not_accepted
         [assertion] assert 0 is None
-F34-scheduler-half-of-the-completion-rule-skipped: CAUGHT (all 16 by an assertion) -- 16 failed, 76 passed in 90.37s (0:01:30)
+F34-scheduler-half-of-the-completion-rule-skipped: CAUGHT (all 16 by an assertion) -- 16 failed, 84 passed in 96.25s (0:01:36)
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[running-powershell]
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[running-pwsh]
@@ -417,14 +417,14 @@ F34-scheduler-half-of-the-completion-rule-skipped: CAUGHT (all 16 by an assertio
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[the-scheduler-cannot-see-the-task-pwsh]
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
     tests/test_git_job_scheduled_task_check.py::test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running[powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-a2363a7aa123
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-35684276954f
     tests/test_git_job_scheduled_task_check.py::test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running[pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-af9e46e6cc1c
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-51df1972095e
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-7737be75f2c0
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-779f9a85c334
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-cb2ae5fd2ee9
-F35-any-state-but-running-or-queued-taken-as-finished: CAUGHT (all 6 by an assertion) -- 6 failed, 86 passed in 90.05s (0:01:30)
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-0601b8f3b11d
+F35-any-state-but-running-or-queued-taken-as-finished: CAUGHT (all 6 by an assertion) -- 6 failed, 94 passed in 95.66s (0:01:35)
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-powershell]
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-pwsh]
@@ -437,15 +437,15 @@ F35-any-state-but-running-or-queued-taken-as-finished: CAUGHT (all 6 by an asser
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
     tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[no-state-at-all-pwsh]
         [assertion] AssertionError: OK: run run-0123456789ab finished with exit=0 and shows its host facts
-F36-task-mode-keeps-error-preference-stop: CAUGHT (all 1 by an assertion) -- 1 failed, 91 passed in 89.85s (0:01:29)
+F36-task-mode-keeps-error-preference-stop: CAUGHT (all 1 by an assertion) -- 1 failed, 99 passed in 95.69s (0:01:35)
     tests/test_git_job_scheduled_task_check.py::test_a_line_on_stderr_does_not_stop_the_task_mode_before_it_writes_its_last_line[powershell]
         [assertion] AssertionError: interpreter.cmd : a warning on stderr 
-F37-marker-ignored-so-real-lane-tests-run-without-a-job: CAUGHT (all 2 by an assertion) -- 2 failed in 6.39s
+F37-marker-ignored-so-real-lane-tests-run-without-a-job: CAUGHT (all 2 by an assertion) -- 2 failed in 6.37s
     tests/test_lanes.py::test_m6_assign_provisions_worktree_by_default_and_workspace
         [assertion] AssertionError: a changing Git command ran without a job
     tests/test_lanes.py::test_786_successful_rollback_removes_worktree_and_branch
         [assertion] AssertionError: a changing Git command ran without a job
-F38-arguments-file-written-as-ascii: CAUGHT (all 4 by an assertion) -- 4 failed, 88 passed in 90.35s (0:01:30)
+F38-arguments-file-written-as-ascii: CAUGHT (all 4 by an assertion) -- 4 failed, 96 passed in 95.51s (0:01:35)
     tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[powershell]
         [assertion] AssertionError: UTF-8 with a byte order mark, so Windows PowerShell 5.1 reads it as UTF-8 too
     tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[pwsh]
@@ -454,61 +454,61 @@ F38-arguments-file-written-as-ascii: CAUGHT (all 4 by an assertion) -- 4 failed,
         [assertion] AssertionError: NO COMPLETION EVIDENCE: the log is 'missing' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
     tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[pwsh]
         [assertion] AssertionError: NO COMPLETION EVIDENCE: the log is 'missing' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
-F39-a-failed-deletion-of-the-task-ignored: CAUGHT (all 16 by an assertion) -- 16 failed, 76 passed in 89.68s (0:01:29)
+F39-a-failed-deletion-of-the-task-ignored: CAUGHT (all 16 by an assertion) -- 16 failed, 84 passed in 95.39s (0:01:35)
     tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-993cad160701
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9b9cf6d2439c
     tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-6dcbab40a23f
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-3e228a6c46ec
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-eb2008401d94
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-0d77d400c9a6
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-0fce80d36df6
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-078b7dd6f04f
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-64ad005af225
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-e89d5e78a373
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-e9b71664a3f9
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-eee2991c8efd
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-task-is-still-there-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-015321849dc1
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-37b3bb0a52ae
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-task-is-still-there-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-b96628f5d064
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-a2725d8457c2
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-78b61d6acdf1
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-93b25b722ec5
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-3e61152adcf7
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-83bd8023bd34
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-a797729f9b5a
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-39f994b25510
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-2f2cbb80967e
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-3c9efc1aec18
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-4b1834a79c13 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-4b1834a79c13 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f20eacc7f271 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-f20eacc7f271 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-e9b80169e23a [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-e9b80169e23a finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-042ff34afd0a [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-042ff34afd0a finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-15ffa225733c [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-15ffa225733c finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-2dbe04c025b7 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-2dbe04c025b7 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-c6db313629cc [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-c6db313629cc finished with exit=...
-F40-fault-runner-checks-only-the-product-files: CAUGHT (all 6 by an assertion) -- 6 failed, 8 passed in 29.03s
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-aa37098e568a [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-aa37098e568a finished with exit=...
+F40-fault-runner-checks-only-the-product-files: CAUGHT (all 6 by an assertion) -- 6 failed, 14 passed in 43.30s
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[script-powershell]
         [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Refusing to start: not every file a fault changes is tracked by git: \nAt <path>    + FullyQualifiedErrorId : Refusing to start: not every file a ...
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[script-pwsh]
-        [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Exception: <path> |\n 213 |  . ts...~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n     | Refusing to start: not every file a fault changes is tracked by...
+        [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Exception: <path> |\n 224 |  . ts...~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n     | Refusing to start: not every file a fault changes is tracked by...
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[test-config-powershell]
         [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Refusing to start: not every file a fault changes is tracked by git: \nAt <path>    + FullyQualifiedErrorId : Refusing to start: not every file a ...
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[test-config-pwsh]
-        [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Exception: <path> |\n 213 |  . ts...~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n     | Refusing to start: not every file a fault changes is tracked by...
+        [assertion] AssertionError: assert ('Refusing to start' in ('' + 'Exception: <path> |\n 224 |  . ts...~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n     | Refusing to start: not every file a fault changes is tracked by...
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[all-faults-powershell]
         [assertion] AssertionError: assert 0 != 0
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[all-faults-pwsh]
         [assertion] AssertionError: assert 0 != 0
-F41-fault-runner-does-not-stop-when-git-cannot-be-read: CAUGHT (all 2 by an assertion) -- 2 failed, 12 passed in 24.44s
+F41-fault-runner-does-not-stop-when-git-cannot-be-read: CAUGHT (all 2 by an assertion) -- 2 failed, 18 passed in 39.64s
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_git_cannot_be_read[powershell]
         [assertion] AssertionError: it must say that git could not be read, not fall back to another refusal
     tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_git_cannot_be_read[pwsh]
         [assertion] AssertionError: it must say that git could not be read, not fall back to another refusal
-F42-final-count-does-not-expect-a-missing-deadline: CAUGHT (1 of 1 by an exception at call time, 0 by an assertion) -- 1 failed, 115 passed in 0.96s
+F42-final-count-does-not-expect-a-missing-deadline: CAUGHT (1 of 1 by an exception at call time, 0 by an assertion) -- 1 failed, 115 passed in 0.97s
     tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout
         [exception] AttributeError: 'NoneType' object has no attribute 'cut'
-F43-every-scheduler-error-read-as-a-task-that-is-gone: CAUGHT (all 10 by an assertion) -- 10 failed, 81 passed, 1 skipped in 273.64s (0:04:33)
+F43-every-scheduler-error-read-as-a-task-that-is-gone: CAUGHT (all 10 by an assertion) -- 10 failed, 89 passed, 1 skipped in 276.23s (0:04:36)
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[any-other-error-is-unreadable-powershell]
         [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[any-other-error-is-unreadable-pwsh]
@@ -518,109 +518,109 @@ F43-every-scheduler-error-read-as-a-task-that-is-gone: CAUGHT (all 10 by an asse
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[a-missing-command-has-the-same-category-and-is-unreadable-pwsh]
         [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
     tests/test_git_job_scheduled_task_check.py::test_a_missing_scheduler_command_before_registering_registers_nothing[powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-fbe2e2f3198b [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-53e07ef3f143 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
     tests/test_git_job_scheduled_task_check.py::test_a_missing_scheduler_command_before_registering_registers_nothing[pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-7683e291b36e [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9c407a3810a2 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-d4bb95ac6187 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-d4bb95ac6187 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-c5fdffd3c001 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-c5fdffd3c001 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-ded05a80a0b9 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-ded05a80a0b9 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-cc8d77a89227 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-cc8d77a89227 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-8539a4ed6ee9 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-8539a4ed6ee9 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-68e7ecb1d6f2 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-68e7ecb1d6f2 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-c37ed7364bcc [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-c37ed7364bcc finished with exit=...
-F44-cleanup-ignores-an-unreadable-scheduler: CAUGHT (all 10 by an assertion) -- 10 failed, 82 passed in 90.71s (0:01:30)
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-c67f39b796e3 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-c67f39b796e3 finished with exit=...
+F44-cleanup-ignores-an-unreadable-scheduler: CAUGHT (all 10 by an assertion) -- 10 failed, 90 passed in 95.94s (0:01:35)
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-2b4e8d73f492
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-b716ffff14a5
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-dea019bb78ba
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-62b51bdb3ceb
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-b893195b396d
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-ba6bfdb93cca
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-fa8c9ce8d7bb
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-1b30b910973f
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-33cab7668c9f
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9ddadad9d2d4
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-ac7aa5037b23
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-c7448639354d
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-91c41f52fc63 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-91c41f52fc63 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-4624d6c30481 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-4624d6c30481 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-006aefe1ca26 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-006aefe1ca26 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f69a4b911098 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-f69a4b911098 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f3439dc68ad1 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-f3439dc68ad1 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-a778dcbabd19 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-a778dcbabd19 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-c9c91b0aad48 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-c9c91b0aad48 finished with exit=...
-F45-task-deleted-printed-for-an-unreadable-scheduler: CAUGHT (all 10 by an assertion) -- 10 failed, 82 passed in 90.02s (0:01:30)
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-6e129d68764d [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-6e129d68764d finished with exit=...
+F45-task-deleted-printed-for-an-unreadable-scheduler: CAUGHT (all 10 by an assertion) -- 10 failed, 90 passed in 96.36s (0:01:36)
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9a80405c692a
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-e2aad8498753
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f44fbdb6a389
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-5468e986a899
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-93b6727c7cdd
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-d7c7c036f55a
     tests/test_git_job_scheduled_task_check.py::test_an_unreadable_scheduler_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-c82949975cb4
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-8400caf8a8b6
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-5aefe5b6048e
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-a456f568993e
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-5ee759b04c2a
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9d78def60f31
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-140005e7ab14 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-140005e7ab14 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-92f319b018c3 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-92f319b018c3 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-cdf6d17ed822 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-cdf6d17ed822 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-fb5f74f4f2c5 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-fb5f74f4f2c5 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f01ce82b529d [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-f01ce82b529d finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-ed2c21e1689d [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-ed2c21e1689d finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-d3268dfad890 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-d3268dfad890 finished with exit=...
-F46-preflight-registers-although-the-scheduler-cannot-be-read: CAUGHT (all 4 by an assertion) -- 4 failed, 87 passed, 1 skipped in 393.00s (0:06:33)
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-bffd13c92a9c [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-bffd13c92a9c finished with exit=...
+F46-preflight-registers-although-the-scheduler-cannot-be-read: CAUGHT (all 4 by an assertion) -- 4 failed, 95 passed, 1 skipped in 397.23s (0:06:37)
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_that_cannot_be_read_before_registering_registers_nothing[powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-dc0eeb17256c [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-3eac6c1a31ac [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_that_cannot_be_read_before_registering_registers_nothing[pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-fdb9598366cc [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-57d80d799d80 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
     tests/test_git_job_scheduled_task_check.py::test_a_missing_scheduler_command_before_registering_registers_nothing[powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-2aa4e540cce5 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-08c10cd2f577 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
     tests/test_git_job_scheduled_task_check.py::test_a_missing_scheduler_command_before_registering_registers_nothing[pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-d95b1a4ba035 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
-F47-a-failed-cleanup-overrides-the-runs-own-code: CAUGHT (all 6 by an assertion) -- 6 failed, 86 passed in 92.80s (0:01:32)
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-770922cfd177 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+F47-a-failed-cleanup-overrides-the-runs-own-code: CAUGHT (all 6 by an assertion) -- 6 failed, 94 passed in 95.89s (0:01:35)
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-task-is-still-there-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9338affe9894
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-9b8bff59b58c
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-task-is-still-there-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-137fae07e09e
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-052559c7328a
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-d34e4e680b1f
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-346c063bc39d
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[rejected-run-and-the-scheduler-is-unreadable-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-de97618b9de5
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-45eea7d68ac7
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-6a311467e9c5
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-dac66cb8560b
     tests/test_git_job_scheduled_task_check.py::test_a_run_that_failed_keeps_its_own_code_and_the_cleanup_warning_is_still_printed[no-completion-evidence-and-the-task-is-still-there-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-74b38c6dbba3
-F48-fault-runner-keeps-only-four-rows-per-fault: CAUGHT (all 2 by an assertion) -- 2 failed, 12 passed in 26.19s
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-5be61424933d
+F48-fault-runner-keeps-only-four-rows-per-fault: CAUGHT (all 2 by an assertion) -- 2 failed, 18 passed in 38.84s
     tests/test_git_job_fault_runner.py::test_every_failing_test_of_a_fault_gets_its_own_row_in_the_results[powershell]
         [assertion] AssertionError: planted faults of #907: one result line each (caught = at least one test failed; every failing test is kept with the first line of its failure)
     tests/test_git_job_fault_runner.py::test_every_failing_test_of_a_fault_gets_its_own_row_in_the_results[pwsh]
         [assertion] AssertionError: planted faults of #907: one result line each (caught = at least one test failed; every failing test is kept with the first line of its failure)
-F49-task-not-found-recognised-by-the-error-category-again: CAUGHT (all 8 by an assertion) -- 8 failed, 83 passed, 1 skipped in 272.89s (0:04:32)
+F49-task-not-found-recognised-by-the-error-category-again: CAUGHT (all 8 by an assertion) -- 8 failed, 91 passed, 1 skipped in 277.12s (0:04:37)
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[a-missing-command-has-the-same-category-and-is-unreadable-powershell]
         [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[a-missing-command-has-the-same-category-and-is-unreadable-pwsh]
         [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
     tests/test_git_job_scheduled_task_check.py::test_a_missing_scheduler_command_before_registering_registers_nothing[powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-a04358f47747 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-203c4baf417f [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
     tests/test_git_job_scheduled_task_check.py::test_a_missing_scheduler_command_before_registering_registers_nothing[pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-6c15e7ceba86 [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-4a47d23d8a7e [interactive] registered mode: unknown; last result: unknown [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in ti...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-b6261417a01a [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-b6261417a01a finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-30d7d327d6d3 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-30d7d327d6d3 finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-fc23bbc2c360 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-fc23bbc2c360 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-caea564d12af [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-caea564d12af finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-84dd43368db7 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-84dd43368db7 finished with exit=...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-53d881af7d4f [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-53d881af7d4f finished with exit=...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-6ad3aee4eab6 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-6ad3aee4eab6 finished with exit=...
-F50-no-error-and-no-answer-read-as-a-confirmed-absence: CAUGHT (all 2 by an assertion) -- 2 failed, 90 passed in 94.25s (0:01:34)
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-b2d400857167 [interactive] registered mode: interactive only; last result: 0 [interactive] OK: run run-b2d400857167 finished with exit=...
+F50-no-error-and-no-answer-read-as-a-confirmed-absence: CAUGHT (all 2 by an assertion) -- 2 failed, 98 passed in 95.64s (0:01:35)
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[no-error-and-no-answer-is-unreadable-powershell]
         [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[no-error-and-no-answer-is-unreadable-pwsh]
         [assertion] AssertionError: assert (0, 'exists=f...adable=false') == (0, 'exists=f...eadable=true')
-F51-a-wrong-task-not-found-error-id: CAUGHT (all 8 by an assertion) -- 8 failed, 90 passed in 89.51s (0:01:29)
+F51-a-wrong-task-not-found-error-id: CAUGHT (all 8 by an assertion) -- 8 failed, 92 passed in 91.38s (0:01:31)
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[no-such-task-is-a-confirmed-absence-powershell]
         [assertion] AssertionError: assert (0, 'exists=f...eadable=true') == (0, 'exists=f...adable=false')
     tests/test_git_job_scheduled_task_check.py::test_the_two_kinds_of_no_from_the_scheduler_are_told_apart[no-such-task-is-a-confirmed-absence-pwsh]
@@ -630,11 +630,30 @@ F51-a-wrong-task-not-found-error-id: CAUGHT (all 8 by an assertion) -- 8 failed,
     tests/test_git_job_scheduled_task_check.py::test_the_real_scheduler_confirms_the_absence_of_a_task_that_was_never_registered[pwsh]
         [assertion] AssertionError: the real scheduler's not-found id is 'CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask'; the script expects 'CmdletizationQuery_NotFound_TaskNam,Get-ScheduledTask'
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f9927b80183a The scheduler could not be read, so it is not known whether a task named stub-task exists. Nothing was registered; fix the...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-3521b9338c8b The scheduler could not be read, so it is not known whether a task named stub-task exists. Nothing was registered; fix the...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-failed-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-47bdeebabdd1 Exception: <path> Line 243 throw "The scheduler could not be read, so it is not known wh â€¦ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-bca6ff092867 Exception: <path> Line 243 throw "The scheduler could not be read, so it is not known wh . ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-powershell]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-55a9e4d86e81 The scheduler could not be read, so it is not known whether a task named stub-task exists. Nothing was registered; fix the...
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-2d350be06614 The scheduler could not be read, so it is not known whether a task named stub-task exists. Nothing was registered; fix the...
     tests/test_git_job_scheduled_task_check.py::test_a_scheduler_command_that_goes_missing_after_the_delete_is_not_a_confirmed_cleanup[delete-said-ok-pwsh]
-        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-f27927c90fdc Exception: <path> Line 243 throw "The scheduler could not be read, so it is not known wh â€¦ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~...
-done; the source files were put back with git checkout
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-11d228c291c3 Exception: <path> Line 243 throw "The scheduler could not be read, so it is not known wh . ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~...
+F52-fault-runner-does-not-refuse-a-hidden-target: CAUGHT (all 4 by an assertion) -- 4 failed, 16 passed in 44.27s
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_a_target_that_git_status_cannot_see[--assume-unchanged-powershell]
+        [assertion] AssertionError: 
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_a_target_that_git_status_cannot_see[--assume-unchanged-pwsh]
+        [assertion] AssertionError: 
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_a_target_that_git_status_cannot_see[--skip-worktree-powershell]
+        [assertion] AssertionError: 
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_a_target_that_git_status_cannot_see[--skip-worktree-pwsh]
+        [assertion] AssertionError: 
+F53-fault-runner-does-not-check-that-a-file-was-put-back: CAUGHT (all 2 by an assertion) -- 2 failed, 18 passed in 38.62s
+    tests/test_git_job_fault_runner.py::test_the_runner_writes_the_original_back_and_says_so_when_git_checkout_does_not_restore_a_file[powershell]
+        [assertion] AssertionError: the planted fault stayed in the file
+    tests/test_git_job_fault_runner.py::test_the_runner_writes_the_original_back_and_says_so_when_git_checkout_does_not_restore_a_file[pwsh]
+        [assertion] AssertionError: the planted fault stayed in the file
+F54-a-failed-delete-with-the-task-absent-says-deleted: CAUGHT (all 2 by an assertion) -- 2 failed, 98 passed in 95.71s (0:01:35)
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_delete_with_the_task_confirmed_absent_says_absent_not_deleted[powershell]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-19b9b67203e8 [interactive] registered mode: a stand-in; last result: 0 [interactive] OK: run run-19b9b67203e8 finished with exit=0 and ...
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_delete_with_the_task_confirmed_absent_says_absent_not_deleted[pwsh]
+        [assertion] AssertionError: [interactive] interactive only (/IT), run id run-2b125eeb1395 [interactive] registered mode: a stand-in; last result: 0 [interactive] OK: run run-2b125eeb1395 finished with exit=0 and ...
+done; every source file was put back (checked byte for byte against the original)

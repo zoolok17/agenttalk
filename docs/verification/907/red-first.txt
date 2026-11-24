@@ -183,3 +183,7 @@ PART G (round 16, tests only). The real-scheduler test, against the previous hea
 
 G1. With the wrong error id in the script (fault F51) the previous test SKIPPED on this machine (it read "unreadable=true" as a scheduler that cannot be read), so the regression passed unseen. The new test asks the real scheduler on its own first, finds that it answers "no such task" (error id `CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask`) and FAILS under both editions: "the real scheduler's not-found id is ...; the script expects ...". Without the fault it passes under both editions (not skipped).
 G2. The independent question is a pure function with six raw answers tested (a real not-found, another id still a not-found, a missing command, access denied, a found task, no answer): it says "scheduler cannot be read" only for the last four.
+
+PART H (round 16, the further read). The new tests against the previous runner and script (3fe95b9b put back), both editions
+
+H1. 8 new tests, all 8 fail on the previous runner and script: a target marked assume-unchanged or skip-worktree with an uncommitted edit (the previous runner did not refuse: 4), a file that git checkout does not restore because a flag is set while the fault is planted (the previous runner said that everything was put back and left the planted text: 2), and a failed delete with the task confirmed absent (it printed "task deleted: True": 2). With the change all 8 pass under both editions.

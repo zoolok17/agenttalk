@@ -280,7 +280,12 @@ function Invoke-OneRun {
             $stillThere = [bool]$after.exists
             $unreadable = [bool]$after.unreadable  # the scheduler could not be asked: the task is NOT known to be gone
             $gone = -not $stillThere -and -not $unreadable
-            Write-Host "[$Label] task deleted: $gone"
+            if ($gone -and $deleteExit -ne 0) {
+                # The scheduler says the task is not there, but the delete command itself failed: it is not "deleted".
+                Write-Host "[$Label] task absent (delete command failed, schtasks returned $deleteExit; the scheduler confirms that the task is not there)"
+            } else {
+                Write-Host "[$Label] task deleted: $gone"
+            }
             $judged = Resolve-Cleanup -Judged $judged -DeleteExit $deleteExit -StillExists $stillThere -Unreadable $unreadable -Name $TaskName
             if (-not $gone) { Write-Host "[$Label] $($judged.text)" }
         }

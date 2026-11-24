@@ -10,7 +10,9 @@
 
   It edits tracked files in place. Run it on a clone you can throw away: it refuses to start when ANY file that a
   selected fault changes has uncommitted edits (the list is derived from the faults themselves, never written by hand),
-  or when `git status` cannot be read, so nothing of yours is lost; it leaves every file as it was committed.
+  or when `git status` cannot be read, or when a target is marked assume-unchanged or skip-worktree (git status cannot see
+  an edit in such a file), so nothing of yours is lost; it leaves every file as it was committed, and says so only after it
+  has checked every file byte for byte against the original (it writes the saved original back if git checkout did not).
 
   What is kept for each fault: the pytest summary, the id of each failing test (every one, none left out), and for every one of
   those the first line of its failure (an assertion, or an exception raised at call time, which is flagged: a fault that
@@ -204,7 +206,13 @@ $faults = @(
       "    if (-not `$task) { `$none.unreadable = `$true; return `$none }", "    if (-not `$task) { return `$none }")) },
   @{ id = 'F51-a-wrong-task-not-found-error-id'; tests = $sched; edits = @(, @($SCRIPT,
       "`$TaskNotFoundId = 'CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask'",
-      "`$TaskNotFoundId = 'CmdletizationQuery_NotFound_TaskNam,Get-ScheduledTask'")) }
+      "`$TaskNotFoundId = 'CmdletizationQuery_NotFound_TaskNam,Get-ScheduledTask'")) },
+  @{ id = 'F52-fault-runner-does-not-refuse-a-hidden-target'; tests = $runner; edits = @(, @($RUNNERFILE,
+      "`$hidden = @(`$flags | Where-Object { `$_ -and `$_[0] -cne 'H' } | ForEach-Object { `$_.Substring(2) })", "`$hidden = @()")) },
+  @{ id = 'F53-fault-runner-does-not-check-that-a-file-was-put-back'; tests = $runner; edits = @(, @($RUNNERFILE,
+      "      if (-not (Test-SameBytes `$p `$originals[`$p])) {", "      if (`$false) {")) },
+  @{ id = 'F54-a-failed-delete-with-the-task-absent-says-deleted'; tests = $sched; edits = @(, @($SCRIPT,
+      "            if (`$gone -and `$deleteExit -ne 0) {", "            if (`$false) {")) }
 )
 
 # Preflight: every file that any selected fault changes (and restores with git checkout) must be tracked and clean.
@@ -214,6 +222,14 @@ $targets = @($selected | ForEach-Object { $_.edits } | ForEach-Object { $_[0] } 
 $tracked = @(git ls-files -- @targets 2>&1)
 if ($LASTEXITCODE -ne 0) { throw "Refusing to start: git could not list the files a fault changes (exit $LASTEXITCODE): $($tracked -join ' ')" }
 if ($tracked.Count -ne $targets.Count) { throw "Refusing to start: not every file a fault changes is tracked by git: $($targets -join ', ')" }
+# `git status` does not see an edit in a file that is marked assume-unchanged (`h` in `git ls-files -v`) or skip-worktree
+# (`S`, or `s` with both): a checkout would discard that edit, or (skip-worktree) would leave the planted fault in the file.
+$flags = @(git ls-files -v -- @targets 2>&1)
+if ($LASTEXITCODE -ne 0) { throw "Refusing to start: git could not show the flags of the files a fault changes (exit $LASTEXITCODE): $($flags -join ' ')" }
+$hidden = @($flags | Where-Object { $_ -and $_[0] -cne 'H' } | ForEach-Object { $_.Substring(2) })
+if ($hidden.Count -gt 0) {
+  throw "Refusing to start: git is told not to look at these files (assume-unchanged or skip-worktree), so an edit in them would not show and could be lost or left behind: $($hidden -join ', '). Undo it with git update-index --no-assume-unchanged / --no-skip-worktree first."
+}
 $status = @(git status --porcelain -- @targets 2>&1)
 if ($LASTEXITCODE -ne 0) { throw "Refusing to start: git status failed (exit $LASTEXITCODE), so uncommitted edits in the files a fault changes cannot be ruled out: $($status -join ' ')" }
 if ($status.Count -gt 0) { throw "Refusing to start: these files, which a fault changes and restores with git checkout, have uncommitted edits: $($targets -join ', '). Commit or stash them first." }
@@ -236,14 +252,21 @@ function Get-FailureLines($XmlPath) {
   return $rows
 }
 
+function Test-SameBytes([string]$Path, [byte[]]$Expected) {
+  if (-not (Test-Path -LiteralPath $Path)) { return $false }
+  $now = [IO.File]::ReadAllBytes($Path)
+  return [Linq.Enumerable]::SequenceEqual([byte[]]$now, [byte[]]$Expected)
+}
+$notRestored = @()
 $lines = @("planted faults of #907: one result line each (caught = at least one test failed; every failing test is kept with the first line of its failure)")
 foreach ($f in $faults) {
   if ($Only -and $f.id -ne $Only) { continue }
   $files = @{}
+  $originals = @{}  # the bytes of each file as it was, kept so that putting it back can be checked
   $planted = $true
   foreach ($e in $f.edits) {
     $path = Join-Path $Repo $e[0]
-    if (-not $files.ContainsKey($path)) { $files[$path] = [IO.File]::ReadAllText($path) }
+    if (-not $files.ContainsKey($path)) { $files[$path] = [IO.File]::ReadAllText($path); $originals[$path] = [IO.File]::ReadAllBytes($path) }
     $text = $files[$path]
     $crlf = $text.Contains("`r`n")
     # A fault's text carries the line endings of THIS file (CRLF after a Windows checkout): compare in LF, convert per target.
@@ -280,8 +303,21 @@ foreach ($f in $faults) {
       $lines += "        [$($row.kind)] $($row.message)"
     }
   } finally {
-    foreach ($p in $files.Keys) { git checkout -- ($p.Substring($Repo.Length).TrimStart('\', '/')) 2>&1 | Out-Null }
+    foreach ($p in $files.Keys) {
+      git checkout -- ($p.Substring($Repo.Length).TrimStart('\', '/')) 2>&1 | Out-Null
+      if (-not (Test-SameBytes $p $originals[$p])) {
+        # git checkout did not give the file back (a flag set during the run, a locked file): write the saved bytes and look again
+        [IO.File]::WriteAllBytes($p, $originals[$p])
+        if (Test-SameBytes $p $originals[$p]) { $lines += "NOTE: $($f.id): git checkout did not restore $($p.Substring($Repo.Length).TrimStart('\', '/')); the saved original was written back and checked" }
+        else { $notRestored += $p.Substring($Repo.Length).TrimStart('\', '/') }
+      }
+    }
   }
 }
-$lines += 'done; the source files were put back with git checkout'
+if ($notRestored.Count -gt 0) {
+  $lines += "NOT PUT BACK: $($notRestored -join ', ') could not be restored to the original bytes; check them with git diff before anything else"
+  Set-Content -LiteralPath $Out -Value $lines -Encoding utf8
+  throw "A planted fault could not be taken out of: $($notRestored -join ', ')"
+}
+$lines += 'done; every source file was put back (checked byte for byte against the original)'
 Set-Content -LiteralPath $Out -Value $lines -Encoding utf8

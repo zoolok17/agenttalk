@@ -306,6 +306,7 @@ function Invoke-Schtasks {
     if ($Line -like '/Delete*') {
         $script:stub.deleted = $true
         if ($env:STUB_DELETE_FAILS -eq '1') { return 1 }
+        if ($env:STUB_DELETE_FAILS -eq 'gone') { $script:stub.exists = $false; return 1 }  # failed, task gone
         $script:stub.exists = $false
         return 0
     }
@@ -327,7 +328,7 @@ def run_with_a_stand_in_scheduler(
     env = dict(
         os.environ,
         STUB_TASK_STATE=state,
-        STUB_DELETE_FAILS="1" if delete_fails else "0",
+        STUB_DELETE_FAILS=delete_fails if isinstance(delete_fails, str) else ("1" if delete_fails else "0"),
         STUB_QUERY=query,
         STUB_PYTEST_EXIT=str(pytest_exit),
         STUB_CALLS=str(calls),
@@ -695,3 +696,14 @@ def test_the_refusal_is_found_whatever_the_terminal_colour_does_to_the_error_tex
     text = plain(raw)
     assert "could not be read" in text and "Nothing was registered" in text, text
     assert calls == [], calls
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_a_failed_delete_with_the_task_confirmed_absent_says_absent_not_deleted(tmp_path, shell):
+    """The delete command failed, but the scheduler answers that there is no such task: the cleanup is confirmed (the
+    exit code stays 0), and the output says "task absent (delete command failed ...)", never "task deleted: True"."""
+    done, out, _ = run_with_a_stand_in_scheduler(tmp_path, shell, delete_fails="gone")
+    text = plain(done.stdout + done.stderr)
+    assert done.returncode == 0, text
+    assert "task absent (delete command failed" in text and "task deleted: True" not in text, text
+    assert (out / "interactive-accepted.log").exists()
