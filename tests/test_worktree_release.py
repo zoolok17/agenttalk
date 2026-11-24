@@ -642,8 +642,9 @@ def test_stale_fsmonitor_cannot_hide_edits(estate, tmp_path, monkeypatch, when):
 
 
 @pytest.mark.parametrize("report", [False, True])
-def test_unrelated_relative_lanes_do_not_block_release(estate, report):
+def test_unrelated_relative_lanes_do_not_block_release(estate, report, monkeypatch):
     repo, wt, cfg = estate
+    monkeypatch.chdir(repo)  # under the suite's fence a caller-relative spelling must lie inside it: here it does
     state = repo / ".agenttalk/state"
     state.mkdir()
     # Synthetic shape from the review: five relative lanes (three active),
@@ -2894,6 +2895,7 @@ def test_a_missing_child_of_a_backslash_named_checkout_is_judged_as_master_judge
     macOS): the check and master agree on every case, among them the one that was lost, a missing child of a checkout
     whose name ends in a backslash (the shared token turns that backslash into a slash, so the child was placed beside
     the checkout and not below it)."""
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # made-up paths on a stand-in file system: the fence is not the point
     world = _FakePosixFolders(monkeypatch, tmp_path, folders)
     assert world.master_names(checkout, recorded) is expected
     assert world.names(checkout, recorded) is expected
@@ -2907,12 +2909,13 @@ def test_a_missing_child_of_a_backslash_named_checkout_is_judged_as_master_judge
     "where",
     ["existing-child", "missing-child", "two-missing", "forward-slashes", "the-root-itself", "just-below-the-root"],
 )
-def test_a_record_naming_a_folder_inside_a_checkout_at_a_drive_root_names_it(tmp_path, where):
+def test_a_record_naming_a_folder_inside_a_checkout_at_a_drive_root_names_it(tmp_path, where, monkeypatch):
     """A checkout registered at a drive root has the token `c:/`, which already ends in a slash. Looking for children
     under `c://` found none, so a record naming a folder inside the drive read as unrelated and release could remove a
     checkout that was in use. This reads the real root of the drive the test folder is on and only compares paths:
     nothing is created or removed at the root. (A `subst` letter does not make this shape: Windows resolves it to
     the folder it points at.)"""
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # only paths are compared; a drive root is outside the suite's fence
     root = Path(tmp_path.anchor)
     path = {
         "existing-child": tmp_path,  # a folder that is there, some levels down

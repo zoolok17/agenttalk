@@ -2466,3 +2466,167 @@ def test_store_fence_allows_settles_a_passing_second_name_like_the_fence_check(
     monkeypatch.setattr(store_mod, "_first_escape", lambda root, fence: seen.pop(0) if len(seen) > 1 else seen[0])
     monkeypatch.setattr(store_mod.time, "sleep", lambda seconds: None)
     assert store_mod.store_fence_allows(tmp_path / "team") is allowed
+
+
+# --- #858 fix round 16: a path that an activity record names is fenced before anything resolves it -----------------
+
+_NAMED_MARK = "zz-record-named"  # in the name of the folder that a record names outside the fence (lower case)
+_NETWORK_MARK = "server-858"  # in the name of the network host of a UNC path
+
+
+def _record_path(kind: str, tmp_path: Path) -> str:
+    """An absolute path a record can name, outside the fence: a folder beside it, or a network path (UNC)."""
+    if kind == "outside":
+        folder = tmp_path / _NAMED_MARK
+        folder.mkdir(exist_ok=True)
+        return str(folder.resolve() / "x")
+    return f"\\\\{_NETWORK_MARK}\\share\\x" if os.name == "nt" else f"//{_NETWORK_MARK}/share/x"
+
+
+def _looked_at(monkeypatch: pytest.MonkeyPatch, *marks: str) -> list[tuple[str, str]]:
+    """Every look at a path whose name holds one of `marks`, by the calls that ask the file system about a path (stat,
+    lstat, realpath, exists, a listing, a link's target). The spy answers an error and never asks the real call, so a
+    network path is never contacted. The fence's own resolver is not exempted: a look it makes is recorded too."""
+    looked: list[tuple[str, str]] = []
+
+    def watch(name, real):
+        def spy(path, *args, **kwargs):
+            try:
+                text = os.fsdecode(os.fspath(path))
+            except TypeError:  # a file descriptor
+                return real(path, *args, **kwargs)
+            if any(mark in os.path.normcase(text) for mark in marks):
+                looked.append((name, text))
+                raise OSError(errno.EIO, "a path outside the fence was looked at (spy)")
+            return real(path, *args, **kwargs)
+
+        return spy
+
+    calls = [(os, "lstat"), (os, "stat"), (os, "scandir"), (os, "listdir"), (os, "readlink"), (os.path, "realpath"),
+             (os.path, "exists"), (os.path, "lexists"), (os.path, "isdir"), (os.path, "isfile")]
+    if os.name == "nt":
+        import nt
+
+        calls.append((nt, "_getfinalpathname"))
+    for owner, name in calls:
+        monkeypatch.setattr(owner, name, watch(f"{owner.__name__}.{name}", getattr(owner, name)))
+    return looked
+
+
+_RECORDS = {
+    "lane-worktree_path": ("lane", "worktree_path"),
+    "lane-cwd": ("lane", "cwd"),
+    "launch-cwd": ("launch", "cwd"),
+}
+
+
+def _write_named(repo: Path, record: str, text: str) -> None:
+    """A record that names `text`: an active lane row, or a pending launch request."""
+    kind, field = _RECORDS[record]
+    state = repo / ".agenttalk" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    if kind == "lane":
+        row = {"status": "active", field: text}
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}), encoding="utf-8")
+    else:
+        (state / "launch-requests").mkdir(exist_ok=True)
+        row = {"state": "pending", field: text}
+        (state / "launch-requests" / "r.json").write_text(json.dumps(row), encoding="utf-8")
+
+
+def _swept_checkout(fence: Path) -> tuple[Path, Path]:
+    """(repo, the merged, clean checkout `.worktrees/done`): a candidate of the sweep, and one a release removes."""
+    done = fence / "repo" / ".worktrees" / "done"
+    return _merged_checkout(fence, done, fence / "scratch"), done
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+@pytest.mark.parametrize("named", ["outside", "network"])
+@pytest.mark.parametrize("record", list(_RECORDS))
+def test_a_record_that_names_a_path_outside_the_fence_keeps_the_checkout_and_nothing_outside_is_looked_at(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+    record: str, named: str, mode: list[str],
+) -> None:
+    """The in-use check reads every record, and each path a record names went through `lstat` and `realpath` before it
+    was judged unrelated: the preflight fences the configured roots and the registered checkouts, not these. Now the
+    fence decides first, from the path as written (no look at it, so a network path is never contacted), and a path it
+    refuses keeps the checkout and says that the record names a path outside the fence: never read as unrelated."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    _write_named(repo, record, _record_path(named, tmp_path))
+    looked = _looked_at(monkeypatch, _NAMED_MARK, _NETWORK_MARK)
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert looked == [], f"a path outside the fence was looked at: {looked}"
+    assert (done / ".git").exists() and str(done) in _git(repo, "worktree", "list").replace("/", os.sep), text
+    assert "names a path outside the fence" in text and "kept" in text.lower(), text
+    assert rc in (0, 1), text  # a kept checkout is a refusal, not a crash
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+def test_a_record_that_names_a_path_inside_the_fence_that_is_not_the_checkout_frees_it_as_before(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: list[str],
+) -> None:
+    """The control: an active lane and a launch request that name some other folder inside the fence are placed as
+    ever (and looked at: the fence allows it); the checkout is released or swept, with no refusal."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    elsewhere = fence / "elsewhere"
+    elsewhere.mkdir()
+    _write_named(repo, "lane-cwd", str(elsewhere))
+    _write_named(repo, "launch-cwd", str(elsewhere))
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert "outside the fence" not in text and f"REFUSED (kept) {done}" not in text and f"KEPT {done}" not in text, text
+    assert not report.exists()
+    if "--release-report" in mode:
+        assert f"WOULD RELEASE {done}" in text, text
+    elif "--apply" in mode or "--release" in mode:
+        assert not done.exists() and rc == 0, text
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+@pytest.mark.parametrize("record", ["lane-worktree_path", "launch-cwd"])
+def test_a_record_that_names_the_checkout_inside_the_fence_still_keeps_it(
+    fenced, tmp_path: Path, capsys: pytest.CaptureFixture, record: str, mode: list[str],
+) -> None:
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    _write_named(repo, record, str(done))
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert (done / ".git").exists(), text
+    assert ("names this checkout" in text or "REFUSED (kept)" in text or "KEPT" in text), text
+    assert "outside the fence" not in text, text
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+def test_a_record_that_names_an_in_fence_link_to_an_outside_folder_keeps_the_checkout(
+    fenced, tmp_path: Path, capsys: pytest.CaptureFixture, mode: list[str],
+) -> None:
+    """A path that is inside the fence as written but leads outside through a link: the fence's own resolution follows
+    the link before it refuses (#913), and then the checkout is kept, with the same reason."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    outside = tmp_path / "elsewhere-outside"
+    outside.mkdir()
+    link = fence / "link-to-outside"
+    _dir_link(link, outside)
+    _write_named(repo, "lane-cwd", str(link / "x"))
+    try:
+        cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+    finally:
+        _unlink_dir(link)
+
+    text = capsys.readouterr().out
+    assert (done / ".git").exists() and "names a path outside the fence" in text, text
