@@ -43,7 +43,8 @@ done, and the claims that depend on them say so.
 | C-7 | Without a job (job refused, assignment refused, Linux, macOS) the write runs exactly as before, with the same steps, times and warning. **One behaviour changes:** if `NtResumeProcess` is missing, fails or is refused, the write now fails to start where the earlier code simply ran Git. | `tests/test_git_write_job_907.py` |
 | C-8 | A program in the job that asks to break away does not leave it: Windows refuses, or, under an outer job that allows breakaway, lets the request through and the program stays in this job and ends with its stop. | `tests/test_git_job_windows.py` |
 | C-9 | On a real Windows host Git can be started paused, put in a new job through the handle `Popen` already holds, resumed through the same handle, and run, also when the test process is already in another job. | `tests/test_git_job_capability.py` |
-| C-10 | The scheduled-task host check (`scripts/check_git_job_scheduled_task.ps1`) accepts only fresh, finished, good evidence: it refuses a missing, empty, another run's or partial log, a non-zero exit, and an exit of 0 without the host facts line. In a full run it also needs the scheduler to show the task as Ready: a time limit, a task that is Running, Queued, Disabled or unknown, or a task the scheduler cannot show, is never accepted, whatever the log holds. Task mode does not stop on a line written to stderr. | `tests/test_git_job_scheduled_task_check.py` |
+| C-10 | The scheduled-task host check (`scripts/check_git_job_scheduled_task.ps1`) accepts only fresh, finished, good evidence: it refuses a missing, empty, another run's or partial log, a non-zero exit, and an exit of 0 without the host facts line. In a full run it also needs the scheduler to show the task as Ready: a time limit, a task that is Running, Queued, Disabled or unknown, or a task the scheduler cannot show, is never accepted, whatever the log holds. Task mode does not stop on a line written to stderr. Its small arguments file keeps every character of a path (UTF-8 with a byte order mark: a folder named with an accent came back with a question mark before). A task that is still there after the delete makes the run exit 4, with the accepted log kept and the way to delete the task by hand printed. | `tests/test_git_job_scheduled_task_check.py` |
+| C-12 | The planted-fault runner never discards an edit it did not make. It refuses to start when any file that a selected fault changes (the list is derived from the faults themselves) has uncommitted edits or is untracked, or when git cannot be read; it keeps the first line of every failing test's failure and flags a failure that is an exception at call time. | `907/faults.ps1`, `tests/test_git_job_fault_runner.py` |
 | C-11 | Every test of another subject keeps the old no-job path (so they stay about their own subject), while the product's default job path is exercised by real tests: the real-Windows tests, a real lane assignment and a real rollback that removes the checkout. | `tests/conftest.py`; `tests/test_git_job_windows.py`; `tests/test_lanes.py` |
 
 ---
@@ -61,7 +62,8 @@ done, and the claims that depend on them say so.
 | C-7 | Fake layer and fake launcher: the no-job Windows steps and times (5 second reap, 25 second wait), the POSIX steps and "and was killed" wording, the fallback rows (failed stop still kills; refused creation; refused assignment). The resume behaviour change is shown by the tests of a refused resume. | Executed |
 | C-8 | Real: a child of a program in our job asks Windows to break away. The test accepts a refusal (error 5) or a grant, and in the grant case requires the child to be a member of OUR job (asked through our job's own handle) and to end with our stop. Same for a program that makes its own inner job that allows breakaway. | Executed on one machine. On that machine the request was **granted** (its outer job allows breakaway) and the child stayed in our job. The refusal (error 5) was seen only in earlier design probes on hosts whose outer job does not allow breakaway; this build did not observe it. |
 | C-9 | The capability check, run before any product change, then kept as a test. It prints its facts as one warning line, so every run's log keeps them. | Executed on one machine; other hosts are open evidence (§6) |
-| C-10 | The verifier is run on made-up logs under both Windows PowerShell 5.1 and PowerShell 7 (ten logs, in `tests/test_git_job_scheduled_task_check.py` and again by hand in `907/verifier-probes.txt`). `-DryRun` prints the two registrations (run 1 with `/IT`, run 2 without it and with `/RP *`) and registers nothing. The whole completion rule is one function, run by `-Mode Decide` on a made-up scheduler state: a finished log with the task Running, Queued, Disabled, Unknown, with no state, or not shown by the scheduler is refused (exit 2), and so are a partial or another run's log; a non-zero exit or no facts line is rejected (exit 3); only a good log with the task Ready is accepted. Task mode is run under both PowerShell editions with a stand-in interpreter that writes one line to stderr (Windows PowerShell 5.1 used to stop there, so the log never got its last line). Planted faults F34, F35, F36. The task runs themselves were **not** done. | Verifier, decision rule, Task mode and dry run: executed. The two scheduled-task runs: **not done** (§6) |
+| C-10 | The verifier is run on made-up logs under both Windows PowerShell 5.1 and PowerShell 7 (ten logs, in `tests/test_git_job_scheduled_task_check.py` and again by hand in `907/verifier-probes.txt`). `-DryRun` prints the two registrations (run 1 with `/IT`, run 2 without it and with `/RP *`) and registers nothing. The whole completion rule is one function, run by `-Mode Decide` on a made-up scheduler state: a finished log with the task Running, Queued, Disabled, Unknown, with no state, or not shown by the scheduler is refused (exit 2), and so are a partial or another run's log; a non-zero exit or no facts line is rejected (exit 3); only a good log with the task Ready is accepted. Task mode is run under both PowerShell editions with a stand-in interpreter that writes one line to stderr (Windows PowerShell 5.1 used to stop there, so the log never got its last line). Planted faults F34, F35, F36. The arguments file is written by `-Mode WriteArgs` (the function `-Mode Run` uses) and read by Task mode, under both editions, with a folder named `café über`: its bytes start with a byte order mark and the path comes back unchanged; the previous ASCII file lost the accent (planted fault F38). `-Mode Run` itself, the wait and the cleanup included, is run against a stand-in scheduler (a tests-only hook replaces the two functions that talk to the scheduler): a good run is accepted, its log copied and its task deleted; a task that cannot be deleted gives exit 4 with the accepted log kept and the deletion command printed (planted fault F39); a finished log with the task shown as Running until the time limit gives exit 2 and no accepted copy. The task runs themselves were **not** done. | Verifier, decision rule, Task mode, `-Mode Run` against a stand-in scheduler and dry run: executed. The two real scheduled-task runs: **not done** (§6) |
+| C-12 | The runner is run in a throw-away git repository (12 tests, under both PowerShell editions): an uncommitted edit of the scheduled-task script, of the test configuration, of a product file, or of any file when every fault is selected makes it refuse to start (it names the file and leaves the edit untouched, and writes no results); a folder that is not a repository makes it refuse; an uncommitted edit of a file that no selected fault changes does not stop it, the fault is planted and put back, and the edit is still there. Planted faults F40 (the check back on only the two product files) and F41 (git failures not stopping it). The failure lines it keeps are in `907/faults-results.txt`. | Executed |
 | C-11 | Reasoned in §5 (decision D-6), plus real tests of the default path with nothing replaced: a plain write through the product, a real lane assignment and a real rollback that removes the checkout (each ends by asserting that a job was started and closed). Planted fault F37 (the marker ignored). | Executed |
 
 ---
@@ -79,11 +81,13 @@ done, and the claims that depend on them say so.
 | Tests on a fake Windows layer (run on every platform) | `tests/test_git_job.py`, `tests/test_git_write_job_907.py`, with the fake in `tests/_git_job_fake.py` |
 | Tests on real Windows and real Git | `tests/test_git_job_windows.py` (marker `real_git_job`) |
 | The host check | `tests/test_git_job_capability.py` (marker `windows_capability`) |
+| The fault runner and its test | `docs/verification/907/faults.ps1`, `tests/test_git_job_fault_runner.py` |
 | The scheduled-task check and its test | `scripts/check_git_job_scheduled_task.ps1`, `tests/test_git_job_scheduled_task_check.py` |
 
-**Test counts at the time of writing:** 178 new tests (43 on the job module, 72 on the write and its time-out paths,
-9 on real Windows with real Git, 2 on the host check, 52 on the scheduled-task script under two PowerShell editions);
-two existing real lane tests also carry the marker `real_git_job` now. The job test files, the older time-out tests, the failed-provision tests and `tests/test_lanes.py` in full: 1176 passed and 7 skipped with two test workers; the real-Windows file and the host check with one worker: 11 passed. Lint (`ruff check src tests`) and the
+**Test counts at the time of writing:** 201 new tests (43 on the job module, 73 on the write and its time-out paths,
+9 on real Windows with real Git, 2 on the host check, 62 on the scheduled-task script under two PowerShell editions,
+12 on the fault runner);
+two existing real lane tests also carry the marker `real_git_job` now. Lint (`ruff check src tests`) and the
 security scan (`bandit -r src`) report nothing.
 
 **Red first**, in two parts (`907/red-first.txt` lists every failing test). A test that fails only because a name, a mode
@@ -95,11 +99,11 @@ process" guards pass there, which is what the design says they must do. Part B: 
 configuration of the previous head put back, the tests added in the fix round fail: 9 because of behaviour (the hand-over
 at its real return, the clock call, the late sleep, the late query, and the stderr line under Windows PowerShell 5.1) and
 26 because a name, a mode or a wording does not exist there (the `Decide` mode, the fixture of the real lane tests, and
-the dry-run wording). With the change, all pass.
+the dry-run wording). With the change, all pass. Part C (the second delta round): the runner tests against the previous runner: 8 of 12 fail, all because of behaviour (it started and discarded edits, or did not refuse). The five new script tests, run under both editions (10 cases), against the previous script with only a test seam added: 6 of 10 fail, all because of behaviour (the accent was lost; a failed deletion returned 0); against the previous script as it was, all 10 fail because a mode or a parameter did not exist there.
 
-**Planted faults.** 38 faults (F01 to F37, with F16b), each planted alone in one place, each shown to compile (a script
-is parsed when its tests run it), to be reached, and to fail at least one test, each then put back: all 38 are caught,
-none only as an error. F14 changed in the fix round: the old fault (polling to the full deadline) became an equivalent
+**Planted faults.** 43 faults (F01 to F42, with F16b), each planted alone in one place, each shown to compile (a script
+is parsed when its tests run it), to be reached, and to fail at least one test, each then put back: all 43 are caught,
+none only as an error. All 43 ran again in one run after the last change (the results file is that run). The results file keeps the first line of every failing test's failure, so each catch can be read: 36 faults fail tests by an assertion only, and 7 (F10, F21, F27, F29, F30, F31, F42) also or only by an exception at call time, which is a weaker catch (F42 only by one: the old code asked for a count with no deadline and failed with an AttributeError, which is exactly the real defect that fault stands for). F14 changed in the fix round: the old fault (polling to the full deadline) became an equivalent
 one once the count checks the deadline before each query, so it is now "a polling window longer than two seconds".
 
 ---
@@ -125,7 +129,12 @@ one once the count checks the deadline before each query, so it is now "a pollin
    fixture that took real lane flows off the default path, and, in the script, a finished log accepted at the time limit
    without the scheduler's half, `Unknown` and `Disabled` counted as finished, and Windows PowerShell 5.1 stopping on a
    stderr line. Each code fix has a test that fails on the previous head and a planted fault. A further read of the delta
-   is outstanding at the time of writing.
+   found the product code right and three points in the new tools.
+8. **A second delta round** (tools only; the product code is unchanged): the fault runner now derives the files it
+   must check from the faults and refuses to start on any uncommitted edit in them, or when git cannot be read (it could
+   discard an edit in the scheduled-task script or the test configuration before); the arguments file keeps accents; a
+   task that cannot be deleted makes the run exit 4; and the runner keeps the first line of each failing test's failure.
+   A further read is outstanding at the time of writing.
 
 ---
 
@@ -192,8 +201,9 @@ one once the count checks the deadline before each query, so it is now "a pollin
 - A partial checkout or a Git lock may still need recovery after any time-out.
 - Interruption windows outside the start and the time-out handling (for example between `start_in_job` returning and the
   write taking its result, or at the entry of the best-effort cleanup itself) stay as the earlier time-out change stated them.
-- The wait loop of `-Mode Run` is not run without a scheduler. The rule it applies is one function, which `-Mode Decide`
-  and its tests exercise with made-up scheduler states.
+- `-Mode Run` is run end to end only against a stand-in scheduler (the wait, the judging, the copy and the deletion
+  are the real code; the two functions that talk to the scheduler are replaced). A real scheduler may behave in a way the
+  stand-in does not, which is why the two real runs stay open evidence.
 - On the one machine measured, a direct breakaway request was granted, not refused (§2, C-8). The program still stays in
   our job. The refusal was seen only in earlier design probes.
 
@@ -221,7 +231,7 @@ four files of the previous head (`src/agenttalk/cli.py`, `src/agenttalk/git_job.
 same way. The failing tests are listed in `907/red-first.txt`.
 
 The planted faults, on a clone you can throw away (the runner edits tracked files and puts them back; it refuses to start
-when the two source files have uncommitted changes):
+when any file that a selected fault changes has uncommitted edits, or when git cannot be read):
 
 ```text
 powershell -NoProfile -File docs/verification/907/faults.ps1 -Python python

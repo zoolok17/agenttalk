@@ -287,6 +287,22 @@ def test_a_query_that_returns_late_in_the_final_count_does_not_say_stopped(monke
     assert WARNING in str(error) and STOPPED not in str(error)
 
 
+def test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout(monkeypatch, tmp_path):
+    """If the clock call that starts the cleanup fails with an ordinary error, no shared deadline exists, so nothing can
+    be confirmed within it: the write still ends as its own time-out (the job stopped and closed, the warning kept, the
+    cause the write's TimeoutExpired), not as an `AttributeError` from a missing deadline."""
+    world = make(monkeypatch, clock=True)
+    broken = raising(RuntimeError("the clock broke"))
+    real = git_job._monotonic
+    monkeypatch.setattr(git_job, "_monotonic", lambda: (broken(), real())[1])
+    error = timeout_error(tmp_path)
+    assert isinstance(error.__cause__, subprocess.TimeoutExpired)
+    assert WARNING in str(error) and STOPPED not in str(error) and "the clock broke" in str(error)
+    log = names(world)
+    assert log.count("terminate") == 1 and log[-1] == "close"
+    assert world.closed == {JOB} and world.violations == []
+
+
 # --- the close, in every ending -----------------------------------------------------------------------------------
 # pending: what the write is about to report when the close happens. when: the close fails before the native close
 # succeeded (the handle is still owned) or after it succeeded (the handle is given up). kind: an ordinary failure, a

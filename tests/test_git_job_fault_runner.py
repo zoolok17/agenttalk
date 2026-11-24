@@ -22,7 +22,8 @@ pytestmark = [
     pytest.mark.skipif(GIT is None, reason="git is not on PATH"),
 ]
 
-# The four files the faults change; the job module holds the text that fault F01 looks for (so a run can plant it).
+# The files the faults change (the runner itself too); the job module holds the text that fault F01 looks for, so a
+# control run can plant it.
 FILES = {
     "src/agenttalk/cli.py": "def cli():\n    return 1\n",
     "src/agenttalk/git_job.py": (
@@ -32,6 +33,7 @@ FILES = {
     ),
     "scripts/check_git_job_scheduled_task.ps1": "# the scheduled-task script\n",
     "tests/conftest.py": "# the test configuration\n",
+    "docs/verification/907/faults.ps1": "# a stand-in for the runner itself: some faults change the runner\n",
 }
 EDIT = "\n# an edit of mine that no one has committed yet\n"
 
@@ -99,7 +101,9 @@ def test_the_runner_refuses_to_start_when_git_cannot_be_read(tmp_path, shell):
     not_a_repo = tmp_path / "plain-folder"
     not_a_repo.mkdir()
     done = run_runner(shell, not_a_repo, tmp_path, "-Only", "F34-scheduler-half-of-the-completion-rule-skipped")
-    assert done.returncode != 0 and "Refusing to start" in done.stdout + done.stderr
+    text = done.stdout + done.stderr
+    assert done.returncode != 0 and "Refusing to start" in text
+    assert "git could not list" in text, "it must say that git could not be read, not fall back to another refusal"
     assert not (tmp_path / "results.txt").exists()
 
 

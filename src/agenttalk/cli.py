@@ -3547,7 +3547,7 @@ def _job_confirmed(job, deadline) -> bool:
     """Whether the job's stop is confirmed: a stop reported success AND the job's live count reached 0 within the
     deadline. The count is read only now, after the stop and the launcher's reap (before that a non-empty job proves
     nothing). A count that could not be read is not 0, and a failed stop followed by a 0 count is not a confirmation."""
-    if job is None:
+    if job is None or deadline is None:  # no shared deadline exists (the clock call failed): nothing can be confirmed
         return False
     count = job.count_after_stop(deadline)
     return job.stop_succeeded and count == 0

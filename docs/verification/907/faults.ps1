@@ -176,12 +176,15 @@ $faults = @(
   @{ id = 'F39-a-failed-deletion-of-the-task-ignored'; tests = $sched; edits = @(, @($SCRIPT,
       "            `$judged = Resolve-Cleanup -Judged `$judged -DeleteExit `$deleteExit -StillExists `$stillThere -Name `$TaskName`n", "")) },
   @{ id = 'F40-fault-runner-checks-only-the-product-files'; tests = $runner; edits = @(, @($RUNNERFILE,
-      "`$status = @(git status --porcelain -- @targets 2>&1)",
-      "`$status = @(git status --porcelain -- 'src/agenttalk/cli.py' 'src/agenttalk/git_job.py' 2>&1)")) },
+      "ForEach-Object { `$_[0] } | Sort-Object -Unique)",
+      "ForEach-Object { `$_[0] } | Where-Object { `$_ -like 'src/*' } | Sort-Object -Unique)")) },
   @{ id = 'F41-fault-runner-does-not-stop-when-git-cannot-be-read'; tests = $runner; edits = @(
       @($RUNNERFILE, "if (`$LASTEXITCODE -ne 0) { throw `"Refusing to start: git could not list", "if (`$false) { throw `"Refusing to start: git could not list"),
       @($RUNNERFILE, "if (`$LASTEXITCODE -ne 0) { throw `"Refusing to start: git status failed", "if (`$false) { throw `"Refusing to start: git status failed"),
-      @($RUNNERFILE, "if (`$tracked.Count -ne `$targets.Count) {", "if (`$false) {")) }
+      @($RUNNERFILE, "if (`$tracked.Count -ne `$targets.Count) {", "if (`$false) {")) },
+  @{ id = 'F42-final-count-does-not-expect-a-missing-deadline'; tests = $fake; edits = @(, @($CLI,
+      "    if job is None or deadline is None:  # no shared deadline exists (the clock call failed): nothing can be confirmed`n        return False`n",
+      "    if job is None:`n        return False`n")) }
 )
 
 # Preflight: every file that any selected fault changes (and restores with git checkout) must be tracked and clean.
@@ -223,8 +226,10 @@ foreach ($f in $faults) {
     if (-not $files.ContainsKey($path)) { $files[$path] = [IO.File]::ReadAllText($path) }
     $text = $files[$path]
     $crlf = $text.Contains("`r`n")
-    $oldText = if ($crlf) { $e[1].Replace("`n", "`r`n") } else { $e[1] }
-    $newText = if ($crlf) { $e[2].Replace("`n", "`r`n") } else { $e[2] }
+    # A fault's text carries the line endings of THIS file (CRLF after a Windows checkout): compare in LF, convert per target.
+    $wantOld = $e[1].Replace("`r`n", "`n"); $wantNew = $e[2].Replace("`r`n", "`n")
+    $oldText = if ($crlf) { $wantOld.Replace("`n", "`r`n") } else { $wantOld }
+    $newText = if ($crlf) { $wantNew.Replace("`n", "`r`n") } else { $wantNew }
     $first = $text.IndexOf($oldText)
     if ($first -lt 0 -or $text.IndexOf($oldText, $first + 1) -ge 0) { $planted = $false; break }
     $files[$path] = $text.Substring(0, $first) + $newText + $text.Substring($first + $oldText.Length)

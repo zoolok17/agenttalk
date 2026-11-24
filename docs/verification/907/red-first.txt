@@ -102,3 +102,55 @@ failing tests: 35; of these, because of behaviour: 9; because a name or a mode i
     tests/test_lanes.py::test_m6_assign_provisions_worktree_by_default_and_workspace  [a name is missing]
     tests/test_lanes.py::test_786_successful_rollback_removes_worktree_and_branch  [a name is missing]
 
+
+PART C. The tests added in the second delta round (the fault runner, the arguments file, the deletion of the task) against the previous head's tools (b297eb0e put back), in three runs
+
+C1. The runner tests against the previous runner (it checked only the two product files and not git itself)
+command: python -m pytest tests/test_git_job_fault_runner.py -q
+result: 8 failed, 4 passed in 14.26s
+failing tests: 8 (all because of behaviour: the old runner started and discarded edits, or did not refuse)
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[script-powershell]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[script-pwsh]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[test-config-powershell]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[test-config-pwsh]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[all-faults-powershell]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[all-faults-pwsh]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_git_cannot_be_read[powershell]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_git_cannot_be_read[pwsh]
+
+C2. The new script tests against the previous script with only a test seam added (the stand-in hook and a mode that writes the arguments file the old way, as ASCII)
+command: python -m pytest <the five new script tests> -q
+result: 6 failed, 4 passed in 20.76s
+failing tests: 6 (all because of behaviour: the arguments file lost the accent; a failed deletion returned 0)
+    tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[pwsh]
+
+C3. The same tests against the previous script as it was
+command: python -m pytest <the five new script tests> -q
+result: 10 failed in 8.39s
+failing tests: 10 (all because a mode or a parameter did not exist there)
+    tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_whose_task_is_deleted_is_accepted_and_copied[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_whose_task_is_deleted_is_accepted_and_copied[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running[pwsh]
+
+
+PART D. The test for the product change of this round (an ordinary error from the clock call that starts the cleanup) against the previous head's src/agenttalk/cli.py (b297eb0e put back)
+
+command: python -m pytest tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout -q   (old cli.py)
+  E   AttributeError: 'NoneType' object has no attribute 'cut'
+  <path>:189: AttributeError: 'NoneType' object has no attribute 'cut'
+  FAILED tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout
+  1 failed in 3.31s
+the failure is a behaviour: the write ends with an AttributeError (no deadline to cut) instead of its own time-out error
+command: the same test with the change: 1 passed in 3.29s

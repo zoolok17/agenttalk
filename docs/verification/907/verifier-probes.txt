@@ -59,3 +59,21 @@ PowerShell 7
 dry run (nothing registered): the two registrations it would make
   [interactive] would run: schtasks /Create /TN agenttalk-git-job-check /SC ONCE /ST 23:59 /IT /RU "example-user" /RL LIMITED /TR "<command: this script -Mode Task -ArgsFile <file>>"
   [background] would run: schtasks /Create /TN agenttalk-git-job-check /SC ONCE /ST 23:59 /RU "example-user" /RP * /RL LIMITED /TR "<command: this script -Mode Task -ArgsFile <file>>"
+
+== part 4: the arguments file with a folder named like "cafe uber" with accents (nothing is registered)
+
+  Windows PowerShell 5.1: previous ASCII file comes back as "caf? ?ber"; now: starts with a byte order mark = True; folder name intact = True
+  PowerShell 7: previous ASCII file comes back as "caf? ?ber"; now: starts with a byte order mark = True; folder name intact = True
+
+== part 5: -Mode Run against a stand-in scheduler (a tests-only hook replaces the two functions that talk to the scheduler; nothing is registered)
+
+Windows PowerShell 5.1
+  good run, task deleted                               exit 0; accepted copy kept: True; [interactive] OK: run <id> finished with exit=0 and shows its host facts
+  good run, the task cannot be deleted                 exit 4; accepted copy kept: True; [interactive] OK: run <id> finished with exit=0 and shows its host facts
+  finished log, task Running until the time limit      exit 2; accepted copy kept: False; [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Running' (a run is complete only when the log is finished AND the task is Ready)
+
+PowerShell 7
+  good run, task deleted                               exit 0; accepted copy kept: True; [interactive] OK: run <id> finished with exit=0 and shows its host facts
+  good run, the task cannot be deleted                 exit 4; accepted copy kept: True; [interactive] OK: run <id> finished with exit=0 and shows its host facts
+  finished log, task Running until the time limit      exit 2; accepted copy kept: False; [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Running' (a run is complete only when the log is finished AND the task is Ready)
+
