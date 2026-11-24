@@ -1385,7 +1385,14 @@ def _registered_worktrees_listed(repo: Path) -> list[Path]:
             err = err.decode("utf-8", "replace")
         why = "git is not resolvable" if rc is None else f"git worktree list failed, rc={rc}: {err.strip()[:200]}"
         raise _listing_failure(why)
-    return _parse_worktree_list_z(out)
+    paths = _parse_worktree_list_z(out)
+    # Fenced at the source: under AGENTTALK_STORE_FENCE every reading of the registered checkouts, the first and every
+    # later one (the report, the sweep's last look, release), refuses a path outside the fence before the caller does
+    # anything with it (a stat, a containment check, a probe). A checkout registered outside after an earlier reading is
+    # caught here, not only by a check made once at the start.
+    for path in paths:
+        store_mod.check_folder_fence(path)
+    return paths
 
 
 def _checkouts_changed(c: Candidate, worktrees: list[Path], cfg: JanitorConfig) -> str | None:

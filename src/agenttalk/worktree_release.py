@@ -101,6 +101,11 @@ def _registered(repo: Path) -> dict[Path, set[str]]:
             paths[current].add(field.split(" ", 1)[0])
     if not paths:
         raise Refused("git did not identify any registered worktrees")
+    # Fenced at the source, like the sweep's strict reader: every reading (the main-repository check, the list of
+    # paths to report or release, and each checkout's own check) refuses a path outside the store fence before anything
+    # looks at it.
+    for path in paths:
+        store_mod.check_folder_fence(path)
     return paths
 
 

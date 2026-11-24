@@ -1554,6 +1554,239 @@ def test_a_release_fences_its_own_list_of_registered_checkouts_too(
     assert report.read_text(encoding="utf-8").split("\n")[:-1] == [str(stranger)]
 
 
+# --- #858 fix round 15: every later read of the registered checkouts is fenced too ----------------------------------
+
+_LIST_ARGS = ("worktree", "list", "--porcelain", "-z")
+
+
+def _stranger_record(outside: Path) -> tuple[bytes, str]:
+    """The record Git would print for a checkout registered at `outside`, as bytes (the sweep's reader) and as text."""
+    sha = "0" * 40
+    return (
+        b"worktree " + os.fsencode(str(outside)) + b"\0HEAD " + sha.encode() + b"\0detached\0\0",
+        "\0worktree " + str(outside) + "\0HEAD " + sha + "\0detached",
+    )
+
+
+def _register_outside_after(
+    monkeypatch: pytest.MonkeyPatch, outside: Path, *, after: int = 1, only: str | None = None
+) -> dict[str, int]:
+    """Git's list of registered checkouts names `outside` too, from the reading number `after` + 1 on. The two readers
+    (the sweep's and release's) are counted apart; the preflight makes the first reading of each; `only` limits it to
+    one reader. This sits below the readers, at the output of Git, so whatever the reader itself does with a path is
+    what is tested."""
+    from agenttalk import janitor, worktree_release
+
+    calls = {"sweep": 0, "release": 0}
+    real_run, real_read = janitor._run_git_checked, worktree_release._read_git
+
+    def run(repo, *args, raw=False):
+        rc, out, err = real_run(repo, *args, raw=raw)
+        if args[:4] == _LIST_ARGS:
+            calls["sweep"] += 1
+            if calls["sweep"] > after and only in (None, "sweep") and rc == 0 and isinstance(out, bytes):
+                out += _stranger_record(outside)[0]
+        return rc, out, err
+
+    def read(repo, *args):
+        out = real_read(repo, *args)
+        if args[:4] == _LIST_ARGS:
+            calls["release"] += 1
+            if calls["release"] > after and only in (None, "release"):
+                out += _stranger_record(outside)[1]
+        return out
+
+    monkeypatch.setattr(janitor, "_run_git_checked", run)
+    monkeypatch.setattr(worktree_release, "_read_git", read)
+    return calls
+
+
+def _watch_looks_at(monkeypatch: pytest.MonkeyPatch, outside: Path) -> list[str]:
+    """Every look at `outside` that the sweep or release makes, noted BEFORE it happens: an existence check, a
+    containment or identity check, the ancestor identities of a release. (The fence's own check of a path is not one of
+    these: it is the check.) The list is empty when nothing outside the fence was looked at."""
+    import pathlib
+
+    from agenttalk import janitor
+
+    looked: list[str] = []
+    target = os.path.normcase(str(outside))
+
+    def is_outside(value) -> bool:
+        return os.path.normcase(str(value)) == target
+
+    real_exists = pathlib.Path.exists
+    real_contains, real_same, real_ids = janitor._contains_worktree, janitor._same_worktree, janitor._ancestor_ids
+
+    def exists(self, *args, **kwargs):
+        if is_outside(self):
+            looked.append("exists")
+        return real_exists(self, *args, **kwargs)
+
+    def contains(candidate, worktree):
+        if is_outside(candidate) or is_outside(worktree):
+            looked.append("containment")
+        return real_contains(candidate, worktree)
+
+    def same(left, right):
+        if is_outside(left) or is_outside(right):
+            looked.append("identity")
+        return real_same(left, right)
+
+    def ids(cfg):
+        if is_outside(cfg.scratch_root):
+            looked.append("ancestor identities")
+        return real_ids(cfg)
+
+    monkeypatch.setattr(pathlib.Path, "exists", exists)
+    monkeypatch.setattr(janitor, "_contains_worktree", contains)
+    monkeypatch.setattr(janitor, "_same_worktree", same)
+    monkeypatch.setattr(janitor, "_ancestor_ids", ids)
+    return looked
+
+
+def _stale_leftover(temp: Path) -> Path:
+    """A scratch-family folder in the temp root, old enough for the sweep to remove (a candidate of `--apply`)."""
+    leftover = temp / "agenttalk-probe-old"
+    leftover.mkdir()
+    note = leftover / "note.txt"
+    note.write_text("kept unless the sweep removes it", encoding="utf-8")
+    for path in (note, leftover):
+        os.utime(path, (1, 1))
+    return leftover
+
+
+_LATER_MODES = {
+    "release-report": ["--release-report"],
+    "release": ["--release", "{done}"],
+    "apply": ["--apply"],
+}
+
+
+@pytest.mark.parametrize("mode", list(_LATER_MODES))
+def test_a_checkout_registered_outside_after_the_preflight_is_never_looked_at(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """A later reading of Git's list is fenced by itself. After the preflight's own reading, the list also names a
+    checkout outside the fence. Release read it again and passed it to its identity check (a stat of the path and its
+    ancestors), and the sweep's last look asked whether it exists and whether it lies under the candidate, all before
+    any fence check. Now the readers refuse the path first: nothing is looked at outside, nothing is released or swept.
+    """
+    fence, _, report = fenced
+    fence = fence.resolve()
+    scratch = fence / "scratch"
+    done = scratch / "done"
+    repo = _merged_checkout(fence, done, scratch)
+    leftover = _stale_leftover(fence / "temp")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    calls = _register_outside_after(monkeypatch, stranger)
+    looked = _watch_looks_at(monkeypatch, stranger)
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(_LATER_MODES[mode], done)])
+
+    assert calls["sweep"] + calls["release"] >= 2, "the later reading never happened, so nothing was tested"
+    assert looked == [], f"the outside checkout was looked at: {looked}"
+    assert rc != 0
+    assert (done / ".git").exists() and (leftover / "note.txt").exists()  # nothing was released or swept
+    assert str(stranger) in report.read_text(encoding="utf-8").split("\n")
+
+
+@pytest.mark.parametrize("mode", list(_LATER_MODES))
+def test_the_same_run_works_when_the_later_reading_is_unchanged(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: str,
+) -> None:
+    """The control for the test above: no checkout is added, so the run does what it always did (the report lists, the
+    release removes, the sweep removes the stale leftover), with no refusal."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    scratch = fence / "scratch"
+    done = scratch / "done"
+    repo = _merged_checkout(fence, done, scratch)
+    leftover = _stale_leftover(fence / "temp")
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(_LATER_MODES[mode], done)])
+
+    assert rc == 0, capsys.readouterr().out
+    assert not report.exists()
+    if mode == "release":
+        assert not done.exists()
+    elif mode == "apply":
+        assert not leftover.exists()
+
+
+@pytest.mark.parametrize("mode", ["release", "apply"])
+def test_a_later_reading_that_adds_an_in_fence_checkout_is_still_fence_checked_and_allowed(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """The control for the fence: a checkout registered INSIDE the fence after the preflight passes the fence, and the
+    fence is asked about it (the reader checks every path it returns), so the check is not simply skipped."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    scratch = fence / "scratch"
+    done = scratch / "done"
+    repo = _merged_checkout(fence, done, scratch)
+    _stale_leftover(fence / "temp")
+    newcomer = fence / "scratch" / "newcomer"
+    newcomer.mkdir()
+    _register_outside_after(monkeypatch, newcomer)  # named "outside" in the helper, but this one is inside the fence
+    asked: list[Path] = []
+    real_check = cli.store_mod.check_folder_fence
+    monkeypatch.setattr(
+        cli.store_mod, "check_folder_fence", lambda folder: asked.append(Path(folder)) or real_check(folder)
+    )
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(_LATER_MODES[mode], done)])
+
+    assert newcomer in asked, "the in-fence newcomer was never checked against the fence"
+    assert not report.exists()
+
+
+@pytest.mark.parametrize("mode", ["release-report", "release"])
+def test_the_preflight_passes_on_the_fence_refusal_of_releases_own_list(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """The sweep's list is clean and only release's own list names an outside checkout from the first reading on: the
+    preflight reports THAT refusal (the path, with the fence's usual line), not the generic "could not list" one."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    _register_outside_after(monkeypatch, stranger, after=0, only="release")
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(_LATER_MODES[mode], done)])
+
+    assert rc == 2 and (done / ".git").exists()
+    assert report.read_text(encoding="utf-8").split("\n")[:-1] == [str(stranger)]
+
+
+@pytest.mark.parametrize("reader", ["sweep", "release"])
+def test_each_reader_of_the_registered_checkouts_fences_what_it_returns(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str,
+) -> None:
+    """One test per reader. Called directly (the preflight's own check is not in the way), the sweep's strict reader and
+    release's own reader each refuse a registered path outside the fence, with the refusal report line, and return the
+    path as before when no fence is set."""
+    from agenttalk import janitor, worktree_release
+
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo = _merged_checkout(fence, fence / "scratch" / "done", fence / "scratch")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    _register_outside_after(monkeypatch, stranger, after=0)
+    read = janitor._registered_worktrees_listed if reader == "sweep" else worktree_release._registered
+
+    with pytest.raises(cli.store_mod.StoreFenceError):
+        read(repo)
+    assert report.read_text(encoding="utf-8").split("\n")[:-1] == [str(stranger)]
+
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # no fence: the same reading just returns it
+    assert stranger in list(read(repo))
+
+
 @pytest.mark.parametrize("reader", [
     "promisor-remote", "partial-clone-extension", "alternates-here", "alternates-chain", "alternates-in-origin",
     "origin-gitfile", "origin-dotgit-link", "origin-dot-git-link",

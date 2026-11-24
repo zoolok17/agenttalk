@@ -13554,6 +13554,8 @@ def cmd_janitor(args: argparse.Namespace) -> int:
             from .worktree_release import Refused, _registered as release_inventory
             try:
                 registered += [path for path in release_inventory(cfg.repo) if path not in registered]
+            except store_mod.StoreFenceError:
+                raise  # the reader fenced a path: that refusal (and its report line) is the answer
             except (Refused, OSError, ValueError):
                 store_mod.refuse_unplaced("the registered checkouts, which Git could not list for a release")
         for folder in registered:
