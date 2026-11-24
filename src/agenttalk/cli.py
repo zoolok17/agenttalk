@@ -16991,7 +16991,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if raw is not None:
             try:
                 body = (json.loads(raw.decode("utf-8")) or {}).get("body", "")
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):  # RecursionError: nested too deeply (#874)
                 body = "<unreadable payload>"
         child_output_tail = (
             meta.get("child_output_tail")
@@ -17200,6 +17200,8 @@ def _requeue_payload(store: Store, raw: bytes) -> tuple[dict | None, str | None]
         Message.from_raw(orig)
     except (ValueError, UnicodeDecodeError) as e:
         return None, f"corrupt payload ({e})"
+    except RecursionError:  # nested too deeply to read: the same refusal (#874)
+        return None, "corrupt payload (nested too deeply)"
     if store.signing_enforced():
         try:
             project_id = store.project_id()
