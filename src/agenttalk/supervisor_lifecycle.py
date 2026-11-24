@@ -312,8 +312,9 @@ def _process_parent_map() -> dict[int, int]:
     invalid = wintypes.HANDLE(-1).value
     if snapshot == invalid:
         error = ctypes.get_last_error()
+        detail = f"winerror {error}" if error else "no error code was reported"
         raise SupervisorLifecycleError(
-            f"could not snapshot process ancestry: CreateToolhelp32Snapshot failed (winerror {error})"
+            f"could not snapshot process ancestry: CreateToolhelp32Snapshot failed ({detail})"
         )
     parents: dict[int, int] = {}
     try:
@@ -329,8 +330,9 @@ def _process_parent_map() -> dict[int, int]:
             function = "Process32NextW"
         error = ctypes.get_last_error()
         if error != 18:  # ERROR_NO_MORE_FILES
+            detail = f"winerror {error}" if error else "no error code was reported"
             raise SupervisorLifecycleError(
-                f"could not snapshot process ancestry: {function} failed (winerror {error})"
+                f"could not snapshot process ancestry: {function} failed ({detail})"
             )
     finally:
         kernel32.CloseHandle(snapshot)

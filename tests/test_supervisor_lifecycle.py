@@ -81,10 +81,11 @@ def _fake_snapshot(monkeypatch, **kwargs):
     return kernel
 
 
-@pytest.mark.parametrize('error', [5, 18])
+@pytest.mark.parametrize('error', [0, 5, 18])
 def test_snapshot_creation_failure_raises(monkeypatch, error):
     kernel = _fake_snapshot(monkeypatch, invalid=True, error=error)
-    with pytest.raises(lifecycle.SupervisorLifecycleError, match=rf'CreateToolhelp32Snapshot.*winerror {error}'):
+    detail = rf'\(winerror {error}\)' if error else 'no error code was reported'
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match=rf'CreateToolhelp32Snapshot.*{detail}'):
         lifecycle._process_parent_map()
     assert kernel.walked == []
     assert kernel.closed == []
@@ -92,14 +93,14 @@ def test_snapshot_creation_failure_raises(monkeypatch, error):
 
 def test_snapshot_first_read_failure_raises(monkeypatch):
     kernel = _fake_snapshot(monkeypatch, error=5)
-    with pytest.raises(lifecycle.SupervisorLifecycleError, match=r'Process32FirstW.*winerror 5'):
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match=r'Process32FirstW.*\(winerror 5\)'):
         lifecycle._process_parent_map()
     assert kernel.closed == [123]
 
 
 def test_snapshot_next_read_failure_discards_partial_map(monkeypatch):
     kernel = _fake_snapshot(monkeypatch, error=6, entries=[(10, 1)])
-    with pytest.raises(lifecycle.SupervisorLifecycleError, match=r'Process32NextW.*winerror 6'):
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match=r'Process32NextW.*\(winerror 6\)'):
         lifecycle._process_parent_map()
     assert kernel.closed == [123]
 
@@ -116,7 +117,9 @@ def test_snapshot_read_without_error_does_not_use_stale_end(monkeypatch, failed_
             return result
         kernel.Process32FirstW.function = first
         kernel.Process32NextW.function = lambda *_args: 0
-    with pytest.raises(lifecycle.SupervisorLifecycleError, match=rf'Process32{failed_read.title()}W.*winerror 0'):
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError, match=rf'Process32{failed_read.title()}W.*no error code was reported',
+    ):
         lifecycle._process_parent_map()
     assert kernel.closed == [123]
 
