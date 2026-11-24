@@ -783,7 +783,10 @@ def _in_use_text(exc: Exception) -> str:
 
 
 class _UseCheckFailed(Exception):
-    """Whether anything is using a checkout could not be established (as opposed to: something is)."""
+    """Whether anything is using a checkout could not be established (as opposed to: something is). `fence` is set
+    when the cause was a refusal by the store fence: the sweep then stops (nothing more touches Git or the disk)."""
+
+    fence = False
 
 
 def _checkouts_under(c: Candidate, registered: list[Path], cfg: JanitorConfig) -> list[Path]:
@@ -1175,8 +1178,9 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     from . import worktree_release  # imported here: that module imports this one
 
     held = contextlib.ExitStack()  # the occupancy claims of the candidate being processed
+    fence_stop: str | None = None  # set when the store fence refused something after the preflight: the sweep stops
     try:
-        for c in report.candidates:
+        for index, c in enumerate(report.candidates):
             held.close()  # the previous candidate's claims
             guard = None
             # Not checked unless the checks completed and the delete itself ran: an identity or ancestry failure at any
@@ -1218,6 +1222,10 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                             held.enter_context(guard)
                         except worktree_release.Refused as exc:
                             keep = _in_use_text(exc)
+                        except store_mod.StoreFenceError as exc:
+                            failure = _UseCheckFailed(_use_check_failure(exc))
+                            failure.fence = True
+                            raise failure from exc
                         except (OSError, ValueError, TypeError) as exc:
                             raise _UseCheckFailed(_use_check_failure(exc)) from exc
                     for w in worktrees:
@@ -1248,6 +1256,8 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         continue
                 except _UseCheckFailed as exc:
                     reason = str(exc)
+                    if exc.fence:
+                        fence_stop = reason
                 except (OSError, RuntimeError) as exc:
                     reason = f"could not check worktree identity: {exc}"
 
@@ -1304,6 +1314,13 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         keep = _in_use_text(exc)
                     except _UseCheckFailed as exc:
                         result, reason, unchecked = "FAILED", str(exc), True
+                        if exc.fence:
+                            fence_stop = reason
+                    except store_mod.StoreFenceError as exc:
+                        # The fence refused a path after the preflight (a checkout registered outside the fence in the
+                        # meantime): nothing after this touches Git or the disk (no further candidate, no prune).
+                        result, reason, unchecked = "FAILED", _use_check_failure(exc), True
+                        fence_stop = reason
                     except (OSError, ValueError, TypeError) as exc:
                         result, reason, unchecked = "FAILED", _use_check_failure(exc), True
                     if keep:
@@ -1314,27 +1331,38 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
             if result == "FAILED":
                 report.apply_failed = True
                 (not_checked if unchecked else failed).append((c.path, reason or "unknown"))
+            if fence_stop is not None:
+                for later in report.candidates[index + 1:]:
+                    summary["FAILED"] = summary.get("FAILED", 0) + 1
+                    not_checked.append((later.path, "not looked at: the sweep stopped, the store fence refused a path"))
+                break
 
     finally:
         held.close()
 
-    reason = _ancestor_change_reason(report.ancestor_ids)
-    if reason is None and report.registered_worktrees is None:
-        # Git forgets a checkout whose folder is gone: pruning on an unknown list decides that blind too.
-        lines.append(
-            f"FAILED: worktree prune skipped: the registered checkouts are unknown ({report.registered_unknown})"
-        )
-    elif reason is None:
-        _run_git(cfg.repo, "worktree", "prune")
-        after, why = _strict_listing(cfg.repo)  # the same strict reading: a failed one is unknown, never a count of 0
-        if after is None:
-            report.apply_failed = True
-            lines.append(f"registered worktrees after prune: unknown ({why}); {_listing_next_step(why)}")
-        else:
-            lines.append(f"registered worktrees after prune: {len(after)}")
-    else:
+    if fence_stop is not None:
+        # Git's prune (and the listing after it) would read every registration, the one outside the fence too.
         report.apply_failed = True
-        lines.append(f"FAILED: worktree prune skipped: {reason}")
+        lines.append(
+            f"FAILED: worktree prune skipped, and the sweep stopped: the store fence refused a path ({fence_stop})")
+    else:
+        reason = _ancestor_change_reason(report.ancestor_ids)
+        if reason is None and report.registered_worktrees is None:
+            # Git forgets a checkout whose folder is gone: pruning on an unknown list decides that blind too.
+            lines.append(
+                f"FAILED: worktree prune skipped: the registered checkouts are unknown ({report.registered_unknown})"
+            )
+        elif reason is None:
+            _run_git(cfg.repo, "worktree", "prune")
+            after, why = _strict_listing(cfg.repo)  # the same strict reading: a failed one is unknown, never a count of 0
+            if after is None:
+                report.apply_failed = True
+                lines.append(f"registered worktrees after prune: unknown ({why}); {_listing_next_step(why)}")
+            else:
+                lines.append(f"registered worktrees after prune: {len(after)}")
+        else:
+            report.apply_failed = True
+            lines.append(f"FAILED: worktree prune skipped: {reason}")
 
     lines.append("removed summary:")
     for key, count in summary.items():

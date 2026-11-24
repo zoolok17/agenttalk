@@ -2604,9 +2604,12 @@ def test_worktree_release_accepts_a_unc_share_root_as_absolute_too(tmp_path, mon
     """Release must not call a share root ambiguous. Its physical matching (`worktree_release._placed`) is kept in
     production but replaced here by a stand-in that looks at nothing, so this test never touches a share or the
     network; it records what release asked to place, which shows that release got past the classification and
-    reached the matching."""
+    reached the matching. The suite's store fence is lifted for this test (the way `tests/test_probe_store.py` models
+    an unfenced shell): under a fence a record's path outside it is refused first, as a string, which is another
+    test's business (`tests/test_store_fence.py`); this one is about the classification and the matching."""
     from agenttalk import worktree_release
 
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE", raising=False)
     asked = []
 
     def place_nothing(path):
