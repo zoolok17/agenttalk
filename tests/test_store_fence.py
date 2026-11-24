@@ -2630,3 +2630,73 @@ def test_a_record_that_names_an_in_fence_link_to_an_outside_folder_keeps_the_che
 
     text = capsys.readouterr().out
     assert (done / ".git").exists() and "names a path outside the fence" in text, text
+
+
+# --- #901 fix round 1: the first listing fails under the fence, and a later one would name an outside checkout ------
+
+
+def _first_listing_fails_then_names_outside(monkeypatch: pytest.MonkeyPatch, outside: Path) -> dict[str, int]:
+    """Git's list of registered checkouts FAILS at the first reading (a non-zero exit, some partial output) and, from
+    the second reading on, succeeds and names `outside` as well. The two readers are counted apart (the sweep's and
+    release's own). The injection sits at the output of Git, below the readers, so what the code does with a failed
+    first reading is what is tested: a refusal at once makes exactly one reading and none by release."""
+    from agenttalk import janitor, worktree_release
+
+    calls = {"sweep": 0, "release": 0}
+    real_run, real_read = janitor._run_git_checked, worktree_release._read_git
+
+    def run(repo, *args, raw=False):
+        if args[:4] == _LIST_ARGS:
+            calls["sweep"] += 1
+            if calls["sweep"] == 1:
+                partial = b"worktree " + os.fsencode(str(repo)) + b"\0HEAD abc\0\0"
+                return 1, partial if raw else partial.decode(), b"fatal: the first list failed (test)" if raw else (
+                    "fatal: the first list failed (test)"
+                )
+        rc, out, err = real_run(repo, *args, raw=raw)
+        if args[:4] == _LIST_ARGS and rc == 0 and isinstance(out, bytes):
+            out += _stranger_record(outside)[0]
+        return rc, out, err
+
+    def read(repo, *args):
+        out = real_read(repo, *args)
+        if args[:4] == _LIST_ARGS:
+            calls["release"] += 1
+            out += _stranger_record(outside)[1]
+        return out
+
+    monkeypatch.setattr(janitor, "_run_git_checked", run)
+    monkeypatch.setattr(worktree_release, "_read_git", read)
+    return calls
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+def test_a_first_listing_that_fails_under_the_fence_is_refused_at_once_even_if_a_later_one_would_succeed(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],
+) -> None:
+    """The plan's combined case, on the fenced route in every mode: the first reading fails and the next would succeed
+    with a checkout outside the fence. The command refuses at the first failure: exactly one reading is made (none by
+    release), nothing outside is looked at, probed or written (its index is byte for byte the same), nothing is released
+    or swept, and the refusal report holds the one line about the list, not the outside path."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    clone = _outside_clone(tmp_path)
+    index = clone / ".git" / "index"
+    before_index, before_clone = index.read_bytes(), _snapshot(clone / ".git")
+    calls = _first_listing_fails_then_names_outside(monkeypatch, clone)
+    looked = _watch_looks_at(monkeypatch, clone)
+    asked = _spy_on_probes(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    # The harm first, so that a failure names what was actually done outside: a look, a status probe, a write.
+    assert looked == [] and asked == [], (looked, asked)  # no metadata read, no status asked
+    assert index.read_bytes() == before_index and _snapshot(clone / ".git") == before_clone  # and nothing written
+    assert rc == 2
+    assert calls == {"sweep": 1, "release": 0}, calls  # refused at the first failure: no second reading of any kind
+    assert (done / ".git").exists() and (done / "source.txt").exists()  # nothing released or swept
+    lines = report.read_text(encoding="utf-8").split("\n")[:-1]
+    assert len(lines) == 1 and "registered checkouts" in lines[0] and lines[0].endswith(_UNPLACED), lines
+    assert str(clone) not in lines[0]
