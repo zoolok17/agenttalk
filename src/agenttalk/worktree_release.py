@@ -445,6 +445,37 @@ def _placed(path: Path) -> str:
     return token
 
 
+def _fence_record_path(path: Path, key: str, source: str) -> None:
+    """Under AGENTTALK_STORE_FENCE, a path that an activity record names is fenced before anything resolves it:
+    `_placed` would `lstat` and `realpath` it, which for a path outside the fence reads (or, for a network path,
+    contacts) what the fence exists to keep out. A path the fence refuses keeps the checkout, with the reason
+    (`Refused`): it is never read as unrelated. Outside a fence nothing changes.
+
+    Two steps. First, from the path as written and with no look at it (`abspath` is a string operation): a path that is
+    outside the fence both as given and as the fence resolves to is refused at once, so a path outside is never
+    resolved at all. A path that is inside only through another spelling of the fence folder (a link to it) is refused
+    too, which only keeps a checkout. Second, a path inside as written goes through the fence's own check, which
+    resolves it and so follows a link before it refuses one that leads out (#913)."""
+    fence = os.environ.get(store_mod.STORE_FENCE_ENV)
+    if not fence:
+        return
+    written = Path(os.path.abspath(path))
+    allowed = {Path(os.path.abspath(fence)), Path(os.path.realpath(fence))}
+    reason = None
+    if not any(written == root or root in written.parents for root in allowed):
+        reason = "is outside the fence"
+    else:
+        try:
+            store_mod.check_folder_fence(path)
+        except store_mod.StoreFenceError:
+            reason = "leads outside the fence"
+    if reason is not None:
+        raise Refused(
+            f"{source}: the record names a path outside the fence (activity path {key} {reason}); "
+            "the checkout was kept, as nothing shows that this path is unrelated to it"
+        )
+
+
 def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | None,
                     source: str = "activity record", lane: bool = False, owner: dict | None = None) -> bool:
     """True when `value` names the checkout `target`. `lane_id` is the registry key of the lane row being read (None
@@ -507,6 +538,7 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
                         raise Refused(f"{source}: relative activity path {key} is ambiguous; "
                                       "record an absolute path first")
                 for candidate in paths:
+                    _fence_record_path(candidate, key, source)  # under a store fence: before anything looks at it
                     try:
                         where = _placed(candidate)
                     except (OSError, ValueError) as exc:
