@@ -204,6 +204,13 @@ def _os_error_text(exc: OSError) -> str:
     return exc.strerror or str(exc) or type(exc).__name__
 
 
+def _exception_text(exc: Exception) -> str:
+    """The words for any caught failure: an OSError by the system's own words (`_os_error_text`), anything else (a
+    subprocess timeout, another `SubprocessError`) by its own text, or its type's name when it has none. `strerror`
+    belongs to an OSError only: reading it from another exception is an AttributeError at the worst moment."""
+    return _os_error_text(exc) if isinstance(exc, OSError) else (str(exc) or type(exc).__name__)
+
+
 def _ancestor_ids(cfg: JanitorConfig) -> tuple[dict[Path, tuple[int, int] | None], list[tuple[Path, str]]]:
     """Record each scanned root and its parents, starting at the drive root.
 
@@ -811,7 +818,7 @@ def _in_use_reason(cfg: JanitorConfig, targets: list[Path]) -> str | None:
 
 
 def _use_check_failure(exc: Exception) -> str:
-    return f"could not check whether anything is using it: {_os_error_text(exc) if isinstance(exc, OSError) else exc}"
+    return f"could not check whether anything is using it: {_exception_text(exc)}"
 
 
 def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> str:
@@ -1354,7 +1361,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
             )
         elif reason is None:
             _run_git(cfg.repo, "worktree", "prune")
-            after, why = _strict_listing(cfg.repo)  # the same strict reading: a failed one is unknown, never a count of 0
+            after, why = _strict_listing(cfg.repo)  # the same strict reading: a failed one is unknown, not a 0
             if after is None:
                 report.apply_failed = True
                 lines.append(f"registered worktrees after prune: unknown ({why}); {_listing_next_step(why)}")
@@ -1460,7 +1467,7 @@ def _registered_worktrees_listed(repo: Path) -> list[Path]:
     try:
         rc, out, err = _run_git_checked(repo, "worktree", "list", "--porcelain", "-z", raw=True)
     except (OSError, subprocess.SubprocessError) as exc:  # Git is there but could not be run
-        raise _listing_failure(f"git could not be run: {_one_line(_os_error_text(exc))}") from exc
+        raise _listing_failure(f"git could not be run: {_one_line(_exception_text(exc))}") from exc
     if rc is None or rc != 0:
         if isinstance(err, bytes):
             err = err.decode("utf-8", "replace")

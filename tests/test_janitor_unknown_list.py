@@ -13,6 +13,7 @@ function that runs Git. Tests that already passed before #901 (what #858 had don
 import dataclasses
 import json
 import os
+import subprocess
 
 import pytest
 
@@ -417,3 +418,144 @@ def test_doctor_shows_gits_message_on_one_sanitized_line(estate, monkeypatch):
     for text in (check.details, check.fix):
         assert not any(bad in text for bad in BAD_CHARACTERS), text
     assert "fatal: boom" in check.details
+
+
+# --- round 2: a Git timeout, or any other failure to run Git that is not an OSError, is an unknown list ----------
+
+NOT_AN_OSERROR = {
+    "timeout": (lambda: subprocess.TimeoutExpired(["git", "worktree", "list"], 30), "timed out"),
+    "subprocess-error": (
+        lambda: subprocess.SubprocessError("git went wrong (test)\nsecond line"), "git went wrong (test)"
+    ),
+    "subprocess-error-without-words": (lambda: subprocess.SubprocessError(), "SubprocessError"),
+}
+
+
+def raises(kind, *, after_prune=False):
+    """An answer for `stand_in`: Git's list raises this exception (only once `worktree prune` has run, if asked)."""
+    make, _ = NOT_AN_OSERROR[kind]
+
+    def answer(n, args, state):
+        if after_prune and not state["pruned"]:
+            return None
+        raise make()
+
+    return answer
+
+
+@pytest.mark.parametrize("kind", list(NOT_AN_OSERROR))
+def test_git_that_times_out_or_cannot_be_run_in_any_way_is_an_unknown_list_in_the_report(estate, monkeypatch, kind):
+    repo, wt, cfg = estate
+    stand_in(monkeypatch, raises(kind))
+
+    report = janitor.build_report(cfg)
+    text = janitor.format_report(report, cfg, apply=False)
+
+    assert report.registered_worktrees is None, text  # no AttributeError out of the handler: the answer is "unknown"
+    assert "registered worktrees: unknown (git could not be run" in text and NOT_AN_OSERROR[kind][1] in text, text
+    line = next(row for row in text.splitlines() if "registered worktrees: unknown" in row)
+    assert NOT_AN_OSERROR[kind][1] in line  # the whole reason is on that one line, a line break written out
+    assert "registered worktrees: 0" not in text and "git worktree list --porcelain -z" in text, text
+
+
+@pytest.mark.parametrize("kind", list(NOT_AN_OSERROR))
+def test_doctor_warns_unknown_when_git_times_out_or_cannot_be_run_in_any_way(estate, monkeypatch, kind):
+    repo, wt, cfg = estate
+    stand_in(monkeypatch, raises(kind))
+
+    check = hygiene(repo)
+
+    assert check is not None and check.status == "warn" and "could not be checked" in check.details, check
+    assert NOT_AN_OSERROR[kind][1] in check.details, check.details
+    assert check.data["outside_worktrees"] is None
+    for text in (check.details, check.fix):
+        assert not any(bad in text for bad in BAD_CHARACTERS), text
+
+
+@pytest.mark.parametrize("kind", list(NOT_AN_OSERROR))
+def test_the_count_after_the_prune_says_unknown_when_git_times_out_or_cannot_be_run_in_any_way(
+    estate, monkeypatch, kind
+):
+    repo, wt, cfg = estate
+    gone = a_plain_candidate(repo, ".probe-gone")
+    calls, state = stand_in(monkeypatch, raises(kind, after_prune=True))
+
+    report = janitor.build_report(cfg)
+    text = janitor.apply(cfg, report)
+
+    assert not gone.exists() and state["pruned"], text  # the sweep itself ran: only the last reading failed
+    assert "registered worktrees after prune: unknown (git could not be run" in text, text
+    assert NOT_AN_OSERROR[kind][1] in text and "after prune: 0" not in text and report.apply_failed, text
+
+
+def test_a_timeout_at_the_final_listing_keeps_the_candidate_and_says_why(estate, monkeypatch):
+    repo, wt, cfg = estate
+    kept = a_plain_candidate(repo, ".probe-kept")
+    make, _ = NOT_AN_OSERROR["timeout"]
+
+    def second_reading_times_out(n, args, state):
+        if n == 2:
+            raise make()
+
+    stand_in(monkeypatch, second_reading_times_out)
+
+    report = janitor.build_report(cfg)
+    text = janitor.apply(cfg, report)
+
+    assert kept.exists(), text
+    assert "timed out" in text and report.apply_failed, text
+
+
+def test_the_text_of_a_caught_failure_comes_from_the_exception_that_has_it():
+    """`_os_error_text` reads `strerror`, which only an OSError has: any other failure is worded by its own text, or by
+    its type's name when it has none, and an OSError keeps the system's words without its file names."""
+    assert janitor._exception_text(PermissionError(13, "access is denied (test)", "C:/some/file")) == (
+        "access is denied (test)"
+    )
+    assert "timed out after 30" in janitor._exception_text(subprocess.TimeoutExpired(["git"], 30))
+    assert janitor._exception_text(subprocess.SubprocessError()) == "SubprocessError"
+    assert janitor._exception_text(ValueError("odd (test)")) == "odd (test)"
+
+
+# --- round 2: the exit codes of the report, as the docs state them -------------------------------------------
+
+
+def test_the_report_exits_0_for_a_useful_partial_report(estate, monkeypatch, capsys):
+    """Report mode: an unknown list of checkouts is said plainly, and the command still exits 0 when the report is
+    useful (the candidates it can safely find are listed) and no scan root could not be read."""
+    repo, wt, cfg = estate
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # the test run's own fence would refuse first: the unfenced path
+    candidate = a_plain_candidate(repo, ".probe-listed")
+    calls, state = stand_in(monkeypatch, lambda n, args, st: (1, b"", b"fatal: the list failed (test)"))
+
+    code = main(["--root", str(repo), "janitor"])
+
+    out = capsys.readouterr().out
+    assert code == 0 and "registered worktrees: unknown" in out and str(candidate) in out, out
+    assert not state["pruned"] and candidate.exists()  # a report removes nothing
+
+
+def test_the_report_exits_1_when_a_scan_root_cannot_be_read(estate, monkeypatch, capsys):
+    repo, wt, cfg = estate
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")
+    monkeypatch.setattr(
+        janitor, "_ancestor_ids", lambda c: ({}, [(c.tmp_root, "could not check ancestor: denied (test)")])
+    )
+
+    code = main(["--root", str(repo), "janitor"])
+
+    out = capsys.readouterr().out
+    assert code == 1 and "denied (test)" in out, out
+
+
+def test_the_report_exits_2_when_the_fence_refuses_the_unknown_list(estate, tmp_path, monkeypatch, capsys):
+    """Under AGENTTALK_STORE_FENCE nothing is listed, read or asked of Git outside the fence, and a list that cannot be
+    had cannot be fenced: the command refuses (exit 2) instead of printing a partial report."""
+    repo, wt, cfg = estate
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(tmp_path / "own-report.txt"))  # this test probes on purpose
+    stand_in(monkeypatch, lambda n, args, st: (1, b"", b"fatal: the list failed (test)"))
+
+    code = main(["--root", str(repo), "janitor"])
+
+    out = capsys.readouterr()
+    assert code == 2 and "registered worktrees: unknown" not in out.out, out

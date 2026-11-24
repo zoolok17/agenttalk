@@ -429,7 +429,14 @@ nothing to remove; a count after the prune that cannot be read prints
 `registered worktrees after prune: unknown (<reason>)` and fails the sweep.
 Doctor warns that the checkouts could not be checked, and its JSON reports
 `outside_worktrees` as `null` (not `0`); its other keys do not change. Nothing
-retries the list or falls back to the plain text form.
+retries the list or falls back to the plain text form. A Git that times out, or fails to run in any way,
+counts as a list that could not be had: the same "unknown", never an error message of its own.
+
+**The exit codes of the report.** The report (`agenttalk janitor` without `--apply`) exits 0 when it could give a
+useful report and no scan root had an access error: a partial report with an unknown list of checkouts is still a
+report, and says so. It exits 1 when a scan root or one of its parents could not be read (an access error), and
+`--apply` exits 1 when any item FAILED. Under `AGENTTALK_STORE_FENCE` a list that cannot be had cannot be fenced, and
+a path the fence refuses ends the command with exit 2, with no partial report.
 
 Two limits remain, because the check made at the delete looks only at the
 checkouts *under* a candidate: a checkout registered after the first list
