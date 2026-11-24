@@ -203,3 +203,141 @@ def test_a_line_on_stderr_does_not_stop_the_task_mode_before_it_writes_its_last_
     assert any("a warning on stderr" in line for line in lines)  # the stderr line is in the log as plain text
     verified = run_script(shell, "-Mode", "Verify", "-Log", str(log), "-RunId", RUN_ID)
     assert verified.returncode == 0 and "OK:" in verified.stdout, verified.stdout + verified.stderr
+
+
+# --- the arguments file keeps every character of a path ---------------------------------------------------------------
+
+ACCENTED = "café über"  # a folder name with accents and a space
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_the_arguments_file_keeps_a_folder_name_with_an_accent(tmp_path, shell):
+    """The arguments file used to be saved as ASCII, so a folder named `café` came back as `caf?` in both editions and
+    the task could not find its repository. It is UTF-8 with a byte order mark now, written the same way by both
+    editions."""
+    repo = tmp_path / ACCENTED
+    repo.mkdir()
+    args_file = tmp_path / "task.args.json"
+    done = run_script(
+        shell, "-Mode", "WriteArgs", "-ArgsFile", str(args_file), "-Repo", str(repo), "-Python", str(repo / "py.cmd"),
+        "-Log", str(repo / "task.log"), "-RunId", RUN_ID, "-BaseTemp", str(repo / "bt"),
+    )  # fmt: skip
+    assert done.returncode == 0, done.stdout + done.stderr
+    data = args_file.read_bytes()
+    assert data.startswith(b"\xef\xbb\xbf"), (
+        "UTF-8 with a byte order mark, so Windows PowerShell 5.1 reads it as UTF-8 too"
+    )
+    saved = json.loads(data.decode("utf-8-sig"))
+    assert saved["Repo"] == str(repo) and saved["Log"] == str(repo / "task.log") and "?" not in saved["Repo"]
+    assert saved["RunId"] == RUN_ID
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the stand-in interpreter is a Windows command file")
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent(tmp_path, shell):
+    """The whole path through the file: written by `-Mode WriteArgs` (the function `-Mode Run` uses), read by Task mode
+    under the same edition, which then changes into the accented folder, runs the interpreter that is in it, and writes
+    the log there."""
+    repo = tmp_path / ACCENTED
+    repo.mkdir()
+    stand_in = repo / "interpreter.cmd"
+    stand_in.write_text(
+        "@echo off\r\n"
+        'echo   x.py:1: GitJobHostFacts: git-job-capability: {"windows": "made up", "session_id": 1, '
+        '"pytest_process_in_a_job": true}\r\n'
+        "exit /b 0\r\n",
+        encoding="ascii",
+    )
+    log = repo / "task.log"
+    args_file = tmp_path / "task.args.json"
+    run_script(
+        shell, "-Mode", "WriteArgs", "-ArgsFile", str(args_file), "-Repo", str(repo), "-Python", str(stand_in),
+        "-Log", str(log), "-RunId", RUN_ID, "-BaseTemp", str(repo / "bt"),
+    )  # fmt: skip
+    done = run_script(shell, "-Mode", "Task", "-ArgsFile", str(args_file))
+    assert done.returncode == 0, done.stdout + done.stderr
+    verified = run_script(shell, "-Mode", "Verify", "-Log", str(log), "-RunId", RUN_ID)
+    assert verified.returncode == 0 and "OK:" in verified.stdout, verified.stdout + verified.stderr
+
+
+# --- `-Mode Run` against a stand-in scheduler (nothing is registered) -------------------------------------------
+
+STUB_SCHEDULER = """
+$script:stub = @{ exists = $false }
+function Get-TaskFacts {
+    if (-not $script:stub.exists) {
+        return @{ exists = $false; status = 'unknown'; logon = 'unknown'; result = 'unknown' }
+    }
+    $state = if ($env:STUB_TASK_STATE) { $env:STUB_TASK_STATE } else { 'Ready' }
+    return @{ exists = $true; status = $state; logon = 'a stand-in'; result = '0' }
+}
+function Invoke-Schtasks {
+    param([string]$Line)
+    if ($Line -like '/Create*') { $script:stub.exists = $true; return 0 }
+    if ($Line -like '/Run*') {
+        # the task "runs": the finished log that Task mode would have written, for this run's id
+        $file = Get-ChildItem -LiteralPath $OutDir -Filter '*.args.json' |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+        $saved = Read-ArgsFile -Path $file.FullName
+        Set-Content -LiteralPath $saved.Log -Encoding utf8 -Value @(
+            "run-id=$($saved.RunId)",
+            ('  x.py:1: GitJobHostFacts: git-job-capability: {"windows": "made up", "session_id": 1, ' +
+             '"pytest_process_in_a_job": true}'),
+            'exit=0')
+        return 0
+    }
+    if ($Line -like '/Delete*') {
+        if ($env:STUB_DELETE_FAILS -eq '1') { return 1 }
+        $script:stub.exists = $false
+        return 0
+    }
+    return 0
+}
+"""
+
+
+def run_with_a_stand_in_scheduler(tmp_path, shell, *, state="Ready", delete_fails=False, seconds=60):
+    stub = tmp_path / "stub-scheduler.ps1"
+    stub.write_text(STUB_SCHEDULER, encoding="utf-8")
+    out = tmp_path / "out"
+    env = dict(os.environ, STUB_TASK_STATE=state, STUB_DELETE_FAILS="1" if delete_fails else "0")
+    done = subprocess.run(  # noqa: S603
+        [
+            shell, "-NoProfile", "-File", str(SCRIPT), "-Mode", "Run", "-Runs", "Interactive", "-Python", "python",
+            "-OutDir", str(out), "-User", "example-user", "-TaskName", "stub-task", "-TimeoutSeconds", str(seconds),
+            "-CommandLengthLimit", "5000", "-SchedulerStub", str(stub),
+        ],
+        capture_output=True, text=True, timeout=180, check=False, env=env,
+    )  # fmt: skip
+    return done, out
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_a_run_whose_task_is_deleted_is_accepted_and_copied(tmp_path, shell):
+    done, out = run_with_a_stand_in_scheduler(tmp_path, shell)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (out / "interactive-accepted.log").exists()
+    assert "task deleted: True" in done.stdout
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_a_failed_deletion_of_the_task_is_not_a_success(tmp_path, shell):
+    """The run is accepted and its log copied, but the task is still there: the exit code is not 0 (it is 4), the output
+    says the task was not deleted and how to delete it by hand, and the accepted evidence is kept."""
+    done, out = run_with_a_stand_in_scheduler(tmp_path, shell, delete_fails=True)
+    assert done.returncode == 4, done.stdout + done.stderr
+    assert "task deleted: False" in done.stdout and "TASK NOT DELETED" in done.stdout
+    assert "schtasks /Delete /TN stub-task /F" in done.stdout
+    assert (out / "interactive-accepted.log").exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running(tmp_path, shell):
+    """The wait of `-Mode Run`, end to end: the log is finished, but the scheduler keeps showing the task as Running
+    until the time limit. The limit must not turn that into an acceptance: exit code 2, no accepted copy, and the task
+    is still deleted."""
+    done, out = run_with_a_stand_in_scheduler(tmp_path, shell, state="Running", seconds=1)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "NO COMPLETION EVIDENCE FROM THE SCHEDULER" in done.stdout
+    assert not (out / "interactive-accepted.log").exists()
+    assert "task deleted: True" in done.stdout

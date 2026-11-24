@@ -8,11 +8,17 @@
   must catch it, writes one result line, and puts the file back with `git checkout`. A fault counts as caught when at
   least one test FAILS (an ERROR, such as a file that no longer compiles, is reported separately and is not a catch).
 
-  It edits tracked files in place. Run it on a clone you can throw away: it refuses to start when the two source files
-  have uncommitted changes, so nothing of yours is lost, and it leaves them as they were committed.
+  It edits tracked files in place. Run it on a clone you can throw away: it refuses to start when ANY file that a
+  selected fault changes has uncommitted edits (the list is derived from the faults themselves, never written by hand),
+  or when `git status` cannot be read, so nothing of yours is lost; it leaves every file as it was committed.
 
-  Paths: every path is a parameter or relative to the repository. The results file holds only the fault name, the
-  pytest summary line and the ids of the failing tests; no path, user name or temporary folder.
+  What is kept for each fault: the pytest summary, the id of each failing test (the first four), and for every one of
+  those the first line of its failure (an assertion, or an exception raised at call time, which is flagged: a fault that
+  fails a test by an exception is a weaker catch than one that fails an assertion). Paths in those lines are replaced
+  by <path>.
+
+  Paths: every path is a parameter or relative to the repository. The results file holds no path, user name or
+  temporary folder.
 
 .PARAMETER Repo      The repository (default: three levels above this script, docs/verification/907).
 .PARAMETER Python    The interpreter that runs pytest (default: python).
@@ -27,7 +33,10 @@ param(
     [string]$BaseTemp = '',
     [string]$Only = ''
 )
-$ErrorActionPreference = 'Stop'
+# Continue, not Stop: Windows PowerShell 5.1 turns a stderr line of a native command (git, python) into a terminating
+# error under Stop, which would end the run before its own message, or in the middle of a fault. Every real failure below
+# is checked and thrown explicitly, and every file is put back in a finally block.
+$ErrorActionPreference = 'Continue'
 if (-not $Repo) { $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path }
 if (-not $Out) { $Out = Join-Path $PSScriptRoot 'faults-results.txt' }
 if (-not $BaseTemp) { $BaseTemp = Join-Path ([IO.Path]::GetTempPath()) ('faults907-' + [guid]::NewGuid().ToString('N').Substring(0, 8)) }
@@ -41,8 +50,6 @@ Set-Location -LiteralPath $Repo
 
 $CLI = 'src/agenttalk/cli.py'
 $JOB = 'src/agenttalk/git_job.py'
-$dirty = @(git status --porcelain -- $CLI $JOB)
-if ($dirty.Count -gt 0) { throw "Refusing to start: $CLI or $JOB has uncommitted changes. Commit or stash them first." }
 
 $fake = @('tests/test_git_write_job_907.py', 'tests/test_git_job.py')
 $real = @('tests/test_git_job_windows.py', '-k', 'limits or monitor')
@@ -50,6 +57,8 @@ $static = @('tests/test_git_job.py')
 $sched = @('tests/test_git_job_scheduled_task_check.py')
 $lane = @('tests/test_lanes.py::test_m6_assign_provisions_worktree_by_default_and_workspace',
           'tests/test_lanes.py::test_786_successful_rollback_removes_worktree_and_branch')
+$runner = @('tests/test_git_job_fault_runner.py')
+$RUNNERFILE = 'docs/verification/907/faults.ps1'
 $CONF = 'tests/conftest.py'
 $SCRIPT = 'scripts/check_git_job_scheduled_task.ps1'
 
@@ -160,10 +169,51 @@ $faults = @(
       "        `$ErrorActionPreference = 'Continue'`n", "")) },
   @{ id = 'F37-marker-ignored-so-real-lane-tests-run-without-a-job'; tests = $lane; edits = @(, @($CONF,
       "    if request.node.get_closest_marker(`"real_git_job`") or request.node.get_closest_marker(`"windows_capability`"):",
-      "    if request.node.get_closest_marker(`"windows_capability`"):")) }
+      "    if request.node.get_closest_marker(`"windows_capability`"):")) },
+  @{ id = 'F38-arguments-file-written-as-ascii'; tests = $sched; edits = @(, @($SCRIPT,
+      "    [IO.File]::WriteAllText(`$Path, (`$Values | ConvertTo-Json), (New-Object Text.UTF8Encoding(`$true)))",
+      "    (`$Values | ConvertTo-Json) | Set-Content -LiteralPath `$Path -Encoding ascii")) },
+  @{ id = 'F39-a-failed-deletion-of-the-task-ignored'; tests = $sched; edits = @(, @($SCRIPT,
+      "            `$judged = Resolve-Cleanup -Judged `$judged -DeleteExit `$deleteExit -StillExists `$stillThere -Name `$TaskName`n", "")) },
+  @{ id = 'F40-fault-runner-checks-only-the-product-files'; tests = $runner; edits = @(, @($RUNNERFILE,
+      "`$status = @(git status --porcelain -- @targets 2>&1)",
+      "`$status = @(git status --porcelain -- 'src/agenttalk/cli.py' 'src/agenttalk/git_job.py' 2>&1)")) },
+  @{ id = 'F41-fault-runner-does-not-stop-when-git-cannot-be-read'; tests = $runner; edits = @(
+      @($RUNNERFILE, "if (`$LASTEXITCODE -ne 0) { throw `"Refusing to start: git could not list", "if (`$false) { throw `"Refusing to start: git could not list"),
+      @($RUNNERFILE, "if (`$LASTEXITCODE -ne 0) { throw `"Refusing to start: git status failed", "if (`$false) { throw `"Refusing to start: git status failed"),
+      @($RUNNERFILE, "if (`$tracked.Count -ne `$targets.Count) {", "if (`$false) {")) }
 )
 
-$lines = @("planted faults of #907: one result line each (caught = at least one test failed)")
+# Preflight: every file that any selected fault changes (and restores with git checkout) must be tracked and clean.
+$selected = @($faults | Where-Object { -not $Only -or $_.id -eq $Only })
+if ($selected.Count -eq 0) { throw "No fault has the id '$Only'." }
+$targets = @($selected | ForEach-Object { $_.edits } | ForEach-Object { $_[0] } | Sort-Object -Unique)
+$tracked = @(git ls-files -- @targets 2>&1)
+if ($LASTEXITCODE -ne 0) { throw "Refusing to start: git could not list the files a fault changes (exit $LASTEXITCODE): $($tracked -join ' ')" }
+if ($tracked.Count -ne $targets.Count) { throw "Refusing to start: not every file a fault changes is tracked by git: $($targets -join ', ')" }
+$status = @(git status --porcelain -- @targets 2>&1)
+if ($LASTEXITCODE -ne 0) { throw "Refusing to start: git status failed (exit $LASTEXITCODE), so uncommitted edits in the files a fault changes cannot be ruled out: $($status -join ' ')" }
+if ($status.Count -gt 0) { throw "Refusing to start: these files, which a fault changes and restores with git checkout, have uncommitted edits: $($targets -join ', '). Commit or stash them first." }
+
+function Get-FailureLines($XmlPath) {
+  # One row per failing test: its id and the first line of its failure, with every path replaced.
+  $rows = @()
+  if (-not (Test-Path -LiteralPath $XmlPath)) { return $rows }
+  $doc = [xml](Get-Content -LiteralPath $XmlPath -Raw)
+  foreach ($case in @($doc.testsuites.testsuite.testcase)) {
+    $bad = if ($case.failure) { $case.failure } elseif ($case.error) { $case.error } else { $null }
+    if ($null -eq $bad) { continue }
+    $message = ([string]$bad.message -split "`n")[0]
+    $message = [regex]::Replace($message, '[A-Za-z]:[\\/][^\s''"<>|]+', '<path>')
+    if ($message.Length -gt 200) { $message = $message.Substring(0, 200) + '...' }
+    $kind = if ($message -match '^(assert|AssertionError|Failed:)') { 'assertion' } else { 'exception' }
+    $id = (([string]$case.classname) -replace '\.', '/') + '.py::' + $case.name
+    $rows += [pscustomobject]@{ id = $id; kind = $kind; message = $message }
+  }
+  return $rows
+}
+
+$lines = @("planted faults of #907: one result line each (caught = at least one test failed; every failing test is kept with the first line of its failure)")
 foreach ($f in $faults) {
   if ($Only -and $f.id -ne $Only) { continue }
   $files = @{}
@@ -187,15 +237,22 @@ foreach ($f in $faults) {
       if ($p -like '*.py') { & $Python -m py_compile $p 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { $compiled = $false } }
     }  # only Python sources are compiled here; a script is parsed when its tests run it
     if (-not $compiled) { $lines += "$($f.id): DOES NOT COMPILE"; continue }
-    $log = & $Python -m pytest @($f.tests) -q --no-header --tb=no -rfE -p no:cacheprovider "--basetemp=$BaseTemp" 2>&1
+    $xml = Join-Path ([IO.Path]::GetTempPath()) ("faults907-" + [guid]::NewGuid().ToString('N') + ".xml")
+    $log = & $Python -m pytest @($f.tests) -q --no-header --tb=no -rfE -p no:cacheprovider "--basetemp=$BaseTemp" "--junitxml=$xml" 2>&1
+    $rows = @(Get-FailureLines $xml)
+    if (Test-Path -LiteralPath $xml) { Remove-Item -LiteralPath $xml }
     $failed = @($log | Where-Object { $_ -match '^(FAILED|ERROR) ' })
     $errors = @($failed | Where-Object { $_ -match '^ERROR ' }).Count
+    $exceptions = @($rows | Where-Object { $_.kind -eq 'exception' }).Count
     $summary = ($log | Where-Object { $_ -match ' (passed|failed|error)' } | Select-Object -Last 1)
     $verdict = if ($failed.Count -gt 0 -and $errors -eq 0) { 'CAUGHT' } elseif ($errors -gt 0) { 'ERROR (not a catch)' } else { 'NOT CAUGHT' }
+    if ($verdict -eq 'CAUGHT') {
+      $verdict += if ($exceptions -eq 0) { " (all $($rows.Count) by an assertion)" } else { " ($exceptions of $($rows.Count) by an exception at call time, $($rows.Count - $exceptions) by an assertion)" }
+    }
     $lines += "$($f.id): $verdict -- $summary"
-    foreach ($line in ($failed | Select-Object -First 4)) {
-      $id = ($line -replace '^(FAILED|ERROR) ', '') -replace ' - .*$', ''
-      $lines += "    $id"
+    foreach ($row in ($rows | Select-Object -First 4)) {
+      $lines += "    $($row.id)"
+      $lines += "        [$($row.kind)] $($row.message)"
     }
   } finally {
     foreach ($p in $files.Keys) { git checkout -- ($p.Substring($Repo.Length).TrimStart('\', '/')) 2>&1 | Out-Null }

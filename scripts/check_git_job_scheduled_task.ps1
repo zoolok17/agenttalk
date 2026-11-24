@@ -18,10 +18,14 @@
               Run 2, whether logged on or not: registers it again WITHOUT /IT and WITH /RP *, so schtasks itself asks
               for the password. The password is typed at that prompt and is never read, stored, logged or printed here.
             Add -DryRun to print every command that would run and register nothing.
-            Exit code 0 only when every run was accepted; otherwise the code of the first run that was not (2 or 3).
+            Exit code 0 only when every run was accepted and its task was deleted; otherwise the code of the first run
+            that was not (2 or 3), or 4 when a run was accepted but its task could not be deleted (the accepted log is
+            kept, and the output says how to delete the task by hand).
     Decide  Judges ONE log together with a MADE-UP scheduler state (-TaskExists, -TaskState), with no scheduler: the whole
             completion rule that Run applies, so a test can show it. Exit codes as Verify; 2 also when the log is
             finished but the scheduler does not show the task as finished.
+    WriteArgs  Writes the small arguments file a registered task reads (the same function Run uses), so a test can show
+            that every character of a path survives it. Needs -ArgsFile, -Repo, -Python, -Log, -RunId and -BaseTemp.
     Task    What the scheduled task itself runs: writes the run id as the first line of the log, then the output of the
             host check, and pytest's own exit code ("exit=<n>") as the last line.
 
@@ -34,6 +38,10 @@
 
   A log is acceptable only when the exit code is 0 and it shows the host facts line
   (GitJobHostFacts: git-job-capability: {...}) with the keys windows, session_id and pytest_process_in_a_job.
+
+  The arguments file is UTF-8 with a byte order mark and is read as UTF-8, in both editions, so a folder name with an accent
+  or any other character comes back unchanged. -SchedulerStub (tests only) names a script that replaces the two functions
+  that talk to the scheduler, so `-Mode Run` can be run without registering anything.
 
   Every path is a parameter or relative to the repository. The command that is registered is short (it names this script
   and a small arguments file written next to the logs); schtasks accepts at most 261 characters, and this script checks
@@ -50,7 +58,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Run', 'Verify', 'Decide', 'Task')] [string]$Mode = 'Run',
+    [ValidateSet('Run', 'Verify', 'Decide', 'WriteArgs', 'Task')] [string]$Mode = 'Run',
     [ValidateSet('Both', 'Interactive', 'Background')] [string]$Runs = 'Both',
     [string]$Repo = '',
     [string]$Python = 'python',
@@ -65,6 +73,7 @@ param(
     [string]$TaskExists = 'true',  # Decide only: whether the (made-up) scheduler shows the task
     [string]$TaskState = '',       # Decide only: the (made-up) state of the task
     [int]$CommandLengthLimit = 261,  # what schtasks /TR accepts; only a test lowers or raises it
+    [string]$SchedulerStub = '',   # tests only: a script that replaces Invoke-Schtasks and Get-TaskFacts
     [switch]$DryRun
 )
 
@@ -147,6 +156,28 @@ function Invoke-Schtasks {
     return $process.ExitCode
 }
 
+function Write-ArgsFile {
+    # UTF-8 with a byte order mark, written through .NET so both editions write the same bytes and keep every character.
+    param([string]$Path, [hashtable]$Values)
+    [IO.File]::WriteAllText($Path, ($Values | ConvertTo-Json), (New-Object Text.UTF8Encoding($true)))
+}
+
+function Read-ArgsFile {
+    param([string]$Path)
+    return ([IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json)
+}
+
+function Resolve-Cleanup {
+    # A run that was judged is not finished until its task is gone. @{ code; text }. A task that is still there after the
+    # delete is a failed cleanup: the accepted evidence stays, but the exit code is not 0 (4 when the run itself was
+    # accepted, otherwise the run's own code) and the text says how to delete it by hand.
+    param($Judged, [int]$DeleteExit, [bool]$StillExists, [string]$Name)
+    if (-not $StillExists) { return $Judged }
+    $text = "TASK NOT DELETED (schtasks /Delete returned $DeleteExit and the task is still there): delete it yourself with schtasks /Delete /TN $Name /F, and do not run this check again before it is gone"
+    $code = if ($Judged.code -eq 0) { 4 } else { $Judged.code }
+    return @{ code = $code; text = "$($Judged.text) | $text" }
+}
+
 function Get-TaskCommand {
     # The registered command is kept short on purpose: everything the task needs is in a small arguments file.
     param([string]$ArgsPath)
@@ -158,7 +189,7 @@ function Get-TaskCommand {
 }
 
 function Invoke-OneRun {
-    # One registered run. Prints what it does and returns @{ code = 0|2|3 }.
+    # One registered run. Prints what it does and returns @{ code = 0|2|3|4 }.
     param([string]$Label, [bool]$Interactive)
     $id = 'run-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
     $logPath = Join-Path $OutDir "$Label.log"
@@ -186,8 +217,7 @@ function Invoke-OneRun {
         throw "A scheduled task named $TaskName already exists. Delete it or pass another -TaskName; this script never replaces a task it did not make."
     }
     if (Test-Path -LiteralPath $logPath) { Remove-Item -LiteralPath $logPath -Force }
-    @{ Repo = $Repo; Python = $Python; Log = $logPath; RunId = $id; BaseTemp = $temp } | ConvertTo-Json |
-        Set-Content -LiteralPath $argsPath -Encoding ascii
+    Write-ArgsFile -Path $argsPath -Values @{ Repo = $Repo; Python = $Python; Log = $logPath; RunId = $id; BaseTemp = $temp }
     $registered = $false
     $judged = @{ code = 2; text = 'NO COMPLETION EVIDENCE: the run did not start' }
     try {
@@ -216,12 +246,17 @@ function Invoke-OneRun {
     finally {
         if ($registered) {
             [void](Invoke-Schtasks -Line "/End /TN $TaskName")  # a no-op when it is not running
-            [void](Invoke-Schtasks -Line "/Delete /TN $TaskName /F")
-            Write-Host "[$Label] task deleted: $(-not (Get-TaskFacts).exists)"
+            $deleteExit = Invoke-Schtasks -Line "/Delete /TN $TaskName /F"
+            $stillThere = [bool](Get-TaskFacts).exists
+            Write-Host "[$Label] task deleted: $(-not $stillThere)"
+            $judged = Resolve-Cleanup -Judged $judged -DeleteExit $deleteExit -StillExists $stillThere -Name $TaskName
+            if ($stillThere) { Write-Host "[$Label] $($judged.text)" }
         }
     }
     return @{ code = $judged.code }
 }
+
+if ($SchedulerStub) { . $SchedulerStub }  # tests only: replaces Invoke-Schtasks and Get-TaskFacts
 
 switch ($Mode) {
     'Verify' {
@@ -236,9 +271,16 @@ switch ($Mode) {
         Write-Output $judged.text
         exit $judged.code
     }
+    'WriteArgs' {
+        if (-not $ArgsFile -or -not $Repo -or -not $Python -or -not $Log -or -not $RunId -or -not $BaseTemp) {
+            Write-Output 'WriteArgs needs -ArgsFile, -Repo, -Python, -Log, -RunId and -BaseTemp'; exit 9
+        }
+        Write-ArgsFile -Path $ArgsFile -Values @{ Repo = $Repo; Python = $Python; Log = $Log; RunId = $RunId; BaseTemp = $BaseTemp }
+        exit 0
+    }
     'Task' {
         if ($ArgsFile) {
-            $saved = Get-Content -Raw -LiteralPath $ArgsFile | ConvertFrom-Json
+            $saved = Read-ArgsFile -Path $ArgsFile
             $Repo = $saved.Repo; $Python = $saved.Python; $Log = $saved.Log; $RunId = $saved.RunId; $BaseTemp = $saved.BaseTemp
         }
         if (-not $Log -or -not $RunId -or -not $BaseTemp) { Write-Output 'Task needs -Log, -RunId and -BaseTemp (or -ArgsFile)'; exit 9 }
