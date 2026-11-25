@@ -140,6 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows process-list failures now stop supervisor operations (#905).**
+  Selecting or validating the PowerShell host, preparing or committing its scheduled task, and claiming the supervisor now stop with exit 3 and name the failing Windows call if Windows cannot list processes, even where the list is not needed.
+
 - Three journal tests now allow a slow writer to finish before checking its events, and check the close ended cleanly (#906).
 
 - **Close checks no longer report hidden submodule work as clean (#796).**
