@@ -653,6 +653,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report
   it to the agenttalk maintainers and that the maintenance advice is for them.
 
+### CI
+
+- **One slow file of tests moves from the second Windows test group to the first, so the second
+  group is no longer close to its time limit.** On Windows, CI splits the tests into two groups, A
+  and B, and runs each group in its own job, once from the source code and once from the built
+  package, with 150 minutes allowed per group. Group B had grown far larger than A: on the master
+  branch, in run 45070700353, it took 132.3 of its 150 minutes on Python 3.10. Over four recent
+  runs, B took on average 113.5 minutes against A's 64.4 on Python 3.10, 105.8 against 57.9 on 3.11,
+  99.6 against 64.8 on 3.12 and 99.3 against 68.8 on 3.13. One file, the lane checkout path tests,
+  is a fifth of group B's time (about 21 minutes per job) and varies less between runs than the
+  other slow files, so it now runs in group A.
+  What you will notice: before this, group B took on average 31 to 49 minutes longer than group A,
+  depending on the Python version. Now the Windows A jobs take about 20 minutes longer and the B
+  jobs about 20 minutes shorter. From the same four runs, the expected averages are A 86.6 and B
+  91.3 minutes on 3.10, 79.1 and 84.6 on 3.11, 84.9 and 79.6 on 3.12, and 88.3 and 79.8 on 3.13,
+  and the slowest group would have taken 108.1 minutes instead of 132.3. Every test still runs
+  once in each mode on every Python version; Linux and macOS are unchanged. Nothing to do.
+  These figures are projections from four runs, and whether the file runs faster or slower after
+  group A's other files was not measured.
+  The file is `tests/test_lane_checkout_paths.py` (follow-up to #378). The group A list is pinned
+  in four places, which all name it now: `checks.pytest.windows_group_a` in `dev-gate.json`,
+  `WINDOWS_GROUP_A` in `src/agenttalk/dev_gate.py`, `GROUP_A` in `tests/test_dev_gate_groups.py`
+  and the group A sentence in `docs/DEV-GATE.md`.
+
 ## [0.105.0] - 2026-11-13
 
 This release makes agenttalk safer and clearer when something goes wrong, and shows more of what is really happening. For a Claude agent run by the wrapper, the status views now show how large its current conversation is (other agents still show the size as unknown), and an old size can no longer look current after a failed save. Commands that tell you to "run this" now print only values that are safe to paste, and new request ids are checked when they are made. A backup now skips the temporary files other commands write while they work and, when files vanish while it reads them, tries again within a short limit; if the store keeps changing, it stops, publishes nothing and asks you to run it again. A reset and the retry of a failed message now take turns, and a failed message can be put back in the queue only once. Release lanes are better protected: a lane that an agent is working in is no longer cleaned up underneath it, a lane whose checkout has gone can be retired on purpose, a held lane can be re-stamped, and the cleanup commands say what they refuse and why. The web console says "nothing checked" instead of a green GO when no gate applies, and the status overview no longer suggests that anyone can safely drain another agent's messages. Notes and gate files report their problems more clearly, and code is now written with a short security note first.
