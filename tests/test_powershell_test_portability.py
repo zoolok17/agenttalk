@@ -21,6 +21,7 @@ EXPECTED_WINDOWS_ONLY = {
     "test_supervisor_lifecycle.py": {
         "test_explicit_selection_repairs_invalid_record_under_writer_locks",
         "test_lifecycle_barrier_blocks_claim_select_and_refresh_without_mutation",
+        "test_snapshot_error_propagates_to_callers",
         "test_task_install_commit_refuses_concurrent_selection_change",
         "test_task_install_prepare_refuses_different_existing_binding",
         "test_task_uninstall_clears_binding_before_new_name_prepare",
