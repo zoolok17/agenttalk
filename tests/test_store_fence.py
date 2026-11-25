@@ -2748,6 +2748,39 @@ def _install_guard(monkeypatch: pytest.MonkeyPatch, fence: Path) -> _OutsideGuar
         guard.outside.append((name, text))
         raise OSError(errno.EIO, "a path outside the fence was looked at (guard)")
 
+    path_options = {"-C", "--git-dir", "--work-tree"}  # options that take a path as the NEXT argument
+
+    def outside_argument(repo_text: str | None, args: tuple) -> str | None:
+        """The first argument of a Git runner that names a path outside the fence, as written, or None. Read as text
+        only: no path is looked at. A path object is read with `os.fspath`; `--opt=value` is split and the value judged;
+        the value after `-C`, `--git-dir` and `--work-tree` is a path; a relative path is read against the runner's
+        repository (`repo_text`), lexically, so `../../elsewhere` from `fence/repo` is beside the fence. A word that is
+        not a path (a branch, a switch) read this way is a name below the repository: inside, never a hit."""
+        previous = None
+        for argument in args:
+            try:
+                text = os.fsdecode(os.fspath(argument))
+            except TypeError:  # not a path and not text: nothing to judge
+                previous = None
+                continue
+            if text.startswith("-") and "=" in text:
+                text = text.partition("=")[2]  # --opt=value: the value
+            elif text.startswith("-") and previous not in path_options:
+                previous = text  # a switch that is not followed by a path (-z, --porcelain, ...)
+                continue
+            previous = text
+            if not text:
+                continue
+            if os.path.isabs(text):
+                full = text
+            elif repo_text:
+                full = os.path.join(repo_text, text)  # lexical: joined and normalised by `inside`, never looked at
+            else:
+                continue
+            if not inside(full):
+                return text
+        return None
+
     def on_the_way(text: str) -> bool:
         """An exact ancestor of the fence, looked at by one of the two things that expect to: the identity checks of the
         configured roots (`_ancestor_ids`, `_ancestor_change_reason`) and a resolution of a path inside the fence. A
@@ -2844,9 +2877,9 @@ def _install_guard(monkeypatch: pytest.MonkeyPatch, fence: Path) -> _OutsideGuar
             text = text_of(repo)
             if text is not None and not inside(text):
                 refuse(_name, text)
-            for argument in args:  # a path outside the fence handed to Git as an argument is a look at it too
-                if isinstance(argument, str) and os.path.isabs(argument) and not inside(argument):
-                    refuse(f"{_name} argument", argument)
+            where = outside_argument(text, args)  # a path outside the fence handed to Git is a look at it too
+            if where is not None:
+                refuse(f"{_name} argument", where)
             return _real(repo, *args, **kwargs)
 
         monkeypatch.setattr(owner, name, git_spy)
@@ -3568,6 +3601,136 @@ def test_the_guard_notes_an_outside_path_handed_to_a_git_runner_as_an_argument(
         assert raised.value.errno == errno.EIO
     assert [name for name, _ in guard.outside] == ["agenttalk.janitor._run_git argument"] * 2, guard.outside
     assert [text for _, text in guard.outside] == [outside, network], guard.outside
+
+
+class _PathLike:
+    """Anything with `__fspath__` that is not a `str` or a `Path`: a Git runner is handed such an argument too."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __fspath__(self) -> str:
+        return self.text
+
+
+def _fake_git_runner(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    """Put a fake in place of `janitor._run_git` BEFORE the guard is installed, so that the guard's spy wraps the fake:
+    what reaches the fake was let through. No Git is started, and nothing real is looked at."""
+    from agenttalk import janitor
+
+    forwarded: list[tuple] = []
+    monkeypatch.setattr(janitor, "_run_git", lambda repo, *args, **kwargs: forwarded.append(args) or "")
+    return forwarded
+
+
+# The forms in which a path reaches a Git runner as an argument, each built around the text `where`.
+_GIT_ARGUMENT_FORMS = {
+    "a-path-object": lambda where: ("worktree", "remove", Path(where)),
+    "an-os-pathlike": lambda where: ("worktree", "remove", _PathLike(where)),
+    "a-plain-string": lambda where: ("worktree", "remove", "--", where),
+    "git-dir-equals": lambda where: (f"--git-dir={where}", "status"),
+    "work-tree-equals": lambda where: (f"--work-tree={where}", "status"),
+    "any-option-equals": lambda where: (f"--some-option={where}", "status"),
+    "dash-C-then-path": lambda where: ("-C", where, "status"),
+    "git-dir-then-path": lambda where: ("--git-dir", where, "status"),
+}
+
+
+def _try_git_forms(monkeypatch: pytest.MonkeyPatch, fence: Path, forms: dict, make_where) -> tuple:
+    """(the guard, what the fake runner received, the refusals) for each form in `forms` handed to the runner, with the
+    runner's repository `fence/repo`: a refusal is the guard's own error (`EIO`), which the real call never gives."""
+    from agenttalk import janitor
+
+    forwarded = _fake_git_runner(monkeypatch)
+    guard = _install_guard(monkeypatch, fence)
+    refused: list[str] = []
+    for name, build in forms.items():
+        try:
+            janitor._run_git(fence / "repo", *build(make_where(name)))
+        except OSError as exc:
+            assert exc.errno == errno.EIO, (name, exc)
+            refused.append(name)
+    return guard, forwarded, refused
+
+
+def test_the_guard_notes_a_path_object_handed_to_a_git_runner(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(a) A path object (`pathlib.Path`, any `os.PathLike`) outside the fence, as an argument, is read with
+    `os.fspath`: recorded, answered with an error and never forwarded to the runner."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = str(tmp_path.resolve() / "zz-outside-object")
+    forms = {name: _GIT_ARGUMENT_FORMS[name] for name in ("a-path-object", "an-os-pathlike")}
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: outside)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert [text for _, text in guard.outside] == [outside] * 2, guard.outside
+
+
+def test_the_guard_notes_a_relative_path_that_leads_outside_the_fence_in_a_git_runners_arguments(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(b) A relative argument is read against the runner's repository, as text (nothing is looked at): from
+    `fence/repo`, `../../zz-outside-relative` is a folder beside the fence. Recorded, answered with an error and never
+    forwarded, as a string, as a path object and inside an option."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    relative = os.path.join("..", "..", "zz-outside-relative")
+    forms = {
+        "a-plain-string": _GIT_ARGUMENT_FORMS["a-plain-string"],
+        "a-path-object": _GIT_ARGUMENT_FORMS["a-path-object"],
+        "git-dir-equals": _GIT_ARGUMENT_FORMS["git-dir-equals"],
+        "dash-C-then-path": _GIT_ARGUMENT_FORMS["dash-C-then-path"],
+    }
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: relative)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert len(guard.outside) == len(forms), guard.outside
+
+
+def test_the_guard_notes_an_outside_path_inside_a_git_option(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(c) A path outside the fence inside an option: `--git-dir=P`, `--work-tree=P`, any `--opt=P`, `-C P` and
+    `--git-dir P`. The value is split out and judged like any other argument."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = str(tmp_path.resolve() / "zz-outside-option")
+    forms = {
+        name: _GIT_ARGUMENT_FORMS[name]
+        for name in ("git-dir-equals", "work-tree-equals", "any-option-equals", "dash-C-then-path", "git-dir-then-path")
+    }
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: outside)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert [text for _, text in guard.outside] == [outside] * len(forms), guard.outside
+
+
+@pytest.mark.parametrize(
+    "kind", ["absolute", "relative-below", "relative-beside"]
+)
+def test_the_guard_lets_an_inside_path_through_in_every_form_of_a_git_runners_arguments(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """The control: the same forms with a path INSIDE the fence (absolute, relative below the repository, relative
+    beside it that stays inside the fence) are forwarded to the runner and not recorded, so the wider check makes no
+    false hit."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    place = {
+        "absolute": str(fence / "inside"),
+        "relative-below": os.path.join("sub", "folder"),
+        "relative-beside": os.path.join("..", "inside-sibling"),
+    }[kind]
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, _GIT_ARGUMENT_FORMS, lambda name: place)
+
+    assert refused == [] and guard.outside == [], (place, refused, guard.outside)
+    assert len(forwarded) == len(_GIT_ARGUMENT_FORMS), (place, forwarded)
 
 
 @pytest.mark.parametrize("route", ["release", "apply"])
