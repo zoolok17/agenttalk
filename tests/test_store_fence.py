@@ -3661,6 +3661,74 @@ def test_an_ordinary_in_use_refusal_still_just_keeps_the_checkout_and_the_sweep_
     assert rc == 0 and "store fence refused" not in text, text
 
 
+@pytest.mark.parametrize("late", ["outside-git-absent", "outside-git-present", "then-a-later-candidate", "none"])
+def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops_the_sweep_before_the_real_prune(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, late: str
+) -> None:
+    """An activity record names a local folder outside the fence, so its checkout is kept from the text alone (no look).
+    After the preflight and the preview, at the start of the real `--apply`, Git gets a registration of that same
+    folder (`.git/worktrees/late-registration`, its `gitdir` naming the folder's `.git`, an old time on it). Git's
+    REAL prune reads every registration and looks at the path it names: with the folder's `.git` absent it removes the
+    entry, with it present it keeps it; either way it has looked outside the fence. So the registrations prune would
+    read are fenced, from Git's own files and as written, before the prune: the sweep stops, the prune does not run (the
+    entry is still there), nothing outside is touched, and the exit code is 1. "then-a-later-candidate": a stale
+    leftover comes after the kept checkout; its last look (Git's list, which looks at every registration too) is
+    fenced the same way first, so the sweep stops there and the leftover is kept. "none", the control: the same kept
+    checkout with no late registration; the sweep goes on, the real prune runs, and the exit code is 0."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    leftover = _stale_leftover(fence / "temp") if late == "then-a-later-candidate" else None
+    refused = (tmp_path / "zz-refused-folder").resolve()  # beside the fence, inside this test's own folder
+    refused.mkdir()
+    if late == "outside-git-present":
+        (refused / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+    _write_guard_record(repo, "lane-every-field", str(refused))
+    admin = repo / ".git" / "worktrees" / "late-registration"
+    real_apply = janitor.apply
+
+    def apply(*args, **kwargs):
+        if late != "none":
+            admin.mkdir(parents=True)
+            (admin / "gitdir").write_text(f"{refused / '.git'}\n", encoding="utf-8")
+            (admin / "HEAD").write_text("ref: refs/heads/late-registration\n", encoding="utf-8")
+            (admin / "commondir").write_text("../..\n", encoding="utf-8")
+            os.utime(admin / "gitdir", (1, 1))
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(janitor, "apply", apply)
+    state, _, prunes = _sweep_with_step_spies(monkeypatch)  # the prune is the real one
+    listed_with_it: list[tuple] = []  # Git's list of checkouts, asked for while the late registration exists
+    spied_run = janitor._run_git_checked
+
+    def run(repo_arg, *args, **kwargs):
+        if args[:2] == ("worktree", "list") and admin.exists():
+            listed_with_it.append(args)
+        return spied_run(repo_arg, *args, **kwargs)
+
+    monkeypatch.setattr(janitor, "_run_git_checked", run)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--apply"])
+
+    text = capsys.readouterr().out
+    assert state["refused"], "the record path was never refused, so nothing was tested"
+    assert (done / ".git").exists() and "REFUSED (kept)" in text, text
+    assert sorted(p.name for p in refused.iterdir()) == ([".git"] if late == "outside-git-present" else []), text
+    if late == "none":
+        assert prunes and rc == 0 and "store fence refused" not in text, text
+        return
+    assert admin.is_dir() and (admin / "gitdir").exists(), "the registration was pruned: Git looked at it"
+    assert rc == 1, text
+    assert prunes == [], "git worktree prune ran, and read a registration outside the fence"
+    assert listed_with_it == [], "Git listed the checkouts, and so looked at the registration outside the fence"
+    assert "worktree prune skipped" in text and "store fence refused" in text, text
+    assert str(refused) in text, text
+    if leftover is not None:
+        assert (leftover / "note.txt").exists(), text  # the later candidate was not removed: the sweep stopped
+
+
 def test_the_guard_notes_an_outside_path_handed_to_a_git_runner_as_an_argument(
     fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
