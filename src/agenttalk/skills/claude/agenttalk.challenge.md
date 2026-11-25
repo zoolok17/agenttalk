@@ -54,6 +54,19 @@ defer still waits for its trigger, a probe still has to be run.
 Re-challenge when the objective, risk class or a binding constraint
 changes, or the cost grows by more than 25%.
 
+**Drift visibility (#923; advisory, `agenttalk task` only warns on stderr).** Record
+`challenge=exempt:<id>` with `<id>` one of `failing-repro-fix`, `review-ordered-fix`,
+`checklist-release`, `rollback`, `revert`, `docs-only`, `operator-waiver`,
+`incident-containment` (an optional note may follow a second colon); any other exemption is
+flagged. The challenge reference must resolve to a verdict stamped before the order: a request
+without a verdict, an unusable or late verdict, or an id the store cannot find is flagged. Put
+`allowance=<N>h` on the first order of a work item (the first valid value is the agreed one;
+later values are shown, never applied). After two fix rounds (a round is one distinct
+`work_cycle`/`work_round` pair) or past the allowance, every further order under that work
+item carries `decision=narrow|stop|continue` and `decision_reason=<why>`. A reshape names what
+it leaves out. `agenttalk broadcast --kind task` is not checked in this slice;
+`agenttalk overview --drift` shows the picture.
+
 ## Requester
 
 1. **Choose the challenger.** Not the proposer, not anyone who drafted

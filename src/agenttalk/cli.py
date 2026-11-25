@@ -1756,6 +1756,15 @@ def cmd_overview(args: argparse.Namespace) -> int:
     from agenttalk import overview as overview_mod
 
     store = _get_store(args)
+    if args.drift:
+        from agenttalk import drift
+
+        rep = drift.report(store.valid_messages(), since=args.since)
+        if args.json:
+            print(json.dumps(rep, indent=2, ensure_ascii=False))
+        else:
+            sys.stdout.write(drift.render_report(rep))
+        return 0
     data = overview_mod.gather(store, label=store.root.name or str(store.root),
                                enable_budget=args.enable_budget)
     if args.json:
@@ -10884,6 +10893,13 @@ def cmd_task(args: argparse.Namespace) -> int:
                 f"agenttalk task: --force — sending anyway. This recipient will "
                 f"NOT see it (agenttalk build predates task-kind support): "
                 f"{names}.\n")
+    # #923: advisory drift lines on stderr BEFORE the write; never changes delivery or the exit code.
+    try:
+        from agenttalk import drift
+        for line in drift.order_warnings(store.valid_messages(), meta):
+            sys.stderr.write(f"agenttalk task: drift: {line}\n")
+    except Exception:  # noqa: BLE001 - advisory only
+        sys.stderr.write("agenttalk task: drift: check unavailable\n")
     minted_id = _maybe_autogen_request_id("task", meta)
     msg = store.send(
         sender=sender,
@@ -18788,6 +18804,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Emit the dashboard's own data as JSON instead of text.")
     pov.add_argument("--enable-budget", action="store_true",
                      help="Also show this machine's paid-model ledger figures. Off by default.")
+    pov.add_argument("--drift", action="store_true",
+                     help="Read-only drift report: challenge evidence, elapsed task-hours, fix rounds.")
+    pov.add_argument("--since", help="With --drift: only orders at or after this UTC time (ISO 8601).")
     pov.set_defaults(func=cmd_overview)
 
     psview = sub.add_parser(

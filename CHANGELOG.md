@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Drift visibility: warnings when work is ordered without a challenge, and a read-only report (#923).**
+  Teams sometimes did more work than was agreed. `agenttalk task` now prints advisory lines before it stores
+  a design, build or fix order that has no answered challenge verdict behind it, an exemption outside a fixed
+  list, or a work item that passed its agreed time allowance or two fix rounds without a recorded decision
+  (`narrow`, `stop` or `continue`). Nothing is refused and delivery is unchanged. `agenttalk overview --drift`
+  shows the same picture for the whole store. The time shown is elapsed task-hours, a proxy that includes
+  waiting, not effort. Older orders are shown as unknown. Both copies of the challenge skill describe the
+  new meta keys (`allowance`, `decision`, `decision_reason`).
+
 - **The lead setup brief explains how to run a Claude seat in a strict permission mode (#826).**
   Before this, the brief said that a wrapped Claude seat runs with no approval prompts and no
   sandbox unless you choose another mode, and left the rest to the team. Now its step 10a gives a
