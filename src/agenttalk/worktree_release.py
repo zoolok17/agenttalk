@@ -96,7 +96,18 @@ def _unchanged(ids: dict) -> None:
         raise Refused(reason)
 
 
+def _fence_git_registrations(repo: Path) -> None:
+    """Before Git builds anything from every registration (its list of checkouts, a removal): Git's registration files
+    are fenced (`janitor._fence_registrations`, the one check every caller uses). A file that cannot be read keeps the
+    checkout (`Refused`); a refusal by the fence is the fence's own error."""
+    try:
+        janitor._fence_registrations(repo)
+    except janitor._UseCheckFailed as exc:
+        raise Refused(f"Git's registered checkouts could not be checked ({exc}); checkout kept") from exc
+
+
 def _registered(repo: Path) -> dict[Path, set[str]]:
+    _fence_git_registrations(repo)  # Git's list looks at every path the registrations name
     # NUL framing also handles paths containing newlines or Git quoting characters.
     out = _read_git(repo, "worktree", "list", "--porcelain", "-z")
     paths: dict[Path, set[str]] = {}
@@ -995,6 +1006,7 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                     _unchanged(candidate_ids)
                     _unchanged(ids)
                     with guard.final_window():
+                        _fence_git_registrations(cfg.repo)  # the removal reads every registration too
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:

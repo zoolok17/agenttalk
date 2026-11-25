@@ -3691,11 +3691,7 @@ def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops
 
     def apply(*args, **kwargs):
         if late != "none":
-            admin.mkdir(parents=True)
-            (admin / "gitdir").write_text(f"{refused / '.git'}\n", encoding="utf-8")
-            (admin / "HEAD").write_text("ref: refs/heads/late-registration\n", encoding="utf-8")
-            (admin / "commondir").write_text("../..\n", encoding="utf-8")
-            os.utime(admin / "gitdir", (1, 1))
+            _write_late_registration(admin, refused)
         return real_apply(*args, **kwargs)
 
     monkeypatch.setattr(janitor, "apply", apply)
@@ -3727,6 +3723,134 @@ def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops
     assert str(refused) in text, text
     if leftover is not None:
         assert (leftover / "note.txt").exists(), text  # the later candidate was not removed: the sweep stopped
+
+
+def _write_late_registration(admin: Path, folder: Path) -> None:
+    """A registration of `folder` as Git writes one (`gitdir`, `HEAD`, `commondir`), with an old time on `gitdir`."""
+    admin.mkdir(parents=True)
+    (admin / "gitdir").write_text(f"{folder / '.git'}\n", encoding="utf-8")
+    (admin / "HEAD").write_text("ref: refs/heads/late-registration\n", encoding="utf-8")
+    (admin / "commondir").write_text("../..\n", encoding="utf-8")
+    os.utime(admin / "gitdir", (1, 1))
+
+
+def _git_asked_for_every_registration(monkeypatch: pytest.MonkeyPatch, admin: Path) -> list[tuple]:
+    """Every Git call, by any runner of the sweep or of release, that reads every registration (`worktree list`,
+    `worktree prune`, `worktree remove`), made while the registration `admin` exists."""
+    from agenttalk import janitor, worktree_release
+
+    asked: list[tuple] = []
+    for owner, name in ((janitor, "_run_git_checked"), (worktree_release, "_git")):
+        real = getattr(owner, name)
+
+        def spy(repo, *args, _real=real, **kwargs):
+            if args[:1] == ("worktree",) and args[1:2] in (("list",), ("prune",), ("remove",)) and admin.exists():
+                asked.append(args)
+            return _real(repo, *args, **kwargs)
+
+        monkeypatch.setattr(owner, name, spy)
+    return asked
+
+
+def test_a_registration_made_after_the_preflight_is_fenced_before_release_asks_git_about_the_registrations(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Release reads Git's list of checkouts again inside the release (the main-repository check, each checkout's own
+    check) and asks Git to remove the checkout; each of these reads every registration and looks at the path it names.
+    A registration of a folder outside the fence, made after the preflight (at the start of the release itself), is
+    refused from Git's own files before Git is asked anything about the registrations: no list, no removal, the
+    checkout is kept, exit 1."""
+    from agenttalk import worktree_release
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    outside = (tmp_path / "zz-late-release").resolve()  # beside the fence, inside this test's own folder
+    outside.mkdir()
+    admin = repo / ".git" / "worktrees" / "late-registration"
+    real_release = worktree_release.release
+
+    def release(*args, **kwargs):
+        _write_late_registration(admin, outside)
+        return real_release(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "release", release)
+    asked = _git_asked_for_every_registration(monkeypatch, admin)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--release", str(done)])
+
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert admin.is_dir(), "the registration was never made, so nothing was tested"
+    assert asked == [], f"Git was asked about every registration, the outside one too: {asked}"
+    assert rc == 1, text
+    assert (done / ".git").exists() and "REMOVED" not in text, text
+    assert str(outside) in text, text
+    assert list(outside.iterdir()) == [], text
+
+
+def _file_link(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link)
+    except OSError as exc:  # Windows without the privilege to make a file link
+        pytest.skip(f"this system cannot make a file link: {exc}")
+
+
+@pytest.mark.parametrize("where", ["worktrees-folder", "entry-folder", "gitdir-file", "commondir-file"])
+def test_the_registration_check_fences_each_git_file_before_it_looks_through_a_link_that_leads_outside(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """The check of Git's registration files reads Git's own folder: `commondir`, the `worktrees` folder, each entry
+    folder and each entry's `gitdir` file. Any of them can be a link (a junction on Windows for a folder) that leads to
+    a folder beside the fence. Each is fenced, by the fence's own check, BEFORE anything looks at it or through it: the
+    check is refused and the guard over every file-system look saw no look outside the fence."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    git_dir = repo / ".git"
+    away = (tmp_path / "zz-git-files-away").resolve()  # beside the fence, inside this test's own folder
+    away.mkdir()
+    if where == "worktrees-folder":
+        (git_dir / "worktrees").rename(away / "worktrees")
+        _dir_link(git_dir / "worktrees", away / "worktrees")
+    elif where == "entry-folder":
+        (away / "entry").mkdir()
+        (away / "entry" / "gitdir").write_text(f"{done / '.git'}\n", encoding="utf-8")
+        _dir_link(git_dir / "worktrees" / "zz-entry", away / "entry")
+    elif where == "gitdir-file":
+        (away / "gitdir").write_text(f"{done / '.git'}\n", encoding="utf-8")
+        (git_dir / "worktrees" / "zz-entry").mkdir()
+        _file_link(git_dir / "worktrees" / "zz-entry" / "gitdir", away / "gitdir")
+    else:
+        (away / "commondir").write_text(".\n", encoding="utf-8")
+        _file_link(git_dir / "commondir", away / "commondir")
+    guard = _install_guard(monkeypatch, fence)
+
+    with pytest.raises(cli.store_mod.StoreFenceError):
+        janitor._fence_registrations(repo)
+
+    assert guard.outside == [], f"a look outside the fence: {guard.outside}"
+
+
+def test_under_the_store_fence_a_failed_strict_list_is_not_replaced_by_the_old_git_list(
+    fenced, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The report keeps a best-effort list of checkouts for its counts when the strict list fails. Under the store
+    fence it does not ask Git for it: that list was never fenced, and Git's listing looks at every registration."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, _ = _swept_checkout(fence)
+    cfg = janitor.JanitorConfig.load(repo)
+    asked = _git_asked_for_every_registration(monkeypatch, repo / ".git")
+
+    report = janitor.build_report(cfg, (None, "the strict list failed (test)"))
+
+    assert asked == [], asked
+    assert report.registered_worktrees == [] and not report.registered_strict
 
 
 def test_the_guard_notes_an_outside_path_handed_to_a_git_runner_as_an_argument(

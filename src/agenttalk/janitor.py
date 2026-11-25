@@ -301,7 +301,13 @@ def get_registered_worktrees(repo: Path) -> list[Path]:
     callers (a dirty-worktree count and doctor's outside-scratch-root
     warning, neither of which removes anything on the strength of this
     result alone). Candidate discovery does NOT use this function: it goes by
-    `_registered_worktrees_listed`, which is strict and tells a failure from "none"."""
+    `_registered_worktrees_listed`, which is strict and tells a failure from "none". Under a store fence, Git's
+    registration files are fenced first (`_fence_registrations`); when that refuses or fails, Git is not asked and the
+    answer is `[]`, as for a failed listing."""
+    try:
+        _fence_registrations(repo)
+    except (store_mod.StoreFenceError, _UseCheckFailed):
+        return []
     _rc, out, _err = _run_git_checked(repo, "worktree", "list", "--porcelain")
     worktrees = []
     for line in out.splitlines():
@@ -751,9 +757,11 @@ def build_report(cfg: JanitorConfig, listing: tuple[list[Path] | None, str] | No
     # When it failed: best effort, for the counts and the preview only. Discovery has refused what it cannot trust, and
     # the old reader turns a name with an accent or U+2028 into a path that does not exist. `apply` decides nothing
     # on it.
-    registered = listing[0] if strict else get_registered_worktrees(cfg.repo)
     # Under a store fence, only a strict list is probed: the old reader's paths were never the ones the fence checked.
     may_probe = strict or not os.environ.get(store_mod.STORE_FENCE_ENV)
+    # Under a fence the old reader is not asked either: the strict list failed, and Git's listing looks at every
+    # registration, so the report counts none (it says the list could not be read).
+    registered = listing[0] if strict else (get_registered_worktrees(cfg.repo) if may_probe else [])
     dirty = [
         w for w in registered
         if may_probe and not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
@@ -1444,26 +1452,31 @@ def _registered_worktrees_listed(repo: Path) -> list[Path]:
 
 def _fence_registrations(repo: Path) -> None:
     """Under AGENTTALK_STORE_FENCE: refuse (`StoreFenceError`) a checkout registered to `repo` outside the fence, read
-    from Git's own files (`<common Git folder>/worktrees/<name>/gitdir`), BEFORE Git is asked to list or prune the
-    registrations. Both read every one of those files and look at the path it names (is its `.git` still there?), so a
-    checkout registered outside after an earlier reading would be looked at by Git itself. Nothing outside the fence is
-    looked at here: a path outside as written is refused from its text alone; a path inside goes through the fence's
-    own check, which follows a link before it refuses one that leads out (#913). An entry Git drops without a look (no
-    `gitdir` file, or an empty one) is passed over. A file that cannot be read keeps the sweep from trusting the list
-    (`_UseCheckFailed`). Outside a fence nothing is done."""
+    from Git's own files (`<common Git folder>/worktrees/<name>/gitdir`), BEFORE Git is asked for anything it builds
+    from every registration: its list of checkouts, the prune, a removal. Each reads every one of those files and looks
+    at the path it names (is its `.git` still there?), so a checkout registered outside after an earlier reading would
+    be looked at by Git itself. The one check for every caller (the sweep, the report, release and the janitor
+    command's fence check).
+
+    Nothing outside the fence is looked at here, the Git files included: each path (the `.git` file or folder,
+    `commondir` and the folder it names, the `worktrees` folder, each entry folder and its `gitdir` file, and the
+    checkout each names with its `.git`) is fenced BEFORE anything looks at it or reads it. A path outside as written
+    is refused from its text alone; a path inside goes through the fence's own check, which follows a link before it
+    refuses one that leads out (#913), so a link or junction among Git's files that leads outside is refused, never
+    followed. An entry Git drops without a look (no `gitdir` file, or an empty one) is passed over. A file that cannot
+    be read keeps the list from being trusted (`_UseCheckFailed`). Outside a fence nothing is done."""
     allowed = store_mod._fence()
     if allowed is None:
         return
     from . import worktree_release  # imported here: that module imports this one
 
-    def fence_as_written(folder: Path, looked_at: Path | None = None) -> None:
-        if worktree_release._outside_as_written(folder):
-            store_mod._refuse(folder, Path(os.path.abspath(folder)), allowed)
-        store_mod.check_folder_fence(folder)
-        if looked_at is not None:
-            store_mod.check_folder_fence(looked_at)
+    def fenced(path: Path) -> Path:
+        if worktree_release._outside_as_written(path):
+            store_mod._refuse(path, Path(os.path.abspath(path)), allowed)
+        store_mod.check_folder_fence(path)
+        return path
 
-    def text_of(file: Path) -> str:
+    def text_of(file: Path) -> str:  # `file` is fenced by the caller
         data = file.read_bytes().strip()
         try:
             return data.decode("utf-8")
@@ -1471,35 +1484,32 @@ def _fence_registrations(repo: Path) -> None:
             store_mod._refuse(file, file, allowed, why="unplaced")
             raise  # not reached: `_refuse` raises
 
+    def named_by(text: str, base: Path) -> Path:  # the path a Git file names, relative to `base` if so
+        return Path(os.path.abspath(os.path.join(base, text)))
+
     try:
-        dot_git = repo / ".git"
-        fence_as_written(dot_git)
+        dot_git = fenced(repo / ".git")
         if dot_git.is_file():  # `repo` is itself a linked checkout: `gitdir: <its Git folder>`
-            git_dir = Path(os.path.abspath(os.path.join(repo, text_of(dot_git).removeprefix("gitdir:").strip())))
+            git_dir = fenced(named_by(text_of(dot_git).removeprefix("gitdir:").strip(), repo))
         elif dot_git.is_dir():
             git_dir = dot_git
         else:
             return  # no Git folder of its own: Git has no registrations of this folder to read
-        fence_as_written(git_dir)
-        common = git_dir
-        if (git_dir / "commondir").is_file():
-            common = Path(os.path.abspath(os.path.join(git_dir, text_of(git_dir / "commondir"))))
-            fence_as_written(common)
-        admin = common / "worktrees"
+        commondir = fenced(git_dir / "commondir")
+        common = fenced(named_by(text_of(commondir), git_dir)) if commondir.is_file() else git_dir
+        admin = fenced(common / "worktrees")
         if not admin.is_dir():
             return
         with os.scandir(admin) as listing:
             entries = sorted((Path(entry.path) for entry in listing), key=lambda p: p.name)
         for entry_path in entries:
-            fence_as_written(entry_path)  # an entry that is a link leading out is refused here
-            gitdir_file = entry_path / "gitdir"
-            if not gitdir_file.is_file():
-                continue
-            named = text_of(gitdir_file)
+            gitdir_file = fenced(fenced(entry_path) / "gitdir")  # the entry, then its file: a link is refused here
+            named = text_of(gitdir_file) if gitdir_file.is_file() else ""
             if not named:
                 continue
-            gitdir = Path(os.path.abspath(os.path.join(entry_path, named)))  # Git's path, relative to the entry if so
-            fence_as_written(gitdir.parent, gitdir)  # the checkout folder as Git lists it, and the `.git` Git looks at
+            gitdir = named_by(named, entry_path)  # Git's path, relative to the entry if so
+            fenced(gitdir.parent)  # the checkout folder as Git lists it
+            fenced(gitdir)  # and the `.git` in it that Git looks at
     except OSError as exc:
         raise _listing_failure(f"Git's registration files could not be read: {_os_error_text(exc)}") from exc
 
