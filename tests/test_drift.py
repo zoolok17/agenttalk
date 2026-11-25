@@ -506,3 +506,30 @@ def test_a_slow_reader_stops_at_the_ceiling_says_history_incomplete_and_still_de
     assert "drift: history incomplete" in err and "lower bounds" in err
     assert "no usable allowance" not in err                         # an unseen allowance is not reported as missing
     assert [m.kind for m in bus.valid_messages()] == ["note", "task"]   # delivered unchanged
+
+
+# --- GitHub reviewer's five P2s on #924 (1 and 3 were already fixed; 2, 4 and 5 pinned here) ---------------
+def test_the_report_derives_the_recorded_decision_instead_of_always_saying_needed():
+    base = two_rounds()
+    decided = order(6, stage="build", request_id="n", decision="narrow", decision_reason="smaller")
+    rep = drift.report(base + [decided], now=NOW)
+    assert rep["work_items"][0]["decided"] is True
+    assert "decision recorded" in drift.render_report(rep)
+    plain = two_rounds()
+    assert drift.report(plain + [order(6, request_id="m")], now=NOW)["work_items"][0]["decided"] is False
+
+
+@pytest.mark.parametrize("bad", ["garbage", "1.5", "-2", "٣"])
+def test_a_malformed_historical_round_number_is_incomplete_accounting_not_a_crash(bad):
+    assert drift._rounds([order(0, stage="fix", work_round=bad, request_id="x")]) == (0, 1)
+    assert drift._rounds([order(0, stage="build", work_round=bad, request_id="y")]) == (0, 0)
+    bad_fix = order(0, stage="fix", work_round=bad, request_id="x", challenge="exempt:review-ordered-fix")
+    rep = drift.report([bad_fix], now=NOW)
+    assert rep["work_items"][0]["untagged"] == 1
+    assert drift.order_warnings([order(0, stage="fix", work_round=bad)], {"stage": "build", "work_item": "w"}, NOW)
+
+
+def test_a_review_request_that_supersedes_a_task_stops_the_tasks_timer_but_is_not_charged():
+    replace = msg(1, kind="review-request", to="reviewer", request_id="rr", supersedes="a", work_item="w")
+    s = hours_of([order(0, request_id="a"), replace])
+    assert s["hours"] == pytest.approx(1) and s["open"] == 0

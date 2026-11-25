@@ -98,7 +98,8 @@ def _spent(msgs, tasks, now):
     first, hours, open_n, bad, index, sup = {}, 0.0, 0, 0, _by_rid(msgs), {}
     for m in tasks:
         first.setdefault((str(m.meta.get("request_id")), m.recipient), m)
-        if m.meta.get("supersedes"):
+    for m in msgs:  # a task OR a review-request may replace a task; only tasks are charged
+        if m.kind in ("task", "review-request") and (m.meta or {}).get("supersedes"):
             sup.setdefault(str(m.meta["supersedes"]), []).append(_t(m.ts))
     for (rid, who), m in first.items():
         start, ends = _t(m.ts), []
@@ -123,6 +124,7 @@ def _rounds(tasks):
     pairs, untagged = set(), set()
     for m in tasks:
         rnd, stage = str(m.meta.get("work_round") or ""), m.meta.get("stage")
+        rnd = rnd if re.fullmatch(r"[0-9]+", rnd) else ""  # a malformed historical number is untagged, never a crash
         if rnd and (stage == "fix" or int(rnd) > 1):
             pairs.add((str(m.meta.get("work_cycle") or "1"), rnd))
         elif stage == "fix":
@@ -145,10 +147,16 @@ def work_item_state(msgs, work_item, now):
             attempts.append(f"{amount:g}h")
     hours, open_n, bad, parallel = _spent(msgs, tasks, now)
     k, u = _rounds(tasks)
-    return {"work_item": work_item, "tasks": len(tasks), "allowance": None if legacy else agreed,
+    last = tasks[-1].meta if tasks else {}
+    return {"work_item": work_item, "tasks": len(tasks), "decided": _decided(last),
+            "allowance": None if legacy else agreed,
             "attempts": attempts, "hours": hours, "open": open_n, "incomplete": bad, "parallel": parallel,
             "rounds": k, "untagged": u, "legacy": legacy,
             "scoped": any((m.meta.get("stage") in STAGES) for m in tasks)}
+
+
+def _decided(meta):
+    return str(meta.get("decision")) in DECISIONS and bool(str(meta.get("decision_reason") or "").strip())
 
 
 def _over(s):
@@ -189,7 +197,7 @@ def check_order(msgs, meta, now, index=None, complete=True):
         if s["allowance"] and new_amount != s["allowance"]:
             s["attempts"].append(f"{new_amount:g}h")
         s["allowance"] = s["allowance"] or new_amount
-    decided = str(meta.get("decision")) in DECISIONS and bool(str(meta.get("decision_reason") or "").strip())
+    decided = _decided(meta)
     if _over(s) and not decided:
         out.append(f"work item {wi}: two fix rounds or the allowance are used - this order needs "
                    "decision=narrow|stop|continue and decision_reason=<why>")
@@ -257,5 +265,5 @@ def render_report(rep):
     for w in rep["warned_orders"]:
         lines.append(f"  warned order {w['order']} (reconstructed from messages, not proof it was shown): "
                      + "; ".join(w["reasons"]) + (f" [decision {w['decision']}]" if w["decision"] else ""))
-    lines += ["  " + growth_line(s, False) for s in rep["work_items"]]
+    lines += ["  " + growth_line(s, s["decided"]) for s in rep["work_items"]]
     return "\n".join(lines) + "\n"
