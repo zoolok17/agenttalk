@@ -3667,7 +3667,10 @@ def test_an_ordinary_in_use_refusal_still_just_keeps_the_checkout_and_the_sweep_
     assert rc == 0 and "store fence refused" not in text, text
 
 
-@pytest.mark.parametrize("late", ["outside-git-absent", "outside-git-present", "then-a-later-candidate", "none"])
+@pytest.mark.parametrize("late", [
+    "outside-git-absent", "outside-git-present", "relative-outside-git-absent", "relative-outside-git-present",
+    "then-a-later-candidate", "none",
+])
 def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops_the_sweep_before_the_real_prune(
     fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, late: str
 ) -> None:
@@ -3680,7 +3683,11 @@ def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops
     entry is still there), nothing outside is touched, and the exit code is 1. "then-a-later-candidate": a stale
     leftover comes after the kept checkout; its last look (Git's list, which looks at every registration too) is
     fenced the same way first, so the sweep stops there and the leftover is kept. "none", the control: the same kept
-    checkout with no late registration; the sweep goes on, the real prune runs, and the exit code is 0."""
+    checkout with no late registration; the sweep goes on, the real prune runs, and the exit code is 0.
+    "relative-...": the registration's `gitdir` names the same folder by a RELATIVE path, `../../<folder>/.git`. Git
+    versions read such a path from different folders (Git 2.39 from the folder it runs in, which leads to the folder
+    beside the fence; Git 2.56 from the registration's own folder), so under the fence a relative `gitdir` is refused
+    as it is, by the maintainers' lead's decision of 2026-11-25 13:20 UTC: the same stop before the prune, exit 1."""
     from agenttalk import janitor
 
     fence, _, _ = fenced
@@ -3689,7 +3696,7 @@ def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops
     leftover = _stale_leftover(fence / "temp") if late == "then-a-later-candidate" else None
     refused = (tmp_path / "zz-refused-folder").resolve()  # beside the fence, inside this test's own folder
     refused.mkdir()
-    if late == "outside-git-present":
+    if late.endswith("outside-git-present"):
         (refused / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
     _write_guard_record(repo, "lane-every-field", str(refused))
     admin = repo / ".git" / "worktrees" / "late-registration"
@@ -3697,7 +3704,7 @@ def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops
 
     def apply(*args, **kwargs):
         if late != "none":
-            _write_late_registration(admin, refused)
+            _write_late_registration(admin, refused, relative=late.startswith("relative"))
         return real_apply(*args, **kwargs)
 
     monkeypatch.setattr(janitor, "apply", apply)
@@ -3717,7 +3724,7 @@ def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops
     text = capsys.readouterr().out
     assert state["refused"], "the record path was never refused, so nothing was tested"
     assert (done / ".git").exists() and "REFUSED (kept)" in text, text
-    assert sorted(p.name for p in refused.iterdir()) == ([".git"] if late == "outside-git-present" else []), text
+    assert sorted(p.name for p in refused.iterdir()) == ([".git"] if late.endswith("git-present") else []), text
     if late == "none":
         assert prunes and rc == 0 and "store fence refused" not in text, text
         return
@@ -3726,15 +3733,21 @@ def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops
     assert prunes == [], "git worktree prune ran, and read a registration outside the fence"
     assert listed_with_it == [], "Git listed the checkouts, and so looked at the registration outside the fence"
     assert "worktree prune skipped" in text and "store fence refused" in text, text
-    assert str(refused) in text, text
+    if late.startswith("relative"):
+        assert "a relative path" in text and f"../../{refused.name}/.git" in text, text
+    else:
+        assert str(refused) in text, text
     if leftover is not None:
         assert (leftover / "note.txt").exists(), text  # the later candidate was not removed: the sweep stopped
 
 
-def _write_late_registration(admin: Path, folder: Path) -> None:
-    """A registration of `folder` as Git writes one (`gitdir`, `HEAD`, `commondir`), with an old time on `gitdir`."""
+def _write_late_registration(admin: Path, folder: Path, *, relative: bool = False) -> None:
+    """A registration of `folder` as Git writes one (`gitdir`, `HEAD`, `commondir`), with an old time on `gitdir`.
+    `relative`: `gitdir` names the folder's `.git` relative to the repository (`../../<folder>/.git` for a folder
+    beside the fence), the form Git 2.39 reads from the folder it runs in."""
     admin.mkdir(parents=True)
-    (admin / "gitdir").write_text(f"{folder / '.git'}\n", encoding="utf-8")
+    named = f"../../{folder.name}/.git" if relative else str(folder / ".git")
+    (admin / "gitdir").write_text(f"{named}\n", encoding="utf-8")
     (admin / "HEAD").write_text("ref: refs/heads/late-registration\n", encoding="utf-8")
     (admin / "commondir").write_text("../..\n", encoding="utf-8")
     os.utime(admin / "gitdir", (1, 1))

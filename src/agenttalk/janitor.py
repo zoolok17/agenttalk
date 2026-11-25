@@ -1463,8 +1463,9 @@ def _fence_registrations(repo: Path) -> None:
     checkout each names with its `.git`) is fenced BEFORE anything looks at it or reads it. A path outside as written
     is refused from its text alone; a path inside goes through the fence's own check, which follows a link before it
     refuses one that leads out (#913), so a link or junction among Git's files that leads outside is refused, never
-    followed. An entry Git drops without a look (no `gitdir` file, or an empty one) is passed over. A file that cannot
-    be read keeps the list from being trusted (`_UseCheckFailed`). Outside a fence nothing is done."""
+    followed. A `gitdir` that names a relative path is refused as it is: Git versions read it from different folders.
+    An entry Git drops without a look (no `gitdir` file, or an empty one) is passed over. A file that cannot be read
+    keeps the list from being trusted (`_UseCheckFailed`). Outside a fence nothing is done."""
     allowed = store_mod._fence()
     if allowed is None:
         return
@@ -1507,7 +1508,11 @@ def _fence_registrations(repo: Path) -> None:
             named = text_of(gitdir_file) if gitdir_file.is_file() else ""
             if not named:
                 continue
-            gitdir = named_by(named, entry_path)  # Git's path, relative to the entry if so
+            if not os.path.isabs(named):
+                # Git versions read a relative `gitdir` from different folders (the folder Git runs in, or this
+                # entry's), so no one place can be checked for it: refused as it is (the maintainers' lead, 2026-11-25).
+                store_mod.refuse_unplaced(f"the registration {gitdir_file}, whose gitdir is a relative path ({named})")
+            gitdir = Path(os.path.abspath(named))
             fenced(gitdir.parent)  # the checkout folder as Git lists it
             fenced(gitdir)  # and the `.git` in it that Git looks at
     except OSError as exc:
