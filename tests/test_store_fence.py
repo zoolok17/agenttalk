@@ -28,6 +28,10 @@ from agenttalk.store import Store
 
 SRC = Path(agenttalk.__file__).resolve().parents[1]   # the agenttalk under test, also in subprocesses
 TESTS = Path(__file__).resolve().parent
+# No background upkeep from the fixtures' own Git commands: a commit or a fetch can start Git's automatic maintenance,
+# which runs on after the command, detached, and writes in the repository (`objects/maintenance.lock`) while a test
+# compares snapshots of it (seen on macOS CI with Python 3.10).
+_NO_UPKEEP = ("-c", "maintenance.auto=false", "-c", "gc.auto=0")
 
 
 def _snapshot(folder: Path) -> dict[str, bytes]:
@@ -550,7 +554,7 @@ def test_janitor_apply_removes_and_commits_nothing_outside_the_fence(fenced, tmp
     if shutil.which("git") is None:
         return
     _set_scratch(inside, root=str(fence / "scratch"), tmp_root=str(fence / "tmp"))
-    git = ["git", "-C", str(inside), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    git = ["git", "-C", str(inside), "-c", "user.name=t", "-c", "user.email=t@example.invalid", *_NO_UPKEEP]
     for step in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "seed"],
                  ["worktree", "add", "-q", "-b", "wip", str(tmp_path / "outside-wt")]):
         subprocess.run([*git, *step], check=True, capture_output=True, timeout=60)
@@ -1212,7 +1216,7 @@ def test_a_posix_child_given_byte_keys_is_fenced(fenced) -> None:
 
 
 def _git(repo: Path, *args: str) -> str:
-    result = subprocess.run([shutil.which("git"), "-C", str(repo), *args],
+    result = subprocess.run([shutil.which("git"), "-C", str(repo), *_NO_UPKEEP, *args],
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
@@ -1224,7 +1228,8 @@ def _merged_checkout(fence: Path, checkout: Path, scratch: Path) -> Path:
     repo = fence / "repo"
     repo.mkdir()
     _git(repo, "init", "-b", "main")
-    for key, value in (("user.name", "Test Author"), ("user.email", "test@example.invalid"), ("gc.auto", "0")):
+    for key, value in (("user.name", "Test Author"), ("user.email", "test@example.invalid"), ("gc.auto", "0"),
+                       ("maintenance.auto", "false")):
         _git(repo, "config", key, value)
     (repo / "source.txt").write_text("original\n", encoding="utf-8")
     (repo / ".gitignore").write_text(".agenttalk/\n.worktrees/\n", encoding="utf-8")
@@ -1372,7 +1377,8 @@ def _outside_clone(tmp_path: Path) -> Path:
     clone = tmp_path / "outside-clone"
     clone.mkdir()
     _git(clone, "init", "-b", "main")
-    for key, value in (("user.name", "Test Author"), ("user.email", "test@example.invalid")):
+    for key, value in (("user.name", "Test Author"), ("user.email", "test@example.invalid"),
+                       ("maintenance.auto", "false"), ("gc.auto", "0")):
         _git(clone, "config", key, value)
     (clone / "tracked.txt").write_text("content\n", encoding="utf-8")
     _git(clone, "add", ".")
