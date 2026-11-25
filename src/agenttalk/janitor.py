@@ -41,6 +41,7 @@ import contextlib
 import dataclasses
 import datetime
 import fnmatch
+import ntpath
 import os
 import re
 import shutil
@@ -1520,6 +1521,21 @@ def _registered_worktrees_listed(repo: Path) -> list[Path]:
     return paths
 
 
+def _fully_qualified(text: str, *, windows: bool = os.name == "nt") -> bool:
+    """Whether a path names one place whatever folder and drive the program reading it is in, by the same rule on every
+    Python (the running Python's `isabs` called `\\x` and `/x` absolute on Windows before 3.13). Windows: a drive with
+    a root (`C:\\x`, `C:/x`) or a UNC share (`\\\\server\\share\\x`); the `\\\\?\\` and `\\\\.\\` forms are refused, and
+    so are `C:x`, `\\x`, `/x` and any relative path. POSIX: a leading `/`. A lexical test only."""
+    if not windows:
+        return text.startswith("/")
+    if text[:2] in ("\\\\", "//", "\\/", "/\\") and text[2:3] in ("?", "."):
+        return False  # the extended and device forms
+    drive, tail = ntpath.splitdrive(text)
+    if drive[:1] in ("\\", "/"):  # a UNC share: it must name a server and a share
+        return len([part for part in drive.replace("/", "\\").split("\\") if part]) >= 2
+    return bool(drive) and tail[:1] in ("\\", "/")
+
+
 def _fence_registrations(repo: Path) -> None:
     """Under AGENTTALK_STORE_FENCE: refuse (`StoreFenceError`) a checkout registered to `repo` outside the fence, read
     from Git's own files (`<common Git folder>/worktrees/<name>/gitdir`), BEFORE Git is asked for anything it builds
@@ -1533,8 +1549,9 @@ def _fence_registrations(repo: Path) -> None:
     checkout each names with its `.git`) is fenced BEFORE anything looks at it or reads it. A path outside as written
     is refused from its text alone; a path inside goes through the fence's own check, which follows a link before it
     refuses one that leads out (#913), so a link or junction among Git's files that leads outside is refused, never
-    followed. An entry Git drops without a look (no `gitdir` file, or an empty one) is passed over. A file that cannot
-    be read keeps the list from being trusted (`_UseCheckFailed`). Outside a fence nothing is done."""
+    followed. A `gitdir` that names a relative path is refused as it is: Git versions read it from different folders.
+    An entry Git drops without a look (no `gitdir` file, or an empty one) is passed over. A file that cannot be read
+    keeps the list from being trusted (`_UseCheckFailed`). Outside a fence nothing is done."""
     allowed = store_mod._fence()
     if allowed is None:
         return
@@ -1577,7 +1594,13 @@ def _fence_registrations(repo: Path) -> None:
             named = text_of(gitdir_file) if gitdir_file.is_file() else ""
             if not named:
                 continue
-            gitdir = named_by(named, entry_path)  # Git's path, relative to the entry if so
+            if not _fully_qualified(named):
+                # Git versions read a relative `gitdir` from different folders (the folder Git runs in, or this
+                # entry's), and one with a root but no drive from whatever drive is current, so no one place can be
+                # checked for it: refused as it is (the maintainers' lead, 2026-11-25).
+                store_mod.refuse_unplaced(
+                    f"the registration {gitdir_file}, whose gitdir is a relative path or has no drive ({named})")
+            gitdir = Path(os.path.abspath(named))
             fenced(gitdir.parent)  # the checkout folder as Git lists it
             fenced(gitdir)  # and the `.git` in it that Git looks at
     except OSError as exc:
