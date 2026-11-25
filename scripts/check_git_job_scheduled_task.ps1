@@ -19,6 +19,7 @@
               for the password. The password is typed at that prompt and is never read, stored, logged or printed here.
             Add -DryRun to print every command that would run and register nothing.
             A missing -BaseTemp folder is created before registering a task.
+            If a task is not known to be gone after cleanup, the next run is not started.
             Exit code 0 only when every run was accepted and its task is KNOWN to be gone (the scheduler answered that
             there is no such task); otherwise the code of the first run that was not (2 or 3: a run that was not
             accepted keeps its own code even when its task is also still there), or 4 when a run was accepted but its
@@ -215,7 +216,7 @@ function Get-TaskCommand {
 }
 
 function Invoke-OneRun {
-    # One registered run. Prints what it does and returns @{ code = 0|2|3|4 }.
+    # One run. Prints what it does and returns its code and whether its task is known to be gone.
     param([string]$Label, [bool]$Interactive)
     $id = 'run-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
     $logPath = Join-Path $OutDir "$Label.log"
@@ -236,7 +237,7 @@ function Invoke-OneRun {
         Write-Host "[$Label] would run: schtasks /Run /TN $TaskName"
         Write-Host "[$Label] would wait at most $TimeoutSeconds s for a log that starts with run-id=$id and ends with exit=<n>, and for the task to be Ready (not Running, Queued, Disabled or unknown)"
         Write-Host "[$Label] would judge the log, copy an accepted one, and run: schtasks /Delete /TN $TaskName /F"
-        return @{ code = 0 }
+        return @{ code = 0; gone = $true }  # no task was registered
     }
 
     $before = Get-TaskFacts
@@ -291,7 +292,7 @@ function Invoke-OneRun {
             if (-not $gone) { Write-Host "[$Label] $($judged.text)" }
         }
     }
-    return @{ code = $judged.code }
+    return @{ code = $judged.code; gone = $gone }
 }
 
 if ($SchedulerStub) { . $SchedulerStub }  # tests only: replaces Invoke-Schtasks and Get-TaskFacts
@@ -367,9 +368,14 @@ switch ($Mode) {
         if ($Runs -in @('Both', 'Interactive')) { $plan += , @('interactive', $true) }
         if ($Runs -in @('Both', 'Background')) { $plan += , @('background', $false) }
         $worst = 0
-        foreach ($item in $plan) {
+        for ($i = 0; $i -lt $plan.Count; $i++) {
+            $item = $plan[$i]
             $outcome = Invoke-OneRun -Label $item[0] -Interactive $item[1]
             if ($worst -eq 0 -and $outcome.code -ne 0) { $worst = $outcome.code }
+            if (-not $outcome.gone -and $i -lt $plan.Count - 1) {
+                Write-Host 'The next run was not started because the earlier task may still exist.'
+                exit $outcome.code
+            }
         }
         exit $worst
     }

@@ -316,7 +316,16 @@ function Invoke-Schtasks {
 
 
 def run_with_a_stand_in_scheduler(
-    tmp_path, shell, *, state="Ready", delete_fails=False, seconds=60, query="ok", pytest_exit=0, base_temp=None
+    tmp_path,
+    shell,
+    *,
+    state="Ready",
+    delete_fails=False,
+    seconds=60,
+    query="ok",
+    pytest_exit=0,
+    base_temp=None,
+    runs="Interactive",
 ):
     """Runs `-Mode Run` against the stand-in. `query` is how the scheduler answers: "ok", "always" unreadable, or
     "after-delete" unreadable once the task has been deleted. Returns (the finished process, the out folder, the
@@ -335,13 +344,41 @@ def run_with_a_stand_in_scheduler(
     )
     done = subprocess.run(  # noqa: S603
         [
-            shell, "-NoProfile", "-File", str(SCRIPT), "-Mode", "Run", "-Runs", "Interactive", "-Python", "python",
+            shell, "-NoProfile", "-File", str(SCRIPT), "-Mode", "Run", "-Runs", runs, "-Python", "python",
             "-OutDir", str(out), "-User", "example-user", "-TaskName", "stub-task", "-TimeoutSeconds", str(seconds),
             "-CommandLengthLimit", "5000", "-SchedulerStub", str(stub),
         ] + (["-BaseTemp", str(base_temp)] if base_temp is not None else []),
         capture_output=True, text=True, timeout=180, check=False, env=env,
     )  # fmt: skip
     return done, out, calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+@pytest.mark.parametrize(
+    "settings, code",
+    [
+        ({"delete_fails": True}, 4),
+        ({"query": "after-delete"}, 4),
+        ({"delete_fails": True, "pytest_exit": 1}, 3),
+        ({"query": "after-delete", "pytest_exit": 1}, 3),
+        ({"delete_fails": True, "state": "Running", "seconds": 1}, 2),
+    ],
+)
+def test_both_runs_stop_if_first_task_is_not_known_gone(tmp_path, shell, settings, code):
+    done, _, calls = run_with_a_stand_in_scheduler(tmp_path, shell, runs="Both", **settings)
+    text = done.stdout + done.stderr
+    assert done.returncode == code, text
+    assert len([call for call in calls if call.startswith("/Create")]) == 1, calls
+    assert "next run was not started because the earlier task may still exist" in text
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+@pytest.mark.parametrize("delete_fails", [False, "gone"])
+def test_both_runs_continue_if_first_task_is_known_gone(tmp_path, shell, delete_fails):
+    done, out, calls = run_with_a_stand_in_scheduler(tmp_path, shell, runs="Both", delete_fails=delete_fails)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len([call for call in calls if call.startswith("/Create")]) == 2, calls
+    assert (out / "interactive-accepted.log").exists() and (out / "background-accepted.log").exists()
 
 
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
