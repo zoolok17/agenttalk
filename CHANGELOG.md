@@ -100,6 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do not add up to the whole suite, or when the two wheel pieces tested different wheels. Linux
   and macOS are unchanged.
   `agenttalk dev-gate --ci-leg windows/<python> --part <part>` runs one piece.
+- **macOS test jobs in CI may now run for 120 minutes instead of 90 (#378).** On 23 November
+  2026, eight macOS jobs on master and three pull requests were stopped at the 90-minute limit
+  without a failing test, while passing macOS jobs took 81 to 89 minutes; these stops caused
+  repeated reruns and held merges. The test run's own limit inside the job (7,200 seconds) is
+  unchanged, and Linux keeps 90 minutes.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
@@ -137,6 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Windows process-list failures now stop supervisor operations (#905).**
   Selecting or validating the PowerShell host, preparing or committing its scheduled task, and claiming the supervisor now stop with exit 3 and name the failing Windows call if Windows cannot list processes, even where the list is not needed.
+
+- Three journal tests now allow a slow writer to finish before checking its events, and check the close ended cleanly (#906).
 
 - **Close checks no longer report hidden submodule work as clean (#796).**
   Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.
@@ -201,6 +208,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   period right before a closing quote or bracket now ends it. A Windows drive path, including
   the drive-relative kind like `<drive>:file`, no longer counts as the end of a sentence part.
   The bundled skills are unchanged: the check gives the same answer for all of them.
+
+- **One message file nested too deeply no longer stops every command (#874).** A file in the message
+  folder holding JSON nested so deeply that Python cannot read it used to stop `status`, `doctor`,
+  `threads`, `drain`, `recv`, `send` and `prune --invalid`, the dashboard's message list, checkpoints and
+  the archive step with a Python error, so one damaged file stopped the whole team from talking. Now
+  such a file is treated like any other invalid message file: the good messages beside it are still
+  delivered, `send` works, and `status --json` lists it under `invalid_messages` with the reason
+  `invalid JSON: nested too deeply` (the same `invalid JSON` start as before, so the
+  `message_json_invalid` code is unchanged). `prune --invalid` moves it into the quarantine folder
+  like any invalid file; it never deletes. The same fix covers three more readers that had the same
+  weakness: `dead-letter show` (prints `<unreadable payload>`), `dead-letter requeue` (refuses, and
+  publishes nothing, for a damaged stored message, or for a damaged requeue record of a task, which an explicit
+  `--again --reason TEXT` replaces, a too-deep record included) and the note file that
+  `dead-letter list` reads beside a dead letter (the letter is still listed). No exit code and no
+  `--json` shape changes. Not changed here: the message scan has no file size limit
+  (checkpoints do), and a message that parses but has a deeply nested field is handled as before.
+
 - **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
   Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
   variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run
