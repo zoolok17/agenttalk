@@ -140,6 +140,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The setup brief installs the release the README installs, and the README says what to do when Windows refuses
+  to start agenttalk (#716, items 6 and 7).** Before this, the brief's step 2a still installed v0.101.1. Now it copies
+  its tag from the README, and its record of the v0.101.1 checks is unchanged. If a policy such as Device Guard refuses
+  `agenttalk.exe` or `pip.exe` (exit code 4551), the README now says to keep using the `python -m` forms.
+
 - **Windows process-list failures now stop supervisor operations (#905).**
   Selecting or validating the PowerShell host, preparing or committing its scheduled task, and claiming the supervisor now stop with exit 3 and name the failing Windows call if Windows cannot list processes, even where the list is not needed.
 
