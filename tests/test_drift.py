@@ -294,7 +294,7 @@ def test_a_late_verdict_does_not_change_an_old_order_in_a_later_report():
 def test_the_report_lists_warned_orders_and_work_items_and_skips_other_stages():
     msgs = [order(0, stage="build", request_id="a", allowance="10h"), order(1, stage="read")]
     rep = drift.report(msgs, now=NOW)
-    assert rep["classes"] == {"absent": 1}
+    assert rep["classes"] == {"absent": 1, "unclassified": 1}
     assert len(rep["warned_orders"]) == 1 and rep["work_items"][0]["allowance"] == 10
     assert "elapsed task-hours" in drift.render_report(rep)
 
@@ -326,25 +326,165 @@ def test_both_challenge_skill_copies_carry_the_drift_rules(path):
         assert needle in text, needle
 
 
-# --- the one-off baseline tool (not product code) -----------------------------------------------------------
-def _baseline():
-    import importlib.util
-    from pathlib import Path
-    path = Path(__file__).parents[1] / "scripts" / "drift_baseline.py"
-    spec = importlib.util.spec_from_file_location("drift_baseline", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# --- PR #924 review: the defects reviewer-1 reproduced, each pinned ----------------------------------------
+def test_a_rescinded_task_stops_its_timer_at_the_requesters_rescind():
+    t = order(0, request_id="a")
+    s = hours_of([t, msg(2, kind="rescind", sender="lead", to="worker", request_id="a")])
+    assert s["hours"] == pytest.approx(2) and s["open"] == 0
 
 
-def test_the_baseline_tool_applies_the_same_rules_over_the_thirty_days_before_activation(monkeypatch):
-    msgs = [verdict(0, "ch-1"), order(1, challenge="ch-1"), order(2), order(3, challenge="ch-9"),
-            order(4, stage="read"), order(800, challenge="ch-1")]
-    out = _baseline().baseline(msgs, ts(24 * 29))
-    assert out["classes"] == {"ok": 1, "absent": 1, "unverifiable": 1} and out["orders"] == 3
+def test_read_and_unstaged_tasks_still_count_toward_the_work_items_elapsed_time():
+    s = hours_of([order(0, stage="read", request_id="r"), msg(0, work_item="w", request_id="u")])
+    assert s["tasks"] == 2 and s["hours"] == pytest.approx(20)
 
 
-def test_the_baseline_tool_counts_an_order_it_cannot_classify_as_unverifiable_never_absent(monkeypatch):
-    monkeypatch.setattr(drift, "classify", lambda *a, **k: 1 / 0)
-    out = _baseline().baseline([order(1, challenge="ch-1")], ts(24 * 29))
-    assert out["classes"] == {"unverifiable": 1}
+def test_parallel_recipients_are_labelled_as_added_and_incomplete_history_is_named():
+    s = hours_of([order(0, request_id="a", to="x"), order(0, request_id="a", to="y")])
+    assert "recipients added" in drift.growth_line(s, False)
+    bad = order(0, request_id="b")
+    bad.ts = "nonsense"
+    assert "incomplete history, 1 tasks" in drift.growth_line(hours_of([bad]), False)
+
+
+@pytest.mark.parametrize("ref", [",,", "ch-1,", ",ch-1", "ch-1,,ch-2", "bad id!", " , "])
+def test_a_malformed_or_empty_reference_list_is_never_evidence(ref):
+    msgs = [verdict(1, "ch-1"), verdict(1, "ch-2")]
+    assert cls(msgs, {"stage": "build", "challenge": ref}) == "unusable"
+
+
+def test_a_task_created_after_the_order_is_not_reuse():
+    later = msg(9, request_id="tk-later", stage="build", challenge="ch-1")
+    assert cls([verdict(1, "ch-1"), later], {"stage": "build", "challenge": "tk-later"}) == "unverifiable"
+
+
+def test_reuse_goes_exactly_one_hop():
+    t1 = msg(2, request_id="t1", stage="build", challenge="ch-1")
+    t2 = msg(3, request_id="t2", stage="build", challenge="t1")
+    assert cls([verdict(1, "ch-1"), t1, t2], {"stage": "build", "challenge": "t1"}) == "reused-ok"
+    assert cls([verdict(1, "ch-1"), t1, t2], {"stage": "build", "challenge": "t2"}) == "unverifiable"
+
+
+@pytest.mark.parametrize("allowance", ["0h", "banana", "-3h", ""])
+def test_a_first_order_with_an_unusable_allowance_warns_and_still_shows_the_growth_line(allowance):
+    meta = {"stage": "build", "work_item": "n", "allowance": allowance, "challenge": "exempt:docs-only"}
+    out = drift.order_warnings([], meta, NOW)
+    assert any("no usable allowance" in x for x in out)
+    assert any(x.startswith("work item n: allowance none usable") for x in out)
+
+
+def test_an_earlier_read_task_does_not_hide_the_missing_allowance_on_the_first_scoped_order():
+    out = drift.order_warnings([order(0, stage="read")], {"stage": "build", "work_item": "w"}, NOW)
+    assert any("no usable allowance" in x for x in out)
+
+
+def test_older_work_keeps_an_unknown_allowance(monkeypatch):
+    monkeypatch.setattr(drift, "ACTIVATION", ts(5))
+    s = drift.work_item_state([order(1, allowance="9h")], "w", NOW)
+    assert s["legacy"] and s["allowance"] is None
+    assert "unknown (older work)" in drift.growth_line(s, False)
+
+
+def test_the_growth_line_is_part_of_every_order_under_an_allowance():
+    msgs = [order(0, allowance="10h", request_id="a"), reply(1, "a", "done")]
+    out = drift.order_warnings(msgs, {"stage": "build", "work_item": "w", "challenge": "exempt:docs-only"}, NOW)
+    assert len(out) == 1 and out[0].startswith("work item w: allowance 10h")
+
+
+def test_untagged_fix_tasks_never_prove_the_decision_threshold():
+    msgs = [order(0, stage="fix", request_id="u1"), order(1, stage="fix", request_id="u2")]
+    out = drift.order_warnings(msgs, {"stage": "build", "work_item": "w", "allowance": "50h"}, NOW)
+    assert not any("needs decision=" in x for x in out)
+    assert any("decision possibly needed" in x and "count incomplete" in x for x in out)
+
+
+def test_an_old_decision_does_not_cover_a_later_order():
+    first = {"stage": "build", "work_item": "w", "decision": "continue", "decision_reason": "ok"}
+    assert not any("needs decision=" in x for x in drift.order_warnings(two_rounds(), first, NOW))
+    later = {"stage": "build", "work_item": "w"}
+    assert any("needs decision=" in x for x in drift.order_warnings(two_rounds([order(6, **first)]), later, NOW))
+
+
+def test_a_read_order_after_two_fix_rounds_also_needs_a_decision():
+    out = drift.order_warnings(two_rounds(), {"stage": "read", "work_item": "w"}, NOW)
+    assert any("needs decision=" in x for x in out)
+
+
+def exempt_fix(hours, rid, rnd, **extra):
+    return order(hours, stage="fix", work_round=rnd, challenge="exempt:review-ordered-fix", request_id=rid, **extra)
+
+
+def test_the_report_rebuilds_decision_warnings_as_of_each_order_and_labels_them_reconstructed():
+    head = [order(0, stage="build", challenge="exempt:docs-only", request_id="b", allowance="50h"),
+            reply(1, "b", "done"),
+            exempt_fix(2, "f1", "1"), reply(3, "f1", "done"), exempt_fix(4, "f2", "2"), reply(5, "f2", "done")]
+    decided = order(6, stage="read", request_id="r", decision="stop", decision_reason="enough")
+    with_decision = drift.report(head + [decided], now=NOW)
+    assert with_decision["warned_orders"] == []
+    quiet = drift.report(head + [order(6, stage="read", request_id="r")], now=NOW)
+    assert len(quiet["warned_orders"]) == 1
+    row = quiet["warned_orders"][0]
+    assert row["reconstructed"] and "needs decision=" in row["reasons"][0]
+    assert "reconstructed from messages" in drift.render_report(quiet)
+
+
+def test_the_report_counts_exposure_as_of_the_order_not_as_of_today():
+    msgs = [order(0, request_id="a", allowance="3h", challenge="exempt:docs-only"),
+            order(2, request_id="b", challenge="exempt:docs-only"), reply(8, "a", "done")]
+    rep = drift.report(msgs, now=NOW)
+    reasons = [r for w in rep["warned_orders"] for r in w["reasons"]]
+    assert not any("needs decision=" in r for r in reasons)   # at hour 2 only 2h were used
+
+
+def test_exemptions_unknown_and_unclassified_stay_out_of_the_nothing_share():
+    msgs = [order(1, request_id="a0")] + [order(1, challenge="exempt:docs-only", request_id=f"e{i}") for i in range(9)]
+    msgs.append(msg(1, request_id="plain"))
+    rep = drift.report(msgs, now=NOW)
+    assert rep["classes"]["exempt-listed"] == 9 and rep["classes"]["unclassified"] == 1
+    assert rep["nothing_share"] == 1.0
+
+
+def test_with_no_activation_instant_everything_is_unknown_and_nothing_is_older_work(monkeypatch):
+    monkeypatch.setattr(drift, "ACTIVATION", None)
+    rep = drift.report([order(1)], now=NOW)
+    assert rep["classes"] == {"unknown": 1} and rep["activation"] is None and rep["warned_orders"] == []
+    assert "not set" in drift.render_report(rep)
+    assert not drift.work_item_state([order(1, allowance="9h")], "w", NOW)["legacy"]
+
+
+def test_overview_drift_leaves_every_file_byte_identical(bus, capsys):
+    send(bus, "stage=build", "work_item=w1", "allowance=5h")
+    capsys.readouterr()
+
+    def snapshot():
+        return {str(p.relative_to(bus.root)): p.read_bytes() for p in bus.root.rglob("*") if p.is_file()}
+
+    before = snapshot()
+    assert run(bus, "overview", "--drift") == 0 and run(bus, "overview", "--drift", "--json") == 0
+    assert before == snapshot()
+
+
+def test_the_task_command_prints_the_same_stdout_with_and_without_the_drift_check(bus, capsys, monkeypatch):
+    import re
+
+    def stdout_for(rid, patched):
+        if patched:
+            monkeypatch.setattr(drift, "order_warnings", lambda *a, **k: [])
+        capsys.readouterr()
+        assert send(bus, "stage=build", "work_item=w1", "allowance=5h", f"request_id={rid}") == 0
+        out = capsys.readouterr().out.replace(rid, "RID")
+        return re.sub(r"\d{8}-\d{6}-\d+-\w+|\d{4}-\d\d-\d\dT[\d:.]+Z?", "X", out)
+
+    assert stdout_for("tk-new", False) == stdout_for("tk-old", True)
+
+
+def test_both_challenge_skill_copies_carry_the_same_full_drift_paragraph():
+    from agenttalk.install_skills import SKILLS_ROOT
+    paragraphs = []
+    for path in ("claude/agenttalk.challenge.md", "codex/agenttalk-challenge/SKILL.md"):
+        text = " ".join((SKILLS_ROOT / path).read_text(encoding="utf-8").split())
+        start = text.index("**Drift visibility")
+        paragraphs.append(text[start:text.index("shows the picture.", start)])
+    assert paragraphs[0] == paragraphs[1]
+    for needle in ("stamped before the order", "agenttalk broadcast --kind task", "is not checked in this slice",
+                   "overview --drift", "names what it leaves out"):
+        assert needle in paragraphs[0], needle

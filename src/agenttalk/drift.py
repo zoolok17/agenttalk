@@ -16,10 +16,14 @@ EXEMPT_IDS = ("failing-repro-fix", "review-ordered-fix", "checklist-release", "r
 VERDICTS = ("proceed", "reshape", "probe", "replace", "defer", "stop")
 DECISIONS = ("narrow", "stop", "continue")
 FIX_ROUNDS = 2
-# Orders sent before this UTC instant are "unknown" in the report (set to the release instant).
-ACTIVATION = "2026-11-26T00:00:00Z"
-_ALLOWANCE = re.compile(r"(\d+(?:\.\d+)?)h")
+# UNSET until the release checklist fills it with the release's UTC instant. While it is None the
+# report calls every order unknown and no work item is treated as older work: nothing becomes a
+# historical boundary by accident.
+ACTIVATION: str | None = None
+_AMOUNT = re.compile(r"(\d+(?:\.\d+)?)h")
+_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _BAD = ("pending", "unusable", "late", "unverifiable")
+_GOOD = ("ok", "reused-ok", "exempt-listed")
 
 
 def _t(ts):
@@ -43,6 +47,11 @@ def _by_rid(msgs):
     return index
 
 
+def _amount(raw):
+    hit = _AMOUNT.fullmatch(str(raw or ""))
+    return float(hit.group(1)) if hit and float(hit.group(1)) > 0 else None
+
+
 def ref_state(index, ref, order_ts, hop=0):
     """D1: the state of one challenge reference as of the order's timestamp."""
     found = index.get(ref, [])
@@ -54,12 +63,12 @@ def ref_state(index, ref, order_ts, hop=0):
         return "ok" if any((_t(m.ts) or order_ts) < order_ts for m in good) else "late"
     if any(_truthy(m.meta.get("challenge")) for m in found):
         return "pending"
-    if hop == 0:  # reuse: a prior task is not proof; its own reference must resolve (one hop)
+    if hop == 0:  # reuse: the prior task must predate this order and its own reference must resolve (one hop)
         for m in found:
             prior = str(m.meta.get("challenge") or "")
-            if m.kind == "task" and prior and not prior.startswith("exempt:"):
-                states = [ref_state(index, r.strip(), order_ts, 1) for r in prior.split(",") if r.strip()]
-                if states and all(s == "ok" for s in states):
+            if m.kind == "task" and prior and not prior.startswith("exempt:") and (_t(m.ts) or order_ts) < order_ts:
+                states = [ref_state(index, r.strip(), order_ts, 1) for r in prior.split(",")]
+                if all(s == "ok" for s in states):
                     return "reused-ok"
     return "unverifiable"
 
@@ -73,48 +82,39 @@ def classify(index, meta, order_ts):
         return "absent", []
     if ref.startswith("exempt:"):
         return ("exempt-listed" if ref.split(":")[1] in EXEMPT_IDS else "exempt-unlisted"), []
-    states = [ref_state(index, r.strip(), order_ts) for r in ref.split(",") if r.strip()]
+    parts = [r.strip() for r in ref.split(",")]
+    if not all(_ID.fullmatch(r) for r in parts):  # empty or malformed segments are never evidence
+        return "unusable", []
+    states = [ref_state(index, r, order_ts) for r in parts]
     for bad in _BAD:
         if bad in states:
             return bad, states
     return ("reused-ok" if "reused-ok" in states else "ok"), states
 
 
-def _allowance(tasks):
-    """D4: the first valid allowance is the agreed one; later different values are attempts."""
-    agreed, attempts = None, []
-    for m in tasks:
-        hit = _ALLOWANCE.fullmatch(str(m.meta.get("allowance") or ""))
-        if hit and float(hit.group(1)) > 0:
-            if agreed is None:
-                agreed = float(hit.group(1))
-            elif float(hit.group(1)) != agreed:
-                attempts.append(hit.group(0))
-    return agreed, attempts
-
-
 def _spent(msgs, tasks, now):
-    """D2: elapsed task-hours; ends at done/declined, supersession or rescind; open work runs to now."""
+    """D2: elapsed task-hours; ends at done/declined, the requester's rescind or a supersession."""
     first, hours, open_n, bad, index, sup = {}, 0.0, 0, 0, _by_rid(msgs), {}
     for m in tasks:
         first.setdefault((str(m.meta.get("request_id")), m.recipient), m)
         if m.meta.get("supersedes"):
             sup.setdefault(str(m.meta["supersedes"]), []).append(_t(m.ts))
     for (rid, who), m in first.items():
-        start = _t(m.ts)
+        start, ends = _t(m.ts), []
         if start is None:
             bad += 1
             continue
-        ends = [_t(r.ts) for r in index.get(rid, []) if r.sender == who
-                and ((r.kind == "task-response" and r.meta.get("status") in ("done", "declined"))
-                     or (r.kind == "rescind" and r.sender == m.sender))]
+        for r in index.get(rid, []):
+            if (r.kind == "task-response" and r.sender == who and r.meta.get("status") in ("done", "declined")) \
+                    or (r.kind == "rescind" and r.sender == m.sender):
+                ends.append(_t(r.ts))
         ends = [e for e in ends + sup.get(rid, []) if e is not None and e >= start]
         if ends:
             hours += (min(ends) - start).total_seconds() / 3600
         else:
             open_n += 1
             hours += max((now - start).total_seconds(), 0) / 3600
-    return hours, open_n, bad
+    return hours, open_n, bad, len({m.recipient for m in first.values()}) > 1
 
 
 def _rounds(tasks):
@@ -130,98 +130,117 @@ def _rounds(tasks):
 
 
 def work_item_state(msgs, work_item, now):
+    """D2-D4 for one work item as of `now`; `msgs` must already be only what existed then."""
     tasks = sorted((m for m in msgs if m.kind == "task" and (m.meta or {}).get("work_item") == work_item),
                    key=lambda m: m.id)
-    agreed, attempts = _allowance(tasks)
-    hours, open_n, bad = _spent(msgs, tasks, now)
+    act = _t(ACTIVATION) if ACTIVATION else None
+    legacy = bool(tasks and act and (_t(tasks[0].ts) or now) < act)
+    agreed, attempts = None, []
+    for m in tasks:
+        amount = _amount(m.meta.get("allowance"))
+        if amount and agreed is None:
+            agreed = amount
+        elif amount and amount != agreed:
+            attempts.append(f"{amount:g}h")
+    hours, open_n, bad, parallel = _spent(msgs, tasks, now)
     k, u = _rounds(tasks)
-    legacy = bool(tasks) and (_t(tasks[0].ts) or now) < _t(ACTIVATION)
-    return {"work_item": work_item, "tasks": len(tasks), "allowance": agreed, "attempts": attempts,
-            "hours": hours, "open": open_n, "incomplete": bad, "rounds": k, "untagged": u, "legacy": legacy}
+    return {"work_item": work_item, "tasks": len(tasks), "allowance": None if legacy else agreed,
+            "attempts": attempts, "hours": hours, "open": open_n, "incomplete": bad, "parallel": parallel,
+            "rounds": k, "untagged": u, "legacy": legacy,
+            "scoped": any((m.meta.get("stage") in STAGES) for m in tasks)}
+
+
+def _over(s):
+    """The threshold is proven only by tagged rounds (a lower bound) or by elapsed time past the allowance."""
+    return s["rounds"] >= FIX_ROUNDS or bool(s["allowance"] and s["hours"] > s["allowance"])
 
 
 def growth_line(s, decided):
     allow = f"{s['allowance']:g}h" if s["allowance"] else ("unknown (older work)" if s["legacy"] else "none usable")
     bound = "at least " if s["open"] or s["incomplete"] else ""
+    notes = (f", {s['open']} open" if s["open"] else "") + (
+        f", incomplete history, {s['incomplete']} tasks" if s["incomplete"] else "") + (
+        ", recipients added" if s["parallel"] else "")
     rounds = f"{s['rounds']} tagged" + (f" + {s['untagged']} untagged (count incomplete)" if s["untagged"] else "")
-    extra = f", {s['open']} open" if s["open"] else ""
+    need = "recorded" if decided else "needed" if _over(s) else (
+        "possibly needed" if s["rounds"] + s["untagged"] >= FIX_ROUNDS else "not needed")
     attempt = f"; attempted change to {', '.join(s['attempts'])} not applied" if s["attempts"] else ""
     return (f"work item {s['work_item']}: allowance {allow}, elapsed task-hours (a proxy, includes waiting) "
-            f"{bound}{s['hours']:.1f}{extra}, fix rounds {rounds} of {FIX_ROUNDS}, "
-            f"decision {'recorded' if decided else 'needed' if _over(s) else 'not needed'}{attempt}")
+            f"{bound}{s['hours']:.1f}{notes}, fix rounds {rounds} of {FIX_ROUNDS}, decision {need}{attempt}")
 
 
-def _over(s):
-    return s["rounds"] + s["untagged"] >= FIX_ROUNDS or bool(s["allowance"] and s["hours"] > s["allowance"])
-
-
-def _decided(meta):
-    return str(meta.get("decision")) in DECISIONS and bool(str(meta.get("decision_reason") or "").strip())
+def check_order(msgs, meta, now, index=None):
+    """(warnings, growth line or None) for one order, given only the messages that existed before it."""
+    out, stage, wi = [], str(meta.get("stage") or ""), meta.get("work_item")
+    if stage in STAGES:
+        cls, states = classify(index or _by_rid(msgs), meta, now)
+        if cls not in _GOOD:
+            seen = f" ({', '.join(states)})" if states else ""
+            out.append(f"challenge evidence for this {stage} order: {cls}{seen}"
+                       + " - no answered challenge verdict existed before this order")
+    if not wi:
+        return out + (["no work_item: this order's growth cannot be tracked"] if stage in STAGES else []), None
+    s = work_item_state(msgs, str(wi), now)
+    new_amount, first_scoped = _amount(meta.get("allowance")), stage in STAGES and not s["scoped"]
+    if first_scoped and not new_amount:
+        out.append(f"work item {wi}: no usable allowance (expected allowance=<N>h, positive, on the first order)")
+    if new_amount and not s["legacy"]:
+        if s["allowance"] and new_amount != s["allowance"]:
+            s["attempts"].append(f"{new_amount:g}h")
+        s["allowance"] = s["allowance"] or new_amount
+    decided = str(meta.get("decision")) in DECISIONS and bool(str(meta.get("decision_reason") or "").strip())
+    if _over(s) and not decided:
+        out.append(f"work item {wi}: two fix rounds or the allowance are used - this order needs "
+                   "decision=narrow|stop|continue and decision_reason=<why>")
+    show = s["allowance"] or first_scoped or s["rounds"] + s["untagged"]
+    return out, (growth_line(s, decided) if show else None)
 
 
 def order_warnings(msgs, meta, now=None):
     """Advisory lines for a task about to be sent (never a refusal)."""
-    now = now or datetime.now(timezone.utc)
-    out, stage = [], str(meta.get("stage") or "")
-    if stage in STAGES:
-        cls, states = classify(_by_rid(msgs), meta, now)
-        if cls not in ("ok", "reused-ok", "exempt-listed"):
-            out.append(f"challenge evidence for this {stage} order: {cls}"
-                       + (f" ({', '.join(states)})" if states else "")
-                       + " - no answered challenge verdict existed before this order")
-    wi = meta.get("work_item")
-    if not wi:
-        if stage in STAGES:
-            out.append("no work_item: this order's growth cannot be tracked")
-        return out
-    s = work_item_state(msgs, str(wi), now)
-    new = _ALLOWANCE.fullmatch(str(meta.get("allowance") or ""))
-    if s["tasks"] == 0 and stage in STAGES and not new:
-        out.append(f"work item {wi}: no usable allowance (expected allowance=<N>h on the first order)")
-    elif new and s["allowance"] and float(new.group(1)) != s["allowance"]:
-        s["attempts"].append(new.group(0))
-    if new and not s["allowance"] and not s["legacy"]:
-        s["allowance"] = float(new.group(1))
-    if s["tasks"] and not s["legacy"] or s["allowance"] or s["rounds"] + s["untagged"]:
-        out.append(growth_line(s, _decided(meta)))
-        if _over(s) and not _decided(meta):
-            out.append(f"work item {wi}: two fix rounds or the allowance are used - this order needs "
-                       "decision=narrow|stop|continue and decision_reason=<why>")
-    return out
+    out, growth = check_order(msgs, meta, now or datetime.now(timezone.utc))
+    return out + ([growth] if growth else [])
 
 
 def report(msgs, since=None, now=None):
-    """Read-only summary for `overview --drift`: class counts, warned orders and work items."""
-    now = now or datetime.now(timezone.utc)
-    first, act = _t(since) if since else None, _t(ACTIVATION)
+    """Read-only summary for `overview --drift`. Warnings are RECONSTRUCTED as of each order's own
+    time from the messages; they do not prove that stderr was shown."""
+    now, msgs = now or datetime.now(timezone.utc), sorted(msgs, key=lambda m: m.id)
+    act, first = (_t(ACTIVATION) if ACTIVATION else None), (_t(since) if since else None)
     index, counts, warned, items = _by_rid(msgs), {}, [], set()
-    for m in msgs:
-        meta = m.meta or {}
-        if m.kind != "task" or str(meta.get("stage") or "") not in STAGES:
+    for i, m in enumerate(msgs):
+        meta, ts = m.meta or {}, _t(m.ts)
+        if m.kind != "task" or ts is None or (first and ts < first):
             continue
-        ts = _t(m.ts)
-        if first and ts and ts < first:
-            continue
-        if ts is None or ts < act:
-            cls = "unknown"
-        else:
-            cls, _ = classify(index, meta, ts)
-            if cls not in ("ok", "reused-ok", "exempt-listed"):
-                warned.append(f"{m.id} ({cls})")
-        counts[cls] = counts.get(cls, 0) + 1
         if meta.get("work_item"):
             items.add(str(meta["work_item"]))
-    known = sum(v for k, v in counts.items() if k != "unknown")
-    return {"classes": counts, "nothing_share": (counts.get("absent", 0) / known) if known else None,
+        staged = str(meta.get("stage") or "") in STAGES
+        known = act is not None and ts >= act
+        cls = classify(index, meta, ts)[0] if known and staged else ("unknown" if staged else "unclassified")
+        if staged or cls == "unclassified":
+            counts[cls] = counts.get(cls, 0) + 1
+        if known and (staged or meta.get("work_item")):
+            lines, _ = check_order(msgs[:i], meta, ts, index)
+            if lines:
+                warned.append({"order": m.id, "class": cls, "reasons": lines, "decision": meta.get("decision"),
+                               "decision_reason": meta.get("decision_reason"), "reconstructed": True})
+    rated = sum(v for k, v in counts.items() if k not in ("unknown", "unclassified", "exempt-listed"))
+    return {"activation": ACTIVATION, "classes": counts,
+            "nothing_share": (counts.get("absent", 0) / rated) if rated else None,
             "warned_orders": warned, "work_items": [work_item_state(msgs, w, now) for w in sorted(items)]}
 
 
 def render_report(rep):
     lines = ["DRIFT (advisory; elapsed task-hours are a proxy, not effort)"]
+    if rep["activation"] is None:
+        lines.append("  Activation instant is not set (release checklist): every order is shown as unknown.")
     lines += [f"  {k}: {v}" for k, v in sorted(rep["classes"].items())] or ["  no design/build/fix orders"]
     share = rep["nothing_share"]
-    lines.append("  nothing share (absent, of classifiable orders): " + ("n/a" if share is None else f"{share:.0%}"))
+    lines.append("  nothing share (absent, of rated orders; exemptions, unknown and unclassified excluded): "
+                 + ("n/a" if share is None else f"{share:.0%}"))
     lines.append("  Older records are unknown; a missing field is not proof that no challenge happened.")
-    lines += ["  warned order: " + w for w in rep["warned_orders"]]
+    for w in rep["warned_orders"]:
+        lines.append(f"  warned order {w['order']} (reconstructed from messages, not proof it was shown): "
+                     + "; ".join(w["reasons"]) + (f" [decision {w['decision']}]" if w["decision"] else ""))
     lines += ["  " + growth_line(s, False) for s in rep["work_items"]]
     return "\n".join(lines) + "\n"
