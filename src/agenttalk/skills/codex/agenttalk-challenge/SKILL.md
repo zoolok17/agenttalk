@@ -80,7 +80,7 @@ defer still waits for its trigger, a probe still has to be run.
 Re-challenge when the objective, risk class or a binding constraint
 changes, or the cost grows by more than 25%.
 
-**Drift visibility (#923; advisory, `agenttalk task` only warns on stderr).** Record
+**Drift visibility (#923; advisory, the task command only warns on stderr).** Record
 `challenge=exempt:<id>` with `<id>` one of `failing-repro-fix`, `review-ordered-fix`,
 `checklist-release`, `rollback`, `revert`, `docs-only`, `operator-waiver`,
 `incident-containment` (an optional note may follow a second colon); any other exemption is
@@ -90,8 +90,8 @@ without a verdict, an unusable or late verdict, or an id the store cannot find i
 later values are shown, never applied). After two fix rounds (a round is one distinct
 `work_cycle`/`work_round` pair) or past the allowance, every further order under that work
 item carries `decision=narrow|stop|continue` and `decision_reason=<why>`. A reshape names what
-it leaves out. `agenttalk broadcast --kind task` is not checked in this slice;
-`agenttalk overview --drift` shows the picture.
+it leaves out. A broadcast of kind task is not checked in this slice;
+The overview command with `--drift` shows the picture.
 
 ## Requester
 

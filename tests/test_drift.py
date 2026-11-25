@@ -485,6 +485,6 @@ def test_both_challenge_skill_copies_carry_the_same_full_drift_paragraph():
         start = text.index("**Drift visibility")
         paragraphs.append(text[start:text.index("shows the picture.", start)])
     assert paragraphs[0] == paragraphs[1]
-    for needle in ("stamped before the order", "agenttalk broadcast --kind task", "is not checked in this slice",
-                   "overview --drift", "names what it leaves out"):
+    for needle in ("stamped before the order", "A broadcast of kind task", "is not checked in this slice",
+                   "overview command with `--drift`", "names what it leaves out"):
         assert needle in paragraphs[0], needle
