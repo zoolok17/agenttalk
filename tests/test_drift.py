@@ -488,3 +488,21 @@ def test_both_challenge_skill_copies_carry_the_same_full_drift_paragraph():
     for needle in ("stamped before the order", "A broadcast of kind task", "is not checked in this slice",
                    "overview command with `--drift`", "names what it leaves out"):
         assert needle in paragraphs[0], needle
+
+
+# --- the 3-second ceiling (lead decision on criterion 14) -----------------------------------------------
+def test_the_bounded_reader_returns_the_same_messages_as_the_trust_gate_when_it_finishes(bus):
+    send(bus, "stage=build", "work_item=w1", "allowance=5h")
+    msgs, complete = drift.read_messages(bus)
+    assert complete and [m.id for m in msgs] == [m.id for m in bus.valid_messages()]
+
+
+def test_a_slow_reader_stops_at_the_ceiling_says_history_incomplete_and_still_delivers(bus, capsys, monkeypatch):
+    bus.send(sender="lead", recipient="worker", kind="note", body="one earlier message")
+    real, ticks = drift.read_messages, iter(range(0, 1000, 5))      # each clock reading is 5 s later
+    monkeypatch.setattr(drift, "read_messages", lambda store: real(store, ceiling=3.0, clock=lambda: next(ticks)))
+    assert send(bus, "stage=build", "work_item=w1", "allowance=5h") == 0
+    err = capsys.readouterr().err
+    assert "drift: history incomplete" in err and "lower bounds" in err
+    assert "no usable allowance" not in err                         # an unseen allowance is not reported as missing
+    assert [m.kind for m in bus.valid_messages()] == ["note", "task"]   # delivered unchanged

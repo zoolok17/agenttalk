@@ -10896,7 +10896,8 @@ def cmd_task(args: argparse.Namespace) -> int:
     # #923: advisory drift lines on stderr BEFORE the write; never changes delivery or the exit code.
     try:
         from agenttalk import drift
-        for line in drift.order_warnings(store.valid_messages(), meta):
+        msgs, complete = drift.read_messages(store)
+        for line in drift.order_warnings(msgs, meta, complete=complete):
             sys.stderr.write(f"agenttalk task: drift: {line}\n")
     except Exception:  # noqa: BLE001 - advisory only
         sys.stderr.write("agenttalk task: drift: check unavailable\n")

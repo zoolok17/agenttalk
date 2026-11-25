@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list, or a work item that passed its agreed time allowance or two fix rounds without a recorded decision
   (`narrow`, `stop` or `continue`). Nothing is refused and delivery is unchanged. `agenttalk overview --drift`
   shows the same picture for the whole store. The time shown is elapsed task-hours, a proxy that includes
-  waiting, not effort. Older orders are shown as unknown. Both copies of the challenge skill describe the
+  waiting, not effort. The check reads the store once more: about +0.4 s at 5,000 and +2.1 s at 20,000
+  messages (medians); after 3 s it stops and says "history incomplete". Older orders are shown as unknown. Both copies of the challenge skill describe the
   new meta keys (`allowance`, `decision`, `decision_reason`).
 
 - **The lead setup brief explains how to run a Claude seat in a strict permission mode (#826).**
