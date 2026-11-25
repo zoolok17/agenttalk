@@ -1384,10 +1384,17 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
             )
         elif reason is None:
             _run_git(cfg.repo, "worktree", "prune")
-            after, why = _strict_listing(cfg.repo)  # the same strict reading: a failed one is unknown, not a 0
+            try:
+                after, why = _strict_listing(cfg.repo)  # the same strict reading: a failed one is unknown, not a 0
+                next_step = _listing_next_step(why) if after is None else ""
+            except store_mod.StoreFenceError as exc:
+                # A registration outside the fence appeared after the prune: the count is unknown, and the report of
+                # what the sweep did is still printed, with the refusal in it.
+                after, why = None, f"the store fence refused a path: {exc}"
+                next_step = "look at that registration before you run the sweep again"
             if after is None:
                 report.apply_failed = True
-                lines.append(f"registered worktrees after prune: unknown ({why}); {_listing_next_step(why)}")
+                lines.append(f"registered worktrees after prune: unknown ({why}); {next_step}")
             else:
                 lines.append(f"registered worktrees after prune: {len(after)}")
         else:

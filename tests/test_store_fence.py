@@ -3911,8 +3911,8 @@ def test_the_registration_check_fences_each_git_file_before_it_looks_through_a_l
 def test_under_the_store_fence_a_failed_strict_list_is_not_replaced_by_the_old_git_list(
     fenced, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The report keeps a best-effort list of checkouts for its counts when the strict list fails. Under the store
-    fence it does not ask Git for it: that list was never fenced, and Git's listing looks at every registration."""
+    """When the strict list fails, the report does not ask Git for another list: that one was never fenced, and Git's
+    listing looks at every registration. The list is UNKNOWN (#901), with the strict list's reason, never `[]`."""
     from agenttalk import janitor
 
     fence, _, _ = fenced
@@ -3924,7 +3924,43 @@ def test_under_the_store_fence_a_failed_strict_list_is_not_replaced_by_the_old_g
     report = janitor.build_report(cfg, (None, "the strict list failed (test)"))
 
     assert asked == [], asked
-    assert report.registered_worktrees == [] and not report.registered_strict
+    assert report.registered_worktrees is None and report.registered_unknown == "the strict list failed (test)"
+
+
+def test_a_registration_made_outside_during_the_prune_makes_the_count_after_it_unknown_and_keeps_the_report(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """After the prune, the sweep reads the strict list again for its count. If Git got a registration of a folder
+    outside the fence in the meantime, the fence refuses that reading (before Git is asked). The count is then
+    UNKNOWN and the sweep fails (exit 1); the refusal does not end the command before the report of what was done
+    is printed, and Git is not asked for its list with the outside registration in place."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, _ = _swept_checkout(fence)
+    outside = (tmp_path / "zz-late-after-prune").resolve()  # beside the fence, inside this test's own folder
+    outside.mkdir()
+    admin = repo / ".git" / "worktrees" / "late-registration"
+    real_run = janitor._run_git
+
+    def run(repo_arg, *args, **kwargs):
+        result = real_run(repo_arg, *args, **kwargs)
+        if args[:2] == ("worktree", "prune"):
+            _write_late_registration(admin, outside)  # just after the real prune
+        return result
+
+    monkeypatch.setattr(janitor, "_run_git", run)
+    asked = _git_asked_for_every_registration(monkeypatch, admin)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--apply"])
+
+    text = capsys.readouterr().out
+    assert admin.is_dir(), "the registration was never made, so nothing was tested"
+    assert asked == [], f"Git was asked about every registration, the outside one too: {asked}"
+    assert rc == 1, text
+    assert "registered worktrees after prune: unknown" in text and "removed summary:" in text, text
+    assert str(outside) in text, text
 
 
 def test_the_guard_notes_an_outside_path_handed_to_a_git_runner_as_an_argument(
@@ -4205,4 +4241,5 @@ def test_under_the_store_fence_a_unc_record_is_kept_and_never_looked_at_on_relea
         assert rc == 0, text
         # The sweep went on: the steps after the refusal really ran, and none of them looked at the path.
         assert prunes, "the prune was not called: the sweep stopped"
-        assert {"_ancestor_change_reason", "get_registered_worktrees"} <= set(after), after
+        # The count after the prune is read from the strict list (#901), not from the old text reader.
+        assert {"_ancestor_change_reason", "_registered_worktrees_listed"} <= set(after), after
