@@ -551,7 +551,7 @@ def test_committed_pytest_timeout_has_wheel_leg_headroom() -> None:
     # fast source legs (~9min) and the slow wheel legs (isolated venv + install +
     # full suite, ~30min on loaded Windows runners). At 1800s the wheel leg hit the
     # cap at ~92-99% and forced multi-cycle CI rerun loops. Keep generous headroom
-    # so it cannot silently regress; the CI job allows timeout-minutes: 90.
+    # so it cannot silently regress; the CI job allows 90 minutes on Linux and 120 on macOS.
     manifest = _manifest()
     assert manifest["checks"]["pytest"]["timeout_seconds"] >= 2400
 

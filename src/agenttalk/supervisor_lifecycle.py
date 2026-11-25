@@ -301,18 +301,39 @@ class _PROCESSENTRY32W(ctypes.Structure):
 
 def _process_parent_map() -> dict[int, int]:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    for call in (kernel32.Process32FirstW, kernel32.Process32NextW):
+        call.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+        call.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
     invalid = wintypes.HANDLE(-1).value
     if snapshot == invalid:
-        raise SupervisorLifecycleError("could not snapshot process ancestry")
+        error = ctypes.get_last_error()
+        detail = f"winerror {error}" if error else "no error code was reported"
+        raise SupervisorLifecycleError(
+            f"could not snapshot process ancestry: CreateToolhelp32Snapshot failed ({detail})"
+        )
     parents: dict[int, int] = {}
     try:
         entry = _PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(entry)
+        ctypes.set_last_error(0)
         ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        function = "Process32FirstW"
         while ok:
             parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            ctypes.set_last_error(0)
             ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            function = "Process32NextW"
+        error = ctypes.get_last_error()
+        if error != 18:  # ERROR_NO_MORE_FILES
+            detail = f"winerror {error}" if error else "no error code was reported"
+            raise SupervisorLifecycleError(
+                f"could not snapshot process ancestry: {function} failed ({detail})"
+            )
     finally:
         kernel32.CloseHandle(snapshot)
     return parents

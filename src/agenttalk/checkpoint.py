@@ -427,7 +427,7 @@ def _bounded_valid_messages(
                         key,
                         expected_key_id=project_id,
                     )
-            except (UnicodeError, ValueError):
+            except (UnicodeError, ValueError, RecursionError):  # RecursionError: nested too deeply (#874)
                 continue
             messages.append(message)
 

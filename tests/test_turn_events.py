@@ -570,13 +570,14 @@ def blocked_first_event(files: Hooked) -> tuple[threading.Event, threading.Event
 def test_rotation_with_a_backlog_keeps_numbers_continuous_and_headers_unnumbered(tmp_path):
     files = Hooked()
     entered, unblock = blocked_first_event(files)
-    sink = run_clean(tmp_path, files=files, segment_bytes=600)
+    sink = run_clean(tmp_path, files=files, segment_bytes=600, close_seconds=CLOSE_LIMIT_SECONDS)
     started(sink, turn="t0")
     assert entered.wait(5)
     for index in range(1, 12):
         started(sink, turn="t%d" % index)  # all queued behind the blocked write
     unblock.set()
     sink.close()
+    assert (sink.state, sink.off_reason) == ("closed", None)
     records = read_everything(agent_dir(tmp_path))
     headers = [r for r in records if r["kind"] == "stream_started"]
     events = events_only(records)
@@ -723,14 +724,16 @@ def test_the_cap_removes_the_oldest_segments_never_the_open_one(tmp_path):
 
 
 def test_a_cap_smaller_than_one_segment_still_keeps_the_open_segment(tmp_path):
-    sink = run_clean(tmp_path, segment_bytes=400, max_bytes=50)
+    sink = run_clean(tmp_path, segment_bytes=400, max_bytes=50, close_seconds=CLOSE_LIMIT_SECONDS)
     for index in range(20):
         started(sink, turn="t%d" % index)
     sink.close()
+    assert (sink.state, sink.off_reason) == ("closed", None)
     segments = te.list_segments(agent_dir(tmp_path))
     assert len(segments) == 1
     records = te.read_segment(segments[0][2]).records
     assert records[0]["kind"] == "stream_started" and records[-1]["kind"] == "stream_closed"
+    assert [event["seq"] for event in events_only(records)][-1:] == [20]
 
 
 def test_a_cap_removal_that_fails_is_counted_and_does_not_stop_the_journal(tmp_path):
@@ -740,10 +743,11 @@ def test_a_cap_removal_that_fails_is_counted_and_does_not_stop_the_journal(tmp_p
         raise PermissionError("SENTINEL-EXC-LOCK")
 
     files.hooks["remove"] = fail
-    sink = run_clean(tmp_path, files=files, segment_bytes=400, max_bytes=800)
+    sink = run_clean(tmp_path, files=files, segment_bytes=400, max_bytes=800, close_seconds=CLOSE_LIMIT_SECONDS)
     for index in range(30):
         started(sink, turn="t%d" % index)
     sink.close()
+    assert (sink.state, sink.off_reason) == ("closed", None)
     assert len(events_only(read_everything(agent_dir(tmp_path)))) == 30
     assert status_of(sink)["faults"]["remove_failed"] >= 1
     assert b"SENTINEL-EXC-LOCK" not in all_bytes(agent_dir(tmp_path))

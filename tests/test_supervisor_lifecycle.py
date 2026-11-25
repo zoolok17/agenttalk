@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,136 @@ WINDOWS_ONLY = pytest.mark.skipif(
     sys.platform != "win32",
     reason="PowerShell host is Windows-only",
 )
+
+
+class _NativeCall:
+    def __init__(self, function):
+        self.function = function
+        self.restype = None
+        self.argtypes = None
+
+    def __call__(self, *args):
+        return self.function(*args)
+
+
+class _SnapshotKernel:
+    def __init__(self, *, invalid=False, error=18, entries=()):
+        self.invalid = invalid
+        self.error = error
+        self.last_error = error
+        self.entries = iter(entries)
+        self.closed = []
+        self.walked = []
+        self.CreateToolhelp32Snapshot = _NativeCall(self.create)
+        self.Process32FirstW = _NativeCall(lambda handle, entry: self.read('first', handle, entry))
+        self.Process32NextW = _NativeCall(lambda handle, entry: self.read('next', handle, entry))
+        self.CloseHandle = _NativeCall(self.close)
+
+    def create(self, *_args):
+        if self.invalid:
+            self.last_error = self.error
+        raw = -1 if self.invalid else 123
+        result_type = self.CreateToolhelp32Snapshot.restype or ctypes.c_int32
+        return result_type(raw).value
+
+    def read(self, which, handle, pointer):
+        self.walked.append((which, handle))
+        item = next(self.entries, None)
+        if item is None:
+            self.last_error = self.error
+            return 0
+        entry = pointer._obj
+        entry.th32ProcessID, entry.th32ParentProcessID = item
+        return 1
+
+    def close(self, handle):
+        self.closed.append(handle)
+        self.last_error = 999
+        return 1
+
+
+def _fake_snapshot(monkeypatch, **kwargs):
+    kernel = _SnapshotKernel(**kwargs)
+    monkeypatch.setattr(ctypes, 'WinDLL', lambda *_args, **_kwargs: kernel, raising=False)
+    monkeypatch.setattr(ctypes, 'get_last_error', lambda: kernel.last_error, raising=False)
+    monkeypatch.setattr(ctypes, 'set_last_error', lambda value: setattr(kernel, 'last_error', value), raising=False)
+    return kernel
+
+
+@pytest.mark.parametrize('error', [0, 5, 18])
+def test_snapshot_creation_failure_raises(monkeypatch, error):
+    kernel = _fake_snapshot(monkeypatch, invalid=True, error=error)
+    detail = rf'\(winerror {error}\)' if error else 'no error code was reported'
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match=rf'CreateToolhelp32Snapshot.*{detail}'):
+        lifecycle._process_parent_map()
+    assert kernel.walked == []
+    assert kernel.closed == []
+
+
+def test_snapshot_first_read_failure_raises(monkeypatch):
+    kernel = _fake_snapshot(monkeypatch, error=5)
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match=r'Process32FirstW.*\(winerror 5\)'):
+        lifecycle._process_parent_map()
+    assert kernel.closed == [123]
+
+
+def test_snapshot_next_read_failure_discards_partial_map(monkeypatch):
+    kernel = _fake_snapshot(monkeypatch, error=6, entries=[(10, 1)])
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match=r'Process32NextW.*\(winerror 6\)'):
+        lifecycle._process_parent_map()
+    assert kernel.closed == [123]
+
+
+@pytest.mark.parametrize('failed_read', ['first', 'next'])
+def test_snapshot_read_without_error_does_not_use_stale_end(monkeypatch, failed_read):
+    kernel = _fake_snapshot(monkeypatch, entries=[(10, 1)])
+    if failed_read == 'first':
+        kernel.Process32FirstW.function = lambda *_args: 0
+    else:
+        def first(*args):
+            result = kernel.read('first', *args)
+            kernel.last_error = 18
+            return result
+        kernel.Process32FirstW.function = first
+        kernel.Process32NextW.function = lambda *_args: 0
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError, match=rf'Process32{failed_read.title()}W.*no error code was reported',
+    ):
+        lifecycle._process_parent_map()
+    assert kernel.closed == [123]
+
+
+@pytest.mark.parametrize(('entries', 'expected'), [([], {}), ([(10, 1), (20, 10)], {10: 1, 20: 10})])
+def test_snapshot_empty_and_complete_list(monkeypatch, entries, expected):
+    kernel = _fake_snapshot(monkeypatch, entries=entries)
+    assert lifecycle._process_parent_map() == expected
+    assert kernel.closed == [123]
+    assert kernel.CreateToolhelp32Snapshot.argtypes == [lifecycle.wintypes.DWORD, lifecycle.wintypes.DWORD]
+    assert kernel.CreateToolhelp32Snapshot.restype is lifecycle.wintypes.HANDLE
+    for call in (kernel.Process32FirstW, kernel.Process32NextW):
+        assert call.argtypes == [lifecycle.wintypes.HANDLE, ctypes.POINTER(lifecycle._PROCESSENTRY32W)]
+        assert call.restype is lifecycle.wintypes.BOOL
+    assert kernel.CloseHandle.argtypes == [lifecycle.wintypes.HANDLE]
+    assert kernel.CloseHandle.restype is lifecycle.wintypes.BOOL
+
+
+def test_snapshot_error_propagates_to_callers(monkeypatch):
+    monkeypatch.setattr(lifecycle, 'os', types.SimpleNamespace(name='nt', getpid=os.getpid))
+    kernel = _fake_snapshot(monkeypatch, invalid=True, error=5)
+    kernel.OpenProcess = _NativeCall(lambda *_args: 456)
+    kernel.GetProcessTimes = _NativeCall(lambda *_args: 1)
+    kernel.QueryFullProcessImageNameW = _NativeCall(lambda _h, _f, buf, _n: setattr(buf, 'value', PWSH) or 1)
+    kernel.GetExitCodeProcess = _NativeCall(lambda _h, code: setattr(code._obj, 'value', 259) or 1)
+    closed_images = []
+    monkeypatch.setattr(psh, 'open_stable_native_file_identity', lambda _path: (_identity(), 789))
+    monkeypatch.setattr(psh, 'close_native_file_handle', closed_images.append)
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match='CreateToolhelp32Snapshot.*winerror 5'):
+        lifecycle._open_process_observation(100)
+    assert closed_images == [789]
+    assert kernel.closed == [456]
+    monkeypatch.setattr(lifecycle, '_open_process_observation', lambda *_args, **_kw: pytest.fail('opened'))
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match='CreateToolhelp32Snapshot.*winerror 5'):
+        lifecycle._validate_ancestry(_observation(100, parent=1, path=PWSH, ticks=1))
 
 
 def _store(tmp_path: Path) -> Store:
