@@ -8,7 +8,6 @@ waiting, not effort); a fix round is a distinct (work_cycle, work_round) pair co
 from __future__ import annotations
 
 import re
-import time
 from datetime import datetime, timezone
 
 STAGES = ("design", "build", "fix")
@@ -178,7 +177,7 @@ def growth_line(s, decided):
             f"{bound}{s['hours']:.1f}{notes}, fix rounds {rounds} of {FIX_ROUNDS}, decision {need}{attempt}")
 
 
-def check_order(msgs, meta, now, index=None, complete=True):
+def check_order(msgs, meta, now, index=None):
     """(warnings, growth line or None) for one order, given only the messages that existed before it."""
     out, stage, wi = [], str(meta.get("stage") or ""), meta.get("work_item")
     if stage in STAGES:
@@ -191,7 +190,7 @@ def check_order(msgs, meta, now, index=None, complete=True):
         return out + (["no work_item: this order's growth cannot be tracked"] if stage in STAGES else []), None
     s = work_item_state(msgs, str(wi), now)
     new_amount, first_scoped = _amount(meta.get("allowance")), stage in STAGES and not s["scoped"]
-    if first_scoped and not new_amount and complete:
+    if first_scoped and not new_amount:
         out.append(f"work item {wi}: no usable allowance (expected allowance=<N>h, positive, on the first order)")
     if new_amount and not s["legacy"]:
         if s["allowance"] and new_amount != s["allowance"]:
@@ -205,24 +204,10 @@ def check_order(msgs, meta, now, index=None, complete=True):
     return out, (growth_line(s, decided) if show else None)
 
 
-def read_messages(store, ceiling=3.0, clock=time.monotonic):
-    """(messages, complete): newest files first, in chunks, until the time ceiling is passed."""
-    if store.signing_enforced():  # the trust gate cannot be chunked: use it whole
-        return store.valid_messages(), True
-    names, got, start = sorted(store.messages_dir.glob("*.json"), reverse=True), [], clock()
-    roster = set(store.load_config().get("agents") or [])
-    for i in range(0, len(names), 500):
-        if clock() - start > ceiling:
-            return sorted(got, key=lambda m: m.id), False
-        got += [m for m, _ in store._scan_messages_with_paths(paths=names[i:i + 500])[0] if m.sender in roster]
-    return sorted(got, key=lambda m: m.id), True
-
-
-def order_warnings(msgs, meta, now=None, complete=True):
+def order_warnings(msgs, meta, now=None):
     """Advisory lines for a task about to be sent (never a refusal)."""
-    out, growth = check_order(msgs, meta, now or datetime.now(timezone.utc), complete=complete)
-    note = [] if complete else ["history incomplete (stopped at the ceiling): allowance and rounds are lower bounds"]
-    return out + note + ([growth] if growth else [])
+    out, growth = check_order(msgs, meta, now or datetime.now(timezone.utc))
+    return out + ([growth] if growth else [])
 
 
 def report(msgs, since=None, now=None):
