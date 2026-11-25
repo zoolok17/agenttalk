@@ -28,6 +28,14 @@ class Refused(ValueError):
     """A check could not establish that this checkout is disposable."""
 
 
+class FenceRefused(Refused):
+    """A `Refused` that comes from the store fence: the fence's own check refused a path that an activity record names
+    (its `StoreFenceError` is the cause). Everything that handles a `Refused` handles it as before (the checkout is
+    kept, and the text says why); the sweep (`janitor.apply`) also tells it from an ordinary "in use" refusal and stops,
+    as it does for the fence's error itself. A subclass, not the fence's error re-raised: the release routes and the
+    janitor command catch `Refused` and would not catch a `StoreFenceError` the same way."""
+
+
 def _git(repo: Path, *args: str, exact: bool = False, data: bytes | None = None) -> tuple[int, str]:
     """(exit code, output). With ``exact`` the output is kept as Git wrote it: a carriage
     return is not turned into a line end, so a path read from it keeps every character.
@@ -480,19 +488,23 @@ def _fence_record_path(path: Path, key: str, source: str) -> None:
     refuses one that leads out (#913)."""
     if not os.environ.get(store_mod.STORE_FENCE_ENV):
         return
-    reason = None
+    reason, fence_error = None, None
     if _outside_as_written(path):
         reason = "is outside the fence"
     else:
         try:
             store_mod.check_folder_fence(path)
-        except store_mod.StoreFenceError:
-            reason = "leads outside the fence"
+        except store_mod.StoreFenceError as exc:
+            reason, fence_error = "leads outside the fence", exc
     if reason is not None:
-        raise Refused(
+        message = (
             f"{source}: the record names a path outside the fence (activity path {key} {reason}); "
             "the checkout was kept, as nothing shows that this path is unrelated to it"
         )
+        if fence_error is not None:
+            # The fence's own check refused it (it resolved the path and it led outside): keep that type.
+            raise FenceRefused(message) from fence_error
+        raise Refused(message)  # refused from the text alone, nothing looked at: an ordinary kept checkout
 
 
 _RECORD_PATH_FIELDS = ("cwd", "launch_cwd", "workspace_path", "worktree_path")

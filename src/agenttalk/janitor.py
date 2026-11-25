@@ -1210,12 +1210,14 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         try:
                             guard = worktree_release.RemovalGuard(cfg, in_use, closed_window=True)
                             held.enter_context(guard)
-                        except worktree_release.Refused as exc:
-                            keep = _in_use_text(exc)
-                        except store_mod.StoreFenceError as exc:
+                        except (worktree_release.FenceRefused, store_mod.StoreFenceError) as exc:
+                            # The fence refused a path (a record's, translated, or the fence's own error): not an
+                            # ordinary kept checkout. The sweep stops after this one.
                             failure = _UseCheckFailed(_use_check_failure(exc))
                             failure.fence = True
                             raise failure from exc
+                        except worktree_release.Refused as exc:
+                            keep = _in_use_text(exc)
                         except (OSError, ValueError, TypeError) as exc:
                             raise _UseCheckFailed(_use_check_failure(exc)) from exc
                     for w in worktrees:
@@ -1300,17 +1302,18 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                             if keep is None:
                                 result, reason = remove_plainly(c.path)
                                 unchecked = False  # every check completed; a failure now is the delete's own
+                    except (worktree_release.FenceRefused, store_mod.StoreFenceError) as exc:
+                        # The fence refused a path after the preflight (a checkout registered outside the fence in the
+                        # meantime, or a record path that leads outside): nothing after this touches Git or the disk
+                        # (no further candidate, no prune). A `Refused` that is only "in use" is handled below.
+                        result, reason, unchecked = "FAILED", _use_check_failure(exc), True
+                        fence_stop = reason
                     except worktree_release.Refused as exc:
                         keep = _in_use_text(exc)
                     except _UseCheckFailed as exc:
                         result, reason, unchecked = "FAILED", str(exc), True
                         if exc.fence:
                             fence_stop = reason
-                    except store_mod.StoreFenceError as exc:
-                        # The fence refused a path after the preflight (a checkout registered outside the fence in the
-                        # meantime): nothing after this touches Git or the disk (no further candidate, no prune).
-                        result, reason, unchecked = "FAILED", _use_check_failure(exc), True
-                        fence_stop = reason
                     except (OSError, ValueError, TypeError) as exc:
                         result, reason, unchecked = "FAILED", _use_check_failure(exc), True
                     if keep:

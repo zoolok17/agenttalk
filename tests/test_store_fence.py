@@ -2961,7 +2961,12 @@ def test_no_in_use_route_looks_at_a_record_named_path_outside_the_fence(
     text = capsys.readouterr().out
     assert guard.outside == [], f"a path outside the fence was looked at: {guard.outside}"
     assert (done / ".git").exists() and str(done) in _git(repo, "worktree", "list").replace("/", os.sep), text
-    assert "REFUSED (kept)" in text or "KEPT" in text, text  # the checkout is kept, with a reason
+    if kind == "link-out" and mode == ["--apply"]:
+        # A record path that leads outside the fence is a refusal by the fence itself: the checkout is kept, as a
+        # failure that stops the sweep (no prune), not as an ordinary "in use" keep.
+        assert "worktree prune skipped" in text and "store fence refused" in text, text
+    else:
+        assert "REFUSED (kept)" in text or "KEPT" in text, text  # the checkout is kept, with a reason
     named = os.path.normcase(os.path.abspath(value))
     given = [c for c in guard.fence_checks if os.path.normcase(os.path.abspath(c)) == named]
     if kind == "link-out":
@@ -3397,3 +3402,140 @@ def test_a_late_fence_refusal_stops_the_sweep_before_the_prune_and_before_anythi
     assert "worktree prune skipped" in text and "store fence refused" in text, text
     assert (done / ".git").exists() and (leftover / "note.txt").exists()  # nothing was removed
     assert str(stranger) in report.read_text(encoding="utf-8").split("\n")
+
+
+# --- round 18c: the fence's refusal of a record path keeps its type all the way up, so the sweep stops ----------
+
+
+def _sweep_with_step_spies(monkeypatch: pytest.MonkeyPatch) -> tuple[dict, list[str], list[tuple]]:
+    """Wrap every step `apply` takes (each Git runner, the listing, the probes, the commit, the removal, the ancestry
+    check) so that a call made after the fence's refusal is noted. Returns (the state, the steps taken after the
+    refusal, the prune calls). The refusal is noticed where a record path is fenced (`_fence_record_path` raising a
+    `Refused` whose cause is the fence's own error: the translated case) and where the last look reads the list
+    (`_checkouts_changed` raising the fence's error itself: the direct case)."""
+    from agenttalk import janitor, worktree_release
+
+    state = {"refused": False}
+    after: list[str] = []
+    prunes: list[tuple] = []
+    real_changed, real_record = janitor._checkouts_changed, worktree_release._fence_record_path
+
+    def changed(*args, **kwargs):
+        try:
+            return real_changed(*args, **kwargs)
+        except cli.store_mod.StoreFenceError:
+            state["refused"] = True
+            raise
+
+    def record(*args, **kwargs):
+        try:
+            return real_record(*args, **kwargs)
+        except worktree_release.Refused as exc:
+            fence_error = isinstance(exc.__cause__ or exc.__context__, cli.store_mod.StoreFenceError)
+            if fence_error or "leads outside the fence" in str(exc):
+                state["refused"] = True  # the fence refused this path, whatever the refusal is called now
+            raise
+
+    real_apply = janitor.apply
+
+    def apply(*args, **kwargs):
+        state["refused"] = False  # the report that came first reads the records too; only what apply does is counted
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(janitor, "apply", apply)
+    monkeypatch.setattr(janitor, "_checkouts_changed", changed)
+    monkeypatch.setattr(worktree_release, "_fence_record_path", record)
+    for name in ("_run_git", "_run_git_checked", "get_registered_worktrees", "_registered_worktrees_listed",
+                 "is_dirty_worktree", "wip_commit_dirty_worktree", "worktree_branch", "remove_plainly",
+                 "_ancestor_change_reason"):
+        real_step = getattr(janitor, name)
+
+        def step(*args, _name=name, _real=real_step, **kwargs):
+            if state["refused"]:
+                after.append(_name)
+            if _name == "_run_git" and args[1:3] == ("worktree", "prune"):
+                prunes.append(args)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(janitor, name, step)
+    return state, after, prunes
+
+
+@pytest.mark.parametrize("how", ["translated", "translated-last-look", "late-inventory"])
+def test_a_refusal_by_the_fence_stops_the_sweep_however_it_reaches_apply(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, how: str
+) -> None:
+    """The fence refuses a path in the middle of a sweep in two ways. DIRECT: Git's list names a checkout outside the
+    fence (the fence's own error comes out of the last look). TRANSLATED: an activity record names a path inside the
+    fence that is a link leading outside; the record reader fences it and turns the fence's error into a `Refused`
+    (its type is `FenceRefused`), at the first look or, for "translated-last-look", only at the last look (the record
+    appears just before the re-read under the lane writers' lock). The translated cases used to be read as an ordinary
+    kept checkout: the sweep went on and ran `git worktree prune`, which reads every registration. All stop it: the
+    steps after the refusal (each Git runner, the listing, the probes, the commit, the removal, the ancestry check,
+    the prune) are not called, nothing is removed, the report says why and the exit code is 1."""
+    from agenttalk import worktree_release
+
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    leftover = _stale_leftover(fence / "temp")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    if how == "late-inventory":
+        calls = _register_outside_after(monkeypatch, stranger)
+    else:
+        calls = {"sweep": 2}
+        target = tmp_path / "zz-link-target"
+        target.mkdir()
+        _dir_link(fence / "link-to-outside", target)
+        value = str(fence / "link-to-outside" / "x")
+        if how == "translated":
+            _write_guard_record(repo, "lane-every-field", value)
+        else:
+            real_reread = worktree_release.RemovalGuard.reread
+
+            def late(self):
+                _write_guard_record(repo, "lane-every-field", value)
+                return real_reread(self)
+
+            monkeypatch.setattr(worktree_release.RemovalGuard, "reread", late)
+    state, after, prunes = _sweep_with_step_spies(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--apply"])
+
+    text = capsys.readouterr().out
+    assert calls["sweep"] >= 2 and state["refused"], "the refusal never happened, so nothing was tested"
+    assert prunes == [], "git worktree prune ran after the fence refused a path"
+    assert after == [], f"steps that ran after the refusal: {after}"
+    assert rc == 1, text
+    assert "worktree prune skipped" in text and "store fence refused" in text, text
+    assert (done / ".git").exists(), text  # the checkout was kept
+    if how == "late-inventory":
+        assert (leftover / "note.txt").exists()  # nor was any later candidate looked at, let alone removed
+        assert str(stranger) in report.read_text(encoding="utf-8").split("\n")
+
+
+def test_an_ordinary_in_use_refusal_still_just_keeps_the_checkout_and_the_sweep_goes_on(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The control: an active lane names the checkout (a path inside the fence, nothing refused by the fence). The
+    checkout is kept and said to be in use, the sweep does not stop: the stale leftover is removed, the prune runs, and
+    the exit code is 0 (a kept checkout is not a failure)."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    leftover = _stale_leftover(fence / "temp")
+    lanes_file = repo / ".agenttalk" / "state" / "lanes.json"
+    lanes_file.parent.mkdir(parents=True, exist_ok=True)
+    lanes_file.write_text(json.dumps({"lanes": {"one": {"status": "active", "worktree_path": str(done)}}}),
+                          encoding="utf-8")
+    state, after, prunes = _sweep_with_step_spies(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--apply"])
+
+    text = capsys.readouterr().out
+    assert not state["refused"]
+    assert (done / ".git").exists() and "REFUSED (kept)" in text, text
+    assert not leftover.exists(), text  # the sweep went on to the next candidate
+    assert prunes, "the prune did not run"
+    assert rc == 0 and "store fence refused" not in text, text
