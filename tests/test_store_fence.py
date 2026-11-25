@@ -7,6 +7,7 @@ import errno
 import json
 import multiprocessing
 import os
+import re
 import runpy
 import shlex
 import shutil
@@ -2748,37 +2749,116 @@ def _install_guard(monkeypatch: pytest.MonkeyPatch, fence: Path) -> _OutsideGuar
         guard.outside.append((name, text))
         raise OSError(errno.EIO, "a path outside the fence was looked at (guard)")
 
-    path_options = {"-C", "--git-dir", "--work-tree"}  # options that take a path as the NEXT argument
+    # Git's own options, with Git's meaning: the guard knows these and nothing else. "switch": takes no value; "value":
+    # may carry a value after "=" (judged like an argument; a value given as the next argument is judged as that
+    # argument); "path": a path, after "=" or as the next argument; "folder": `-C`, a change of folder; "config": `-c`,
+    # a `key=value` setting as the next argument; "git-path": `rev-parse --git-path P`, a path that Git reads against
+    # its own Git folder, as the next argument (so only a plain word or an absolute path inside passes). The options
+    # before the command (`git <options> <command>`) are not the command's: `-C` after the command is not a change of
+    # folder (`git commit -C <commit>`). Any option not in these tables is recorded, with or without a value.
+    before_command = {"-C": "folder", "-c": "config", "--git-dir": "path", "--work-tree": "path",
+                      "--no-optional-locks": "switch", "--no-pager": "switch", "--no-replace-objects": "switch"}
+    after_command = {
+        **dict.fromkeys(("-z", "-v", "-q", "--quiet", "-f", "--force", "--others", "--ignored", "--exclude-standard",
+                         "--symref", "--no-tags", "--no-prune", "--no-recurse-submodules", "--verify", "--get",
+                         "--get-regexp", "--get-url", "--name-only", "--stdin", "--stdin-paths", "--no-filters",
+                         "--stage", "--show-toplevel", "--is-ancestor", "--detach"), "switch"),
+        **dict.fromkeys(("--porcelain", "--untracked-files", "--ignore-submodules", "--type", "--abbrev-ref",
+                         "--contains", "--format"), "value"),
+        "--separate-git-dir": "path",
+        "--git-path": "git-path",
+    }
+    separators = os.sep + (os.altsep or "")
+
+    def unplaceable(text: str, base: str | None) -> bool:
+        """True unless `text` is provably a plain word (a name with no folder in it: a command, a branch, a remote, a
+        ref) or a path inside the fence. Read as text only, nothing is looked at: a relative path is read against the
+        folder Git is in (`base`), lexically, so `../../elsewhere` from `fence/repo` is beside the fence."""
+        if not text:
+            return False
+        if "://" in text or "::" in text or text.startswith("~"):
+            return True  # an address, a remote helper, a home folder Git expands: no place the guard can judge
+        if os.path.isabs(text):
+            return not inside(text)
+        if os.path.splitdrive(text)[0]:
+            return True  # a drive with no folder after it (`C:x`): read against that drive's own current folder
+        first = re.split(f"[{re.escape(separators)}]", text, maxsplit=1)[0]
+        if ":" in first:
+            return True  # `host:path`, Git's short form for an address, or pathspec magic (`:/`)
+        if not any(s in text for s in separators) and text != "..":
+            return False  # a plain word
+        return base is None or not inside(os.path.join(base, text))  # lexical: normalised by `inside`
+
+    def unplaceable_setting(setting: str) -> bool:
+        """A `-c key=value` setting: the key must be a plain setting name, and the value a plain word or an absolute
+        path inside the fence. A relative path is not placeable: Git reads some settings (`core.worktree`) against
+        its own folder, not against the folder it runs in."""
+        key, _, value = setting.partition("=")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", key):
+            return True
+        return unplaceable(value, None)  # no folder to read a relative value against
 
     def outside_argument(repo_text: str | None, args: tuple) -> str | None:
-        """The first argument of a Git runner that names a path outside the fence, as written, or None. Read as text
-        only: no path is looked at. A path object is read with `os.fspath`; `--opt=value` is split and the value judged;
-        the value after `-C`, `--git-dir` and `--work-tree` is a path; a relative path is read against the runner's
-        repository (`repo_text`), lexically, so `../../elsewhere` from `fence/repo` is beside the fence. A word that is
-        not a path (a branch, a switch) read this way is a name below the repository: inside, never a hit."""
-        previous = None
-        for argument in args:
+        """The first argument of a Git runner that the guard cannot prove harmless, as written, or None. FAIL CLOSED:
+        an argument passes only when it is a known option (see the tables above), a plain word, or a path inside the
+        fence; an unknown option (with or without a value), a value given to a switch, an argument that is not text,
+        and anything the guard cannot place are recorded. Git's order is followed: each `-C` before the command (as
+        `-C P` or `-CP`) moves the folder that every later relative path is read against. After `--` every argument
+        is a path. Read as text only: no path is looked at; a path object is read with `os.fspath`."""
+        base = repo_text
+        command = only_paths = False
+        rest = list(args)
+        while rest:
+            argument = rest.pop(0)
             try:
                 text = os.fsdecode(os.fspath(argument))
-            except TypeError:  # not a path and not text: nothing to judge
-                previous = None
+            except TypeError:
+                return repr(argument)  # not text and not a path: the guard cannot read it
+            if only_paths or not text.startswith("-") or text == "-":
+                if unplaceable(text, base):
+                    return text
+                command = True  # the first plain word is the command
                 continue
-            if text.startswith("-") and "=" in text:
-                text = text.partition("=")[2]  # --opt=value: the value
-            elif text.startswith("-") and previous not in path_options:
-                previous = text  # a switch that is not followed by a path (-z, --porcelain, ...)
+            if text == "--":
+                only_paths = True
                 continue
-            previous = text
-            if not text:
-                continue
-            if os.path.isabs(text):
-                full = text
-            elif repo_text:
-                full = os.path.join(repo_text, text)  # lexical: joined and normalised by `inside`, never looked at
+            if not command and text.startswith("-C") and text != "-C":
+                name, value = "-C", text[2:]  # `-CP`, one argument
             else:
+                name, equals, value = text.partition("=")
+                value = value if equals else None
+            kind = (after_command if command else before_command).get(name)
+            if kind is None or (kind == "switch" and value is not None):
+                return text if value is None else value  # unknown, or a switch given a value: the guard cannot tell
+            if kind == "switch":
                 continue
-            if not inside(full):
-                return text
+            if kind == "value":
+                if value is not None and unplaceable(value, base):
+                    return value
+                continue
+            if value is None:  # "path", "folder", "config" and "git-path" take the next argument
+                if not rest:
+                    return text  # the value is missing
+                try:
+                    value = os.fsdecode(os.fspath(rest.pop(0)))
+                except TypeError:
+                    return text
+            elif kind in ("config", "git-path"):
+                return text  # `-c=...` and `--git-path=...` are not Git's forms
+            if kind == "config":
+                if unplaceable_setting(value):
+                    return value
+                continue
+            if kind == "git-path":
+                if unplaceable(value, None):  # read against the Git folder, which the guard does not know
+                    return value
+                continue
+            if unplaceable(value, base):
+                return value
+            if kind == "folder" and value:  # Git leaves the folder as it is for an empty `-C ""`
+                if base is None and not os.path.isabs(value):
+                    return value
+                base = os.path.abspath(os.path.join(base or "", value))
         return None
 
     def on_the_way(text: str) -> bool:
@@ -3710,6 +3790,85 @@ def test_the_guard_notes_an_outside_path_inside_a_git_option(
     assert [text for _, text in guard.outside] == [outside] * len(forms), guard.outside
 
 
+def test_the_guard_notes_an_outside_path_in_a_config_value_a_combined_dash_c_and_after_a_change_of_folder(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(1) `-c core.worktree=P`: the value of a configuration setting is split out and judged. (2) `-CP`, written as one
+    argument, is a change of folder like `-C P`. (3) Git applies each `-C` in order, so a relative argument after it
+    is read against the NEW folder: from `fence/repo`, `-C <fence> --git-dir=../P` names a folder beside the fence.
+    Each is recorded, answered with an error and never forwarded."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = str(tmp_path.resolve() / "zz-outside-form")
+    beside = "zz-outside-form"  # tmp_path/fence is the fence, so ../<beside> from the fence is the folder above
+    assert (fence.parent / beside) == Path(outside), "the fence is expected one level below tmp_path"
+    forms = {
+        "config-value": lambda where: ("-c", f"core.worktree={where}", "status"),
+        "dash-C-combined": lambda where: (f"-C{where}", "status"),
+        "relative-after-dash-C": lambda where: ("-C", str(fence), f"--git-dir=../{beside}", "status"),
+        "relative-after-dash-C-combined": lambda where: (f"-C{fence}", "worktree", "remove", "--", f"../{beside}"),
+    }
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: outside)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert len(guard.outside) == len(forms), guard.outside
+
+
+def test_the_guard_notes_an_unknown_git_option_that_carries_a_value(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: an option the guard does not know, with a value, is recorded whatever the value (the guard cannot
+    tell what Git reads from it), as `--opt=V` before or after the command and as a short option with its value
+    joined (`-OV`). The same holds for an option the guard knows to take no value, given one anyway, and for an
+    unknown option with no value (the guard cannot tell whether Git reads the next argument as its value)."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = str(tmp_path.resolve() / "zz-outside-unknown")
+    inside = str(fence / "inside")
+    forms = {
+        "unknown-before-the-command-inside": lambda where: (f"--some-option={inside}", "status"),
+        "unknown-after-the-command-inside": lambda where: ("status", f"--some-option={inside}"),
+        "unknown-short-joined-outside": lambda where: ("status", f"-O{where}"),
+        "unknown-short-joined-inside": lambda where: ("status", f"-O{inside}"),
+        "a-switch-given-a-value": lambda where: ("worktree", "list", f"-z={inside}"),
+        "dash-C-after-the-command": lambda where: ("commit", "-C", inside),
+        "unknown-with-no-value": lambda where: ("status", "--some-switch"),
+        "unknown-then-an-outside-path": lambda where: ("status", "--some-option", where),
+    }
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: outside)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert len(guard.outside) == len(forms), guard.outside
+
+
+def test_the_guard_notes_a_git_argument_it_cannot_place(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: an argument that is neither provably a plain word nor provably a path inside the fence is
+    recorded: an address (`file:///...`, `host:path`), a home folder Git expands (`~/...`), a relative path in a
+    configuration value or after `--git-path` (Git reads those against its own folder, not the working one), a drive
+    with no folder after it (Windows), and an argument that is not text at all."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    forms = {
+        "a-file-address": lambda where: ("ls-remote", "file:///zz-outside-address"),
+        "a-host-and-path": lambda where: ("ls-remote", "zz-host:zz/outside"),
+        "a-home-folder": lambda where: ("worktree", "remove", "--", "~/zz-outside-home"),
+        "a-relative-config-value": lambda where: ("-c", "core.worktree=sub/folder", "status"),
+        "a-relative-git-path": lambda where: ("rev-parse", "--git-path", os.path.join("..", "zz-outside-git-path")),
+        "not-text": lambda where: ("worktree", "remove", 858),
+    }
+    if os.name == "nt":
+        forms["a-drive-with-no-folder"] = lambda where: ("worktree", "remove", "--", "Z:zz-outside-drive")
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: "")
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert len(guard.outside) == len(forms), guard.outside
+
+
 @pytest.mark.parametrize(
     "kind", ["absolute", "relative-below", "relative-beside"]
 )
@@ -3718,7 +3877,10 @@ def test_the_guard_lets_an_inside_path_through_in_every_form_of_a_git_runners_ar
 ) -> None:
     """The control: the same forms with a path INSIDE the fence (absolute, relative below the repository, relative
     beside it that stays inside the fence) are forwarded to the runner and not recorded, so the wider check makes no
-    false hit."""
+    false hit: also as `-CP` written as one argument, after a change of folder (`-C sub`, so `..` from there is the
+    repository), after `ls-remote --get-url`, beside the known switches and a plain `--git-path` word, and, for an
+    absolute path, as a configuration value (`-c core.worktree=P`). An unknown option
+    (`--some-option=P`) is not in the control: it is recorded whatever its value (see the test of unknown options)."""
     fence, _, _ = fenced
     fence = fence.resolve()
     place = {
@@ -3726,11 +3888,21 @@ def test_the_guard_lets_an_inside_path_through_in_every_form_of_a_git_runners_ar
         "relative-below": os.path.join("sub", "folder"),
         "relative-beside": os.path.join("..", "inside-sibling"),
     }[kind]
+    forms = {name: build for name, build in _GIT_ARGUMENT_FORMS.items() if name != "any-option-equals"}
+    forms["dash-C-combined"] = lambda where: (f"-C{where}", "status")
+    forms["after-dash-C"] = lambda where: ("-C", "sub", "worktree", "remove", "--", where)
+    forms["after-dash-C-combined"] = lambda where: ("-Csub", "--git-dir", where, "status")
+    forms["known-options-and-words"] = lambda where: (
+        "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=all", "-z", "--", where)
+    forms["git-path-a-plain-word"] = lambda where: ("rev-parse", "--git-path", "objects")
+    forms["get-url"] = lambda where: ("ls-remote", "--get-url", where)
+    if kind == "absolute":
+        forms["config-value"] = lambda where: ("-c", f"core.worktree={where}", "status")
 
-    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, _GIT_ARGUMENT_FORMS, lambda name: place)
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: place)
 
     assert refused == [] and guard.outside == [], (place, refused, guard.outside)
-    assert len(forwarded) == len(_GIT_ARGUMENT_FORMS), (place, forwarded)
+    assert len(forwarded) == len(forms), (place, forwarded)
 
 
 @pytest.mark.parametrize("route", ["release", "apply"])
