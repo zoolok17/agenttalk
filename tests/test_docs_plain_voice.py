@@ -125,6 +125,8 @@ def test_the_manuals_name_no_install_pin_only_the_readme_does() -> None:
     """A pin in a manual or the setup brief (#716) is a second version to bump at every release; the README holds it."""
     for path in (MANUAL, OPERATOR_MANUAL, BRIEF):
         assert ANY_PIN.findall(path.read_text(encoding="utf-8")) == [], path.name
+    # the brief's expected `--version` output follows `<tag>` too, never a fixed version
+    assert not re.search(r"Expected last line: `?agenttalk v?\d", BRIEF.read_text(encoding="utf-8"))
 
 
 def test_the_readme_pins_the_release_this_tree_ships() -> None:
