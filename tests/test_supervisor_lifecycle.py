@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -138,8 +139,8 @@ def test_snapshot_empty_and_complete_list(monkeypatch, entries, expected):
     assert kernel.CloseHandle.restype is lifecycle.wintypes.BOOL
 
 
-@WINDOWS_ONLY
 def test_snapshot_error_propagates_to_callers(monkeypatch):
+    monkeypatch.setattr(lifecycle, 'os', types.SimpleNamespace(name='nt', getpid=os.getpid))
     kernel = _fake_snapshot(monkeypatch, invalid=True, error=5)
     kernel.OpenProcess = _NativeCall(lambda *_args: 456)
     kernel.GetProcessTimes = _NativeCall(lambda *_args: 1)
