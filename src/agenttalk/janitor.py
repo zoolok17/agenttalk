@@ -41,6 +41,7 @@ import contextlib
 import dataclasses
 import datetime
 import fnmatch
+import ntpath
 import os
 import shutil
 import stat
@@ -1450,6 +1451,21 @@ def _registered_worktrees_listed(repo: Path) -> list[Path]:
     return paths
 
 
+def _fully_qualified(text: str, *, windows: bool = os.name == "nt") -> bool:
+    """Whether a path names one place whatever folder and drive the program reading it is in, by the same rule on every
+    Python (the running Python's `isabs` called `\\x` and `/x` absolute on Windows before 3.13). Windows: a drive with
+    a root (`C:\\x`, `C:/x`) or a UNC share (`\\\\server\\share\\x`); the `\\\\?\\` and `\\\\.\\` forms are refused, and
+    so are `C:x`, `\\x`, `/x` and any relative path. POSIX: a leading `/`. A lexical test only."""
+    if not windows:
+        return text.startswith("/")
+    if text[:2] in ("\\\\", "//", "\\/", "/\\") and text[2:3] in ("?", "."):
+        return False  # the extended and device forms
+    drive, tail = ntpath.splitdrive(text)
+    if drive[:1] in ("\\", "/"):  # a UNC share: it must name a server and a share
+        return len([part for part in drive.replace("/", "\\").split("\\") if part]) >= 2
+    return bool(drive) and tail[:1] in ("\\", "/")
+
+
 def _fence_registrations(repo: Path) -> None:
     """Under AGENTTALK_STORE_FENCE: refuse (`StoreFenceError`) a checkout registered to `repo` outside the fence, read
     from Git's own files (`<common Git folder>/worktrees/<name>/gitdir`), BEFORE Git is asked for anything it builds
@@ -1508,10 +1524,12 @@ def _fence_registrations(repo: Path) -> None:
             named = text_of(gitdir_file) if gitdir_file.is_file() else ""
             if not named:
                 continue
-            if not os.path.isabs(named):
+            if not _fully_qualified(named):
                 # Git versions read a relative `gitdir` from different folders (the folder Git runs in, or this
-                # entry's), so no one place can be checked for it: refused as it is (the maintainers' lead, 2026-11-25).
-                store_mod.refuse_unplaced(f"the registration {gitdir_file}, whose gitdir is a relative path ({named})")
+                # entry's), and one with a root but no drive from whatever drive is current, so no one place can be
+                # checked for it: refused as it is (the maintainers' lead, 2026-11-25).
+                store_mod.refuse_unplaced(
+                    f"the registration {gitdir_file}, whose gitdir is a relative path or has no drive ({named})")
             gitdir = Path(os.path.abspath(named))
             fenced(gitdir.parent)  # the checkout folder as Git lists it
             fenced(gitdir)  # and the `.git` in it that Git looks at

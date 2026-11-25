@@ -3815,6 +3815,64 @@ def _file_link(link: Path, target: Path) -> None:
         pytest.skip(f"this system cannot make a file link: {exc}")
 
 
+# Every form of a `gitdir` value, and whether it is fully qualified under Windows rules and under POSIX rules.
+_GITDIR_FORMS = [
+    (r"C:\x\.git", True, False), ("C:/x/.git", True, False),
+    (r"\\server\share\x\.git", True, False), ("//server/share/x/.git", True, True),
+    (r"\\?\C:\x\.git", False, False), (r"\\.\C:\x\.git", False, False), ("//?/C:/x/.git", False, True),
+    ("C:x", False, False), (r"\x\.git", False, False), ("/x/.git", False, True),
+    (r".\x\.git", False, False), (r"..\x\.git", False, False), ("../x/.git", False, False), ("x", False, False),
+    ("", False, False),
+]
+
+
+@pytest.mark.parametrize("text, windows, posix", _GITDIR_FORMS)
+def test_a_gitdir_value_is_fully_qualified_by_the_same_rule_on_every_python(
+    text: str, windows: bool, posix: bool
+) -> None:
+    """The rule that decides whether a registration's `gitdir` names one place for every Git, independent of the running
+    Python's `isabs` (which, on Windows before Python 3.13, also called `\\x` and `/x` absolute): under Windows rules a
+    drive with a root, or a UNC share; the `\\\\?\\` and `\\\\.\\` forms are refused; under POSIX rules a leading `/`.
+    Both rules are checked here on any platform."""
+    from agenttalk import janitor
+
+    assert janitor._fully_qualified(text, windows=True) is windows
+    assert janitor._fully_qualified(text, windows=False) is posix
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a value with a root and no drive is a Windows form")
+@pytest.mark.parametrize("separator", ["\\", "/"])
+def test_a_rooted_gitdir_without_a_drive_is_refused_even_where_python_calls_it_absolute(
+    fenced, monkeypatch: pytest.MonkeyPatch, separator: str
+) -> None:
+    """A `gitdir` of `\\<path>` or `/<path>`, with a root and no drive, names a place on whatever drive is current for
+    the program that reads it, so Git and the check could read it on different drives. Python before 3.13 calls it
+    absolute on Windows; that answer is emulated here (so the test shows the rule on any Python), and the value names a
+    place INSIDE the fence on this drive: the check still refuses it, before Git is asked anything."""
+    import ntpath
+
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    rooted = str(done / ".git")[2:]  # the drive taken off: `\...\done\.git`
+    if separator == "/":
+        rooted = rooted.replace("\\", "/")
+    _write_late_registration(repo / ".git" / "worktrees" / "rooted-registration", done)
+    (repo / ".git" / "worktrees" / "rooted-registration" / "gitdir").write_text(f"{rooted}\n", encoding="utf-8")
+
+    def isabs_before_313(path) -> bool:  # Python 3.10-3.12 on Windows: a root is enough
+        tail = ntpath.splitdrive(os.fspath(path))[1]
+        return len(tail) > 0 and tail[0] in "\\/"
+
+    monkeypatch.setattr(ntpath, "isabs", isabs_before_313)
+    assert os.path.isabs(rooted), "the older answer was not emulated, so nothing was tested"
+
+    with pytest.raises(cli.store_mod.StoreFenceError, match="relative path"):
+        janitor._fence_registrations(repo)
+
+
 @pytest.mark.parametrize("where", ["worktrees-folder", "entry-folder", "gitdir-file", "commondir-file"])
 def test_the_registration_check_fences_each_git_file_before_it_looks_through_a_link_that_leads_outside(
     fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
