@@ -213,7 +213,7 @@ def read_messages(store, ceiling=3.0, clock=time.monotonic):
 def order_warnings(msgs, meta, now=None, complete=True):
     """Advisory lines for a task about to be sent (never a refusal)."""
     out, growth = check_order(msgs, meta, now or datetime.now(timezone.utc), complete=complete)
-    note = [] if complete else ["history incomplete (read stopped at the ceiling): allowance and rounds are lower bounds"]
+    note = [] if complete else ["history incomplete (stopped at the ceiling): allowance and rounds are lower bounds"]
     return out + note + ([growth] if growth else [])
 
 
