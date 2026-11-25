@@ -28,6 +28,14 @@ class Refused(ValueError):
     """A check could not establish that this checkout is disposable."""
 
 
+class FenceRefused(Refused):
+    """A `Refused` that comes from the store fence: the fence's own check refused a path that an activity record names
+    (its `StoreFenceError` is the cause). Everything that handles a `Refused` handles it as before (the checkout is
+    kept, and the text says why); the sweep (`janitor.apply`) also tells it from an ordinary "in use" refusal and stops,
+    as it does for the fence's error itself. A subclass, not the fence's error re-raised: the release routes and the
+    janitor command catch `Refused` and would not catch a `StoreFenceError` the same way."""
+
+
 def _git(repo: Path, *args: str, exact: bool = False, data: bytes | None = None) -> tuple[int, str]:
     """(exit code, output). With ``exact`` the output is kept as Git wrote it: a carriage
     return is not turned into a line end, so a path read from it keeps every character.
@@ -88,7 +96,18 @@ def _unchanged(ids: dict) -> None:
         raise Refused(reason)
 
 
+def _fence_git_registrations(repo: Path) -> None:
+    """Before Git builds anything from every registration (its list of checkouts, a removal): Git's registration files
+    are fenced (`janitor._fence_registrations`, the one check every caller uses). A file that cannot be read keeps the
+    checkout (`Refused`); a refusal by the fence is the fence's own error."""
+    try:
+        janitor._fence_registrations(repo)
+    except janitor._UseCheckFailed as exc:
+        raise Refused(f"Git's registered checkouts could not be checked ({exc}); checkout kept") from exc
+
+
 def _registered(repo: Path) -> dict[Path, set[str]]:
+    _fence_git_registrations(repo)  # Git's list looks at every path the registrations name
     # NUL framing also handles paths containing newlines or Git quoting characters.
     out = _read_git(repo, "worktree", "list", "--porcelain", "-z")
     paths: dict[Path, set[str]] = {}
@@ -480,19 +499,23 @@ def _fence_record_path(path: Path, key: str, source: str) -> None:
     refuses one that leads out (#913)."""
     if not os.environ.get(store_mod.STORE_FENCE_ENV):
         return
-    reason = None
+    reason, fence_error = None, None
     if _outside_as_written(path):
         reason = "is outside the fence"
     else:
         try:
             store_mod.check_folder_fence(path)
-        except store_mod.StoreFenceError:
-            reason = "leads outside the fence"
+        except store_mod.StoreFenceError as exc:
+            reason, fence_error = "leads outside the fence", exc
     if reason is not None:
-        raise Refused(
+        message = (
             f"{source}: the record names a path outside the fence (activity path {key} {reason}); "
             "the checkout was kept, as nothing shows that this path is unrelated to it"
         )
+        if fence_error is not None:
+            # The fence's own check refused it (it resolved the path and it led outside): keep that type.
+            raise FenceRefused(message) from fence_error
+        raise Refused(message)  # refused from the text alone, nothing looked at: an ordinary kept checkout
 
 
 _RECORD_PATH_FIELDS = ("cwd", "launch_cwd", "workspace_path", "worktree_path")
@@ -983,6 +1006,7 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                     _unchanged(candidate_ids)
                     _unchanged(ids)
                     with guard.final_window():
+                        _fence_git_registrations(cfg.repo)  # the removal reads every registration too
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:

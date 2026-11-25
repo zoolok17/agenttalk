@@ -307,7 +307,13 @@ def _run_git(repo: Path, *args: str) -> str:
 def get_registered_worktrees(repo: Path) -> list[Path]:
     """The old best-effort reader, kept only as the text reader that the strict one replaced: it returns `[]` when git
     is unresolvable or fails, and it reads Git's text with the console's encoding. Nothing in the janitor or doctor
-    decides, counts or warns on it any more (#901): they go by `_strict_listing`, which tells a failure from "none"."""
+    decides, counts or warns on it any more (#901): they go by `_strict_listing`, which tells a failure from "none".
+    Under a store fence, Git's registration files are fenced first (`_fence_registrations`); when that refuses or
+    fails, Git is not asked and the answer is `[]`, as for a failed listing."""
+    try:
+        _fence_registrations(repo)
+    except (store_mod.StoreFenceError, _UseCheckFailed):
+        return []
     _rc, out, _err = _run_git_checked(repo, "worktree", "list", "--porcelain")
     worktrees = []
     for line in out.splitlines():
@@ -1227,12 +1233,14 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         try:
                             guard = worktree_release.RemovalGuard(cfg, in_use, closed_window=True)
                             held.enter_context(guard)
-                        except worktree_release.Refused as exc:
-                            keep = _in_use_text(exc)
-                        except store_mod.StoreFenceError as exc:
+                        except (worktree_release.FenceRefused, store_mod.StoreFenceError) as exc:
+                            # The fence refused a path (a record's, translated, or the fence's own error): not an
+                            # ordinary kept checkout. The sweep stops after this one.
                             failure = _UseCheckFailed(_use_check_failure(exc))
                             failure.fence = True
                             raise failure from exc
+                        except worktree_release.Refused as exc:
+                            keep = _in_use_text(exc)
                         except (OSError, ValueError, TypeError) as exc:
                             raise _UseCheckFailed(_use_check_failure(exc)) from exc
                     for w in worktrees:
@@ -1317,17 +1325,18 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                             if keep is None:
                                 result, reason = remove_plainly(c.path)
                                 unchecked = False  # every check completed; a failure now is the delete's own
+                    except (worktree_release.FenceRefused, store_mod.StoreFenceError) as exc:
+                        # The fence refused a path after the preflight (a checkout registered outside the fence in the
+                        # meantime, or a record path that leads outside): nothing after this touches Git or the disk
+                        # (no further candidate, no prune). A `Refused` that is only "in use" is handled below.
+                        result, reason, unchecked = "FAILED", _use_check_failure(exc), True
+                        fence_stop = reason
                     except worktree_release.Refused as exc:
                         keep = _in_use_text(exc)
                     except _UseCheckFailed as exc:
                         result, reason, unchecked = "FAILED", str(exc), True
                         if exc.fence:
                             fence_stop = reason
-                    except store_mod.StoreFenceError as exc:
-                        # The fence refused a path after the preflight (a checkout registered outside the fence in the
-                        # meantime): nothing after this touches Git or the disk (no further candidate, no prune).
-                        result, reason, unchecked = "FAILED", _use_check_failure(exc), True
-                        fence_stop = reason
                     except (OSError, ValueError, TypeError) as exc:
                         result, reason, unchecked = "FAILED", _use_check_failure(exc), True
                     if keep:
@@ -1347,11 +1356,25 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     finally:
         held.close()
 
+    prune_blocked = None
+    if fence_stop is None:
+        # Git's prune reads every registration and looks at the path each names, one made after the preflight too (a
+        # kept checkout whose record path was refused from its text can be registered meanwhile): the registrations
+        # prune will read are fenced, as written, before it runs, whichever way the sweep came here.
+        try:
+            _fence_registrations(cfg.repo)
+        except store_mod.StoreFenceError as exc:
+            fence_stop = _use_check_failure(exc)
+        except _UseCheckFailed as exc:
+            prune_blocked = str(exc)
     if fence_stop is not None:
         # Git's prune (and the listing after it) would read every registration, the one outside the fence too.
         report.apply_failed = True
         lines.append(
             f"FAILED: worktree prune skipped, and the sweep stopped: the store fence refused a path ({fence_stop})")
+    elif prune_blocked is not None:
+        report.apply_failed = True
+        lines.append(f"FAILED: worktree prune skipped: {prune_blocked}")
     else:
         reason = _ancestor_change_reason(report.ancestor_ids)
         if reason is None and report.registered_worktrees is None:
@@ -1463,7 +1486,9 @@ def _registered_worktrees_listed(repo: Path) -> list[Path]:
     The text reader (`get_registered_worktrees`) answers `[]` for a failed listing and reads text with the console's
     encoding; a list that reads either as "none registered" would hide a checkout. This one reads bytes with NUL
     boundaries (`-z`), and every caller, the first list and the later ones, goes by it. Its reason is one line:
-    Git's own words are cut and any control character is written out."""
+    Git's own words are cut and any control character is written out. Under a fence, Git's own registration files
+    are fenced first (`_fence_registrations`): Git's listing looks at every path they name."""
+    _fence_registrations(repo)
     try:
         rc, out, err = _run_git_checked(repo, "worktree", "list", "--porcelain", "-z", raw=True)
     except (OSError, subprocess.SubprocessError) as exc:  # Git is there but could not be run
@@ -1486,6 +1511,70 @@ def _registered_worktrees_listed(repo: Path) -> list[Path]:
     for path in paths:
         store_mod.check_folder_fence(path)
     return paths
+
+
+def _fence_registrations(repo: Path) -> None:
+    """Under AGENTTALK_STORE_FENCE: refuse (`StoreFenceError`) a checkout registered to `repo` outside the fence, read
+    from Git's own files (`<common Git folder>/worktrees/<name>/gitdir`), BEFORE Git is asked for anything it builds
+    from every registration: its list of checkouts, the prune, a removal. Each reads every one of those files and looks
+    at the path it names (is its `.git` still there?), so a checkout registered outside after an earlier reading would
+    be looked at by Git itself. The one check for every caller (the sweep, the report, release and the janitor
+    command's fence check).
+
+    Nothing outside the fence is looked at here, the Git files included: each path (the `.git` file or folder,
+    `commondir` and the folder it names, the `worktrees` folder, each entry folder and its `gitdir` file, and the
+    checkout each names with its `.git`) is fenced BEFORE anything looks at it or reads it. A path outside as written
+    is refused from its text alone; a path inside goes through the fence's own check, which follows a link before it
+    refuses one that leads out (#913), so a link or junction among Git's files that leads outside is refused, never
+    followed. An entry Git drops without a look (no `gitdir` file, or an empty one) is passed over. A file that cannot
+    be read keeps the list from being trusted (`_UseCheckFailed`). Outside a fence nothing is done."""
+    allowed = store_mod._fence()
+    if allowed is None:
+        return
+    from . import worktree_release  # imported here: that module imports this one
+
+    def fenced(path: Path) -> Path:
+        if worktree_release._outside_as_written(path):
+            store_mod._refuse(path, Path(os.path.abspath(path)), allowed)
+        store_mod.check_folder_fence(path)
+        return path
+
+    def text_of(file: Path) -> str:  # `file` is fenced by the caller
+        data = file.read_bytes().strip()
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            store_mod._refuse(file, file, allowed, why="unplaced")
+            raise  # not reached: `_refuse` raises
+
+    def named_by(text: str, base: Path) -> Path:  # the path a Git file names, relative to `base` if so
+        return Path(os.path.abspath(os.path.join(base, text)))
+
+    try:
+        dot_git = fenced(repo / ".git")
+        if dot_git.is_file():  # `repo` is itself a linked checkout: `gitdir: <its Git folder>`
+            git_dir = fenced(named_by(text_of(dot_git).removeprefix("gitdir:").strip(), repo))
+        elif dot_git.is_dir():
+            git_dir = dot_git
+        else:
+            return  # no Git folder of its own: Git has no registrations of this folder to read
+        commondir = fenced(git_dir / "commondir")
+        common = fenced(named_by(text_of(commondir), git_dir)) if commondir.is_file() else git_dir
+        admin = fenced(common / "worktrees")
+        if not admin.is_dir():
+            return
+        with os.scandir(admin) as listing:
+            entries = sorted((Path(entry.path) for entry in listing), key=lambda p: p.name)
+        for entry_path in entries:
+            gitdir_file = fenced(fenced(entry_path) / "gitdir")  # the entry, then its file: a link is refused here
+            named = text_of(gitdir_file) if gitdir_file.is_file() else ""
+            if not named:
+                continue
+            gitdir = named_by(named, entry_path)  # Git's path, relative to the entry if so
+            fenced(gitdir.parent)  # the checkout folder as Git lists it
+            fenced(gitdir)  # and the `.git` in it that Git looks at
+    except OSError as exc:
+        raise _listing_failure(f"Git's registration files could not be read: {_os_error_text(exc)}") from exc
 
 
 def _checkouts_changed(c: Candidate, worktrees: list[Path], cfg: JanitorConfig) -> str | None:

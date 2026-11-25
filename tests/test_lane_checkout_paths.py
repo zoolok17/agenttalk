@@ -2624,6 +2624,48 @@ def test_worktree_release_accepts_a_unc_share_root_as_absolute_too(tmp_path, mon
     assert any(path.rstrip("\\") == r"\\server\share" for path in asked)  # reached the matching, looked at nothing
 
 
+@pytest.mark.skipif(os.name != "nt", reason="a UNC path is only absolute on Windows")
+def test_under_the_store_fence_a_unc_record_path_keeps_the_checkout_and_nothing_looks_at_it(tmp_path, monkeypatch):
+    """The fenced twin of the test above, with the suite's own store fence ON (not lifted): the same UNC record is
+    refused (`Refused`: the checkout is kept, never released), and no `lstat`, `stat`, `realpath` or placing of that
+    path happens first. Every look at it is answered with an error and noted, so the share is never contacted."""
+    import errno
+
+    from agenttalk import worktree_release
+
+    assert os.environ.get("AGENTTALK_STORE_FENCE"), "this test is about the fence the suite sets for every test"
+    unc = r"\\server\share"
+    looked = []
+
+    def is_unc(path) -> bool:
+        try:
+            return os.fspath(path).rstrip("\\").lower() == unc
+        except TypeError:
+            return False
+
+    def watch(name, real):
+        def spy(path, *args, **kwargs):
+            if is_unc(path):
+                looked.append(name)
+                raise OSError(errno.EIO, "the share was looked at (test)")
+            return real(path, *args, **kwargs)
+
+        return spy
+
+    for owner, name in ((os, "lstat"), (os, "stat"), (os.path, "realpath"), (os.path, "exists")):
+        monkeypatch.setattr(owner, name, watch(f"{owner.__name__}.{name}", getattr(owner, name)))
+    monkeypatch.setattr(worktree_release, "_placed", lambda path: looked.append("_placed") or "c:/elsewhere")
+    row = {"lane_id": OTHER, "worktree_toplevel_canonical": unc}
+
+    with pytest.raises(worktree_release.Refused, match="outside the fence") as refused:
+        worktree_release._names_checkout(
+            row, tmp_path / "elsewhere", tmp_path, lane_id=BAD, source="lanes.json lane bad", lane=True
+        )
+
+    assert "the checkout was kept" in str(refused.value)
+    assert looked == [], f"the share was looked at: {looked}"
+
+
 # ---------------------------------------- the committed-publication exception is kept for a relative canonical too
 
 
