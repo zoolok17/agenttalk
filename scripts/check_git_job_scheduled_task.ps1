@@ -18,6 +18,7 @@
               Run 2, whether logged on or not: registers it again WITHOUT /IT and WITH /RP *, so schtasks itself asks
               for the password. The password is typed at that prompt and is never read, stored, logged or printed here.
             Add -DryRun to print every command that would run and register nothing.
+            A missing -BaseTemp folder is created before registering a task.
             Exit code 0 only when every run was accepted and its task is KNOWN to be gone (the scheduler answered that
             there is no such task); otherwise the code of the first run that was not (2 or 3: a run that was not
             accepted keeps its own code even when its task is also still there), or 4 when a run was accepted but its
@@ -349,6 +350,19 @@ switch ($Mode) {
             }
         }
         if (-not $DryRun -and -not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
+        if ($BaseTemp -and -not (Test-Path -LiteralPath $BaseTemp -PathType Container)) {
+            if ($DryRun) {
+                Write-Host "would create -BaseTemp folder: $BaseTemp"
+            } else {
+                try {
+                    New-Item -ItemType Directory -Path $BaseTemp -Force -ErrorAction Stop | Out-Null
+                    if (-not (Test-Path -LiteralPath $BaseTemp -PathType Container)) { throw 'not a folder' }
+                } catch {
+                    Write-Output "Could not create -BaseTemp folder: $BaseTemp. $($_.Exception.Message)"
+                    exit 9
+                }
+            }
+        }
         $plan = @()
         if ($Runs -in @('Both', 'Interactive')) { $plan += , @('interactive', $true) }
         if ($Runs -in @('Both', 'Background')) { $plan += , @('background', $false) }

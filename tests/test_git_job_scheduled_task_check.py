@@ -316,7 +316,7 @@ function Invoke-Schtasks {
 
 
 def run_with_a_stand_in_scheduler(
-    tmp_path, shell, *, state="Ready", delete_fails=False, seconds=60, query="ok", pytest_exit=0
+    tmp_path, shell, *, state="Ready", delete_fails=False, seconds=60, query="ok", pytest_exit=0, base_temp=None
 ):
     """Runs `-Mode Run` against the stand-in. `query` is how the scheduler answers: "ok", "always" unreadable, or
     "after-delete" unreadable once the task has been deleted. Returns (the finished process, the out folder, the
@@ -338,10 +338,43 @@ def run_with_a_stand_in_scheduler(
             shell, "-NoProfile", "-File", str(SCRIPT), "-Mode", "Run", "-Runs", "Interactive", "-Python", "python",
             "-OutDir", str(out), "-User", "example-user", "-TaskName", "stub-task", "-TimeoutSeconds", str(seconds),
             "-CommandLengthLimit", "5000", "-SchedulerStub", str(stub),
-        ],
+        ] + (["-BaseTemp", str(base_temp)] if base_temp is not None else []),
         capture_output=True, text=True, timeout=180, check=False, env=env,
     )  # fmt: skip
     return done, out, calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_run_creates_missing_base_temp_before_registering(tmp_path, shell):
+    base_temp = tmp_path / "missing" / "base"
+    done, out, calls = run_with_a_stand_in_scheduler(tmp_path, shell, base_temp=base_temp)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert base_temp.is_dir()
+    assert (out / "interactive-accepted.log").exists()
+    assert any(call.startswith("/Create") for call in calls)
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_dry_run_reports_missing_base_temp_without_creating_it(tmp_path, shell):
+    base_temp = tmp_path / "missing" / "base"
+    out = tmp_path / "out"
+    done = run_script(
+        shell, "-Mode", "Run", "-DryRun", "-Runs", "Interactive", "-Python", "python", "-OutDir", str(out),
+        "-BaseTemp", str(base_temp), "-User", "u", "-CommandLengthLimit", "5000",
+    )  # fmt: skip
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "would create -BaseTemp" in done.stdout and str(base_temp) in done.stdout
+    assert not base_temp.exists() and not out.exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_run_refuses_uncreatable_base_temp_before_registering(tmp_path, shell):
+    parent = tmp_path / "file"
+    parent.write_text("not a directory", encoding="utf-8")
+    done, _, calls = run_with_a_stand_in_scheduler(tmp_path, shell, base_temp=parent / "base")
+    assert done.returncode == 9, done.stdout + done.stderr
+    assert "-BaseTemp" in done.stdout + done.stderr
+    assert calls == []
 
 
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
