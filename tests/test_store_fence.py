@@ -2844,6 +2844,9 @@ def _install_guard(monkeypatch: pytest.MonkeyPatch, fence: Path) -> _OutsideGuar
             text = text_of(repo)
             if text is not None and not inside(text):
                 refuse(_name, text)
+            for argument in args:  # a path outside the fence handed to Git as an argument is a look at it too
+                if isinstance(argument, str) and os.path.isabs(argument) and not inside(argument):
+                    refuse(f"{_name} argument", argument)
             return _real(repo, *args, **kwargs)
 
         monkeypatch.setattr(owner, name, git_spy)
@@ -3407,7 +3410,9 @@ def test_a_late_fence_refusal_stops_the_sweep_before_the_prune_and_before_anythi
 # --- round 18c: the fence's refusal of a record path keeps its type all the way up, so the sweep stops ----------
 
 
-def _sweep_with_step_spies(monkeypatch: pytest.MonkeyPatch) -> tuple[dict, list[str], list[tuple]]:
+def _sweep_with_step_spies(
+    monkeypatch: pytest.MonkeyPatch, *, real_prune: bool = True
+) -> tuple[dict, list[str], list[tuple]]:
     """Wrap every step `apply` takes (each Git runner, the listing, the probes, the commit, the removal, the ancestry
     check) so that a call made after the fence's refusal is noted. Returns (the state, the steps taken after the
     refusal, the prune calls). The refusal is noticed where a record path is fenced (`_fence_record_path` raising a
@@ -3432,7 +3437,7 @@ def _sweep_with_step_spies(monkeypatch: pytest.MonkeyPatch) -> tuple[dict, list[
             return real_record(*args, **kwargs)
         except worktree_release.Refused as exc:
             fence_error = isinstance(exc.__cause__ or exc.__context__, cli.store_mod.StoreFenceError)
-            if fence_error or "leads outside the fence" in str(exc):
+            if fence_error or "outside the fence" in str(exc):
                 state["refused"] = True  # the fence refused this path, whatever the refusal is called now
             raise
 
@@ -3455,6 +3460,8 @@ def _sweep_with_step_spies(monkeypatch: pytest.MonkeyPatch) -> tuple[dict, list[
                 after.append(_name)
             if _name == "_run_git" and args[1:3] == ("worktree", "prune"):
                 prunes.append(args)
+                if not real_prune:
+                    return ""  # recorded, not run: the call is what is shown, and nothing real is pruned
             return _real(*args, **kwargs)
 
         monkeypatch.setattr(janitor, name, step)
@@ -3539,3 +3546,62 @@ def test_an_ordinary_in_use_refusal_still_just_keeps_the_checkout_and_the_sweep_
     assert not leftover.exists(), text  # the sweep went on to the next candidate
     assert prunes, "the prune did not run"
     assert rc == 0 and "store fence refused" not in text, text
+
+
+def test_the_guard_notes_an_outside_path_handed_to_a_git_runner_as_an_argument(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Condition (2): the path a record names is never in any Git runner's arguments. The guard's runner spies check
+    the repository AND every argument: an absolute path outside the fence (a UNC one included) is recorded and answered
+    with an error; a path inside is let through. No Git is started."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = _guard_value("outside", tmp_path, fence)  # made before the guard: it would answer a look at the folder
+    network = _guard_value("network", tmp_path, fence)
+    guard = _install_guard(monkeypatch, fence)
+
+    for path in (outside, network):
+        with pytest.raises(OSError) as raised:
+            janitor._run_git(fence, "worktree", "remove", "--", path)
+        assert raised.value.errno == errno.EIO
+    assert [name for name, _ in guard.outside] == ["agenttalk.janitor._run_git argument"] * 2, guard.outside
+    assert [text for _, text in guard.outside] == [outside, network], guard.outside
+
+
+@pytest.mark.parametrize("route", ["release", "apply"])
+def test_under_the_store_fence_a_unc_record_is_kept_and_never_looked_at_on_release_and_apply(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, route: str
+) -> None:
+    """Conditions (1), (2) and (4), with the suite's fence on. An activity record names a UNC (network) path. It is
+    refused from its text alone: the checkout is KEPT on both routes, and the path is never looked at. ONE guard watches
+    the whole run (every file-system look, and every Git runner's repository and arguments): it records any look at a
+    path outside the fence and answers it with an error, so the test fails if one happens, on release and apply alike.
+    RELEASE: exit 1, `KEPT <checkout>: ... the record names a path outside the fence ... the checkout was kept`.
+    APPLY: the checkout is `REFUSED (kept)`, the sweep GOES ON (it does not stop): the ancestry check, the prune (shown
+    as called, not run) and the list of checkouts after it all run, and none of them looks at the path; exit 0."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    _write_guard_record(repo, "lane-every-field", _guard_value("network", tmp_path, fence))
+    guard = _install_guard(monkeypatch, fence)
+    state, after, prunes = _sweep_with_step_spies(monkeypatch, real_prune=False)
+
+    rc = cli.main(["--root", str(repo), "janitor", *(["--release", str(done)] if route == "release" else ["--apply"])])
+
+    text = capsys.readouterr().out
+    assert guard.outside == [], f"the path was looked at: {guard.outside}"
+    assert (done / ".git").exists() and (done / "source.txt").exists(), text  # kept, not released
+    assert "store fence refused" not in text and "REMOVED" not in text, text
+    if route == "release":
+        assert rc == 1, text
+        assert f"KEPT {done}: " in text and "the record names a path outside the fence" in text, text
+        assert "the checkout was kept" in text, text
+    else:
+        assert state["refused"], "the refusal never happened, so nothing was tested"
+        assert "REFUSED (kept)" in text and "the record names a path outside the fence" in text, text
+        assert rc == 0, text
+        # The sweep went on: the steps after the refusal really ran, and none of them looked at the path.
+        assert prunes, "the prune was not called: the sweep stopped"
+        assert {"_ancestor_change_reason", "get_registered_worktrees"} <= set(after), after
