@@ -112,6 +112,7 @@ include = [
     "/docs/verification/907/faults.ps1",
     "/hatch_build.py",
     "/pyproject.toml",
+    "/scripts/check_git_job_scheduled_task.ps1",
     "/src",
     "/tests",
 ]

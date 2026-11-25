@@ -160,6 +160,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Git write that runs out of time keeps its warning when the stopped programs cannot be counted (#920).**
+  On Windows, after a time-out agenttalk counts what is still running in Git's job. If that count failed with an
+  ordinary error twice, the raw error came out instead of the time-out, and `lane assign` skipped its advice for a
+  half-made checkout. Now a count that fails is treated like one that could not be read: the time-out error and its
+  warning that a program may still be running are kept, and so is the recovery advice.
+- The maintainers' checks for #907 are stricter (#920): the scheduled-task check fails, and does not start its
+  second run, when it cannot confirm that a task was stopped, and it makes a relative `-Repo` absolute; the planted-fault
+  runner reads relative paths from where it was started, fails when no fault ran any test, and keeps only counts in its
+  results file, so no test name or failure text is written there. The source package now ships the scheduled-task check.
+
 - **Windows process-list failures now stop supervisor operations (#905).**
   Selecting or validating the PowerShell host, preparing or committing its scheduled task, and claiming the supervisor now stop with exit 3 and name the failing Windows call if Windows cannot list processes, even where the list is not needed.
 

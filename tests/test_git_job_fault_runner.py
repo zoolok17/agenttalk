@@ -7,6 +7,7 @@ stand-in files, on every PowerShell that is installed; the faults are never plan
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,14 +36,15 @@ FILES = {
     "scripts/check_git_job_scheduled_task.ps1": "# the scheduled-task script\n",
     "tests/conftest.py": "# the test configuration\n",
     "docs/verification/907/faults.ps1": "# a stand-in for the runner itself: some faults change the runner\n",
-    # The tests that fault F01 is run against: six of them fail when the fault is planted (it writes a limit value).
+    # The tests that fault F01 is run against: four of them fail when the fault is planted (it writes a limit value).
+    # Their ids, and the message each fails with, look like paths and a user name: none may reach the results (#920).
     "tests/test_git_job_windows.py": (
         "import pathlib\n\nimport pytest\n\n"
         'SOURCE = pathlib.Path(__file__).resolve().parents[1] / "src" / "agenttalk" / "git_job.py"\n\n\n'
-        '@pytest.mark.parametrize("n", range(6))\n'
+        '@pytest.mark.parametrize("n", ["private/report.txt", "/private", "C:\\\\Users\\\\Jane Doe\\\\x", "Janedoe"])\n'
         "def test_limits_hold(n):\n"
-        '    assert "0x2000" not in SOURCE.read_text(encoding="utf-8")\n\n\n'
-        "def test_limits_flag_the_file_when_asked():\n"
+        '    assert "0x2000" not in SOURCE.read_text(encoding="utf-8"), n\n\n\n'
+        "def test_limits_flag_the_file_when_asked(tmp_path):  # tmp_path: pytest makes its base-temp folder\n"
         "    import os\n    import subprocess\n\n"
         '    if os.environ.get("FLAG_THE_FILE"):  # a flag set while the fault is planted, as a person might\n'
         '        subprocess.run(["git", "-C", str(SOURCE.parents[2]), "update-index", "--skip-worktree", '
@@ -137,15 +139,69 @@ def test_an_edit_in_a_file_that_no_selected_fault_changes_does_not_stop_the_runn
 
 
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
-def test_every_failing_test_of_a_fault_gets_its_own_row_in_the_results(tmp_path, repo, shell):
-    """The results claim that every failing test is kept with the first line of its failure. A fault that fails six
-    tests (F01 against the stand-in tests) must show six rows, not the first four."""
+def test_every_failing_test_of_a_fault_is_counted_and_none_gets_a_row_of_its_own(tmp_path, repo, shell):
+    """The results keep counts only (#920): a fault that fails four tests (F01 against the stand-in tests) says so in
+    numbers, and no row per test is written."""
     done = run_runner(shell, repo, tmp_path, "-Only", "F01-kill-on-close-set")
     assert done.returncode == 0, done.stdout + done.stderr
     text = (tmp_path / "results.txt").read_text(encoding="utf-8-sig")
-    assert "CAUGHT (all 6 by an assertion)" in text, text
-    rows = [line.strip() for line in text.splitlines() if line.strip().startswith("tests/test_git_job_windows.py::")]
-    assert sorted(rows) == [f"tests/test_git_job_windows.py::test_limits_hold[{n}]" for n in range(6)], text
+    expected = "F01-kill-on-close-set: CAUGHT -- ran 5, passed 1, failed 4, errors 0, skipped 0; failed by assertion 4,"
+    assert expected in text, text
+    assert [line for line in text.splitlines() if line.startswith(("F01", " "))] == [text.splitlines()[1]], text
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_the_results_file_keeps_no_pytest_text(tmp_path, repo, shell):
+    """#920: the failing tests' ids and messages look like paths and a user name; none of it is written, and neither is
+    pytest's own summary ("4 failed, 1 passed in 0.10s"; the runner's own words are "passed 1, failed 4")."""
+    done = run_runner(shell, repo, tmp_path, "-Only", "F01-kill-on-close-set")
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = (tmp_path / "results.txt").read_text(encoding="utf-8-sig")
+    for word in ("private", "report.txt", "Jane", "Doe", "Janedoe", "test_limits_hold", "test_git_job_windows"):
+        assert word not in text, (word, text)
+    assert re.search(r"\d+ (passed|failed)", text) is None, text
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+def test_a_relative_repo_out_and_basetemp_from_another_location_still_run_the_named_fault(tmp_path, repo, shell):
+    """#920: PowerShell's location is the repository's parent folder, the process's folder is another one. Relative
+    paths are read from PowerShell's location, before the runner changes folder; the fault is planted and its tests
+    run."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    command = (f"Set-Location -LiteralPath '{repo.parent}'; & '{RUNNER}' -Repo '{repo.name}' -Python '{sys.executable}'"
+               " -Out results.txt -BaseTemp bt -Only F01-kill-on-close-set; exit $LASTEXITCODE")
+    done = subprocess.run(  # noqa: S603
+        [shell, "-NoProfile", "-Command", command], cwd=elsewhere, capture_output=True, text=True, timeout=180,
+        check=False,
+    )  # fmt: skip
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = (repo.parent / "results.txt").read_text(encoding="utf-8-sig")
+    assert "F01-kill-on-close-set: CAUGHT -- ran 5," in text, text
+    assert (repo.parent / "bt").is_dir() and not (repo / "bt").exists() and not (repo / "results.txt").exists()
+
+
+# #920: a run in which no selected fault ran its tests is not a pass. (file changed and committed first, its new text,
+# what the environment adds, and the fault's line)
+NOTHING_RAN = [
+    pytest.param("src/agenttalk/git_job.py", "class Native:\n    pass\n", {}, "NOT PLANTED", id="fault-text-not-found"),
+    pytest.param("tests/test_git_job_windows.py", "# no tests here\n", {}, "NO TESTS RAN", id="no-tests-collected"),
+    pytest.param(None, None, {"PYTEST_ADDOPTS": "--no-such-option"}, "NO RESULT", id="no-counts-to-read"),
+]
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
+@pytest.mark.parametrize("target, content, env, verdict", NOTHING_RAN)
+def test_a_run_in_which_no_selected_fault_ran_its_tests_exits_non_zero(
+    tmp_path, repo, shell, target, content, env, verdict
+):
+    if target:
+        (repo / target).write_text(content, encoding="utf-8", newline="\n")
+        git(repo, "commit", "-q", "-am", "the change this case needs")
+    done = run_runner(shell, repo, tmp_path, "-Only", "F01-kill-on-close-set", env=env)
+    text = (tmp_path / "results.txt").read_text(encoding="utf-8-sig")
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert f"F01-kill-on-close-set: {verdict}" in text and "nothing was tested" in text, text
 
 
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
