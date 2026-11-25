@@ -109,6 +109,7 @@ include = [
     "/docs/supervisor-hosting.md",
     "/docs/supervisor-liveness-design.md",
     "/docs/supervisor-tutorial.md",
+    "/docs/verification/907/faults.ps1",
     "/hatch_build.py",
     "/pyproject.toml",
     "/src",
