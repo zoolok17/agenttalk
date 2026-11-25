@@ -420,6 +420,54 @@ def test_doctor_shows_gits_message_on_one_sanitized_line(estate, monkeypatch):
     assert "fatal: boom" in check.details
 
 
+def test_doctor_under_a_fence_says_unknown_when_the_fence_refuses_a_registered_checkout(
+    tmp_path, monkeypatch, capsys
+):
+    """Under a store fence, Git's registration files are fenced before Git lists the checkouts: a registration of a
+    folder outside the fence is refused (the fence's own error). Doctor's scratch check used to let that error out of
+    the check; now the list is UNKNOWN with the fence's reason, like any list that could not be had, and the rest of
+    doctor runs as before. The whole doctor run is checked too: the check is a warning, which doctor counts as exit 0
+    unless another check is an error (exit 2)."""
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    fence = (tmp_path / "fence").resolve()
+    repo = fence / "repo"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "Test Author")
+    git(repo, "config", "user.email", "test@example.invalid")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+    for folder in ("scratch", "temp"):
+        (fence / folder).mkdir()
+    (repo / ".agenttalk").mkdir()
+    (repo / ".agenttalk" / "config.json").write_text(json.dumps({
+        "scratch": {"root": str(fence / "scratch"), "tmp_root": str(fence / "temp")}}))
+    outside = (tmp_path / "zz-outside-registered").resolve()  # beside the fence, inside this test's own folder
+    outside.mkdir()
+    admin = repo / ".git" / "worktrees" / "late-registration"
+    admin.mkdir(parents=True)
+    (admin / "gitdir").write_text(f"{outside / '.git'}\n", encoding="utf-8")
+    (admin / "HEAD").write_text("ref: refs/heads/late-registration\n", encoding="utf-8")
+    (admin / "commondir").write_text("../..\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(tmp_path / "fence-report.txt"))
+
+    check = hygiene(repo)
+
+    assert check is not None and check.status == "warn", check
+    assert "could not be checked" in check.details and "store fence refused" in check.details, check.details
+    assert str(outside) in check.details, check.details
+    assert check.data["outside_worktrees"] is None
+    assert "registration" in check.fix and "safe.directory" not in check.fix, check.fix
+    assert list(outside.iterdir()) == []
+
+    rc = main(["--root", str(repo), "doctor", "--json"])
+
+    report = json.loads(capsys.readouterr().out)
+    (scratch,) = [c for c in report["checks"] if c["name"] == "scratch_hygiene"]
+    assert scratch["status"] == "warn" and scratch["data"]["outside_worktrees"] is None, scratch
+    assert rc == (2 if any(c["status"] == "error" for c in report["checks"]) else 0), report
+
+
 # --- round 2: a Git timeout, or any other failure to run Git that is not an OSError, is an unknown list ----------
 
 NOT_AN_OSERROR = {

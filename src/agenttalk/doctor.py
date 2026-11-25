@@ -34,6 +34,7 @@ from agenttalk import supervisor_lifecycle
 from agenttalk.store import (
     STORE_SCHEMA_CAPABILITIES,
     Store,
+    StoreFenceError,
     find_root,
     find_stores_upward,
     store_fence_allows,
@@ -2041,11 +2042,19 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
     try:
         cfg = janitormod.JanitorConfig.load(project_root)
         # One strict list of the registered checkouts, shared by discovery and the outside-checkout count (#901).
-        listing = janitormod._strict_listing(project_root)
+        fence_refused = False
+        try:
+            listing = janitormod._strict_listing(project_root)
+        except StoreFenceError as exc:
+            # Under a store fence a registered checkout the fence refuses: the list is UNKNOWN, with the fence's
+            # reason, like any list that could not be had (#901), and the rest of doctor runs on.
+            listing, fence_refused = (None, f"the store fence refused a path: {exc}"), True
         candidates, access_errors = janitormod.find_candidates(cfg, listing)
     except OSError:
         return None
     registered, unknown_why = listing
+    next_step = ("look at the registration the store fence refused (named above)" if fence_refused
+                 else janitormod._listing_next_step(unknown_why) if registered is None else "")
     # A list that could not be had is UNKNOWN, not "none outside": the count is None (JSON null), never 0.
     outside_worktrees = None if registered is None else [
         w for w in registered
@@ -2074,7 +2083,7 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
         status="warn",
         details="; ".join(parts) + f" (scratch root: {cfg.scratch_root})",
         fix=("run `agenttalk janitor` to report, `agenttalk janitor --apply` to clean up" if registered is not None
-             else f"{janitormod._listing_next_step(unknown_why)}; then run `agenttalk janitor` to report"),
+             else f"{next_step}; then run `agenttalk janitor` to report"),
         data={"outside_worktrees": None if outside_worktrees is None else len(outside_worktrees),
               "outside_candidates": len(outside_candidates),
               "scratch_root": str(cfg.scratch_root)},
