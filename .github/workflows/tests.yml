@@ -162,7 +162,9 @@ jobs:
     # this layout's first run (windows_timeout_reason in dev-gate.json). Each group
     # keeps its 9000s run limit, and a part's 165-minute ceiling is that limit
     # plus setup and the evidence upload. The aggregate requires every part.
-    # Linux/macOS keep one run per mode and the 90-minute job ceiling.
+    # Linux/macOS keep one run per mode. Linux keeps the 90-minute job ceiling; macOS has 120 minutes
+    # (#378: on 23 November 2026, 8 macOS jobs were stopped at 90 minutes without a failing test,
+    # while passing macOS jobs took 81 to 89 minutes).
     timeout-minutes: ${{ matrix.os.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -189,7 +191,7 @@ jobs:
             timeout_minutes: 165  # #378: the 9000s group limit plus 15 minutes for setup and upload
           - id: macos
             runner: macos-latest
-            timeout_minutes: 90
+            timeout_minutes: 120  # #378: passing macOS jobs take 81 to 89 minutes
         python-version: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

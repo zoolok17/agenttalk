@@ -400,7 +400,9 @@ def test_status_json_schema(
     assert rc == 0
     payload = _json.loads(capsys.readouterr().out)
     # Required top-level keys
-    assert payload["root"] == str(store_root)
+    assert "root" not in payload and "project_id" not in payload
+    assert _run(["status", "--json", "--show-personal"], store_root) == 0
+    assert _json.loads(capsys.readouterr().out)["root"] == str(store_root)
     assert payload["session_id"]
     assert payload["message_count"] == 1
     assert payload["stale_threshold_seconds"] == 60.0
@@ -414,9 +416,19 @@ def test_status_json_schema(
         assert a["stale"] is None
         # cursor is None until something ack'd
         assert a["cursor"] is None
+        assert "capacity" not in a
     # beta got the message, so beta is unread=1
     beta = next(a for a in payload["agents"] if a["name"] == "beta")
     assert beta["unread"] == 1
+    from agenttalk import capacity as capmod
+    Store(store_root).write_capacity(
+        "alpha", capmod.CapacitySnapshot.unknown("alpha", account="codex:test:home-12345678").to_dict()
+    )
+    assert _run(["status", "--json"], store_root) == 0
+    rows = {a["name"]: a for a in _json.loads(capsys.readouterr().out)["agents"]}
+    assert set(rows["alpha"]["capacity"]) == {"state", "observed_at", "reason", "account_group"}
+    assert rows["alpha"]["capacity"]["account_group"] == ["alpha"]
+    assert "capacity" not in rows["beta"]
 
 
 def test_status_json_includes_heartbeat_when_set(
@@ -3983,8 +3995,9 @@ def test_301_an_old_reading_is_shown_stale_by_capacity_and_status(
     assert "capacity" not in rows["beta"]
 
 
+@pytest.mark.parametrize("show_personal", [False, True])
 def test_301_r2_seats_on_one_account_each_show_their_own_row(
-    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch, show_personal: bool,
 ) -> None:
     from agenttalk import capacity as capmod
 
@@ -3993,20 +4006,134 @@ def test_301_r2_seats_on_one_account_each_show_their_own_row(
     now = datetime.now(timezone.utc)
     store = Store(tmp_path)
     for agent, used, plan, minutes in (("alpha", 12.0, "pro", 3), ("beta", 40.0, "plus", 1)):
-        snap = capmod.CapacitySnapshot.unknown(agent, account="codex:tester")
+        snap = capmod.CapacitySnapshot.unknown(agent, account="codex:tester:home-12345678")
         snap.source, snap.confidence, snap.plan_type = "codex_rollout", "observed", plan
         snap.observed_at = (now - timedelta(minutes=minutes)).isoformat(timespec="seconds")
         snap.primary_used_percent = used
         store.write_capacity(agent, snap.to_dict())
     capsys.readouterr()
 
-    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    assert cli.main(["--root", str(tmp_path), "capacity", *(["--show-personal"] if show_personal else [])]) == 0
     out = capsys.readouterr().out
-    assert out.count("codex account of OS user tester") == 1 and "2 seats: alpha, beta" in out
+    header = "  codex account of OS user tester (home-12345678), 2 seats: alpha, beta" if show_personal else (
+        "  codex account, 2 seats: alpha, beta")
+    assert header in out.splitlines()
     rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("    ")}
     assert "12% used" in rows["alpha"] and "plan=pro" in rows["alpha"] and "3min ago" in rows["alpha"]
     assert "40% used" in rows["beta"] and "plan=plus" in rows["beta"] and "1min ago" in rows["beta"]
     assert out.index("    beta") < out.index("    alpha")          # newest first
+
+
+def test_616_capacity_account_display_privacy_and_grouping(tmp_path: Path, capsys, monkeypatch) -> None:
+    from agenttalk import capacity as capmod
+
+    monkeypatch.setattr(capmod.getpass, "getuser", lambda: "invented-login")
+    cli.main(["init", "--path", str(tmp_path), "--agents", "beta,alpha,gamma,legacy,empty"])
+    store = Store(tmp_path)
+    read_all = Store.read_all_capacities
+    monkeypatch.setattr(Store, "read_all_capacities", lambda self: dict(reversed(list(read_all(self).items()))))
+    first = capmod.account_key("codex", tmp_path / "invented-home-one")
+    second = capmod.account_key("codex", tmp_path / "invented-home-two")
+    for agent, account in (("alpha", first), ("beta", first), ("gamma", second), ("legacy", None)):
+        snapshot = capmod.CapacitySnapshot.unknown(agent, account=account).to_dict()
+        if account is None:
+            snapshot.pop("account")
+            snapshot.pop("schema_version")
+        store.write_capacity(agent, snapshot)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    out = capsys.readouterr().out
+    assert "invented-login" not in out and "home-" not in out
+    headers = [line for line in out.splitlines() if line.startswith("  codex account,")]
+    assert len(headers) == 2
+    assert set(headers) == {"  codex account, 2 seats: alpha, beta", "  codex account, 1 seat: gamma"}
+    assert any(line.startswith("  legacy") for line in out.splitlines())
+
+    assert cli.main(["--root", str(tmp_path), "capacity", "--show-personal"]) == 0
+    out = capsys.readouterr().out
+    first_header = f"  codex account of OS user invented-login ({first.rsplit(':', 1)[1]}), 2 seats: alpha, beta"
+    second_header = f"  codex account of OS user invented-login ({second.rsplit(':', 1)[1]}), 1 seat: gamma"
+    assert first_header in out.splitlines()
+    assert second_header in out.splitlines()
+    assert store.read_capacity("alpha")["account"] == first
+
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    output = capsys.readouterr().out
+    assert "invented-login" not in output and "home-" not in output
+    rows = {row["name"]: row for row in json.loads(output)["agents"]}
+    assert rows["alpha"]["capacity"]["account_group"] == ["alpha", "beta"]
+    assert rows["beta"]["capacity"]["account_group"] == ["alpha", "beta"]
+    assert rows["gamma"]["capacity"]["account_group"] == ["gamma"]
+    assert "account_group" not in rows["legacy"]["capacity"]
+    assert all("account" not in row["capacity"] for row in rows.values() if "capacity" in row)
+    assert "capacity" not in rows["empty"]
+
+    assert cli.main(["--root", str(tmp_path), "status", "--json", "--show-personal"]) == 0
+    shown = {row["name"]: row for row in json.loads(capsys.readouterr().out)["agents"]}
+    for agent, account in (("alpha", first), ("beta", first), ("gamma", second), ("legacy", None)):
+        expected = dict(rows[agent]["capacity"])
+        expected.pop("account_group", None)
+        expected["account"] = account
+        assert shown[agent]["capacity"] == expected
+    assert "capacity" not in shown["empty"]
+
+
+@pytest.mark.parametrize("command", ["capacity", "status"])
+@pytest.mark.parametrize("account", [["invented-login"], "invented-login", "invented-login:x:home-1",
+                                     "inventedlogin:x:home-12345678"])
+def test_867_malformed_account_list_does_not_expose_login(tmp_path: Path, capsys, command, account) -> None:
+    from agenttalk import capacity as capmod
+
+    assert cli.main(["init", "--path", str(tmp_path), "--agents", "alpha"]) == 0
+    snapshot = capmod.CapacitySnapshot.unknown("alpha").to_dict()
+    snapshot["account"] = account
+    Store(tmp_path).write_capacity("alpha", snapshot)
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(tmp_path), command, *(["--json"] if command == "status" else [])]) == 0
+    output = capsys.readouterr().out
+    assert "invented-login" not in output and "inventedlogin" not in output
+    if command == "status":
+        row = json.loads(output)["agents"][0]["capacity"]
+        assert "account" not in row and "account_group" not in row
+        assert cli.main(["--root", str(tmp_path), "status", "--json", "--show-personal"]) == 0
+        shown = json.loads(capsys.readouterr().out)["agents"][0]["capacity"]
+        assert shown["account"] == account
+    else:
+        assert cli.main(["--root", str(tmp_path), "capacity", "--show-personal"]) == 0
+        explicit = capsys.readouterr().out
+        assert "invented-login" in explicit or "inventedlogin" in explicit
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex", "ovh-qwen"])
+def test_867_supported_account_keys_are_grouped(tmp_path: Path, capsys, monkeypatch, provider) -> None:
+    from agenttalk import capacity as capmod
+
+    monkeypatch.setattr(capmod.getpass, "getuser", lambda: "invented-login")
+    assert cli.main(["init", "--path", str(tmp_path), "--agents", "alpha"]) == 0
+    account = capmod.account_key(provider, tmp_path)
+    Store(tmp_path).write_capacity("alpha", capmod.CapacitySnapshot.unknown("alpha", account=account).to_dict())
+    capsys.readouterr()
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    assert f"{provider} account, 1 seat: alpha" in capsys.readouterr().out
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["agents"][0]["capacity"]["account_group"] == ["alpha"]
+
+
+def test_867_status_show_personal_help(capsys) -> None:
+    with pytest.raises(SystemExit) as result:
+        cli.main(["status", "--help"])
+    assert result.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "operating-system login" in text and "folder fingerprint" in text
+
+
+def test_616_capacity_show_personal_help(capsys) -> None:
+    with pytest.raises(SystemExit) as result:
+        cli.main(["capacity", "--help"])
+    assert result.value.code == 0
+    assert "operating-system login name" in capsys.readouterr().out
 
 
 def test_301_r2_an_expired_reading_is_never_shown_as_current(
@@ -5696,3 +5823,286 @@ def test_backup_refuses_uninitialized_store(
     empty_root = tmp_path / "never-initialized"
     empty_root.mkdir()
     _run_expect_exit(["backup"], empty_root, 2)
+
+@pytest.mark.parametrize("signing", [False, True])
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("home_style", ["windows", "unix"])
+def test_870_status_hides_personal_paths_and_recovers(tmp_path, capsys, monkeypatch, signing, as_json, home_style):
+    import copy
+
+    home = tmp_path / ("Users" if home_style == "windows" else "home") / "invented-login"
+    # LOCALAPPDATA is a Windows folder: status reads it only on Windows, so off Windows the
+    # path holds no login and is expected to stay as it is.
+    local_owner = "invented-login" if os.name == "nt" else "shared"
+    local = tmp_path / "outside" / local_owner / "appdata"
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    assert cli.main(["init", "--path", str(tmp_path / "store"), "--agents", "alpha"]) == 0
+    capsys.readouterr()
+    pid = "invented-project-id"
+    path = str(home / "some" / "file")
+    alt = path.replace("\\", "/")
+    local_path = str(local / "file")
+    payload = {
+        "root": str(home / "project"), "session_id": "session", "project_id": pid,
+        "signing_enforced": signing, "message_count": 0, "invalid_messages": [{"id": "bad", "reason": path}],
+        "agents": [], "warnings": [alt, local_path], "lead_chat": {"request_id": "req", "detail": path},
+        "powershell_host": {"status": "ok", "edition": "Core", "version": {"major": 7}, "age_seconds": 1,
+                            "path": path, "identity": {"final_path": path}, "project_id": pid,
+                            "warning": local_path, "future": path},
+    }
+    if signing:
+        payload["hmac_key"] = {"path": str(home / pid), "exists": True, "readable": True,
+                               "mode_warning": path, "in_project_dir": False}
+    monkeypatch.setattr(cli, "_gather_status", lambda store: copy.deepcopy(payload))
+    monkeypatch.setattr(Store, "legacy_config_project_id", lambda self: pid)
+    args = ["--root", str(tmp_path / "store"), "status", *(["--json"] if as_json else [])]
+    assert cli.main(args) == 0
+    default = capsys.readouterr().out
+    assert "invented-login" not in default and pid not in default
+    assert "<home>" in default
+    assert ("<localappdata>" in default) is (os.name == "nt")
+    if as_json:
+        data = json.loads(default)
+        assert "root" not in data and "project_id" not in data
+        assert set(data["powershell_host"]) == {"status", "edition", "version", "age_seconds", "warning"}
+        assert data["lead_chat"]["detail"].startswith("<home>")
+        if signing:
+            assert "path" not in data["hmac_key"]
+    else:
+        assert "root:       (hidden; add --show-personal" in default
+        assert "legacy project_id = (hidden; add --show-personal)" in default
+        if signing:
+            assert "path hidden; add --show-personal" in default
+    assert cli.main(args + ["--show-personal"]) == 0
+    shown = capsys.readouterr().out
+    if as_json:
+        assert shown == json.dumps(payload, indent=2) + "\n"
+    else:
+        lines = [f"root:       {payload['root']}", "session_id: session", "agents:     ", "messages:   0",
+                 "operator:   0 operator question(s) pending", f"powershell: OK {path}",
+                 f"  warning:  {local_path}"]
+        if signing:
+            lines.extend([f"hmac:       enforced · key PROBLEM ({payload['hmac_key']['path']})",
+                          f"  warning:  {path}"])
+        lines.extend(["hmac:       NOTE: legacy fields in config.json are IGNORED",
+                      "            (enforcement is anchored to the per-user key file at the",
+                      "             PATH-DERIVED project_id, not to anything in config.json).",
+                      f"            legacy project_id = {pid}",
+                      "INVALID:    1 message failed schema/roster validation "
+                      "(see `agenttalk status --json` for details under invalid_messages[]; "
+                      "`agenttalk prune --invalid --dry-run` to inspect)",
+                      f"WARN:       {alt}", f"WARN:       {local_path}"])
+        assert shown == "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize("command", ["status", "capacity"])
+def test_870_old_option_rejected(command, capsys, tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--root", str(tmp_path), command, "--show-account"])
+    assert exc.value.code == 2
+    capsys.readouterr()
+
+
+def test_870_web_status_keeps_project_and_key_values(tmp_path):
+    from agenttalk import signing, web
+
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    data = web.status_payload(store)
+    assert data["project_root"] == str(store.root)
+    assert data["project_id"] == store.project_id()
+    assert data["hmac_key"]["path"] == signing.inspect_key(store.project_id(), store.root).to_dict()["path"]
+
+
+@pytest.mark.parametrize("platform,home,local,sample,expected", [
+    ("nt", r"C:\Users\Invented-Login", r"C:\Users\Invented-Login\AppData\Local",
+     "c:/users/invented-login/AppData/Local/file", "<home>/AppData/Local/file"),
+    ("nt", r"C:\Users\Invented-Login", r"D:\private\Invented-Login",
+     r"d:/PRIVATE/invented-login/file", "<localappdata>/file"),
+    ("posix", "/home/invented-login", "", "/home/invented-login/file", "<home>/file"),
+])
+def test_870_redaction_platform_paths(monkeypatch, platform, home, local, sample, expected):
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os, "name", platform)
+        patch.setattr(cli.os.path, "expanduser", lambda _: home)
+        patch.setenv("LOCALAPPDATA", local)
+        result = cli._status_redact_home(sample)
+    assert result == expected
+
+
+@pytest.mark.parametrize("signing", [False, True])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_870_real_store_under_home(tmp_path, monkeypatch, capsys, signing, as_json):
+    from agenttalk import signing as signing_module
+
+    home = tmp_path / "invented-login"
+    root = home / "project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("LOCALAPPDATA", str(home / "appdata"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    assert cli.main(["init", "--path", str(root), "--agents", "alpha"]) == 0
+    store = Store(root)
+    pid = store.project_id()
+    if signing:
+        signing_module.init_key(pid)
+    capsys.readouterr()
+    args = ["--root", str(root), "status", *(["--json"] if as_json else [])]
+    assert cli.main(args) == 0
+    hidden = capsys.readouterr().out
+    assert "invented-login" not in hidden and pid not in hidden
+    assert cli.main(args + ["--show-personal"]) == 0
+    shown = capsys.readouterr().out
+    assert "invented-login" in shown
+    if as_json:
+        assert json.loads(shown)["project_id"] == pid
+    elif signing:
+        assert pid in shown
+
+
+def test_870_r1_damaged_key_hides_project_id(tmp_path, monkeypatch, capsys):
+    from agenttalk import signing
+
+    home = tmp_path / "invented-login"
+    root = home / "project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("LOCALAPPDATA", str(home / "appdata"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    assert cli.main(["init", "--path", str(root), "--agents", "alpha"]) == 0
+    store = Store(root)
+    pid = store.project_id()
+    key = signing.init_key(pid)
+    key.write_text("not-a-hex-key", encoding="utf-8")
+    capsys.readouterr()
+    args = ["--root", str(root), "status", "--json"]
+    assert cli.main(args) == 0
+    default = capsys.readouterr().out
+    assert pid not in default
+    assert "<project_id>" in json.loads(default)["hmac_key"]["key_error"]
+    assert cli.main(args + ["--show-personal"]) == 0
+    assert pid in json.loads(capsys.readouterr().out)["hmac_key"]["key_error"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX key permissions")
+@pytest.mark.parametrize("as_json", [False, True])
+def test_870_r1_key_mode_warning_hides_project_id(tmp_path, monkeypatch, capsys, as_json):
+    from agenttalk import signing
+
+    home = tmp_path / "invented-login"
+    root = home / "project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    assert cli.main(["init", "--path", str(root), "--agents", "alpha"]) == 0
+    pid = Store(root).project_id()
+    key = signing.init_key(pid)
+    key.chmod(0o644)
+    capsys.readouterr()
+    args = ["--root", str(root), "status", *(["--json"] if as_json else [])]
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    assert pid not in output and "<project_id>" in output
+    assert cli.main(args + ["--show-personal"]) == 0
+    assert pid in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_870_r1_exception_paths_hidden(tmp_path, monkeypatch, capsys, as_json):
+    home = tmp_path / "invented-login"
+    root = tmp_path / "project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    assert cli.main(["init", "--path", str(root), "--agents", "alpha"]) == 0
+    capsys.readouterr()
+    original = cli._gather_status
+    detail = str(PermissionError(13, "invented failure", str(home / "secret.txt")))
+
+    def gather(store):
+        data = original(store)
+        data["warnings"].append(detail)
+        data["powershell_host"] = {"status": "error", "warning": detail}
+        return data
+
+    monkeypatch.setattr(cli, "_gather_status", gather)
+    args = ["--root", str(root), "status", *(["--json"] if as_json else [])]
+    assert cli.main(args) == 0
+    default = capsys.readouterr().out
+    assert "invented-login" not in default
+    if as_json:
+        data = json.loads(default)
+        assert "<home>" in data["warnings"][-1]
+        assert "<home>" in data["powershell_host"]["warning"]
+    else:
+        assert default.count("<home>") == 2
+    assert cli.main(args + ["--show-personal"]) == 0
+    assert "invented-login" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("platform,home,root,sample,expected", [
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-login2\file",
+     r"C:\Users\invented-login2\file"),
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-login.old\file",
+     r"C:\Users\invented-login.old\file"),
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-loginX\file",
+     r"C:\Users\invented-loginX\file"),
+    ("nt", "C:\\", None, r"C:\Windows\file and D:\C:\x", r"C:\Windows\file and D:\C:\x"),
+    ("nt", "\\\\", None, "abc", "abc"),
+    ("nt", r"C:\Users\invented-login", None, r"under C:\Users\invented-login.", "under <home>."),
+    ("nt", r"C:\Users\invented-login", None, r"under C:\Users\invented-login, then D:", "under <home>, then D:"),
+    ("nt", r"C:\Users\invented-login", None, r"(home C:\Users\invented-login)", "(home <home>)"),
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-login: access denied", "<home>: access denied"),
+    ("nt", r"C:\Users\invented-login", None, r"C:\Users\invented-login; retry", "<home>; retry"),
+    ("nt", r"C:\Users\invented-login", r"D:\invented-login-work", r"(D:\invented-login-work)", "(<root>)"),
+    ("posix", "/home/invented-login", None, "under /home/invented-login.", "under <home>."),
+])
+def test_870_r1_home_boundary_and_root(monkeypatch, platform, home, root, sample, expected):
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os, "name", platform)
+        patch.setattr(cli.os.path, "expanduser", lambda _: home)
+        patch.delenv("LOCALAPPDATA", raising=False)
+        result = cli._status_redact_home(sample, root=root)
+    assert result == expected
+
+
+def test_870_r2_root_home_keeps_local_and_project(monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os, "name", "nt")
+        patch.setattr(cli.os.path, "expanduser", lambda _: "C:\\")
+        patch.setenv("USERPROFILE", "C:\\")
+        patch.setenv("LOCALAPPDATA", r"C:\Users\invented-login\AppData\Local")
+        result = cli._status_redact_home(
+            r"C:\Users\invented-login\AppData\Local\file and C:\project\file",
+            root=r"C:\project",
+        )
+    assert result == r"<localappdata>\file and <root>\file"
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_870_r1_project_root_outside_home_hidden(tmp_path, monkeypatch, capsys, as_json):
+    home = tmp_path / "invented-home"
+    root = tmp_path / "outside-project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    assert cli.main(["init", "--path", str(root), "--agents", "alpha"]) == 0
+    capsys.readouterr()
+    original = cli._gather_status
+
+    def gather(store):
+        data = original(store)
+        data["warnings"].append(str(root / "file"))
+        return data
+
+    monkeypatch.setattr(cli, "_gather_status", gather)
+    args = ["--root", str(root), "status", *(["--json"] if as_json else [])]
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    assert "<root>" in output
+    if as_json:
+        assert "<root>" in json.loads(output)["warnings"][-1]
+    else:
+        assert str(root) not in output
+    assert cli.main(args + ["--show-personal"]) == 0
+    output = capsys.readouterr().out
+    assert str(root) in (json.loads(output)["warnings"][-1] if as_json else output)

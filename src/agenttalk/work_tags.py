@@ -124,7 +124,7 @@ def task_metadata(meta, args):
     return result
 
 
-COPY_ONLY_META = frozenset({"requeued_from", "signature", "signed_at"})
+COPY_ONLY_META = frozenset({"requeued_from", "signature", "signed_at", "requeued_again", "requeued_again_after"})
 
 
 def opener_fields(message):

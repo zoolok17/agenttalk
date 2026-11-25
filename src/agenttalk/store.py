@@ -1043,9 +1043,18 @@ class RequeueRefused(ValueError):
     """A requeue refused because the dead letter was already requeued. ``retry`` is a failed copy that may be
     retried instead, or None; the caller adds the advice, after the lock is released."""
 
-    def __init__(self, message: str, retry: str | None = None):
+    def __init__(self, message: str, retry: str | None = None, *, again_allowed: bool = False):
         super().__init__(message)
         self.retry = retry
+        self.again_allowed = again_allowed
+
+
+class RequeueStateDamaged(RequeueRefused):
+    """A malformed or unsupported requeue record that an explicit replay can replace."""
+
+
+class RequeueStateReadError(RequeueRefused):
+    """The requeue record or an earlier copy could not be accessed."""
 
 
 # Names that the product writes under itself. An older roster may already contain one (it was valid), so
@@ -3845,6 +3854,7 @@ class Store:
         _dispatch_vendors: dict | None = None,
         _refuse_live_request: bool = False,
         _requeue_source: tuple[str, str] | None = None,
+        _requeue_again: str | None = None,
         _validate_only: bool = False,
     ) -> Message:
         if not self.initialized():
@@ -3869,6 +3879,7 @@ class Store:
                     _dispatch_vendors=_dispatch_vendors,
                     _refuse_live_request=_refuse_live_request,
                     _requeue_source=_requeue_source,
+                    _requeue_again=_requeue_again,
                     _validate_only=_validate_only,
                 )
         config_before = os.stat(self.config_path)
@@ -3900,6 +3911,11 @@ class Store:
         # A caller that already supplied `epoch_at_send` wins (broadcast
         # snapshots one epoch for the whole fan-out — B3).
         meta = supplied_meta
+        previous_requeue = None
+        if _requeue_again is not None and _requeue_source is not None:
+            previous_requeue = self._requeue_previous(*_requeue_source)
+            meta["requeued_again"] = _requeue_again
+            meta["requeued_again_after"] = previous_requeue
         if authority_sensitive:
             roster = list(cfg.get("agents") or [])
             roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
@@ -4030,10 +4046,11 @@ class Store:
                         for m in self.valid_messages()
                         if m.kind in work_tags.OPENERS and m.meta.get("request_id") == rid
                     ]
-                    if any(m.recipient == recipient for m in copies):
+                    recipient_copy = next((m for m in copies if m.recipient == recipient), None)
+                    if recipient_copy is not None:
                         raise ValueError(
                             f"{recipient} already has a live copy of request {pc.meta_text(rid)}; "
-                            "nothing was published. "
+                            f"nothing was published. Existing copy: {pc.meta_text(recipient_copy.id)}. "
                             "Use the existing copy, or resend by hand with a new request id."
                         )
                     if copies and _dispatch_vendors is None:  # a fresh stamp could not match the copies still live
@@ -4066,7 +4083,11 @@ class Store:
                     )
                 claimed = None
                 if _requeue_source is not None:
-                    claimed = self._claim_requeue(_requeue_source, msg.id, str(cfg.get("session_id") or ""))
+                    claimed = self._claim_requeue(
+                        _requeue_source, msg.id, str(cfg.get("session_id") or ""),
+                        **({"again_after": previous_requeue, "again_reason": _requeue_again}
+                           if _requeue_again is not None else {}),
+                    )
                 self._reserve_message_publication_sequence(
                     msg.id,
                     self.valid_messages(),
@@ -4513,6 +4534,11 @@ class Store:
                 data = json.loads(text)
             except json.JSONDecodeError as e:
                 invalid.append((p, p.stem, f"invalid JSON: {e}"))
+                continue
+            except RecursionError:
+                # Nested past what the parser can read (#874): invalid like any other unreadable file. The wording
+                # is fixed because the parser's own differs between Python versions.
+                invalid.append((p, p.stem, "invalid JSON: nested too deeply"))
                 continue
             try:
                 msg = Message.from_raw(data)
@@ -5188,7 +5214,8 @@ class Store:
     # the publish, so a pause before that point cannot go stale (#706), and marked published right after it, under the
     # same lock. A published record always refuses a repeat, wherever the copy has gone. A claimed one lets the repeat
     # through only in the store session it was made in and with the copy found nowhere (quarantine included): then
-    # the publish never happened. In every other case nothing can tell, and the work is sent again as new work.
+    # the first publish never happened. An intentional repeat also keeps its previous copy and reason in the claim,
+    # so an interrupted repeat cannot be mistaken for an unpublished first attempt.
     def _requeue_state_path(self, agent: str, message_id: str) -> Path:
         return self.dead_letter_dir / validate_agent_name(agent) / f"{message_id}.requeue-state"
 
@@ -5213,9 +5240,17 @@ class Store:
             state = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
-        except (OSError, ValueError) as exc:
-            raise RequeueRefused(
+        except OSError as exc:
+            raise RequeueStateReadError(
                 f"{escape_controls(path)} cannot be read ({escape_controls(exc)}); nothing was published."
+            ) from exc
+        except ValueError as exc:
+            raise RequeueStateDamaged(
+                f"{escape_controls(path)} cannot be read ({escape_controls(exc)}); nothing was published."
+            ) from exc
+        except RecursionError as exc:  # nested too deeply to read: damaged like any other unreadable record (#874)
+            raise RequeueStateDamaged(
+                f"{escape_controls(path)} cannot be read (nested too deeply); nothing was published."
             ) from exc
         if not (
             isinstance(state, dict)
@@ -5226,8 +5261,18 @@ class Store:
             and state.get("state") in ("claimed", "published")
             and isinstance(state.get("session_id"), str)
             and _SESSION_ID_RE.match(state["session_id"])
+            and (
+                ("requeued_again" not in state and "requeued_again_after" not in state)
+                or (
+                    isinstance(state.get("requeued_again"), str)
+                    and bool(state["requeued_again"].strip())
+                    and isinstance(state.get("requeued_again_after"), str)
+                    and (state["requeued_again_after"] in ("none", "unreadable")
+                         or bool(_ID_RE.fullmatch(state["requeued_again_after"])))
+                )
+            )
         ):
-            raise RequeueRefused(
+            raise RequeueStateDamaged(
                 f"{escape_controls(path)} is damaged or not supported by this version; nothing was published."
             )
         return state
@@ -5290,8 +5335,22 @@ class Store:
         where = self._find_message(agent, earlier)
         if where is None:
             if state["state"] == "claimed" and state["session_id"] == session_id:
-                return None  # claimed, never marked published, and nowhere: the publish never happened
+                previous = state.get("requeued_again_after", "none")
+                if previous == "none":
+                    return None  # No earlier copy, and this attempt was never published.
+                if previous == "unreadable":
+                    return ("the last attempt was not sent, but the earlier record could not be read; "
+                            "check the earlier work before sending again", None)
+                if self._find_message(agent, previous) is not None:
+                    return (f"the last attempt was not sent; an earlier copy {previous} was already sent", None)
+                return (f"the last attempt was not sent; an earlier copy {previous} may have been sent", None)
             record = escape_controls(self._requeue_state_path(agent, dead_letter_id))
+            if state["state"] == "claimed" and "requeued_again" in state:
+                return (
+                    f"{record} says an intentional requeue as {earlier} was started in an earlier session; "
+                    "that copy is not anywhere the store keeps and the store cannot confirm publication",
+                    None,
+                )
             if state["state"] == "published":
                 return (
                     f"{record} names {earlier} as the copy this dead letter was requeued as, which the record says "
@@ -5315,15 +5374,43 @@ class Store:
                 pass
         return f"this dead letter was already requeued as {earlier}, which is now {where}", retry
 
-    def _claim_requeue(self, source: tuple[str, str], new_id: str, session_id: str) -> tuple[str, str, dict]:
+    def _requeue_previous(self, agent: str, dead_letter_id: str) -> str:
+        try:
+            state = self._read_requeue_state(agent, dead_letter_id)
+        except RequeueStateDamaged:
+            return "unreadable"
+        if state is None:
+            return "none"
+        try:
+            if (state["state"] == "claimed" and "requeued_again_after" in state
+                    and state["session_id"] == str(self.load_config().get("session_id") or "")
+                    and self._find_message(agent, state["requeued_as"]) is None):
+                return state["requeued_again_after"]
+        except OSError as exc:
+            raise RequeueStateReadError(
+                f"could not check the earlier copy ({escape_controls(exc)}); nothing was published."
+            ) from exc
+        return state["requeued_as"]
+
+    def _claim_requeue(self, source: tuple[str, str], new_id: str, session_id: str,
+                       *, again_after: str | None = None, again_reason: str | None = None) -> tuple[str, str, dict]:
         """Refuse a replay, else record this requeue as claimed before it is published."""
         agent, dead_letter_id = source
         self.requeue_mark_failure = None
         try:
-            block = self._requeue_block(agent, dead_letter_id, session_id)
-            if block is not None:
-                raise RequeueRefused(f"{block[0]}; nothing was published.", block[1])
+            if again_after is not None and self._requeue_previous(agent, dead_letter_id) != again_after:
+                raise RequeueRefused("the earlier requeue changed while preparing; retry; nothing was published.")
+            try:
+                block = self._requeue_block(agent, dead_letter_id, session_id)
+            except RequeueStateDamaged:
+                if again_after is None:
+                    raise
+            else:
+                if block is not None and again_after is None:
+                    raise RequeueRefused(f"{block[0]}; nothing was published.", block[1], again_allowed=True)
             claim = {"requeued_as": new_id, "session_id": session_id, "state": "claimed"}
+            if again_after is not None:
+                claim.update(requeued_again=again_reason, requeued_again_after=again_after)
             self._write_requeue_state(agent, dead_letter_id, claim)
         except OSError as exc:
             hint = (
@@ -5332,7 +5419,7 @@ class Store:
                 if isinstance(exc, PermissionError)
                 else ""
             )
-            raise RequeueRefused(
+            raise RequeueStateReadError(
                 f"could not check the earlier copy or update its record ({escape_controls(exc)}); nothing was "
                 f"published and no record was changed.{hint}"
             ) from exc
@@ -5393,7 +5480,7 @@ class Store:
                         if isinstance(loaded, dict):
                             meta = loaded
                             meta_loaded = True
-                    except (OSError, ValueError):
+                    except (OSError, ValueError, RecursionError):  # RecursionError: nested too deeply (#874)
                         meta = {}
                 meta.setdefault("agent", d.name)
                 orig = meta.get("message_id")

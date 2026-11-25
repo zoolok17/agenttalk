@@ -1765,30 +1765,142 @@ def cmd_overview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _groupable_capacity_account(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(
+        r"(?:claude|codex|ovh-qwen):[^:]*:home-[0-9a-f]{8}", value
+    ) is not None
+
+
+def _status_redact_home(value, *, root=None, project_id=None):
+    """Hide known personal values in status text, including nested diagnostics."""
+    if isinstance(value, dict):
+        return {key: _status_redact_home(item, root=root, project_id=project_id) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_status_redact_home(item, root=root, project_id=project_id) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    home = os.path.expanduser("~")
+    home_stripped = home.rstrip("\\/")
+    if not home_stripped or home_stripped == "~" or re.fullmatch(r"[a-zA-Z]:", home_stripped):
+        home = ""
+    local = os.environ.get("LOCALAPPDATA", "") if os.name == "nt" else ""
+
+    def path_key(path):
+        key = str(path or "").replace("\\", "/").rstrip("/")
+        return key.casefold() if os.name == "nt" else key
+
+    def inside(path, parent):
+        path, parent = path_key(path), path_key(parent)
+        return bool(parent and (path == parent or path.startswith(parent + "/")))
+
+    folders = [(home, "<home>")]
+    if local and not inside(local, home):
+        folders.append((local, "<localappdata>"))
+    if root and not inside(root, home):
+        folders.append((root, "<root>"))
+
+    patterns = []
+    replacements = {}
+    for folder, replacement in sorted(folders, key=lambda pair: len(str(pair[0])), reverse=True):
+        stripped = str(folder or "").rstrip("\\/")
+        if not stripped or stripped == "~" or re.fullmatch(r"[a-zA-Z]:", stripped):
+            continue
+        parts = re.split(r"[\\/]", stripped)
+
+        def shown_or_raw(part):
+            # Warnings can contain paths escaped by printed_commands.shown.
+            pieces = []
+            for char in part:
+                escaped = pc.shown(char, limit=1)[1:-1]
+                choices = {re.escape(char), re.escape(escaped)}
+                if escaped != char:
+                    choices.add(re.escape(escaped[:2] + escaped[2:].upper()))
+                if os.name == "nt" and escaped != char:
+                    for variant in (char.lower(), char.upper()):
+                        if len(variant) == 1:
+                            choices.add(re.escape(pc.shown(variant, limit=1)[1:-1]))
+                pieces.append(next(iter(choices)) if len(choices) == 1 else f"(?:{'|'.join(sorted(choices))})")
+            return "".join(pieces)
+
+        def normalized_part(part):
+            forms = {unicodedata.normalize(form, part) for form in ("NFC", "NFD")}
+            options = sorted(shown_or_raw(form) for form in forms)
+            return options[0] if len(options) == 1 else f"(?:{'|'.join(options)})"
+
+        pattern = r"(?:[\\/]|\\u005[cC])+".join(normalized_part(part) for part in parts)
+        name = f"path{len(patterns)}"
+        patterns.append(fr"(?P<{name}>{pattern})(?![\w-]|\.[\w-]|\\u(?:005[fF]|007[eE]))")
+        replacements[name] = replacement
+    if isinstance(project_id, str) and project_id:
+        patterns.append(fr"(?P<project_id>{re.escape(project_id)})")
+        replacements["project_id"] = "<project_id>"
+    if not patterns:
+        return value
+    def replace(match):
+        # Encoded letters, digits and combining marks can continue a sibling folder name;
+        # punctuation and symbols can also end a path, so hide the ambiguous prefix.
+        if match.lastgroup != "project_id":
+            tail = value[match.end():match.end() + 10]
+            escaped = re.match(r"\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))", tail)
+            if escaped:
+                code = int(escaped.group(1) or escaped.group(2), 16)
+                if 0x80 <= code <= 0x10ffff and unicodedata.category(chr(code))[0] in "LMN":
+                    return match.group()
+        return replacements[match.lastgroup]
+
+    return re.sub("|".join(patterns), replace, value, flags=re.IGNORECASE if os.name == "nt" else 0)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _get_store(args)
     payload = _gather_status(store)
+    show_personal = getattr(args, "show_personal", False)
+    root, project_id = payload.get("root"), payload.get("project_id")
+    if not show_personal:
+        payload.pop("root", None)
+        payload.pop("project_id", None)
+        if isinstance(payload.get("hmac_key"), dict):
+            payload["hmac_key"].pop("path", None)
+        if isinstance(payload.get("powershell_host"), dict):
+            host = payload["powershell_host"]
+            payload["powershell_host"] = {key: value for key, value in host.items()
+                                          if key in {"status", "edition", "version", "age_seconds", "warning"}}
     if args.json:
+        if not show_personal:
+            groups: dict[str, list[str]] = {}
+            for row in payload["agents"]:
+                account = row.get("capacity", {}).get("account")
+                if _groupable_capacity_account(account):
+                    groups.setdefault(account, []).append(row["name"])
+            for row in payload["agents"]:
+                if "capacity" in row:
+                    account = row["capacity"].pop("account", None)
+                    if _groupable_capacity_account(account):
+                        row["capacity"]["account_group"] = sorted(groups[account])
+        if not show_personal:
+            payload = _status_redact_home(payload, root=root, project_id=project_id)
         print(json.dumps(payload, indent=2))
         return 0
-    print(f"root:       {payload['root']}")
+    if not show_personal:
+        payload = _status_redact_home(payload, root=root, project_id=project_id)
+    root = payload.get("root", "(hidden; add --show-personal to show the project folder)")
+    print(f"root:       {root}")
     print(f"session_id: {payload['session_id']}")
     print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
     print(f"messages:   {payload['message_count']}")
     print(f"operator:   {payload.get('operator_questions_pending', 0)} operator question(s) pending")
     if "powershell_host" in payload:
         host = payload["powershell_host"]
-        print(
-            "powershell: "
-            f"{host.get('status', 'unknown').upper()} "
-            f"{host.get('path', 'unavailable')}"
-        )
+        host_path = host.get("path", "unavailable") if show_personal else "(path hidden; add --show-personal)"
+        print(f"powershell: {host.get('status', 'unknown').upper()} {host_path}")
         if host.get("warning"):
             print(f"  warning:  {host['warning']}")
     if payload["signing_enforced"]:
         hk = payload.get("hmac_key") or {}
         status_label = "OK" if hk.get("exists") and hk.get("readable") and not hk.get("mode_warning") else "PROBLEM"
-        print(f"hmac:       enforced · key {status_label} ({hk.get('path', '?')})")
+        key_path = hk.get("path", "?") if show_personal else "path hidden; add --show-personal to show it"
+        print(f"hmac:       enforced · key {status_label} ({key_path})")
         if hk.get("mode_warning"):
             print(f"  warning:  {hk['mode_warning']}")
         if hk.get("in_project_dir"):
@@ -1803,7 +1915,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if legacy_flag is not None:
             print(f"            legacy require_signatures = {legacy_flag}")
         if legacy_pid is not None:
-            print(f"            legacy project_id = {legacy_pid}")
+            legacy_value = legacy_pid if show_personal else "(hidden; add --show-personal)"
+            print(f"            legacy project_id = {legacy_value}")
     if payload["invalid_messages"]:
         n = len(payload["invalid_messages"])
         print(f"INVALID:    {n} message{'s' if n != 1 else ''} failed schema/roster validation "
@@ -3177,8 +3290,9 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     """Run a narrowly allowlisted mutating git command.
 
     This is intentionally separate from `_git`: callers must opt into mutating git,
-    every positional path/ref remains an argv element, and timeouts kill+reap before
-    returning so a lane is never persisted after an unknown write state.
+    every positional path/ref remains an argv element. On Windows, a timeout attempts
+    to kill the launcher and warn: the programs Git started are not stopped and may still
+    be running, and a partial checkout or lock may still need recovery.
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
@@ -3242,6 +3356,164 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
+        _raise_git_write_timeout(proc, timeout, e)  # looks after its own interruptions
+    except Exception:  # an ordinary error before any timeout: no interruption is in flight, so a new one wins
+        try:
+            _kill_and_reap(proc, interruptible=True)
+        except BaseException:
+            _kill_and_reap(proc)
+            raise
+        raise
+    except BaseException:
+        _kill_and_reap(proc)
+        raise
+    return proc.returncode, out or "", err or ""
+
+
+_GIT_STILL_RUNNING = (
+    " Git or a program it started may still be running; wait for it to finish before retrying or cleaning up."
+)
+
+
+def _best_effort(step) -> None:
+    """Run one cleanup step. Nothing it raises, a second Ctrl-C or SystemExit included, is passed on: the caller is
+    already handling an interruption and that original one is the one that should be raised. See `_run_swallowing`
+    and `_sigint_deferred` for the limits."""
+    try:
+        step()
+    except BaseException:  # noqa: BLE001, S110  # nosec B110
+        pass
+
+
+def _best_effort_interruptible(step) -> None:
+    """Like `_best_effort`, but only an ordinary error is swallowed: an interruption (KeyboardInterrupt or SystemExit)
+    escapes at once, so a Ctrl-C is not lost while no other interruption is being handled."""
+    try:
+        step()
+    except Exception:  # noqa: BLE001, S110  # nosec B110
+        pass
+
+
+@contextlib.contextmanager
+def _sigint_deferred():
+    """While the cleanup of an interruption already being handled runs, a new Ctrl-C is taken by a temporary handler
+    and dropped: the first interruption is the one being raised, and a second must not replace it or cut the bounded
+    cleanup short. The previous handler is read before anything is installed and put back in a finally.
+
+    Limits, plainly: a main-thread OS Ctrl-C is suppressed while the temporary handler is installed. Installation
+    failures still let cleanup continue; a partly installed handler can stay active until restoration. Python can
+    only change handlers on the main thread, so nothing is deferred elsewhere (a Ctrl-C is only delivered to the
+    main thread anyway). Entry, exit and handler transitions are not an arbitrary-exception guarantee."""
+    import signal
+
+    previous = signal.getsignal(signal.SIGINT)
+    try:
+        try:
+            signal.signal(signal.SIGINT, lambda signum, frame: None)
+        except BaseException:  # noqa: BLE001, S110  # nosec B110
+            # Not the main thread, the install failed, or it was itself interrupted: the cleanup still continues (a
+            # partly installed handler can stay active until the finally restores the previous one), and the original
+            # interruption is still the one raised by the caller.
+            pass
+        yield
+    finally:
+        if signal.getsignal(signal.SIGINT) is not previous:  # also covers an install that failed after it took effect
+            signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
+
+
+def _run_swallowing(steps) -> None:
+    """Run the cleanup steps through one guarded dispatcher, so that an exception raised between two of them (outside
+    the steps' own guards) does not replace the interruption being handled.
+
+    All of the loop control (the condition, the choice of the step, the call) is inside one try. A step is marked as
+    started by its own first action, inside `_best_effort`; a step that was not started is run on the next pass and
+    one that was started is not run again. Steps are safe to repeat (a kill, a reap and a wait can all be asked
+    twice). The passes are limited.
+
+    Limits, plainly: one-off failures in the guarded dispatcher are retried while the budget permits. Arbitrary
+    injected exceptions at step marking or entry can leave an operation unattempted; recurring dispatcher failures
+    can exhaust the budget; faults that stop the counter or limit check progressing can defeat that bound. Entry,
+    exit and handler transitions are not an arbitrary-exception guarantee: the few lines that set the loop up, the
+    `try` that starts a pass and the `return` that ends it are outside any guard, and Python offers no way to guard
+    them."""
+    started, passes = set(), 0
+    while True:
+        try:
+            passes += 1
+            if passes > 2 * len(steps) + 2:
+                return
+            for position, step in enumerate(steps):
+                if position not in started:
+                    _best_effort(_marking(started, position, step))
+            return
+        except BaseException:  # noqa: BLE001, S110  # nosec B110
+            pass
+
+
+def _marking(started, position, step):
+    def run() -> None:
+        started.add(position)
+        step()
+
+    return run
+
+
+def _kill_and_reap(proc, *, interruptible: bool = False) -> None:
+    """Try to kill the launcher and reap it. Every step is its own best effort; no ordinary error escapes.
+
+    A failing poll never skips the kill, a failing kill never skips the reap, and a failing or
+    timed-out reap is followed by wait(), which does not touch the pipes. Each step is bounded.
+    Nothing here confirms that the launcher stopped: with a kill and a reap that keep failing it is left running.
+
+    While an interruption is already being handled (the default) a second Ctrl-C is swallowed so that the first one
+    is the one that is raised (see `_run_swallowing` and `_sigint_deferred` for the limits). With ``interruptible``
+    (the caller has no interruption in flight) an interruption that arrives during a step stops the cleanup at
+    once and propagates, so the caller can do its own bounded cleanup and raise it.
+    """
+    state = {"running": True, "reaped": False}  # running stays True when poll() fails: cannot tell, so act
+
+    def poll() -> None:
+        state["running"] = proc.poll() is None
+
+    def kill() -> None:
+        if state["running"]:
+            proc.kill()
+
+    def reap() -> None:
+        if state["running"]:
+            proc.communicate(timeout=5)
+            state["reaped"] = True
+
+    def wait() -> None:
+        # A hook or descendant holding the captured stdout/stderr pipe handles open can keep
+        # communicate() blocked past this retry even though the killed process is already
+        # dead - wait() does not touch the pipes at all, so it still completes once the
+        # process is actually gone. A second timeout leaves the launcher's reap unconfirmed.
+        if state["running"] and not state["reaped"]:
+            proc.wait(timeout=25)
+
+    steps = [poll, kill, reap, wait]
+    if interruptible:
+        for step in steps:
+            _best_effort_interruptible(step)
+    else:
+        with _sigint_deferred():
+            _run_swallowing(steps)
+
+
+def _raise_git_write_timeout(proc, timeout: float, timed_out: subprocess.TimeoutExpired):
+    """Stop a timed-out Git command and raise ``GitWriteError`` (never returns).
+
+    An attempt is made to kill the launcher (through Popen's own handle on Windows) and to reap it; neither is
+    confirmed. The programs Git started are NOT stopped, so on Windows the error always says they may still be
+    running. No program is launched here. The whole handling sits inside the interruption boundary: Ctrl-C anywhere
+    in it makes a best-effort attempt to kill and reap the launcher (it may not succeed), and the original
+    interruption is the one raised. Once the write has timed out, any ordinary error (an Exception) from the kill,
+    the reap or the wait is still the timeout: it becomes the same warned ``GitWriteError`` with the original
+    ``TimeoutExpired`` of the write as its cause (a timeout of the reap itself stays as its context), which the
+    lane assignment's timeout recovery is keyed on. Only a real interruption propagates as such.
+    """
+    try:
         # kill() can itself raise (PermissionError on Windows,
         # ProcessLookupError if the child already exited) - guarded so it
         # can never pre-empt the GitWriteError raised below.
@@ -3249,48 +3521,35 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
             proc.kill()
         try:
             out, err = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired as reap:
-            # A third exit from this function's timeout handling that used
-            # to raise immediately without ever calling wait() - a killed
-            # git could still go unreaped while this function returned
-            # (via raising), contradicting the docstring's own kill+REAP
-            # contract and leaving a lane mutation's lock state uncertain.
-            # Same fallback as the BaseException branch below: wait() does
-            # not touch the pipes, so it still completes once the process
-            # is actually gone.
+        except subprocess.TimeoutExpired:  # the reap's own timeout becomes the context of the error below
+            # A child can hold the pipes open after the launcher exits. wait()
+            # reaps the launcher without waiting for those pipes to close.
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=25)
             raise GitWriteError(
                 "mutating git timed out and could not be reaped; git/config lock may be stranded"
-            ) from reap
-        raise GitWriteError(
-            f"mutating git timed out after {timeout:g}s and was killed: {err or out or e}"
-        ) from e
-    except BaseException:
-        if proc.poll() is None:
-            # kill() can itself raise - unguarded, that secondary error
-            # would replace the owner BaseException being handled here and
-            # skip the reap fallback below entirely.
-            with contextlib.suppress(OSError):
-                proc.kill()
-            try:
-                proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                # A hook or descendant holding the captured stdout/stderr
-                # pipe handles open can keep communicate() blocked past
-                # this retry even though the killed process is already
-                # dead - wait() does not touch the pipes at all, so it
-                # still completes once the process is actually gone.
-                # This function's own contract (kill+REAP before
-                # returning, so a lane is never persisted after an
-                # unknown write state) applies on this path too, not
-                # just the routine-timeout branch above; silently
-                # swallowing a second TimeoutExpired here left the reap
-                # unconfirmed.
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=25)
+                + (_GIT_STILL_RUNNING if os.name == "nt" else "")
+            ) from timed_out  # the write's own timeout is the cause
+        result = f"mutating git timed out after {timeout:g}s"
+        if os.name != "nt":
+            result += " and was killed"
+        warning = _GIT_STILL_RUNNING if os.name == "nt" else ""
+        raise GitWriteError(f"{result}: {err or out or timed_out}" + warning) from timed_out
+    except GitWriteError:
         raise
-    return proc.returncode, out or "", err or ""
+    except Exception as failure:  # the kill, the reap or the wait failed after the timeout: still the timeout
+        try:
+            _kill_and_reap(proc, interruptible=True)  # no interruption is in flight: one that arrives now wins
+        except BaseException:
+            _kill_and_reap(proc)  # the same bounded best-effort cleanup as for any interruption, then re-raise it
+            raise
+        raise GitWriteError(
+            "mutating git timed out and could not be reaped; git/config lock may be stranded"
+            f" ({failure})" + (_GIT_STILL_RUNNING if os.name == "nt" else "")
+        ) from timed_out
+    except BaseException:
+        _kill_and_reap(proc)
+        raise
 
 
 def _resolve_revision(root, ref: str) -> tuple[str, str]:
@@ -13175,16 +13434,23 @@ def cmd_capacity(args: argparse.Namespace) -> int:
     # is shown under the account, newest first, never merged with another seat's.
     accounts: dict[str, list[str]] = {}
     for agent in sorted(caps):
-        accounts.setdefault(str(caps[agent].get("account") or ""), []).append(agent)
+        account = caps[agent].get("account")
+        if args.show_personal:
+            account = str(account or "")
+        elif not _groupable_capacity_account(account):
+            account = ""
+        accounts.setdefault(account, []).append(agent)
     kw = {"threshold": args.threshold, "reset_soon_min": args.reset_soon_min,
           "context_threshold": args.context_threshold}
     for account, agents in sorted(accounts.items()):
         indent = "  "
         if account:  # a file written before #301 names no account: rows stand alone
             provider, _, rest = account.partition(":")
-            user, _, home = rest.partition(":")
-            print(f"  {provider} account of OS user {user}{f' ({home})' if home else ''}, "
-                  f"{len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
+            label = f"{provider} account"
+            if args.show_personal:
+                user, _, home = rest.partition(":")
+                label += f" of OS user {user}{f' ({home})' if home else ''}"
+            print(f"  {label}, {len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
             indent = "    "
         ages = {a: capmod.age_seconds(str(capmod.newest_observed_at(caps[a]) or "")) for a in agents}
         for agent in sorted(agents, key=lambda a: float("inf") if ages[a] is None else ages[a]):
@@ -14654,8 +14920,9 @@ def _dead_letter_notifier(store, agent: str):
                     + "Inspect: " + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=ag, i=mid))
             if disposed:
                 body += ("  If it still makes sense to send it again (the requeue command refuses, and says why, "
-                         "when the message cannot be retried): "
-                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid))
+                         "when the message cannot be retried), requeue it once: "
+                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid)
+                         + ". To resend it deliberately when allowed, add --again --reason TEXT.")
             store.send(sender=agent, recipient=target, kind="question",
                        subject="dead-letter notice", body=body,
                        meta={"needs_operator": "true", "dead_letter": "true",
@@ -16724,7 +16991,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if raw is not None:
             try:
                 body = (json.loads(raw.decode("utf-8")) or {}).get("body", "")
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):  # RecursionError: nested too deeply (#874)
                 body = "<unreadable payload>"
         child_output_tail = (
             meta.get("child_output_tail")
@@ -16760,6 +17027,11 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
     if action == "requeue":
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):
             sys.stderr.write("agenttalk dead-letter requeue: --agent and --id are required.\n")
+            return 2
+        again = bool(getattr(args, "again", False))
+        reason = getattr(args, "reason", None)
+        if again and (not reason or not reason.strip()):
+            sys.stderr.write("agenttalk dead-letter requeue: --again needs a non-empty --reason.\n")
             return 2
         if not _is_listed_dead_letter(store, args.agent, args.id):   # F5 traversal/typo guard
             sys.stderr.write(
@@ -16825,13 +17097,16 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         rid = meta.get("request_id")
         # A live copy is a valid task or review request with this request id and recipient still in the
         # message store, even after it was answered or rescinded; dead-lettering or compaction removes it.
-        if rid and orig.get("kind") in _dl_tags.OPENERS and any(
-                m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
-                for m in store.valid_messages()):
+        live_copy = next((
+            m for m in store.valid_messages()
+            if m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
+        ), None) if rid and orig.get("kind") in _dl_tags.OPENERS else None
+        if live_copy is not None:
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {pc.line(orig.get('to'))} already has a live copy "
-                f"of request {pc.meta_text(rid)}; "
-                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n"
+                f"of request {pc.meta_text(rid)}; nothing was published. "
+                f"Existing copy: {pc.meta_text(live_copy.id)}. "
+                "Use the existing copy, or resend by hand with a new request id.\n"
             )
             return 2
         if not shape_ok:
@@ -16844,21 +17119,15 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             new = store.send(
                 **sendargs,
                 _refuse_live_request=True,
-                _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
+                _requeue_source=(args.agent, args.id),
+                _requeue_again=reason if again else None,
             )
         except PreparedMessageRefused as e:
-            if orig.get("kind") in _dl_tags.OPENERS:
-                route = _requeue_route(args, orig)
-            else:
-                template = "agenttalk dead-letter requeue --agent {agent} --id {id}"
-                values = {"agent": args.agent, "id": args.id}
-                if reopen_event is not None:
-                    template += " --force-resolved --from {actor} --reason {reason}"
-                    values.update(actor=reopen_event["actor"], reason=reopen_event["reason"])
-                route = (
-                    "After the reset has finished, retry the same dead letter to keep its original correlation:\n  "
-                    + pc.cmd(template, **values) + "."
-                )
+            note, command = _requeue_retry_command(store, args, reason, reopen_event)
+            route = (
+                "After the reset has finished, retry the same dead letter: run this command once in PowerShell "
+                "or a POSIX shell to keep the dead letter's original correlation.\n" + note + "  " + command
+            )
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {pc.line(str(e))} "
                 + route + "\n"
@@ -16877,17 +17146,27 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 if problem
                 else ""
             )
-            sys.stderr.write(
-                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
-                + (
-                    "Retry that copy instead: "
-                    + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=args.agent, i=retry)
-                    + "."
-                    if retry and not problem
-                    else attention + _requeue_route(args, orig)
-                )
-                + "\n"
-            )
+            if (orig.get("kind") not in _dl_tags.OPENERS
+                    and (e.again_allowed or isinstance(e, store_mod.RequeueStateDamaged))):
+                advice = "If the earlier requeue is why it was refused, pass --again --reason TEXT."
+            elif orig.get("kind") not in _dl_tags.OPENERS:
+                note, command = _requeue_retry_command(store, args, reason, reopen_event)
+                if isinstance(e, store_mod.RequeueStateReadError):
+                    record = pc.shown(
+                        str(store._requeue_state_path(args.agent, args.id)), pc.PATH_SHOWN_MAX_CHARACTERS,
+                        source="is the requeue record beside this dead letter in the store",
+                    )
+                    fix = f"Resolve the reported access problem first; the requeue record is {record}. "
+                else:
+                    fix = attention + "Resolve the refusal above first. "
+                advice = fix + "Then retry the same dead letter once:\n" + note + "  " + command
+            else:
+                if retry and not problem:
+                    note, command = _requeue_retry_command(store, args, reason, reopen_event, message_id=retry)
+                    advice = "Retry that copy instead:\n" + note + "  " + command
+                else:
+                    advice = attention + _requeue_route(args, orig)
+            sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))} {advice}\n")
             return 2
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))}\n")
@@ -16903,6 +17182,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 f"{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} again "
                 f"while the copy is in the store.\n"
             )
+        if again:
+            print(f"requeued again as {pc.meta_text(new.id)} after {pc.meta_text(new.meta['requeued_again_after'])}: "
+                  f"{pc.line(reason)}")
         print(f"requeued dead-letter {pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
@@ -16918,6 +17200,8 @@ def _requeue_payload(store: Store, raw: bytes) -> tuple[dict | None, str | None]
         Message.from_raw(orig)
     except (ValueError, UnicodeDecodeError) as e:
         return None, f"corrupt payload ({e})"
+    except RecursionError:  # nested too deeply to read: the same refusal (#874)
+        return None, "corrupt payload (nested too deeply)"
     if store.signing_enforced():
         try:
             project_id = store.project_id()
@@ -16974,6 +17258,39 @@ def _retry_problem(store: Store, agent: str, copy_id: str) -> str | None:
     except (ValueError, FileNotFoundError) as e:
         return str(e)
     return None
+
+
+def _requeue_retry_command(store, args, reason, reopen_event, *, message_id=None):
+    """Render a retry for the selected store; an override applies only to its original item."""
+    template = "agenttalk --root {root} dead-letter requeue --agent {agent} --id {id}"
+    values = {"root": str(store.root), "agent": args.agent, "id": message_id or args.id}
+    again = message_id is None and getattr(args, "again", False)
+    if message_id is not None:
+        reopen_event = None
+    if again:
+        template += " --again"
+    if reopen_event is not None:
+        template += " --force-resolved --from {actor}"
+        values["actor"] = reopen_event["actor"]
+    if reopen_event is not None or again:
+        retry_reason = reopen_event["reason"] if reopen_event is not None else reason
+        template += " --reason={reason}" if retry_reason.startswith("-") else " --reason {reason}"
+        values["reason"] = retry_reason
+    rendered = {}
+    unsafe = []
+    for name, value in values.items():
+        if pc.is_plain(value):
+            rendered[name] = value
+        elif (isinstance(value, str) and (name == "reason" or not value.startswith("-"))
+              and re.fullmatch(r"[A-Za-z0-9_./:\\ -]+", value)):
+            rendered[name] = shlex.quote(value)
+        else:
+            rendered[name] = f"<{name}>"
+            source = "is the resolved store folder named by --root" if name == "root" else pc.SUPPLIED_SOURCE
+            unsafe.append(f"<{name}> is {pc.shown(value, pc.PATH_SHOWN_MAX_CHARACTERS, source=source)}")
+    note = ("Not a ready command: " + ", ".join(unsafe) + "; replace the placeholders safely.\n"
+            if unsafe else "")
+    return note, template.format(**rendered)
 
 
 def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
@@ -18460,6 +18777,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("status", help="Show roster, message count, per-agent cursor + unread.")
     ps.add_argument("--json", action="store_true",
                     help="Emit structured JSON instead of human-readable text.")
+    ps.add_argument("--show-personal", action="store_true",
+                    help="Show personal paths, project ID, operating-system login name and folder fingerprint.")
     ps.set_defaults(func=cmd_status)
 
     pov = sub.add_parser(
@@ -20361,13 +20680,18 @@ def build_parser() -> argparse.ArgumentParser:
     dls.add_argument("--json", action="store_true")
     dls.set_defaults(func=cmd_dead_letter)
     dlr = dlsub.add_parser("requeue",
-                           help="Re-inject as a FRESH message (new id, own fresh attempt "
-                                "count); original evidence preserved. No cursor rewind.")
+                           description="Requeue any kind of dead letter once. Repeating it is refused unless "
+                                       "--again and a non-empty --reason are given. A live task or review request "
+                                       "with the same request ID still blocks requeue.",
+                           help="Requeue any dead-letter kind once as a fresh message; the original is preserved. "
+                                "Use --again --reason to send again; live task/review request copies still block.")
     dlr.add_argument("--agent", required=True)
     dlr.add_argument("--id", required=True, help="The dead-lettered message id.")
     dlr.add_argument("--force-resolved", dest="force_resolved", action="store_true",
                      help="Requeue an item that was RESOLVED (requires --reason).")
-    dlr.add_argument("--reason", help="Reason (required with --force-resolved).")
+    dlr.add_argument("--again", action="store_true", help="Send again intentionally; requires --reason and records it. "
+                     "A live task or review request with the same request id still blocks requeue.")
+    dlr.add_argument("--reason", help="Non-empty reason required with --force-resolved or --again.")
     dlr.add_argument("--from", dest="sender", help="Actor for the audit event.")
     dlr.set_defaults(func=cmd_dead_letter)
     dlres = dlsub.add_parser("resolve",
@@ -21144,6 +21468,8 @@ def build_parser() -> argparse.ArgumentParser:
     pcap.add_argument("mode", nargs="?", choices=["show", "refresh"], default="show",
                       help="show (default) the team's published budgets, or refresh (publish your own)")
     pcap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    pcap.add_argument("--show-personal", action="store_true",
+                      help="On show, print the operating-system login name and home-folder fingerprint")
     pcap.add_argument("--source", choices=["auto", "claude", "codex"], default="auto",
                       help="On refresh, which local source to read (default: auto-detect)")
     pcap.add_argument("--threshold", type=float, default=80.0,

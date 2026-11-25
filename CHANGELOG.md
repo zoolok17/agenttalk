@@ -35,6 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Status hides personal paths and project ID by default (#870).** `status --json`
+  omits `root`, `project_id` and `hmac_key.path`, so scripts reading those keys must
+  use `--show-personal` to recover them. Text marks them hidden. The option also
+  replaces the unreleased `--show-account` on status and capacity. Home and external
+  local app-data paths in status free text are replaced by placeholders by default.
+  The text `powershell:` line hides its path; JSON omits `powershell_host.path`,
+  `.identity`, `.project_id` and fields outside its allowlist. The project root outside
+  home and the project ID are replaced in free text as well.
+- **Capacity headings now omit account identifiers by default.** This makes routine
+  output safer to share. To see the operating-system login and home-folder fingerprint
+  as before, run `agenttalk capacity --show-personal`. The same protection now covers
+  `agenttalk status --json` (#867). A malformed account is not shown in the default capacity heading.
+- **Status JSON no longer exposes account text by default (#867).** Each capacity
+  reading with an account now has `account_group`, the sorted seats sharing it,
+  instead of `account`; a script reading `account` now finds the key missing. To keep the old account text, use `status --json
+  --show-personal`; to group seats, compare `account_group`. Budget readers need
+  no change. The store itself records the login, so review it before sharing it.
 - **Reopening a close now checks the revision against the checkout.** Git must
   resolve the requested revision and show it as HEAD, including when the close
   keeps its existing revision. A missing checkout, unavailable Git, unresolved
@@ -46,6 +63,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the close lock is taken, so a checkout moved in that gap is not caught.
   The close record also distinguishes unknown cleanliness from a checkout not
   shown clean, and the hold message no longer calls an unchecked checkout dirty.
+
+- **A Windows Git write timeout now always says that Git's own programs may still be running (#791).**
+  When a changing Git command runs past its time limit, agenttalk tries to stop the Git launcher and does
+  not stop the programs Git started (for example a content filter), so on Windows the error now always adds
+  that Git or a program it started may still be running and that you should wait before retrying or
+  cleaning up. It no longer says the command "was killed" on Windows, because at most the launcher was
+  stopped and even that is not confirmed. The same warned timeout error is raised when stopping or
+  collecting the launcher itself fails after the timeout (for example a broken pipe), so lane setup still
+  recognises the timeout and keeps its checkout. No program (such as `taskkill.exe`) is launched while this
+  is handled. Pressing Ctrl-C at any point during the timeout handling now makes a best-effort attempt to
+  kill and reap the launcher, step by step (it may not succeed if the kill and the reap keep failing), and
+  raises the original interruption; a failing clean-up step or a second Ctrl-C from the keyboard is not
+  meant to replace it (best effort, with limits stated in the code); this stronger clean-up applies on
+  every platform, while the timeout message itself is unchanged outside Windows. A partial checkout or lock may still need recovery. Stopping the programs Git started, by making
+  them members of a job that ends with the launcher, is a planned follow-up (#907).
+
 - **The release checklist now names the README as the only install pin.** Since the user manuals
   stopped carrying their own install line (#835), step 1 of the release ritual in
   `docs/ROLES-SKILLS-PROCEDURES.md` still said to update one in the new user manual, which a test now
@@ -67,6 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do not add up to the whole suite, or when the two wheel pieces tested different wheels. Linux
   and macOS are unchanged.
   `agenttalk dev-gate --ci-leg windows/<python> --part <part>` runs one piece.
+- **macOS test jobs in CI may now run for 120 minutes instead of 90 (#378).** On 23 November
+  2026, eight macOS jobs on master and three pull requests were stopped at the 90-minute limit
+  without a failing test, while passing macOS jobs took 81 to 89 minutes; these stops caused
+  repeated reruns and held merges. The test run's own limit inside the job (7,200 seconds) is
+  unchanged, and Linux keeps 90 minutes.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
@@ -102,6 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Three journal tests now allow a slow writer to finish before checking its events, and check the close ended cleanly (#906).
+
 - **Close checks no longer report hidden submodule work as clean (#796).**
   Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.
 
@@ -117,6 +157,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Opening a close no longer records a checkout as clean when Git cannot check it (#862).**
   Teams whose store is outside a Git checkout will see ordinary closes hold until they record a diff artifact.
+
+- **A dead letter can no longer be requeued twice by accident (#891).** Previously, rerunning the command for a message, review result or other reply, rescind, end, or task or review request without a request ID exited 0 and sent another copy; now a repeat for every kind exits 2 and names the first copy. When that copy is still found, the refusal says the dead letter was “already requeued as” the copy and says where it is. When the record says the copy was published but it is no longer found, the refusal names the record and copy, says it “was published,” and says the copy is no longer in the places the store keeps; this also exits 2. An incomplete claim from an earlier store session has different wording. A live task or review request with the same request ID, or an unreadable record, also causes exit 2. Scripts should account for these forms rather than matching only “already requeued.” To send deliberately again, pass `--again --reason TEXT`; the reason is recorded. A task or review request with a live copy of the same request ID remains blocked even with `--again`. An older non-opener dead letter, or a dead letter of any kind with no request ID, requeued before this change has no record, so its next requeue is accepted once before later repeats are refused. Scripts that deliberately repeat the command need the new flags.
+
+  An interrupted deliberate repeat keeps its earlier copy and reason in the requeue record, so a plain retry is refused when an earlier copy exists. Older versions ignore these optional record fields and cannot provide that protection. Retry advice after a reset keeps `--again` and its reason. Printed retry commands name the store with `--root`, even if the original command did not; refusal advice puts the command on its own indented line without a trailing full stop. A retry suggested for a different copy does not carry the original item's override.
 
 - **Three first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
   line for every seat; now it names the seat and the change, for example "roster: worker model vendor
@@ -161,6 +205,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   period right before a closing quote or bracket now ends it. A Windows drive path, including
   the drive-relative kind like `<drive>:file`, no longer counts as the end of a sentence part.
   The bundled skills are unchanged: the check gives the same answer for all of them.
+
+- **One message file nested too deeply no longer stops every command (#874).** A file in the message
+  folder holding JSON nested so deeply that Python cannot read it used to stop `status`, `doctor`,
+  `threads`, `drain`, `recv`, `send` and `prune --invalid`, the dashboard's message list, checkpoints and
+  the archive step with a Python error, so one damaged file stopped the whole team from talking. Now
+  such a file is treated like any other invalid message file: the good messages beside it are still
+  delivered, `send` works, and `status --json` lists it under `invalid_messages` with the reason
+  `invalid JSON: nested too deeply` (the same `invalid JSON` start as before, so the
+  `message_json_invalid` code is unchanged). `prune --invalid` moves it into the quarantine folder
+  like any invalid file; it never deletes. The same fix covers three more readers that had the same
+  weakness: `dead-letter show` (prints `<unreadable payload>`), `dead-letter requeue` (refuses, and
+  publishes nothing, for a damaged stored message, or for a damaged requeue record of a task, which an explicit
+  `--again --reason TEXT` replaces, a too-deep record included) and the note file that
+  `dead-letter list` reads beside a dead letter (the letter is still listed). No exit code and no
+  `--json` shape changes. Not changed here: the message scan has no file size limit
+  (checkpoints do), and a message that parses but has a deeply nested field is handled as before.
+
 - **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
   Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
   variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run
@@ -199,7 +260,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the submodule or record a truthful dirty artifact. Scratch release keeps its
   existing stricter rules.
 
-- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for dead-letter replies and control messages, retry the same requeue command to keep their original correlation.
+- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes; for any dead-letter kind, retry the same requeue command to keep its original correlation; the advice preserves an explicit store root and prints the command separately. A refused prepared send ends with these codes (already so since 0.105.0, now documented and tested): `send_rejected` for a web-intent send, and HTTP 409 `lead_chat_send_rejected` for a lead-chat send.
 
 - **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
   Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail

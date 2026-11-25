@@ -56,19 +56,19 @@ def test_unretryable_copy_advice_shows_the_stored_id_without_publishing(
 
     monkeypatch.setattr(Store, "send", refuse_send)
     monkeypatch.setattr(cli, "_retry_problem", lambda *args: "saved payload" + separator + "FORGED_REASON")
-    monkeypatch.setattr(cli, "_requeue_route", lambda *args: "Send fresh work by hand.")
     capsys.readouterr()
 
     assert _run(store.root, "dead-letter", "requeue", "--agent", "beta", "--id", original.id) == 2
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == (
+    assert captured.err.startswith(
         "agenttalk dead-letter requeue: previous copy needs attention; nothing was published. "
         f'The copy "copy{escaped}FORGED" cannot be retried as it is (saved payload{escaped}FORGED_REASON); '
-        "it needs attention. Send fresh work by hand.\n"
+        "it needs attention. Resolve the refusal above first. Then retry the same dead letter once:\n"
     )
-    assert separator not in captured.err.removesuffix("\n") and len(captured.err.splitlines()) == 1
+    assert f"dead-letter requeue --agent beta --id {original.id}" in captured.err
+    assert separator not in captured.err.splitlines()[0] and len(captured.err.splitlines()) == 2
     assert payload.read_bytes() == before_payload and list(store.valid_messages()) == before
 
 
