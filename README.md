@@ -182,6 +182,10 @@ $env:AGENTTALK_PY = (Resolve-Path .\agenttalk-env\Scripts\python.exe).Path
 & $env:AGENTTALK_PY -m agenttalk install-skills
 ```
 
+If Windows refuses to start `agenttalk.exe` or `pip.exe` (a security policy such as Device Guard can do
+this, with exit code 4551), keep using the `& $env:AGENTTALK_PY -m pip` and `& $env:AGENTTALK_PY -m agenttalk` forms shown here.
+Ask your assistant to use them too, instead of a plain `agenttalk`. If Python itself is refused, ask the machine's administrator.
+
 Linux and macOS (sh):
 
 On Debian or Ubuntu, install the venv package first: `sudo apt install python3-venv` (on Python 3.14 this brings `python3.14-venv`).
