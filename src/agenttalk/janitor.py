@@ -37,9 +37,11 @@ would over-match in the shared temp root - fnmatchcase is used instead).
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import fnmatch
+import ntpath
 import os
 import shutil
 import stat
@@ -148,6 +150,13 @@ class JanitorReport:
     access_errors: list[tuple[Path, str]]
     ancestor_ids: dict[Path, tuple[int, int] | None] | None = None
     apply_failed: bool = False
+    # Candidates that a lane, launch or supervisor record still names (or whose use could not be checked), with the
+    # reason. A preview only: `apply` reads the records again (#858).
+    in_use: dict[Path, str] = dataclasses.field(default_factory=dict)
+    # False when Git's strict listing of the checkouts failed while the report was made, so `registered_worktrees` is
+    # the best-effort reader's answer: it may hold wrong paths (a name with an accent or U+2028) or miss a checkout.
+    # No safety decision may rest on it: `apply` keeps every folder that is not a link, as not checked (#858).
+    registered_strict: bool = True
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -257,7 +266,7 @@ def _safe_iterdir(path: Path) -> tuple[list[Path], tuple[Path, str] | None]:
         return [], (path, _os_error_text(exc))
 
 
-def _run_git_checked(repo: Path, *args: str) -> tuple[int | None, str, str]:
+def _run_git_checked(repo: Path, *args: str, raw: bool = False) -> tuple[int | None, str, str]:
     """Run git, returning (returncode, stdout, stderr). returncode is
     `None` if git itself is unresolvable - callers that need to
     distinguish "genuinely nothing to report" from "could not even run
@@ -267,13 +276,14 @@ def _run_git_checked(repo: Path, *args: str) -> tuple[int | None, str, str]:
     post-commit clean confirmation) silently treated an unrunnable git
     the same as a successful, empty answer - the exact mechanism that let
     a live, dirty, untracked-file-holding worktree be removed with no
-    refusal printed anywhere."""
+    refusal printed anywhere. `raw=True` returns the bytes Git wrote (no decoding with the console's encoding, no
+    newline translation) for a caller that must keep paths exactly as Git wrote them."""
     git = shutil.which("git")
     if git is None:
         return None, "", "git is not resolvable"
     result = subprocess.run(  # nosec B603 - resolved executable, argv list
         [git, "-C", str(repo), *args],
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=not raw, check=False,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -291,31 +301,20 @@ def get_registered_worktrees(repo: Path) -> list[Path]:
     fails, the same as "no worktrees registered" to THIS function's own
     callers (a dirty-worktree count and doctor's outside-scratch-root
     warning, neither of which removes anything on the strength of this
-    result alone). Candidate discovery under `.worktrees/` does NOT use
-    this function for that reason - see `_worktrees_discovery_ok`."""
+    result alone). Candidate discovery does NOT use this function: it goes by
+    `_registered_worktrees_listed`, which is strict and tells a failure from "none". Under a store fence, Git's
+    registration files are fenced first (`_fence_registrations`); when that refuses or fails, Git is not asked and the
+    answer is `[]`, as for a failed listing."""
+    try:
+        _fence_registrations(repo)
+    except (store_mod.StoreFenceError, _UseCheckFailed):
+        return []
     _rc, out, _err = _run_git_checked(repo, "worktree", "list", "--porcelain")
     worktrees = []
     for line in out.splitlines():
         if line.startswith("worktree "):
             worktrees.append(Path(line[len("worktree "):]))
     return worktrees
-
-
-def _worktrees_discovery_ok(repo: Path) -> tuple[bool, str]:
-    """Whether candidate discovery under `.worktrees/` can trust git's
-    account of what is registered there. False means git is unresolvable,
-    or `worktree list` itself failed (a damaged `.git`, "detected dubious
-    ownership", etc.) - in either case candidate discovery must leave
-    EVERYTHING under `.worktrees/` alone rather than reading the failure
-    as "zero worktrees registered" and removing every directory there as
-    an ordinary, unregistered candidate with no WIP-commit-or-refuse gate
-    ever applied to it."""
-    rc, _out, err = _run_git_checked(repo, "worktree", "list", "--porcelain")
-    if rc is None:
-        return False, "git is not resolvable"
-    if rc != 0:
-        return False, f"git worktree list failed, rc={rc}: {err.strip()}"
-    return True, ""
 
 
 def _find_git_entries(root: Path) -> tuple[list[Path], bool]:
@@ -351,7 +350,7 @@ def _find_git_entries(root: Path) -> tuple[list[Path], bool]:
 def _tree_contains_git_entry(root: Path) -> bool:
     """True if `root`'s own tree contains a `.git` entry anywhere, OR a
     nested subdirectory could not be listed - see `_find_git_entries`.
-    Used when `_worktrees_discovery_ok` is False: git itself cannot be
+    Used when the strict list of checkouts could not be had: git itself cannot be
     trusted to say what is or isn't a worktree, so this is the fallback
     signal that a directory candidate might be (or contain) one, and must
     be refused rather than silently removed."""
@@ -471,7 +470,18 @@ def worktree_head_reachable(path: Path) -> bool:
     return bool(out.strip())
 
 
-def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Path, str]]]:
+def _strict_listing(repo: Path) -> tuple[list[Path] | None, str]:
+    """(the strict list of registered checkouts, "") or (None, why it could not be had or read reliably). One reading
+    for discovery and the report, so both decide on the same list; `apply` reads it again at the delete."""
+    try:
+        return _registered_worktrees_listed(repo), ""
+    except _UseCheckFailed as failed:
+        return None, getattr(failed, "why", str(failed))
+
+
+def find_candidates(
+    cfg: JanitorConfig, listing: tuple[list[Path] | None, str] | None = None
+) -> tuple[list[Candidate], list[tuple[Path, str]]]:
     _, ancestor_errors = _ancestor_ids(cfg)
     if ancestor_errors:
         return [], ancestor_errors
@@ -487,8 +497,12 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
     # shares one scratch root - Rule 1) or a standalone clone: git being
     # perfectly resolvable for cfg.repo says nothing about whether a
     # tree elsewhere under the shared root belongs to it.
-    discovery_ok, discovery_reason = _worktrees_discovery_ok(cfg.repo)
-    registered_worktrees = get_registered_worktrees(cfg.repo) if discovery_ok else []
+    # The list is the strict one (bytes, NUL boundaries), the same the report and the delete go by: the old text
+    # reader turns a name with an accent or U+2028 into a path that does not exist, and a separate clone sitting at
+    # that path would be taken for an owned checkout and removed as a plain folder. No strict list: nothing is trusted.
+    strict_list, discovery_reason = listing if listing is not None else _strict_listing(cfg.repo)
+    discovery_ok = strict_list is not None
+    registered_worktrees = strict_list if strict_list is not None else []
 
     def add(path: Path, reason: str) -> None:
         # NEVER path.resolve() - that follows symlinks (POSIX) and would
@@ -509,7 +523,7 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
         # there (another clone's worktree dropped in by hand, a
         # standalone clone, or this repo's OWN worktree whose
         # `.git/worktrees/<name>` admin entry was separately lost) is
-        # exactly as invisible to `get_registered_worktrees` as one
+        # exactly as invisible to the list of registered checkouts as one
         # found anywhere else, and the dirty/refuse gate in apply() only
         # ever runs for entries git DOES still recognize as registered.
         if not is_link_like(path) and path.is_dir():
@@ -731,22 +745,84 @@ def find_foreign_kept(cfg: JanitorConfig) -> list[Path]:
     ]
 
 
-def build_report(cfg: JanitorConfig) -> JanitorReport:
+def build_report(cfg: JanitorConfig, listing: tuple[list[Path] | None, str] | None = None) -> JanitorReport:
+    """`listing` is a strict listing that was already read (and, under a store fence, fenced): the probes below then go
+    to exactly the paths that were checked, not to a second reading that could differ."""
     ancestor_ids, ancestor_errors = _ancestor_ids(cfg)
     if ancestor_errors:
         return JanitorReport([], [], [], [], ancestor_errors)
-    candidates, access_errors = find_candidates(cfg)
-    registered = get_registered_worktrees(cfg.repo)
+    if listing is None:
+        listing = _strict_listing(cfg.repo)  # the same reading as the comparison at the delete, and as discovery's
+    candidates, access_errors = find_candidates(cfg, listing)
+    strict = listing[0] is not None
+    # When it failed: best effort, for the counts and the preview only. Discovery has refused what it cannot trust, and
+    # the old reader turns a name with an accent or U+2028 into a path that does not exist. `apply` decides nothing
+    # on it.
+    # Under a store fence, only a strict list is probed: the old reader's paths were never the ones the fence checked.
+    may_probe = strict or not os.environ.get(store_mod.STORE_FENCE_ENV)
+    # Under a fence the old reader is not asked either: the strict list failed, and Git's listing looks at every
+    # registration, so the report counts none (it says the list could not be read).
+    registered = listing[0] if strict else (get_registered_worktrees(cfg.repo) if may_probe else [])
     dirty = [
         w for w in registered
-        if not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
+        if may_probe and not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
     ]
     foreign = find_foreign_kept(cfg)
+    in_use = {}
+    for c in candidates:
+        targets = [] if c.link else _checkouts_under(c, registered, cfg)
+        if targets:
+            reason = _in_use_reason(cfg, targets)
+            if reason is not None:
+                in_use[c.path] = reason
     return JanitorReport(
         candidates=candidates, registered_worktrees=registered,
         dirty_worktrees=dirty, foreign_kept=foreign, access_errors=access_errors,
         ancestor_ids=ancestor_ids,
+        in_use=in_use, registered_strict=strict,
     )
+
+
+_IN_USE_NEXT_STEP = (
+    "; leave it until what uses it has finished (or the record that names it is retired), then run the sweep again"
+)
+
+
+def _in_use_text(exc: Exception) -> str:
+    """A refusal because something uses the checkout, with what to do next."""
+    return str(exc) + _IN_USE_NEXT_STEP
+
+
+class _UseCheckFailed(Exception):
+    """Whether anything is using a checkout could not be established (as opposed to: something is). `fence` is set
+    when the cause was a refusal by the store fence: the sweep then stops (nothing more touches Git or the disk)."""
+
+    fence = False
+
+
+def _checkouts_under(c: Candidate, registered: list[Path], cfg: JanitorConfig) -> list[Path]:
+    """The registered checkouts that removing `c` would remove, the main repository left out (it is never removed)."""
+    return [w for w in registered if w.exists() and _contains_worktree(c.path, w) and not _same_worktree(w, cfg.repo)]
+
+
+def _in_use_reason(cfg: JanitorConfig, targets: list[Path]) -> str | None:
+    """Why these checkouts must be kept because something uses them, or None. The same rules a release applies
+    (`worktree_release`: active, pending and launch records, retained occupancy) and the same strict reading of the
+    paths those records name; nothing is changed. A record that cannot be read or placed keeps them too (the reason says
+    so), never read as idle. A listing: it takes no claim, so `apply` checks again."""
+    from . import worktree_release  # imported here: that module imports this one
+
+    try:
+        worktree_release.check_unused(cfg, targets)
+    except worktree_release.Refused as exc:
+        return _in_use_text(exc)
+    except (OSError, ValueError, TypeError) as exc:
+        return _use_check_failure(exc)
+    return None
+
+
+def _use_check_failure(exc: Exception) -> str:
+    return f"could not check whether anything is using it: {_os_error_text(exc) if isinstance(exc, OSError) else exc}"
 
 
 def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> str:
@@ -757,6 +833,9 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
         f"registered worktrees: {len(report.registered_worktrees)}",
         f"dirty registered worktrees: {len(report.dirty_worktrees)}",
     ]
+    if not report.registered_strict:
+        lines.append("Git could not list the registered checkouts reliably, so the counts above may be wrong and "
+                     "`--apply` keeps every folder as not checked: fix Git for this repository, then run it again.")
     if report.dirty_worktrees:
         lines.append(
             "DIRTY includes checkouts that could not be fully checked; hidden tracked files are kept for inspection."
@@ -773,9 +852,16 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
         oldest = sorted(report.candidates, key=lambda c: c.mtime)[:15]
         for c in oldest:
             when = datetime.datetime.fromtimestamp(c.mtime).strftime("%Y-%m-%d")
-            lines.append(f"  {when} {c.path}")
-        if len(report.candidates) > 15:
-            lines.append(f"  ... and {len(report.candidates) - 15} more")
+            if c.path in report.in_use:
+                lines.append(f"  REFUSED (kept) {c.path}: {report.in_use[c.path]}")
+            else:
+                lines.append(f"  {when} {c.path}")
+        # A kept checkout is never left to "and N more": every refusal is listed, whatever the display limit.
+        later = [c for c in sorted(report.candidates, key=lambda c: c.mtime)[15:] if c.path in report.in_use]
+        for c in later:
+            lines.append(f"  REFUSED (kept) {c.path}: {report.in_use[c.path]}")
+        if len(report.candidates) > 15 + len(later):
+            lines.append(f"  ... and {len(report.candidates) - 15 - len(later)} more")
         lines.append("re-run with --apply to preserve dirty removal candidates as WIP commits, "
                       "delete, and prune.")
     return "\n".join(store_mod.report_line(line) for line in lines)
@@ -1088,104 +1174,201 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         return refuse_ancestry(reason)
     summary: dict[str, int] = {}
     failed: list[tuple[Path, str]] = []
-    for c in report.candidates:
-        reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
-        if reason is not None:
-            result = "FAILED"
-        else:
-            # Complete all keep checks for this candidate before any WIP commit.
-            # Link candidates are only unlinked, never entered or committed.
-            worktrees = []
-            try:
-                if not c.link:
-                    worktrees = [w for w in report.registered_worktrees
-                                 if w.exists() and _contains_worktree(c.path, w)]
-                keep = None
-                for w in report.registered_worktrees:
-                    if (not c.link and w.exists() and not _same_worktree(w, cfg.repo)
-                            and not _same_worktree(w, c.path) and _contains_worktree(w, c.path)):
-                        keep = "candidate is inside a registered worktree; keep it until the whole worktree is removed"
-                        break
-                for w in worktrees:
-                    if keep:
-                        break
-                    if _same_worktree(w, cfg.repo):
-                        keep = "the main repository is never committed or removed"
-                        break
-                    keep = index_safety.keep_reason(w) or ignored_worktree_keep_reason(w)
-                    if keep:
-                        break
-                    branch = worktree_branch(w)
-                    unsafe_branch = (branch in cfg.default_branches
-                                     or branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS)
-                    if unsafe_branch and is_dirty_worktree(w):
-                        keep = "dirty worktree on a default branch or detached HEAD"
-                        break
-                    if (branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS
-                            and not worktree_head_reachable(w)):
-                        keep = "detached worktree with unreachable HEAD (would be lost on prune)"
-                        break
-                if keep:
-                    lines.append(f"  REFUSED (kept) {c.path}: {keep}")
-                    guidance = _visibility_guidance(w, keep)
-                    if guidance:
-                        lines.append(guidance)
-                    summary["refused"] = summary.get("refused", 0) + 1
-                    continue
-            except (OSError, RuntimeError) as exc:
-                reason = f"could not check worktree identity: {exc}"
+    not_checked: list[tuple[Path, str]] = []  # kept because nothing could show whether anything uses them
+    from . import worktree_release  # imported here: that module imports this one
 
-            refused = False
-            for w in worktrees:
-                if reason:
-                    break
-                reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
-                if reason:
-                    break
-                if is_dirty_worktree(w):
-                    commit = wip_commit_dirty_worktree(w, default_branches=cfg.default_branches)
-                    lines.append(commit.message)
-                    if commit.refused:
-                        refused = True
-                        break
-            if refused:
-                summary["refused"] = summary.get("refused", 0) + 1
-                continue
-            if reason is None:
-                reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
-            if reason is None:
-                keep = None
-                for w in worktrees:
-                    keep = index_safety.keep_reason(w)
-                    if keep:
-                        break
-                if keep:
-                    lines.append(f"  REFUSED (kept) {c.path}: {keep}")
-                    guidance = _visibility_guidance(w, keep)
-                    if guidance:
-                        lines.append(guidance)
-                    summary["refused"] = summary.get("refused", 0) + 1
-                    continue
-            if reason is None:
-                # The read-only Git probes above may take time; retain the identity
-                # check immediately before the existing filesystem removal.
-                reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+    held = contextlib.ExitStack()  # the occupancy claims of the candidate being processed
+    fence_stop: str | None = None  # set when the store fence refused something after the preflight: the sweep stops
+    try:
+        for index, c in enumerate(report.candidates):
+            held.close()  # the previous candidate's claims
+            guard = None
+            # Not checked unless the checks completed and the delete itself ran: an identity or ancestry failure at any
+            # point leaves what is at the path unestablished, and the report must not advise removing it by hand.
+            unchecked = True
+            reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+            if reason is None and not c.link and not report.registered_strict:
+                # The report's list of checkouts is the best-effort reader's: it can name a checkout by a path that
+                # does not exist, so neither the ancestor protection nor the lookup of checkouts under a candidate
+                # could be trusted. Nothing is decided on it, in either direction of containment.
+                reason = str(_listing_failure("the listing the report was made from failed or could not be read"))
             if reason is not None:
                 result = "FAILED"
             else:
-                result, reason = remove_plainly(c.path)
-        summary[result] = summary.get(result, 0) + 1
-        if result == "FAILED":
-            report.apply_failed = True
-            failed.append((c.path, reason or "unknown"))
+                # Complete all keep checks for this candidate before any WIP commit.
+                # Link candidates are only unlinked, never entered or committed.
+                worktrees = []
+                try:
+                    if not c.link:
+                        worktrees = [w for w in report.registered_worktrees
+                                     if w.exists() and _contains_worktree(c.path, w)]
+                    keep = None
+                    for w in report.registered_worktrees:
+                        if (not c.link and w.exists() and not _same_worktree(w, cfg.repo)
+                                and not _same_worktree(w, c.path) and _contains_worktree(w, c.path)):
+                            keep = (
+                                "candidate is inside a registered worktree; keep it until the whole worktree is removed"
+                            )
+                            break
+                    # Before any work-in-progress commit: is something using a checkout that removing this would
+                    # remove? The same rules a release applies, with the lanes' occupancy claims kept until the
+                    # candidate is done (#858). All of them are resolved first, so a parent of several checkouts is
+                    # kept whole when any one is in use or cannot be checked.
+                    in_use = [w for w in worktrees if not _same_worktree(w, cfg.repo)]
+                    if in_use and not keep:
+                        try:
+                            guard = worktree_release.RemovalGuard(cfg, in_use, closed_window=True)
+                            held.enter_context(guard)
+                        except (worktree_release.FenceRefused, store_mod.StoreFenceError) as exc:
+                            # The fence refused a path (a record's, translated, or the fence's own error): not an
+                            # ordinary kept checkout. The sweep stops after this one.
+                            failure = _UseCheckFailed(_use_check_failure(exc))
+                            failure.fence = True
+                            raise failure from exc
+                        except worktree_release.Refused as exc:
+                            keep = _in_use_text(exc)
+                        except (OSError, ValueError, TypeError) as exc:
+                            raise _UseCheckFailed(_use_check_failure(exc)) from exc
+                    for w in worktrees:
+                        if keep:
+                            break
+                        if _same_worktree(w, cfg.repo):
+                            keep = "the main repository is never committed or removed"
+                            break
+                        keep = index_safety.keep_reason(w) or ignored_worktree_keep_reason(w)
+                        if keep:
+                            break
+                        branch = worktree_branch(w)
+                        unsafe_branch = (branch in cfg.default_branches
+                                         or branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS)
+                        if unsafe_branch and is_dirty_worktree(w):
+                            keep = "dirty worktree on a default branch or detached HEAD"
+                            break
+                        if (branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS
+                                and not worktree_head_reachable(w)):
+                            keep = "detached worktree with unreachable HEAD (would be lost on prune)"
+                            break
+                    if keep:
+                        lines.append(f"  REFUSED (kept) {c.path}: {keep}")
+                        guidance = _visibility_guidance(w, keep)
+                        if guidance:
+                            lines.append(guidance)
+                        summary["refused"] = summary.get("refused", 0) + 1
+                        continue
+                except _UseCheckFailed as exc:
+                    reason = str(exc)
+                    if exc.fence:
+                        fence_stop = reason
+                except (OSError, RuntimeError) as exc:
+                    reason = f"could not check worktree identity: {exc}"
 
-    reason = _ancestor_change_reason(report.ancestor_ids)
-    if reason is None:
-        _run_git(cfg.repo, "worktree", "prune")
-        lines.append(f"registered worktrees after prune: {len(get_registered_worktrees(cfg.repo))}")
-    else:
+                refused = False
+                for w in worktrees:
+                    if reason:
+                        break
+                    reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+                    if reason:
+                        break
+                    if is_dirty_worktree(w):
+                        commit = wip_commit_dirty_worktree(w, default_branches=cfg.default_branches)
+                        lines.append(commit.message)
+                        if commit.refused:
+                            refused = True
+                            break
+                if refused:
+                    summary["refused"] = summary.get("refused", 0) + 1
+                    continue
+                if reason is None:
+                    reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+                if reason is None:
+                    keep = None
+                    for w in worktrees:
+                        keep = index_safety.keep_reason(w)
+                        if keep:
+                            break
+                    if keep:
+                        lines.append(f"  REFUSED (kept) {c.path}: {keep}")
+                        guidance = _visibility_guidance(w, keep)
+                        if guidance:
+                            lines.append(guidance)
+                        summary["refused"] = summary.get("refused", 0) + 1
+                        continue
+                if reason is None:
+                    # The read-only Git probes above may take time; retain the identity
+                    # check immediately before the existing filesystem removal.
+                    reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+                if reason is not None:
+                    result = "FAILED"
+                else:
+                    keep = None
+                    try:
+                        # The last look, made at the removal: every record again under the lane writers' lock, and
+                        # the set of checkouts that this removal takes with it.
+                        with guard.final_window() if guard else contextlib.nullcontext():
+                            keep = _checkouts_changed(c, worktrees, cfg)
+                            if keep is None and guard:
+                                guard.reread()  # the very last look, after the comparison above
+                            if keep is None:
+                                result, reason = remove_plainly(c.path)
+                                unchecked = False  # every check completed; a failure now is the delete's own
+                    except (worktree_release.FenceRefused, store_mod.StoreFenceError) as exc:
+                        # The fence refused a path after the preflight (a checkout registered outside the fence in the
+                        # meantime, or a record path that leads outside): nothing after this touches Git or the disk
+                        # (no further candidate, no prune). A `Refused` that is only "in use" is handled below.
+                        result, reason, unchecked = "FAILED", _use_check_failure(exc), True
+                        fence_stop = reason
+                    except worktree_release.Refused as exc:
+                        keep = _in_use_text(exc)
+                    except _UseCheckFailed as exc:
+                        result, reason, unchecked = "FAILED", str(exc), True
+                        if exc.fence:
+                            fence_stop = reason
+                    except (OSError, ValueError, TypeError) as exc:
+                        result, reason, unchecked = "FAILED", _use_check_failure(exc), True
+                    if keep:
+                        lines.append(f"  REFUSED (kept) {c.path}: {keep}")
+                        summary["refused"] = summary.get("refused", 0) + 1
+                        continue
+            summary[result] = summary.get(result, 0) + 1
+            if result == "FAILED":
+                report.apply_failed = True
+                (not_checked if unchecked else failed).append((c.path, reason or "unknown"))
+            if fence_stop is not None:
+                for later in report.candidates[index + 1:]:
+                    summary["FAILED"] = summary.get("FAILED", 0) + 1
+                    not_checked.append((later.path, "not looked at: the sweep stopped, the store fence refused a path"))
+                break
+
+    finally:
+        held.close()
+
+    prune_blocked = None
+    if fence_stop is None:
+        # Git's prune reads every registration and looks at the path each names, one made after the preflight too (a
+        # kept checkout whose record path was refused from its text can be registered meanwhile): the registrations
+        # prune will read are fenced, as written, before it runs, whichever way the sweep came here.
+        try:
+            _fence_registrations(cfg.repo)
+        except store_mod.StoreFenceError as exc:
+            fence_stop = _use_check_failure(exc)
+        except _UseCheckFailed as exc:
+            prune_blocked = str(exc)
+    if fence_stop is not None:
+        # Git's prune (and the listing after it) would read every registration, the one outside the fence too.
         report.apply_failed = True
-        lines.append(f"FAILED: worktree prune skipped: {reason}")
+        lines.append(
+            f"FAILED: worktree prune skipped, and the sweep stopped: the store fence refused a path ({fence_stop})")
+    elif prune_blocked is not None:
+        report.apply_failed = True
+        lines.append(f"FAILED: worktree prune skipped: {prune_blocked}")
+    else:
+        reason = _ancestor_change_reason(report.ancestor_ids)
+        if reason is None:
+            _run_git(cfg.repo, "worktree", "prune")
+            lines.append(f"registered worktrees after prune: {len(get_registered_worktrees(cfg.repo))}")
+        else:
+            report.apply_failed = True
+            lines.append(f"FAILED: worktree prune skipped: {reason}")
 
     lines.append("removed summary:")
     for key, count in summary.items():
@@ -1195,4 +1378,172 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                      "Look at each one, then remove it yourself:")
         for path, reason in failed:
             lines.append(f"  {_scanned_root_relative(path, cfg)}: {reason}")
+    if not_checked:
+        # Never "remove it yourself": a folder whose checkout status could not be established may hold a live
+        # checkout, and removing it by hand skips the very check that could not be made.
+        lines.append(f"FAILED ({len(not_checked)}) - kept, not removed, and not checked: janitor could not establish "
+                     "whether these folders hold a checkout or are in use, so do not remove them by hand. Fix the "
+                     "cause named for each (for Git: fix Git for this repository), then run the sweep again:")
+        for path, reason in not_checked:
+            lines.append(f"  {_scanned_root_relative(path, cfg)}: {reason}")
     return "\n".join(store_mod.report_line(line) for line in lines)
+
+
+def _listing_failure(why: str) -> "_UseCheckFailed":
+    failed = _UseCheckFailed(
+        f"could not list the registered checkouts to compare them before the delete ({why}); it was kept. "
+        "Git could not list this repository's checkouts, so nothing shows that this folder holds none: fix Git "
+        "for it (`git worktree list` must work there), then run the sweep again")
+    failed.why = why  # discovery reports this plain reason, without the advice about the delete
+    return failed
+
+
+def _parse_worktree_list_z(out) -> list[Path]:
+    """The paths of `git worktree list --porcelain -z`, read from the bytes Git wrote: NUL ends every field and an empty
+    field ends a record, so a path with a newline, U+2028 or any non-ASCII letter is one path, exactly as written.
+    Anything that does not look like that output is not guessed at: `_UseCheckFailed`."""
+    if isinstance(out, str):  # a stand-in that answers text
+        out = out.encode("utf-8", "surrogateescape")
+    if not out.endswith(b"\0\0"):
+        # Every record ends with an empty field after its last field (git worktree: with -z "the terminator is NUL
+        # instead of LF" and the empty line between records becomes an empty field), so complete output ends NUL NUL.
+        # Output cut after a field, even after a NUL, is cut short.
+        raise _listing_failure("its output is not complete (the last record is not closed)")
+    paths, in_record = [], False
+    for field in out.split(b"\0")[:-1]:
+        if field == b"":
+            in_record = False
+        elif field.startswith(b"worktree "):
+            if in_record or len(field) == len(b"worktree "):
+                raise _listing_failure("its output could not be read reliably")
+            try:
+                paths.append(Path(field[len(b"worktree "):].decode("utf-8")))
+            except UnicodeDecodeError:
+                raise _listing_failure("a checkout path in its output is not valid UTF-8") from None
+            in_record = True
+        elif not in_record:
+            raise _listing_failure("its output could not be read reliably")
+    if not paths:
+        raise _listing_failure("its output names no checkout")
+    return paths
+
+
+def _registered_worktrees_listed(repo: Path) -> list[Path]:
+    """Git's list of registered worktrees, or `_UseCheckFailed` when it could not be had or read reliably.
+    `get_registered_worktrees` answers `[]` for a failed listing on purpose (its callers remove nothing on that answer),
+    and reads text with the console's encoding; a comparison that reads either as "none registered" would miss a
+    checkout that appeared since the first look. This one reads bytes with NUL boundaries (`-z`). Under a fence, Git's
+    own registration files are fenced first (`_fence_registrations`): Git's listing looks at every path they name."""
+    _fence_registrations(repo)
+    rc, out, err = _run_git_checked(repo, "worktree", "list", "--porcelain", "-z", raw=True)
+    if rc is None or rc != 0:
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+        why = "git is not resolvable" if rc is None else f"git worktree list failed, rc={rc}: {err.strip()[:200]}"
+        raise _listing_failure(why)
+    paths = _parse_worktree_list_z(out)
+    # Fenced at the source: under AGENTTALK_STORE_FENCE every reading of the registered checkouts, the first and every
+    # later one (the report, the sweep's last look, release), refuses a path outside the fence before the caller does
+    # anything with it (a stat, a containment check, a probe). A checkout registered outside after an earlier reading is
+    # caught here, not only by a check made once at the start.
+    for path in paths:
+        store_mod.check_folder_fence(path)
+    return paths
+
+
+def _fully_qualified(text: str, *, windows: bool = os.name == "nt") -> bool:
+    """Whether a path names one place whatever folder and drive the program reading it is in, by the same rule on every
+    Python (the running Python's `isabs` called `\\x` and `/x` absolute on Windows before 3.13). Windows: a drive with
+    a root (`C:\\x`, `C:/x`) or a UNC share (`\\\\server\\share\\x`); the `\\\\?\\` and `\\\\.\\` forms are refused, and
+    so are `C:x`, `\\x`, `/x` and any relative path. POSIX: a leading `/`. A lexical test only."""
+    if not windows:
+        return text.startswith("/")
+    if text[:2] in ("\\\\", "//", "\\/", "/\\") and text[2:3] in ("?", "."):
+        return False  # the extended and device forms
+    drive, tail = ntpath.splitdrive(text)
+    if drive[:1] in ("\\", "/"):  # a UNC share: it must name a server and a share
+        return len([part for part in drive.replace("/", "\\").split("\\") if part]) >= 2
+    return bool(drive) and tail[:1] in ("\\", "/")
+
+
+def _fence_registrations(repo: Path) -> None:
+    """Under AGENTTALK_STORE_FENCE: refuse (`StoreFenceError`) a checkout registered to `repo` outside the fence, read
+    from Git's own files (`<common Git folder>/worktrees/<name>/gitdir`), BEFORE Git is asked for anything it builds
+    from every registration: its list of checkouts, the prune, a removal. Each reads every one of those files and looks
+    at the path it names (is its `.git` still there?), so a checkout registered outside after an earlier reading would
+    be looked at by Git itself. The one check for every caller (the sweep, the report, release and the janitor
+    command's fence check).
+
+    Nothing outside the fence is looked at here, the Git files included: each path (the `.git` file or folder,
+    `commondir` and the folder it names, the `worktrees` folder, each entry folder and its `gitdir` file, and the
+    checkout each names with its `.git`) is fenced BEFORE anything looks at it or reads it. A path outside as written
+    is refused from its text alone; a path inside goes through the fence's own check, which follows a link before it
+    refuses one that leads out (#913), so a link or junction among Git's files that leads outside is refused, never
+    followed. A `gitdir` that names a relative path is refused as it is: Git versions read it from different folders.
+    An entry Git drops without a look (no `gitdir` file, or an empty one) is passed over. A file that cannot be read
+    keeps the list from being trusted (`_UseCheckFailed`). Outside a fence nothing is done."""
+    allowed = store_mod._fence()
+    if allowed is None:
+        return
+    from . import worktree_release  # imported here: that module imports this one
+
+    def fenced(path: Path) -> Path:
+        if worktree_release._outside_as_written(path):
+            store_mod._refuse(path, Path(os.path.abspath(path)), allowed)
+        store_mod.check_folder_fence(path)
+        return path
+
+    def text_of(file: Path) -> str:  # `file` is fenced by the caller
+        data = file.read_bytes().strip()
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            store_mod._refuse(file, file, allowed, why="unplaced")
+            raise  # not reached: `_refuse` raises
+
+    def named_by(text: str, base: Path) -> Path:  # the path a Git file names, relative to `base` if so
+        return Path(os.path.abspath(os.path.join(base, text)))
+
+    try:
+        dot_git = fenced(repo / ".git")
+        if dot_git.is_file():  # `repo` is itself a linked checkout: `gitdir: <its Git folder>`
+            git_dir = fenced(named_by(text_of(dot_git).removeprefix("gitdir:").strip(), repo))
+        elif dot_git.is_dir():
+            git_dir = dot_git
+        else:
+            return  # no Git folder of its own: Git has no registrations of this folder to read
+        commondir = fenced(git_dir / "commondir")
+        common = fenced(named_by(text_of(commondir), git_dir)) if commondir.is_file() else git_dir
+        admin = fenced(common / "worktrees")
+        if not admin.is_dir():
+            return
+        with os.scandir(admin) as listing:
+            entries = sorted((Path(entry.path) for entry in listing), key=lambda p: p.name)
+        for entry_path in entries:
+            gitdir_file = fenced(fenced(entry_path) / "gitdir")  # the entry, then its file: a link is refused here
+            named = text_of(gitdir_file) if gitdir_file.is_file() else ""
+            if not named:
+                continue
+            if not _fully_qualified(named):
+                # Git versions read a relative `gitdir` from different folders (the folder Git runs in, or this
+                # entry's), and one with a root but no drive from whatever drive is current, so no one place can be
+                # checked for it: refused as it is (the maintainers' lead, 2026-11-25).
+                store_mod.refuse_unplaced(
+                    f"the registration {gitdir_file}, whose gitdir is a relative path or has no drive ({named})")
+            gitdir = Path(os.path.abspath(named))
+            fenced(gitdir.parent)  # the checkout folder as Git lists it
+            fenced(gitdir)  # and the `.git` in it that Git looks at
+    except OSError as exc:
+        raise _listing_failure(f"Git's registration files could not be read: {_os_error_text(exc)}") from exc
+
+
+def _checkouts_changed(c: Candidate, worktrees: list[Path], cfg: JanitorConfig) -> str | None:
+    """Why `c` must be kept because the registered checkouts under it are no longer the ones that were checked (one
+    was added, or one is gone), or None. A candidate that held none is looked at again too: a checkout can be
+    registered under a plain folder after the report was made. A link is only unlinked and is not looked at."""
+    if c.link:
+        return None
+    now = [w for w in _registered_worktrees_listed(cfg.repo) if w.exists() and _contains_worktree(c.path, w)]
+    if len(now) != len(worktrees) or not all(any(_same_worktree(w, x) for x in worktrees) for w in now):
+        return "the registered checkouts under it changed while it was being checked; run the sweep again"
+    return None

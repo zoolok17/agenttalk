@@ -6,8 +6,10 @@ preservation commit, recursive-delete fallback or branch deletion is used.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import ctypes
+import errno
 import json
 import os
 import re
@@ -24,6 +26,14 @@ from . import store as store_mod
 
 class Refused(ValueError):
     """A check could not establish that this checkout is disposable."""
+
+
+class FenceRefused(Refused):
+    """A `Refused` that comes from the store fence: the fence's own check refused a path that an activity record names
+    (its `StoreFenceError` is the cause). Everything that handles a `Refused` handles it as before (the checkout is
+    kept, and the text says why); the sweep (`janitor.apply`) also tells it from an ordinary "in use" refusal and stops,
+    as it does for the fence's error itself. A subclass, not the fence's error re-raised: the release routes and the
+    janitor command catch `Refused` and would not catch a `StoreFenceError` the same way."""
 
 
 def _git(repo: Path, *args: str, exact: bool = False, data: bytes | None = None) -> tuple[int, str]:
@@ -86,7 +96,18 @@ def _unchanged(ids: dict) -> None:
         raise Refused(reason)
 
 
+def _fence_git_registrations(repo: Path) -> None:
+    """Before Git builds anything from every registration (its list of checkouts, a removal): Git's registration files
+    are fenced (`janitor._fence_registrations`, the one check every caller uses). A file that cannot be read keeps the
+    checkout (`Refused`); a refusal by the fence is the fence's own error."""
+    try:
+        janitor._fence_registrations(repo)
+    except janitor._UseCheckFailed as exc:
+        raise Refused(f"Git's registered checkouts could not be checked ({exc}); checkout kept") from exc
+
+
 def _registered(repo: Path) -> dict[Path, set[str]]:
+    _fence_git_registrations(repo)  # Git's list looks at every path the registrations name
     # NUL framing also handles paths containing newlines or Git quoting characters.
     out = _read_git(repo, "worktree", "list", "--porcelain", "-z")
     paths: dict[Path, set[str]] = {}
@@ -99,6 +120,11 @@ def _registered(repo: Path) -> dict[Path, set[str]]:
             paths[current].add(field.split(" ", 1)[0])
     if not paths:
         raise Refused("git did not identify any registered worktrees")
+    # Fenced at the source, like the sweep's strict reader: every reading (the main-repository check, the list of
+    # paths to report or release, and each checkout's own check) refuses a path outside the store fence before anything
+    # looks at it.
+    for path in paths:
+        store_mod.check_folder_fence(path)
     return paths
 
 
@@ -222,7 +248,10 @@ def _refuse_elsewhere(repository: Path) -> None:
     for name in _ELSEWHERE_FILES:
         if os.path.lexists(repository / name):
             store_mod.refuse_unplaced(f"git remote origin: {repository / name}, which sends Git to another folder")
-    store_mod.check_second_names(_refuse_links(repository))
+    # The walk that looks for the other names of a hard-linked file follows the links it meets inside the fence, which
+    # resolves each of them: a link inside the fence that leads to an unrelated place outside was looked at (round 18).
+    # Here the links are not followed (the folders they lead to inside the fence are walked as themselves).
+    store_mod.check_second_names(_refuse_links(repository), follow_links=False)
     for name in ("config", "config.worktree"):
         settings = repository / name
         try:
@@ -260,6 +289,11 @@ def check_fence(cfg: janitor.JanitorConfig) -> str:
     path = _local_repository(url, cfg.repo) if url else None
     if path is None:
         store_mod.refuse_unplaced("git remote origin, which is not a local folder")
+    # As written first, before anything resolves it: an origin outside the fence (a network path too) is refused
+    # at once, and neither the resolver below nor the fence's own check (which resolves) is asked about it.
+    for written in (path, Path(f"{path}.git")):
+        if _outside_as_written(written):
+            store_mod._refuse(written, Path(os.path.abspath(written)), store_mod._fence(), why="outside")
     # As configured, and as release hands it on. Git tries path/.git, path, path.git/.git, path.git.
     bases = [form for base in dict.fromkeys((path, path.resolve())) for form in (base, Path(f"{base}.git"))]
     for base in bases:
@@ -350,6 +384,171 @@ def _read_record(cfg: janitor.JanitorConfig, path: Path) -> dict:
         raise Refused(f"could not read activity record {path.name}") from exc
 
 
+# The names that `_placed` accepted as absent while one `_activity` read ran, kept so that they can be looked at again
+# at the removal decision (`_still_absent`). A lookup that said "absent" is true only for that instant.
+_absent_seen: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("absent_seen", default=None)
+
+
+@contextlib.contextmanager
+def _watching_absent():
+    seen: list[str] = []
+    token = _absent_seen.set(seen)
+    try:
+        yield seen
+    finally:
+        _absent_seen.reset(token)
+
+
+def _still_absent(seen: list[str]) -> None:
+    """Refuse when any name that was read as absent exists now. A record that named a path that was not there was
+    judged unrelated from one lookup; the name can be created, as a link to the checkout, right after that lookup. So
+    the read under the locks is followed by a second look at each of those names, immediately before Git removes the
+    checkout. This narrows the window; it cannot close it (no check by path can: see the notes on the concurrent
+    rename race), and the same window exists in `lanes._resolve_absent` for a path with one missing part."""
+    for entry in seen:
+        try:
+            os.lstat(entry)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise Refused(
+                f"a path that a record names could not be looked at again before the removal ({_why(exc)}); "
+                "the checkout was kept; make that path readable, then run the release again"
+            ) from exc
+        raise Refused(
+            "a path that a record names, and that was absent when the records were read, exists now; "
+            "the checkout was kept; run the release again: it reads the records afresh and says what uses it"
+        )
+
+
+def _why(exc: BaseException) -> str:
+    """A short reason for a refusal: what the system said, never a path."""
+    return str(getattr(exc, "strerror", None) or type(exc).__name__)
+
+
+def _placed(path: Path) -> str:
+    """Where `path` is, as a canonical token (`lanes.canonical_host_path_checked`), resolved strictly: any failure to
+    follow it (access denied, a sharing violation, a loop, a dangling link or junction, a file where a folder should
+    be, an unsupported spelling) raises OSError, which the caller turns into a refusal. The tolerant `Path.resolve()`
+    hands back a partial answer that still names a link when Windows cannot follow it, so a record that names the
+    checkout through that link read as an unrelated path (#853).
+
+    A path that is not there is accepted only when its absence is proved. Starting from the nearest part that exists
+    (its `lstat` answers, so a link is looked at, not followed), which must resolve strictly and be a folder, the
+    missing names are added to its resolved place as written: nothing that is not there can be a link. One, two or
+    more missing parts are placed this way, so a record of a folder that is long gone does not hold a checkout. A
+    missing name that is `.` or `..` cannot be placed and raises."""
+    current = os.fspath(path)
+    missing: list[str] = []
+    while True:
+        try:
+            os.lstat(current)
+            break
+        except FileNotFoundError:
+            # Only this platform's separators: on Linux and macOS a backslash is an ordinary character of a name,
+            # and stripping it would watch `gone` for a recorded `gone\`, which a real `gone\` could then slip past.
+            parent, name = os.path.split(current.rstrip(os.sep + (os.altsep or "")))
+            if not name or not parent or parent == current:
+                raise
+            if name in (".", "..") or (os.name == "nt" and ":" in name):
+                message = "cannot be placed: a missing part that is not a plain name"
+                raise OSError(errno.EINVAL, message, current) from None
+            missing.append(name)
+            current = parent
+    token = lanes.canonical_host_path_checked(current)
+    if os.name != "nt":
+        # The shared token turns a literal backslash of a POSIX name into "/": `co\\` and `co/` become one token, and a
+        # name that ends in a backslash gets a trailing "/", so nothing placed below it starts with `token + "/"` and
+        # a missing child was judged unrelated. Here the exact POSIX path is compared, as master does with its path
+        # ancestry. The shared function has just resolved this same part and made its checks, so this cannot differ.
+        token = os.path.realpath(current, strict=True)
+    if missing:
+        if not stat.S_ISDIR(os.stat(current).st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "cannot be placed: the part that exists is not a folder", current)
+        token = token.rstrip("/") + "/" + "/".join(os.path.normcase(name) for name in reversed(missing))
+        seen = _absent_seen.get()
+        if seen is not None:
+            seen.append(os.path.join(current, missing[-1]))  # the name directly below the part that exists
+    return token
+
+
+def _outside_as_written(path: Path) -> bool:
+    """Under AGENTTALK_STORE_FENCE: is `path`, made absolute as written, outside the fence both as given and as the
+    fence folder itself resolves? No look at `path`: `abspath` is a string operation. (The fence folder, which no record
+    or remote names, is resolved to make the comparison.) Outside a fence: False."""
+    fence = os.environ.get(store_mod.STORE_FENCE_ENV)
+    if not fence:
+        return False
+    written = Path(os.path.abspath(path))
+    allowed = {Path(os.path.abspath(fence)), Path(os.path.realpath(fence))}
+    return not any(written == root or root in written.parents for root in allowed)
+
+
+def _fence_record_path(path: Path, key: str, source: str) -> None:
+    """Under AGENTTALK_STORE_FENCE, a path that an activity record names is fenced before anything resolves it:
+    `_placed` would `lstat` and `realpath` it, which for a path outside the fence reads (or, for a network path,
+    contacts) what the fence exists to keep out. A path the fence refuses keeps the checkout, with the reason
+    (`Refused`): it is never read as unrelated. Outside a fence nothing changes.
+
+    Two steps. First, the path as written is compared with the fence without any look at the PATH: `abspath` is a string
+    operation, so a path that is outside the fence both as given and as the fence resolves to is refused at once and is
+    never resolved. (The fence folder itself, which is not named by a record, is resolved with `realpath` to make that
+    comparison: step 1 is not string-only, it is free of any look at the record-named path.) A path that is inside only
+    through another spelling of the fence folder (a link to it) is refused too, which only keeps a checkout. Second, a
+    path inside as written goes through the fence's own check, which resolves it and so follows a link before it
+    refuses one that leads out (#913)."""
+    if not os.environ.get(store_mod.STORE_FENCE_ENV):
+        return
+    reason, fence_error = None, None
+    if _outside_as_written(path):
+        reason = "is outside the fence"
+    else:
+        try:
+            store_mod.check_folder_fence(path)
+        except store_mod.StoreFenceError as exc:
+            reason, fence_error = "leads outside the fence", exc
+    if reason is not None:
+        message = (
+            f"{source}: the record names a path outside the fence (activity path {key} {reason}); "
+            "the checkout was kept, as nothing shows that this path is unrelated to it"
+        )
+        if fence_error is not None:
+            # The fence's own check refused it (it resolved the path and it led outside): keep that type.
+            raise FenceRefused(message) from fence_error
+        raise Refused(message)  # refused from the text alone, nothing looked at: an ordinary kept checkout
+
+
+_RECORD_PATH_FIELDS = ("cwd", "launch_cwd", "workspace_path", "worktree_path")
+
+
+def _fence_named_fields(value: dict, repo: Path, source: str, *, lane: bool) -> None:
+    """Under a store fence, fence EVERY absolute path that a record dictionary names in a field that names a folder,
+    before anything else is done with the dictionary. Without this, the code that judges a damaged lane row (and the
+    repair advice it prints, which looks at the row's OTHER saved path to say whether something is still there) ran
+    before the check of each path and looked at a path outside the fence (round 17). One function at the top of the
+    reader means that no later step, advice included, can reach a record-named absolute path that was not fenced. A
+    relative path is not a path outside the fence: the existing rules judge it, and each spelling that is tried for it
+    is fenced where it is placed. Outside a fence nothing is done."""
+    if not os.environ.get(store_mod.STORE_FENCE_ENV):
+        return
+    for key in _RECORD_PATH_FIELDS + (("worktree_toplevel_canonical",) if lane else ()):
+        item = value.get(key)
+        if not isinstance(item, str) or not item.strip():
+            continue
+        text = item.replace("{ROOT}", str(repo))
+        try:
+            absolute = lanes.path_is_absolute(text)
+        except (ValueError, TypeError):
+            absolute = False  # not a path at all: the damage rules below refuse it, and nothing can be looked at
+        if absolute:
+            try:
+                _fence_record_path(Path(text), key, source)
+            except Refused:
+                raise  # the checkout is kept, with the reason
+            except ValueError:
+                continue  # a name with NUL or a lone surrogate cannot be looked at either: the damage rules refuse it
+
+
 def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | None,
                     source: str = "activity record", lane: bool = False, owner: dict | None = None) -> bool:
     """True when `value` names the checkout `target`. `lane_id` is the registry key of the lane row being read (None
@@ -357,6 +556,8 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
     lane, so a recovery hint always names the row that was selected. `owner` is that live row: the first lane-level
     call sets it, and the recursion keeps it, so a saved copy inside the row (the lane snapshot of a pending delivery)
     is judged for its advice by the state of the row that holds it, not by the copy's own old state."""
+    if isinstance(value, dict):
+        _fence_named_fields(value, repo, source, lane=lane)  # before ANYTHING else is done with this dictionary
     if lane and owner is None and isinstance(value, dict):
         owner = value
     if lane and isinstance(value, dict):
@@ -394,7 +595,7 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
             raise Refused(f"{source}: relative activity path {key} is ambiguous; "
                           "record an absolute path first; "
                           f"{recovery}")
-    fields = {"cwd", "launch_cwd", "workspace_path", "worktree_path"}
+    fields = set(_RECORD_PATH_FIELDS)
     if lane:
         fields.add("worktree_toplevel_canonical")
     if isinstance(value, dict):
@@ -412,8 +613,26 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
                         raise Refused(f"{source}: relative activity path {key} is ambiguous; "
                                       "record an absolute path first")
                 for candidate in paths:
-                    physical = candidate.resolve()
-                    if target.resolve() in (physical, *physical.parents):
+                    _fence_record_path(candidate, key, source)  # under a store fence: before anything looks at it
+                    try:
+                        where = _placed(candidate)
+                    except (OSError, ValueError) as exc:
+                        raise Refused(
+                            f"{source}: could not establish where activity path {key} leads "
+                            f"({_why(exc)}); the checkout was kept"
+                        ) from exc
+                    try:
+                        mine = _placed(target)
+                    except (OSError, ValueError) as exc:
+                        raise Refused(
+                            f"{source}: could not establish where the checkout is ({_why(exc)}); the checkout was kept"
+                        ) from exc
+                    # A child's token starts with the checkout's token and exactly one "/". The token of a root (`c:/`
+                    # on a drive, `/` on Linux and macOS) already ends in that "/", so it is not added a second time
+                    # (`mine + "/"` looked for `c://` and judged every folder in the drive unrelated). A token that
+                    # ends in a backslash (a POSIX name) is not touched: only "/" is stripped, as `_placed` joins.
+                    prefix = mine.rstrip("/") + "/"
+                    if where == mine or where.startswith(prefix):
                         return True
             elif key in fields and item is not None:
                 if not isinstance(item, str):
@@ -433,6 +652,10 @@ def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
     named = []
     for lane_id, row in (_activity(cfg, target) or {}).items():
         source = f"lanes.json lane {lane_id}"
+        try:  # before the id names, peeks or claims anything: its token path must stay in the store
+            lanes.validate_lane_id(lane_id)
+        except lanes.LaneError as exc:
+            raise Refused(f"{source}: {exc}; the checkout was kept") from exc
         retained = row.get("occupancy_worktrees", [])
         if not isinstance(retained, list) or any(not isinstance(p, str) or not p.strip() for p in retained):
             raise Refused(f"{source}: could not read retained occupancy worktrees")
@@ -499,6 +722,89 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> dict | None:
                         lanes[lane_id], target, cfg.repo, lane_id=lane_id, source=source, lane=True):
                     raise Refused(f"a launch request names this checkout ({path.name}, {source})")
     return lanes
+
+
+def check_unused(cfg: janitor.JanitorConfig, targets: list[Path]) -> None:
+    """A look that changes nothing, for a listing: refuses (`Refused`, or an OSError, ValueError or TypeError for a
+    record that cannot be read) when any of these registered checkouts is in use, by the same rules a release applies:
+    an active, pending or launch record that names it, or a lane that names it whose occupancy token is held or cannot
+    be checked."""
+    for target in _in_claim_order(targets):
+        _free_lanes(cfg, target, lane_occupancy.peek)  # reads the records first (`_activity`), then looks at tokens
+
+
+def _in_claim_order(targets: list[Path]) -> list[Path]:
+    return sorted(targets, key=lambda path: os.path.normcase(os.fspath(path)))
+
+
+class RemovalGuard:
+    """What a removal of registered checkouts holds, shared by a release and the ordinary sweep.
+
+    Entering it takes a non-waiting cleanup claim on every lane that names one of the checkouts (checkouts in a fixed
+    order, one claim per lane even when two checkouts name it) and refuses, releasing every claim taken, when a record
+    makes any of them in use or a claim is not free. The claims are kept until the block ends, so no session can start
+    on those lanes through everything that follows (a work-in-progress commit, the removal). `final_window()` is the
+    last look, made at the removal itself.
+
+    The last look (`reread()`) is the whole first look again, for a release and for the sweep: every record, ended
+    lanes and their retained occupancy paths included (a session can outlive its lane, #853), a claim on every lane
+    that names a checkout now and did not before, kept until the block ends, and a second look at every name that was
+    read as absent. `closed_window` is for the sweep and decides only the lock: a release takes the lane writers' lock
+    only when a lane named a checkout at the first look, so a record written after its last read by a program that
+    does not take the lock is not seen; with `closed_window` the lock is taken whenever the store exists."""
+
+    def __init__(self, cfg: janitor.JanitorConfig, targets: list[Path], *, closed_window: bool = False):
+        self.cfg = cfg
+        self.targets = _in_claim_order(targets)
+        self.named: list[str] = []
+        self.closed_window = closed_window
+        self._claims = contextlib.ExitStack()
+        self._claimed: set[str] = set()
+
+    def _claim(self, store, lane_id):
+        if lane_id in self._claimed:
+            return None
+        busy = self._claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
+        if busy is None:
+            self._claimed.add(lane_id)
+        return busy
+
+    def _take_claims(self) -> None:
+        for target in self.targets:
+            self.named += [lane for lane in _free_lanes(self.cfg, target, self._claim) if lane not in self.named]
+
+    def __enter__(self) -> "RemovalGuard":
+        try:
+            self._take_claims()
+        except BaseException:
+            self._claims.close()
+            raise
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._claims.close()
+
+    def reread(self) -> None:
+        """The last look before the removal: every record again (ended lanes and their retained occupancy paths too), a
+        claim on any lane that names a checkout now, and a second look at the names that were read as absent
+        (`_still_absent`)."""
+        with _watching_absent() as seen:
+            self._take_claims()
+        _still_absent(seen)
+
+    @contextlib.contextmanager
+    def final_window(self):
+        """Re-reads every record under the lock that every lane writer takes, then lets the caller remove. The token
+        does not stop a lane writer; this lock, which every one of them takes, does. It is taken only here, not around
+        the checks that hash every file: lane writers wait 10 seconds for it. Names read as absent are looked at once
+        more before the caller goes on (`_still_absent`)."""
+        if self.named:
+            locked = True
+        else:
+            locked = self.closed_window and (self.cfg.repo / ".agenttalk").is_dir()  # no store, no lane writers
+        with store_mod.Store(self.cfg.repo)._config_lock() if locked else contextlib.nullcontext():
+            self.reread()  # never `_activity` alone: it skips ended lanes, whose sessions can still use a checkout
+            yield
 
 
 # One Git call hashes at most this many files and bytes (a file over the byte limit goes alone), and a file with a
@@ -690,14 +996,12 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                 _unchanged(ids)
                 size, head = _check_worktree(cfg, path, default)
                 if target is None:
-                    _free_lanes(cfg, path, lane_occupancy.peek)
+                    check_unused(cfg, [path])
                     _unchanged(candidate_ids)
                     lines.append(f"WOULD RELEASE {path}: {size} bytes")
                     continue
                 _unchanged(candidate_ids)
-                with contextlib.ExitStack() as claims:  # kept through the removal: no session can start on these lanes
-                    named = _free_lanes(cfg, path, lambda store, lane: claims.enter_context(
-                        lane_occupancy.cleanup_claim(store, lane)))
+                with RemovalGuard(cfg, [path]) as guard:  # claims kept through the removal: no session can start
                     # Re-read mutable eligibility, then recheck identities at the
                     # deletion boundary. No stale report can authorize a removal.
                     _, current_head = _check_worktree(cfg, path, default)
@@ -705,10 +1009,8 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                         raise Refused("checkout HEAD changed during the checks")
                     _unchanged(candidate_ids)
                     _unchanged(ids)
-                    # The token does not stop a lane writer; this lock, which every one of them takes, does. Only
-                    # here, not around the checks above: they hash every file, and lane writers wait 10 seconds.
-                    with store_mod.Store(cfg.repo)._config_lock() if named else contextlib.nullcontext():
-                        _activity(cfg, path)
+                    with guard.final_window():
+                        _fence_git_registrations(cfg.repo)  # the removal reads every registration too
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:
