@@ -1,0 +1,116 @@
+verifier probes: scripts/check_git_job_scheduled_task.ps1 on made-up logs and made-up scheduler states (run id run-0123456789ab); nothing is registered
+exit codes: 0 accepted, 2 no completion evidence, 3 finished but rejected
+
+== part 1: -Mode Verify (the log half only)
+
+Windows PowerShell 5.1
+  good                           exit 0  OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  missing                        exit 2  NO COMPLETION EVIDENCE: the log is 'missing' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  empty                          exit 2  NO COMPLETION EVIDENCE: the log is 'empty' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  another-runs-log               exit 2  NO COMPLETION EVIDENCE: the log is 'other-run' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  partial-no-exit-line           exit 2  NO COMPLETION EVIDENCE: the log is 'partial' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  exit-line-not-last             exit 2  NO COMPLETION EVIDENCE: the log is 'partial' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  non-zero-exit                  exit 3  REJECT: pytest exit code was 1, not 0
+  exit-0-without-the-facts-line  exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
+  facts-line-of-the-old-form     exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
+  facts-without-a-session-id     exit 3  REJECT: the host facts do not name "session_id"
+
+PowerShell 7
+  good                           exit 0  OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  missing                        exit 2  NO COMPLETION EVIDENCE: the log is 'missing' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  empty                          exit 2  NO COMPLETION EVIDENCE: the log is 'empty' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  another-runs-log               exit 2  NO COMPLETION EVIDENCE: the log is 'other-run' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  partial-no-exit-line           exit 2  NO COMPLETION EVIDENCE: the log is 'partial' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  exit-line-not-last             exit 2  NO COMPLETION EVIDENCE: the log is 'partial' (a finished log of this run starts with run-id=run-0123456789ab and ends with exit=<n>)
+  non-zero-exit                  exit 3  REJECT: pytest exit code was 1, not 0
+  exit-0-without-the-facts-line  exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
+  facts-line-of-the-old-form     exit 3  REJECT: the log shows no host facts line (GitJobHostFacts: git-job-capability:): exit 0 without facts is not proof
+  facts-without-a-session-id     exit 3  REJECT: the host facts do not name "session_id"
+
+== part 2: -Mode Decide (the whole rule: the log AND a made-up scheduler state)
+
+Windows PowerShell 5.1
+  finished log, task Ready                         exit 0  OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  finished log, task Running                       exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Running' 
+  finished log, task Queued                        exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Queued' 
+  finished log, task Disabled                      exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Disabled' 
+  finished log, task Unknown                       exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Unknown' 
+  finished log, no state                           exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is '' 
+  finished log, task not shown by the scheduler    exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the scheduler does not show the task 
+  partial log, task Ready                          exit 2  NO COMPLETION EVIDENCE: the log is 'partial' 
+  non-zero exit, task Ready                        exit 3  REJECT: pytest exit code was 1, not 0
+
+PowerShell 7
+  finished log, task Ready                         exit 0  OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  finished log, task Running                       exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Running' 
+  finished log, task Queued                        exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Queued' 
+  finished log, task Disabled                      exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Disabled' 
+  finished log, task Unknown                       exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Unknown' 
+  finished log, no state                           exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is '' 
+  finished log, task not shown by the scheduler    exit 2  NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the scheduler does not show the task 
+  partial log, task Ready                          exit 2  NO COMPLETION EVIDENCE: the log is 'partial' 
+  non-zero exit, task Ready                        exit 3  REJECT: pytest exit code was 1, not 0
+
+== part 3: -Mode Task with a stand-in interpreter that writes one line to stderr (nothing is registered)
+
+  Windows PowerShell 5.1: task mode exit 0; last line of its log: exit=0; verifier exit 0: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+  PowerShell 7: task mode exit 0; last line of its log: exit=0; verifier exit 0: OK: run run-0123456789ab finished with exit=0 and shows its host facts
+
+dry run (nothing registered): the two registrations it would make
+  [interactive] would run: schtasks /Create /TN agenttalk-git-job-check /SC ONCE /ST 23:59 /IT /RU "example-user" /RL LIMITED /TR "<command: this script -Mode Task -ArgsFile <file>>"
+  [background] would run: schtasks /Create /TN agenttalk-git-job-check /SC ONCE /ST 23:59 /RU "example-user" /RP * /RL LIMITED /TR "<command: this script -Mode Task -ArgsFile <file>>"
+
+== part 4: the arguments file with a folder named like "cafe uber" with accents (nothing is registered)
+
+  Windows PowerShell 5.1: previous ASCII file comes back as "caf? ?ber"; now: starts with a byte order mark = True; folder name intact = True
+  PowerShell 7: previous ASCII file comes back as "caf? ?ber"; now: starts with a byte order mark = True; folder name intact = True
+
+== part 5: -Mode Run against a stand-in scheduler (a tests-only hook replaces the two functions that talk to the scheduler; nothing is registered)
+
+Windows PowerShell 5.1
+  good run, task deleted                               exit 0; accepted copy kept: True; [interactive] OK: run <id> finished with exit=0 and shows its host facts
+  good run, the task cannot be deleted                 exit 4; accepted copy kept: True; [interactive] OK: run <id> finished with exit=0 and shows its host facts
+  finished log, task Running until the time limit      exit 2; accepted copy kept: False; [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Running' (a run is complete only when the log is finished AND the task is Ready)
+
+PowerShell 7
+  good run, task deleted                               exit 0; accepted copy kept: True; [interactive] OK: run <id> finished with exit=0 and shows its host facts
+  good run, the task cannot be deleted                 exit 4; accepted copy kept: True; [interactive] OK: run <id> finished with exit=0 and shows its host facts
+  finished log, task Running until the time limit      exit 2; accepted copy kept: False; [interactive] NO COMPLETION EVIDENCE FROM THE SCHEDULER in time: the log is finished but the task is 'Running' (a run is complete only when the log is finished AND the task is Ready)
+
+== part 6 (round 14): a scheduler that cannot be read is not a task that is gone (nothing is registered; a tests-only hook replaces the two functions that talk to the scheduler)
+
+Windows PowerShell 5.1
+  good run, task deleted (control)                                   exit 0; "task deleted": True; warning: none; accepted copy: True
+  accepted run, delete failed, scheduler unreadable afterwards       exit 4; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: True
+  accepted run, delete said ok, scheduler unreadable afterwards      exit 4; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: True
+  REJECTED run (pytest exit 1), task still there after the delete    exit 3; "task deleted": False; warning: NOT DELETED; accepted copy: False
+  REJECTED run (pytest exit 1), scheduler unreadable afterwards      exit 3; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: False
+  no completion evidence (Running at the limit), task still there    exit 2; "task deleted": False; warning: NOT DELETED; accepted copy: False
+  scheduler unreadable before anything is registered                 exit 1; "task deleted": not printed; warning: refused before registering; accepted copy: False
+
+PowerShell 7
+  good run, task deleted (control)                                   exit 0; "task deleted": True; warning: none; accepted copy: True
+  accepted run, delete failed, scheduler unreadable afterwards       exit 4; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: True
+  accepted run, delete said ok, scheduler unreadable afterwards      exit 4; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: True
+  REJECTED run (pytest exit 1), task still there after the delete    exit 3; "task deleted": False; warning: NOT DELETED; accepted copy: False
+  REJECTED run (pytest exit 1), scheduler unreadable afterwards      exit 3; "task deleted": False; warning: NOT CONFIRMED DELETED; accepted copy: False
+  no completion evidence (Running at the limit), task still there    exit 2; "task deleted": False; warning: NOT DELETED; accepted copy: False
+  scheduler unreadable before anything is registered                 exit 1; "task deleted": not printed; warning: refused before registering; accepted copy: False
+
+The real scheduler, asked read-only about a name that was never registered (agenttalk-no-such-task-907r14):
+  Windows PowerShell 5.1: exists=false unreadable=false
+  PowerShell 7: exists=false unreadable=false
+
+== part 7 (round 15): the scheduler's own error id, not the error category (read only, nothing is registered; clean environment, a made-up task name)
+
+  pwsh: clean env, default modules                                       facts: 'exists=false unreadable=false'  | direct: 'fqid=CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask category=ObjectNotFound'
+  pwsh: clean env, PSModulePath = an empty folder                        facts: 'exists=false unreadable=true'  | direct: 'fqid=CommandNotFoundException category=ObjectNotFound'
+  powershell: clean env, default modules                                 facts: 'exists=false unreadable=false'  | direct: 'fqid=CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask category=ObjectNotFound'
+  powershell: clean env, PSModulePath = an empty folder                  facts: 'exists=false unreadable=false'  | direct: 'fqid=CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask category=ObjectNotFound'
+
+  (A Windows PowerShell 5.1 whose module path is emptied still finds the module in the system folder, so a missing command cannot be made there for real; the tests use stand-ins in both editions.)
+
+Colour forced on in PowerShell 7 (`$PSStyle.OutputRendering = 'Ansi'`) with a missing scheduler command and no registration:
+  colour codes in the raw error text: True
+  the previous normalization (whitespace and the error frame) finds "Nothing was registered": False
+  the new normalization finds it: True
