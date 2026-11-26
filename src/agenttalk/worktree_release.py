@@ -647,6 +647,12 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
 def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
     """Every lane that names this checkout, whatever its status (a session can outlive its lane's delivery), after
     ``claim(store, lane_id)`` has found the lane's occupancy token free."""
+    def old_match(path):
+        try:
+            return os.name != "nt" and path.replace("{ROOT}", str(cfg.repo)) == _placed(target).replace("\\", "/")
+        except (OSError, ValueError) as exc:
+            raise Refused(f"could not establish where the checkout is ({_why(exc)}); the checkout was kept") from exc
+
     named = []
     for lane_id, row in (_activity(cfg, target) or {}).items():
         source = f"lanes.json lane {lane_id}"
@@ -658,6 +664,7 @@ def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
                           "name ends in a backslash; set it to the checkout's real absolute folder")
         if _names_checkout(row, target, cfg.repo, lane_id=lane_id, source=source, lane=True) or any(
                 _names_checkout({"worktree_path": p}, target, cfg.repo, lane_id=lane_id, source=source, lane=True)
+                or old_match(p)
                 for p in retained):
             named.append(lane_id)
     for lane_id in named:

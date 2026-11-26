@@ -2910,15 +2910,28 @@ def test_healthy_retained_claim_names_checkout_beside_guarded_canonical(monkeypa
     assert worktree_release._free_lanes(cfg, target, lambda *args: None) == ["earlier"]
 
 
-def test_an_old_inside_backslash_claim_is_the_documented_limit(monkeypatch, tmp_path):
+def test_an_old_inside_backslash_claim_keeps_the_checkout(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # the stand-in paths are not real
-    world = _FakePosixFolders(monkeypatch, tmp_path, ["/w", "/w/a\\b", "/w/a", "/w/a/b"])
+    world = _FakePosixFolders(monkeypatch, tmp_path, ["/w", "/w/a\\b", "/w/a", "/w/a/b", "/w/else"])
     assert not world.names("/w/a\\b", "/w/a/b")  # an old claim collapsed the literal backslash
     assert world.names("/w/a\\b", "/w/a\\b")  # a launch record keeps its raw path
-    monkeypatch.setattr(worktree_release, "_activity", lambda cfg, target: {
-        "old": {"status": "abandoned", "occupancy_worktrees": ["/w/a/b"]}})
+    row = {"status": "abandoned", "worktree_path": "/w/else", "occupancy_worktrees": ["/w/a/b"]}
+    monkeypatch.setattr(worktree_release, "_activity", lambda cfg, target: {"old": row})
     cfg = types.SimpleNamespace(repo=world.purepath("/w/repo"))
-    assert worktree_release._free_lanes(cfg, world.purepath("/w/a\\b"), lambda *args: None) == []
+    target = world.purepath("/w/a\\b")
+    def busy(*args):
+        return lane_occupancy.IN_USE
+    with pytest.raises(worktree_release.Refused, match="lane 'old' is in use"):
+        worktree_release._free_lanes(cfg, target, busy)
+    row["occupancy_worktrees"] = ["/w/a\\b"]  # the current spelling still keeps it
+    with pytest.raises(worktree_release.Refused, match="lane 'old' is in use"):
+        worktree_release._free_lanes(cfg, target, busy)
+    row["occupancy_worktrees"] = ["/w/else"]
+    assert worktree_release._free_lanes(cfg, target, busy) == []
+    row["occupancy_worktrees"] = ["/w/a\\/b".replace("\\", "/")]
+    assert row["occupancy_worktrees"] == ["/w/a//b"]  # the old fold did not normalize again
+    with pytest.raises(worktree_release.Refused, match="older version"):
+        worktree_release._free_lanes(cfg, target, busy)
 
 
 @pytest.mark.parametrize("checkout, recorded, folders, expected", _CHECKOUT_CASES)

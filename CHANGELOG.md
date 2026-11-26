@@ -147,6 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was saved with a trailing slash, which the guard cannot detect; a readable
   launch record naming the real folder still protects it. A checkout detached by hand has no branch in Git's list
   and is not detected by the acknowledgement's branch check.
+  Release keeps a checkout if an older saved claim may name it with slashes; inspect the lane before freeing it.
 
 - **Close checks no longer report hidden submodule work as clean (#796).**
   Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.
