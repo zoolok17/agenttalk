@@ -6836,6 +6836,10 @@ def _lane_remove_prepared(store, pending: dict) -> None:
     # other folder and the file there is not the delivery's (its canonical path matches because both spellings resolve
     # through the link). The delivery's managed folders must be real folders, or nothing is removed.
     deliveries = lane_mod.deliveries_dir(store)
+    refusal = (
+        "agenttalk lane deliver: the delivery's prepared-copy folder is a link (or cannot be checked), so "
+        "the prepared copy was left in place; check the folders under the store's lane-deliveries folder.\n"
+    )
     for folder in (deliveries, own.parent):
         try:
             linked = lane_mod._is_link(os.fspath(folder))
@@ -6844,14 +6848,12 @@ def _lane_remove_prepared(store, pending: dict) -> None:
         except OSError:
             linked = True  # it cannot be looked at, so it is not shown to be a real folder
         if linked:
-            sys.stderr.write(
-                "agenttalk lane deliver: the delivery's prepared-copy folder is a link (or cannot be checked), so "
-                "the prepared copy was left in place; check the folders under the store's lane-deliveries folder.\n")
+            sys.stderr.write(refusal)
             return
-    try:
-        own.unlink(missing_ok=True)
-    except OSError:
-        pass
+    # The folders were checked by name; a swap between that and a delete by name would redirect the delete. So the
+    # delete is made through the two folders held open (#843), and where that cannot be done the copy stays.
+    if lane_mod._remove_in_managed_folders(deliveries, own) == "refused":
+        sys.stderr.write(refusal)
 
 
 def _lane_rebind_pending_delivery(
@@ -13622,13 +13624,32 @@ def cmd_janitor(args: argparse.Namespace) -> int:
     cfg = janitormod.JanitorConfig.load(root)
     releasing = getattr(args, "release", None) is not None or getattr(args, "release_report", False)
     origin = "origin"
+    listing = None
     if os.environ.get(store_mod.STORE_FENCE_ENV):
         # In every mode, nothing is listed, read, removed or asked of git outside the fence.
-        folders = [cfg.scratch_root, cfg.tmp_root, cfg.repo / ".worktrees",
-                   *janitormod.get_registered_worktrees(cfg.repo)]
+        # The checkouts fenced are the EXACT paths the probes below use, read the way the probes read them (#858):
+        # the report and the sweep probe the strict list (bytes, NUL boundaries) and are handed this very reading; a
+        # release probes its own NUL-framed list, so that one is fenced too. The older text reader cuts a name with
+        # U+2028 short, to a path that does not exist, so a link with such a name would pass a fence it must fail.
+        # No list that can be read: nothing is probed. The folders that need no listing are checked first.
+        folders = [cfg.scratch_root, cfg.tmp_root, cfg.repo / ".worktrees"]
         if getattr(args, "release", None) is not None:
             folders.append(Path(args.release).absolute())     # the checkout --release would remove
         for folder in folders:
+            store_mod.check_folder_fence(folder)
+        listing = janitormod._strict_listing(cfg.repo)
+        if listing[0] is None:
+            store_mod.refuse_unplaced("the registered checkouts, which Git could not list reliably")
+        registered = list(listing[0])
+        if releasing:
+            from .worktree_release import Refused, _registered as release_inventory
+            try:
+                registered += [path for path in release_inventory(cfg.repo) if path not in registered]
+            except store_mod.StoreFenceError:
+                raise  # the reader fenced a path: that refusal (and its report line) is the answer
+            except (Refused, OSError, ValueError):
+                store_mod.refuse_unplaced("the registered checkouts, which Git could not list for a release")
+        for folder in registered:
             store_mod.check_folder_fence(folder)
         if releasing:
             from .worktree_release import check_fence
@@ -13640,7 +13661,7 @@ def cmd_janitor(args: argparse.Namespace) -> int:
         return code
     if args.keep_days is not None:
         cfg.keep_days = args.keep_days
-    report = janitormod.build_report(cfg)
+    report = janitormod.build_report(cfg, listing)  # under a fence: the list that was just fenced
     if args.apply:
         print(janitormod.apply(cfg, report))
     else:

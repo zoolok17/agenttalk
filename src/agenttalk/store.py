@@ -151,14 +151,26 @@ def _unmatched(names_found: dict) -> tuple[Path, str] | None:
     return None
 
 
+def _is_link_entry(entry: os.DirEntry) -> bool:
+    """A symbolic link, or a Windows junction or other reparse point: an entry that leads somewhere else."""
+    if entry.is_symlink():
+        return True
+    try:
+        return bool(getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400)  # a reparse point
+    except OSError:
+        return True  # it cannot be told apart: treated as a link, which is not followed where links are skipped
+
+
 def _walk_names(start: Path, allowed: Path, names_found: dict, *,
-                known_only: bool = False) -> tuple[Path, str] | None:
+                known_only: bool = False, follow_links: bool = True) -> tuple[Path, str] | None:
     """Walk the folder `start`, links inside it followed while they lead inside `allowed`,
     counting in `names_found` each name it meets of a file with several names; a link to
     such a file adds the file but not a name. Returns (place, why) for the first place that
     leads outside ("outside"), cannot be inspected ("unreadable") or has no identity
     ("linked"). With `known_only` the walk only looks for more names of the files already in
-    `names_found`, and passes over such places: they hold no name inside `allowed`."""
+    `names_found`, and passes over such places: they hold no name inside `allowed`. With `follow_links` false (only
+    with `known_only`) a link inside is not followed at all, so it is never resolved: every folder inside `allowed` is
+    walked as itself, so the names found are the same, and a link to a place outside is not looked at."""
     pending, seen = [start], set()
     while pending:
         place = pending.pop()
@@ -196,6 +208,8 @@ def _walk_names(start: Path, allowed: Path, names_found: dict, *,
             return place, "unreadable"
         for entry in entries:
             if entry.is_symlink() or entry.is_dir(follow_symlinks=False):
+                if known_only and not follow_links and _is_link_entry(entry):
+                    continue         # not resolved: what it leads to is not looked at, and no new name comes of it
                 pending.append(Path(entry.path))
                 continue
             try:
@@ -262,11 +276,14 @@ def check_folder_fence(folder: Path) -> None:
         _refuse(folder, real, allowed)
 
 
-def check_second_names(files) -> None:
+def check_second_names(files, *, follow_links: bool = True) -> None:
     """Refuse, when ``AGENTTALK_STORE_FENCE`` is set, a file among `files` (a link is followed
     to its file) with a second name the fence cannot vouch for: a file with several names (hard
     links) passes only when all of them turn up inside the fence, the rule a store's state
-    folder follows. A file that cannot exist, being absent or below a plain file, passes."""
+    folder follows. A file that cannot exist, being absent or below a plain file, passes.
+    The walk of the fence that looks for the other names follows the links it meets while they lead inside
+    the fence, which resolves them (and so looks at where each leads). With `follow_links` false it follows none:
+    the verdict is the same, and no link inside the fence is resolved."""
     allowed = _fence()
     if allowed is None:
         return
@@ -281,7 +298,7 @@ def check_second_names(files) -> None:
         if stat.S_ISREG(status.st_mode) and status.st_nlink > 1 and _note_names(names_found, file, status, found=0):
             _refuse(file, file, allowed, why="linked")
     if names_found:
-        _walk_names(allowed, allowed, names_found, known_only=True)
+        _walk_names(allowed, allowed, names_found, known_only=True, follow_links=follow_links)
         unmatched = _unmatched(names_found)
         if unmatched:
             _refuse(unmatched[0], unmatched[0], allowed, why="linked")

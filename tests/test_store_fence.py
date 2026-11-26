@@ -7,9 +7,11 @@ import errno
 import json
 import multiprocessing
 import os
+import re
 import runpy
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import textwrap
@@ -26,6 +28,10 @@ from agenttalk.store import Store
 
 SRC = Path(agenttalk.__file__).resolve().parents[1]   # the agenttalk under test, also in subprocesses
 TESTS = Path(__file__).resolve().parent
+# No background upkeep from the fixtures' own Git commands: a commit or a fetch can start Git's automatic maintenance,
+# which runs on after the command, detached, and writes in the repository (`objects/maintenance.lock`) while a test
+# compares snapshots of it (seen on macOS CI with Python 3.10).
+_NO_UPKEEP = ("-c", "maintenance.auto=false", "-c", "gc.auto=0")
 
 
 def _snapshot(folder: Path) -> dict[str, bytes]:
@@ -548,7 +554,7 @@ def test_janitor_apply_removes_and_commits_nothing_outside_the_fence(fenced, tmp
     if shutil.which("git") is None:
         return
     _set_scratch(inside, root=str(fence / "scratch"), tmp_root=str(fence / "tmp"))
-    git = ["git", "-C", str(inside), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    git = ["git", "-C", str(inside), "-c", "user.name=t", "-c", "user.email=t@example.invalid", *_NO_UPKEEP]
     for step in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "seed"],
                  ["worktree", "add", "-q", "-b", "wip", str(tmp_path / "outside-wt")]):
         subprocess.run([*git, *step], check=True, capture_output=True, timeout=60)
@@ -699,6 +705,7 @@ def test_janitor_lists_and_asks_git_nothing_outside_the_fence(
 
     monkeypatch.setattr(janitor, "_safe_iterdir", listing)
     monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside, worktree])
+    monkeypatch.setattr(janitor, "_registered_worktrees_listed", lambda repo: [inside, worktree])  # discovery's list
     monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: asked.append(Path(path)) or False)
     assert cli.main(["--root", str(inside), "janitor", *mode]) == 2
     reached = tmp_path / f"outside-{outside_part}"
@@ -1209,7 +1216,7 @@ def test_a_posix_child_given_byte_keys_is_fenced(fenced) -> None:
 
 
 def _git(repo: Path, *args: str) -> str:
-    result = subprocess.run([shutil.which("git"), "-C", str(repo), *args],
+    result = subprocess.run([shutil.which("git"), "-C", str(repo), *_NO_UPKEEP, *args],
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
@@ -1221,7 +1228,8 @@ def _merged_checkout(fence: Path, checkout: Path, scratch: Path) -> Path:
     repo = fence / "repo"
     repo.mkdir()
     _git(repo, "init", "-b", "main")
-    for key, value in (("user.name", "Test Author"), ("user.email", "test@example.invalid"), ("gc.auto", "0")):
+    for key, value in (("user.name", "Test Author"), ("user.email", "test@example.invalid"), ("gc.auto", "0"),
+                       ("maintenance.auto", "false")):
         _git(repo, "config", key, value)
     (repo / "source.txt").write_text("original\n", encoding="utf-8")
     (repo / ".gitignore").write_text(".agenttalk/\n.worktrees/\n", encoding="utf-8")
@@ -1346,6 +1354,445 @@ def test_janitor_release_with_an_origin_inside_the_fence_still_works(
         assert not checkout.exists()
     else:
         assert f"WOULD RELEASE {checkout}" in capsys.readouterr().out
+
+
+# --- #858 fix round 14: the fence checks the EXACT registered paths that the probes use ---------------------------
+
+LINE_SEPARATOR = " "  # a legal file name character; Python's splitlines() treats it as a line break
+
+_MODES = {"report": [], "apply": ["--apply"], "release-report": ["--release-report"],
+          "release": ["--release", "{done}"]}
+_JANITOR_MODES = [pytest.param(args, id=name) for name, args in _MODES.items()]
+# Which list is made to fail, in which modes: the sweep's strict listing is held by all four (one preflight serves every
+# mode); release's own list is read by the two release modes only.
+_LIST_CASES = [
+    pytest.param(which, _MODES[name], id=f"{name}-{which}")
+    for which, names in (("janitor-list", list(_MODES)), ("release-list", ["release-report", "release"]))
+    for name in names
+]
+
+
+def _outside_clone(tmp_path: Path) -> Path:
+    """A plain repository OUTSIDE the fence; a `git status` there rewrites its index (a file has another time)."""
+    clone = tmp_path / "outside-clone"
+    clone.mkdir()
+    _git(clone, "init", "-b", "main")
+    for key, value in (("user.name", "Test Author"), ("user.email", "test@example.invalid"),
+                       ("maintenance.auto", "false"), ("gc.auto", "0")):
+        _git(clone, "config", key, value)
+    (clone / "tracked.txt").write_text("content\n", encoding="utf-8")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-qm", "base")
+    os.utime(clone / "tracked.txt", (1_000_000_000, 1_000_000_000))  # so that status must rewrite the index
+    return clone
+
+
+def _janitor_args(mode: list[str], done: Path) -> list[str]:
+    return [part.format(done=done) for part in mode]
+
+
+def _spy_on_probes(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Every checkout the janitor asks `git status` about, in order."""
+    from agenttalk import janitor
+
+    asked: list[Path] = []
+    real = janitor.is_dirty_worktree
+    monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: asked.append(Path(path)) or real(path))
+    return asked
+
+
+def _linked_registered_checkout(fence: Path, tmp_path: Path, name: str) -> tuple[Path, Path, Path, Path]:
+    """(repo, an ordinary in-fence checkout `done`, the registered checkout `link`, the outside clone).
+
+    `link` is registered under `name` inside the fence, and is a link (a junction on Windows, which needs no rights; a
+    symlink elsewhere) to the outside clone: Git still lists the name, and a `git status` run there would run in, and
+    rewrite the index of, the clone that is outside the fence."""
+    scratch = fence / "scratch"
+    done = scratch / "done"
+    repo = _merged_checkout(fence, done, scratch)
+    link = scratch / name
+    _git(repo, "worktree", "add", "-b", "lane-linked", str(link))
+    shutil.rmtree(link)
+    clone = _outside_clone(tmp_path)
+    _dir_link(link, clone)
+    return repo, done, link, clone
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+def test_a_registered_link_whose_name_holds_a_line_separator_is_fenced_before_any_probe(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],
+) -> None:
+    """The review bot's P1. The fence checked the registered checkouts as the old text reader lists them, which cuts a
+    name with U+2028 short, to a path that does not exist. A registered checkout with such a name that is a link to a
+    checkout outside the fence therefore passed, and the report, which probes the exact registered path, ran `git
+    status` in the outside checkout and rewrote its index. The fence now checks the exact paths the probes use, so the
+    link is refused first, in every mode (the report, the sweep, release-report and release), and nothing outside is
+    touched: no probe is made there and its index is byte for byte the same."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done, link, clone = _linked_registered_checkout(fence, tmp_path, f"a{LINE_SEPARATOR}b")
+    index = clone / ".git" / "index"
+    before_index, before_clone = index.read_bytes(), _snapshot(clone / ".git")
+    asked = _spy_on_probes(monkeypatch)
+    try:
+        rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+    finally:
+        _unlink_dir(link)
+    outside = clone.resolve()
+    assert rc == 2
+    reached = [Path(os.path.realpath(path)) for path in asked]
+    assert all(path != outside and outside not in path.parents for path in reached), f"a probe went outside: {asked}"
+    assert index.read_bytes() == before_index and _snapshot(clone / ".git") == before_clone
+    assert (done / ".git").exists() and (done / "source.txt").exists()      # nothing was released or swept
+    refused = report.read_text(encoding="utf-8").split("\n")[:-1]
+    assert len(refused) == 1 and refused[0].endswith(f" -> {outside}"), refused
+
+
+@pytest.mark.parametrize("which, mode", _LIST_CASES)
+def test_a_registered_list_that_cannot_be_read_reliably_under_the_fence_refuses(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str, mode: list[str],
+) -> None:
+    """With no list of exact paths that the fence can check, nothing is probed. The sweep's strict listing failing
+    refuses all four modes (the release modes hold it too, so one preflight serves every mode); release's own list
+    failing refuses the two release modes, which are the ones that read it."""
+    from agenttalk import janitor, worktree_release
+
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+
+    def broken_janitor_list(_repo):
+        raise janitor._UseCheckFailed("could not list the registered checkouts (test)")
+
+    def broken_release_list(_repo):
+        raise worktree_release.Refused("git worktree list failed (test)")
+
+    if which == "janitor-list":
+        monkeypatch.setattr(janitor, "_registered_worktrees_listed", broken_janitor_list)
+    else:
+        monkeypatch.setattr(worktree_release, "_registered", broken_release_list)
+    asked = _spy_on_probes(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    assert rc == 2 and asked == []
+    assert (done / ".git").exists() and (done / "source.txt").exists()
+    lines = report.read_text(encoding="utf-8").split("\n")[:-1]
+    assert len(lines) == 1 and "registered checkouts" in lines[0] and lines[0].endswith(_UNPLACED), lines
+
+
+@pytest.mark.parametrize("mode", [
+    pytest.param([], id="report"),
+    pytest.param(["--apply"], id="apply"),
+    pytest.param(["--release-report"], id="release-report"),
+])
+def test_ordinary_in_fence_checkouts_are_still_probed_under_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: list[str],
+) -> None:
+    """The control: an ordinary registered checkout inside the fence passes the preflight and is handled as before (the
+    report and the sweep probe it; release-report reads it), with no refusal."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    asked = _spy_on_probes(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", *mode])
+
+    assert rc == 0, capsys.readouterr().out
+    assert not report.exists()
+    if "--release-report" in mode:
+        assert f"WOULD RELEASE {done}" in capsys.readouterr().out
+    else:
+        assert [Path(os.path.realpath(path)) for path in asked] == [Path(os.path.realpath(done))]
+
+
+@pytest.mark.parametrize("fence_set", [True, False], ids=["fenced", "no-fence"])
+def test_the_report_probes_only_a_strict_list_under_a_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fence_set: bool,
+) -> None:
+    """`build_report` can be called without the command around it. When the strict list failed it falls back to the old
+    reader for the counts and the preview; under a fence it must not probe those paths (they were never the ones the
+    fence checked). Without a fence the old best-effort probe is unchanged."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    if not fence_set:
+        monkeypatch.delenv("AGENTTALK_STORE_FENCE")
+    cfg = janitor.JanitorConfig.load(repo)
+    monkeypatch.setattr(janitor, "_registered_worktrees_listed",
+                        lambda _repo: (_ for _ in ()).throw(janitor._UseCheckFailed("could not list (test)")))
+    asked = _spy_on_probes(monkeypatch)
+
+    report = janitor.build_report(cfg)
+
+    assert not report.registered_strict
+    assert [Path(os.path.realpath(path)) for path in asked] == ([] if fence_set else [Path(os.path.realpath(done))])
+
+
+@pytest.mark.parametrize("mode", [
+    pytest.param(["--release-report"], id="release-report"),
+    pytest.param(["--release", "{done}"], id="release"),
+])
+def test_a_release_fences_its_own_list_of_registered_checkouts_too(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],
+) -> None:
+    """A release probes the paths of ITS OWN NUL-framed list, not the sweep's. They are the same on any ordinary
+    repository, so this makes release's list hold a checkout outside the fence that the sweep's list does not: the
+    fence still refuses it, before release asks anything of Git."""
+    from agenttalk import worktree_release
+
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    real = worktree_release._registered
+    monkeypatch.setattr(worktree_release, "_registered", lambda repo_: {**real(repo_), stranger: set()})
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    assert rc == 2
+    assert (done / ".git").exists() and (done / "source.txt").exists()
+    assert report.read_text(encoding="utf-8").split("\n")[:-1] == [str(stranger)]
+
+
+# --- #858 fix round 15: every later read of the registered checkouts is fenced too ----------------------------------
+
+_LIST_ARGS = ("worktree", "list", "--porcelain", "-z")
+
+
+def _stranger_record(outside: Path) -> tuple[bytes, str]:
+    """The record Git would print for a checkout registered at `outside`, as bytes (the sweep's reader) and as text."""
+    sha = "0" * 40
+    return (
+        b"worktree " + os.fsencode(str(outside)) + b"\0HEAD " + sha.encode() + b"\0detached\0\0",
+        "\0worktree " + str(outside) + "\0HEAD " + sha + "\0detached",
+    )
+
+
+def _register_outside_after(
+    monkeypatch: pytest.MonkeyPatch, outside: Path, *, after: int = 1, only: str | None = None
+) -> dict[str, int]:
+    """Git's list of registered checkouts names `outside` too, from the reading number `after` + 1 on. The two readers
+    (the sweep's and release's) are counted apart; the preflight makes the first reading of each; `only` limits it to
+    one reader. This sits below the readers, at the output of Git, so whatever the reader itself does with a path is
+    what is tested."""
+    from agenttalk import janitor, worktree_release
+
+    calls = {"sweep": 0, "release": 0}
+    real_run, real_read = janitor._run_git_checked, worktree_release._read_git
+
+    def run(repo, *args, raw=False):
+        rc, out, err = real_run(repo, *args, raw=raw)
+        if args[:4] == _LIST_ARGS:
+            calls["sweep"] += 1
+            if calls["sweep"] > after and only in (None, "sweep") and rc == 0 and isinstance(out, bytes):
+                out += _stranger_record(outside)[0]
+        return rc, out, err
+
+    def read(repo, *args):
+        out = real_read(repo, *args)
+        if args[:4] == _LIST_ARGS:
+            calls["release"] += 1
+            if calls["release"] > after and only in (None, "release"):
+                out += _stranger_record(outside)[1]
+        return out
+
+    monkeypatch.setattr(janitor, "_run_git_checked", run)
+    monkeypatch.setattr(worktree_release, "_read_git", read)
+    return calls
+
+
+def _watch_looks_at(monkeypatch: pytest.MonkeyPatch, outside: Path) -> list[str]:
+    """Every look at `outside` that the sweep or release makes, noted BEFORE it happens: an existence check, a
+    containment or identity check, the ancestor identities of a release. (The fence's own check of a path is not one of
+    these: it is the check.) The list is empty when nothing outside the fence was looked at."""
+    import pathlib
+
+    from agenttalk import janitor
+
+    looked: list[str] = []
+    target = os.path.normcase(str(outside))
+
+    def is_outside(value) -> bool:
+        return os.path.normcase(str(value)) == target
+
+    real_exists = pathlib.Path.exists
+    real_contains, real_same, real_ids = janitor._contains_worktree, janitor._same_worktree, janitor._ancestor_ids
+
+    def exists(self, *args, **kwargs):
+        if is_outside(self):
+            looked.append("exists")
+        return real_exists(self, *args, **kwargs)
+
+    def contains(candidate, worktree):
+        if is_outside(candidate) or is_outside(worktree):
+            looked.append("containment")
+        return real_contains(candidate, worktree)
+
+    def same(left, right):
+        if is_outside(left) or is_outside(right):
+            looked.append("identity")
+        return real_same(left, right)
+
+    def ids(cfg):
+        if is_outside(cfg.scratch_root):
+            looked.append("ancestor identities")
+        return real_ids(cfg)
+
+    monkeypatch.setattr(pathlib.Path, "exists", exists)
+    monkeypatch.setattr(janitor, "_contains_worktree", contains)
+    monkeypatch.setattr(janitor, "_same_worktree", same)
+    monkeypatch.setattr(janitor, "_ancestor_ids", ids)
+    return looked
+
+
+def _stale_leftover(temp: Path) -> Path:
+    """A scratch-family folder in the temp root, old enough for the sweep to remove (a candidate of `--apply`)."""
+    leftover = temp / "agenttalk-probe-old"
+    leftover.mkdir()
+    note = leftover / "note.txt"
+    note.write_text("kept unless the sweep removes it", encoding="utf-8")
+    for path in (note, leftover):
+        os.utime(path, (1, 1))
+    return leftover
+
+
+_LATER_MODES = {
+    "release-report": ["--release-report"],
+    "release": ["--release", "{done}"],
+    "apply": ["--apply"],
+}
+
+
+@pytest.mark.parametrize("mode", list(_LATER_MODES))
+def test_a_checkout_registered_outside_after_the_preflight_is_never_looked_at(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """A later reading of Git's list is fenced by itself. After the preflight's own reading, the list also names a
+    checkout outside the fence. Release read it again and passed it to its identity check (a stat of the path and its
+    ancestors), and the sweep's last look asked whether it exists and whether it lies under the candidate, all before
+    any fence check. Now the readers refuse the path first: nothing is looked at outside, nothing is released or swept.
+    """
+    fence, _, report = fenced
+    fence = fence.resolve()
+    scratch = fence / "scratch"
+    done = scratch / "done"
+    repo = _merged_checkout(fence, done, scratch)
+    leftover = _stale_leftover(fence / "temp")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    calls = _register_outside_after(monkeypatch, stranger)
+    looked = _watch_looks_at(monkeypatch, stranger)
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(_LATER_MODES[mode], done)])
+
+    assert calls["sweep"] + calls["release"] >= 2, "the later reading never happened, so nothing was tested"
+    assert looked == [], f"the outside checkout was looked at: {looked}"
+    assert rc != 0
+    assert (done / ".git").exists() and (leftover / "note.txt").exists()  # nothing was released or swept
+    assert str(stranger) in report.read_text(encoding="utf-8").split("\n")
+
+
+@pytest.mark.parametrize("mode", list(_LATER_MODES))
+def test_the_same_run_works_when_the_later_reading_is_unchanged(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: str,
+) -> None:
+    """The control for the test above: no checkout is added, so the run does what it always did (the report lists, the
+    release removes, the sweep removes the stale leftover), with no refusal."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    scratch = fence / "scratch"
+    done = scratch / "done"
+    repo = _merged_checkout(fence, done, scratch)
+    leftover = _stale_leftover(fence / "temp")
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(_LATER_MODES[mode], done)])
+
+    assert rc == 0, capsys.readouterr().out
+    assert not report.exists()
+    if mode == "release":
+        assert not done.exists()
+    elif mode == "apply":
+        assert not leftover.exists()
+
+
+@pytest.mark.parametrize("mode", ["release", "apply"])
+def test_a_later_reading_that_adds_an_in_fence_checkout_is_still_fence_checked_and_allowed(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """The control for the fence: a checkout registered INSIDE the fence after the preflight passes the fence, and the
+    fence is asked about it (the reader checks every path it returns), so the check is not simply skipped."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    scratch = fence / "scratch"
+    done = scratch / "done"
+    repo = _merged_checkout(fence, done, scratch)
+    _stale_leftover(fence / "temp")
+    newcomer = fence / "scratch" / "newcomer"
+    newcomer.mkdir()
+    _register_outside_after(monkeypatch, newcomer)  # named "outside" in the helper, but this one is inside the fence
+    asked: list[Path] = []
+    real_check = cli.store_mod.check_folder_fence
+    monkeypatch.setattr(
+        cli.store_mod, "check_folder_fence", lambda folder: asked.append(Path(folder)) or real_check(folder)
+    )
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(_LATER_MODES[mode], done)])
+
+    assert newcomer in asked, "the in-fence newcomer was never checked against the fence"
+    assert not report.exists()
+
+
+@pytest.mark.parametrize("mode", ["release-report", "release"])
+def test_the_preflight_passes_on_the_fence_refusal_of_releases_own_list(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """The sweep's list is clean and only release's own list names an outside checkout from the first reading on: the
+    preflight reports THAT refusal (the path, with the fence's usual line), not the generic "could not list" one."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    _register_outside_after(monkeypatch, stranger, after=0, only="release")
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(_LATER_MODES[mode], done)])
+
+    assert rc == 2 and (done / ".git").exists()
+    assert report.read_text(encoding="utf-8").split("\n")[:-1] == [str(stranger)]
+
+
+@pytest.mark.parametrize("reader", ["sweep", "release"])
+def test_each_reader_of_the_registered_checkouts_fences_what_it_returns(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str,
+) -> None:
+    """One test per reader. Called directly (the preflight's own check is not in the way), the sweep's strict reader and
+    release's own reader each refuse a registered path outside the fence, with the refusal report line, and return the
+    path as before when no fence is set."""
+    from agenttalk import janitor, worktree_release
+
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo = _merged_checkout(fence, fence / "scratch" / "done", fence / "scratch")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    _register_outside_after(monkeypatch, stranger, after=0)
+    read = janitor._registered_worktrees_listed if reader == "sweep" else worktree_release._registered
+
+    with pytest.raises(cli.store_mod.StoreFenceError):
+        read(repo)
+    assert report.read_text(encoding="utf-8").split("\n")[:-1] == [str(stranger)]
+
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # no fence: the same reading just returns it
+    assert stranger in list(read(repo))
 
 
 @pytest.mark.parametrize("reader", [
@@ -1997,7 +2444,7 @@ def test_janitor_checks_the_worktrees_folder_first(
     real_iterdir = janitor._safe_iterdir
     monkeypatch.setattr(janitor, "_safe_iterdir", lambda path: listed.append(Path(path)) or real_iterdir(path))
     monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside])
-    monkeypatch.setattr(janitor, "_worktrees_discovery_ok", lambda repo: (True, ""))
+    monkeypatch.setattr(janitor, "_registered_worktrees_listed", lambda repo: [inside])  # discovery's list
     monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: False)
     monkeypatch.setattr(janitor, "_run_git", lambda *args, **kwargs: (0, "", ""))   # no real git, on any code
     monkeypatch.setattr(janitor, "_run_git_checked", lambda *args, **kwargs: (0, "", ""))
@@ -2029,3 +2476,1736 @@ def test_store_fence_allows_settles_a_passing_second_name_like_the_fence_check(
     monkeypatch.setattr(store_mod, "_first_escape", lambda root, fence: seen.pop(0) if len(seen) > 1 else seen[0])
     monkeypatch.setattr(store_mod.time, "sleep", lambda seconds: None)
     assert store_mod.store_fence_allows(tmp_path / "team") is allowed
+
+
+# --- #858 fix round 16: a path that an activity record names is fenced before anything resolves it -----------------
+
+_NAMED_MARK = "zz-record-named"  # in the name of the folder that a record names outside the fence (lower case)
+_NETWORK_MARK = "server-858"  # in the name of the network host of a UNC path
+
+
+def _record_path(kind: str, tmp_path: Path) -> str:
+    """An absolute path a record can name, outside the fence: a folder beside it, or a network path (UNC)."""
+    if kind == "outside":
+        folder = tmp_path / _NAMED_MARK
+        folder.mkdir(exist_ok=True)
+        return str(folder.resolve() / "x")
+    return f"\\\\{_NETWORK_MARK}\\share\\x" if os.name == "nt" else f"//{_NETWORK_MARK}/share/x"
+
+
+def _looked_at(monkeypatch: pytest.MonkeyPatch, *marks: str) -> list[tuple[str, str]]:
+    """Every look at a path whose name holds one of `marks`, by the calls that ask the file system about a path (stat,
+    lstat, realpath, exists, a listing, a link's target). The spy answers an error and never asks the real call, so a
+    network path is never contacted. The fence's own resolver is not exempted: a look it makes is recorded too."""
+    looked: list[tuple[str, str]] = []
+
+    def watch(name, real):
+        def spy(path, *args, **kwargs):
+            try:
+                text = os.fsdecode(os.fspath(path))
+            except TypeError:  # a file descriptor
+                return real(path, *args, **kwargs)
+            if any(mark in os.path.normcase(text) for mark in marks):
+                looked.append((name, text))
+                raise OSError(errno.EIO, "a path outside the fence was looked at (spy)")
+            return real(path, *args, **kwargs)
+
+        return spy
+
+    calls = [(os, "lstat"), (os, "stat"), (os, "scandir"), (os, "listdir"), (os, "readlink"), (os.path, "realpath"),
+             (os.path, "exists"), (os.path, "lexists"), (os.path, "isdir"), (os.path, "isfile")]
+    if os.name == "nt":
+        import nt
+
+        calls.append((nt, "_getfinalpathname"))
+    for owner, name in calls:
+        monkeypatch.setattr(owner, name, watch(f"{owner.__name__}.{name}", getattr(owner, name)))
+    return looked
+
+
+_RECORDS = {
+    "lane-worktree_path": ("lane", "worktree_path"),
+    "lane-cwd": ("lane", "cwd"),
+    "launch-cwd": ("launch", "cwd"),
+}
+
+
+def _write_named(repo: Path, record: str, text: str) -> None:
+    """A record that names `text`: an active lane row, or a pending launch request."""
+    kind, field = _RECORDS[record]
+    state = repo / ".agenttalk" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    if kind == "lane":
+        row = {"status": "active", field: text}
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}), encoding="utf-8")
+    else:
+        (state / "launch-requests").mkdir(exist_ok=True)
+        row = {"state": "pending", field: text}
+        (state / "launch-requests" / "r.json").write_text(json.dumps(row), encoding="utf-8")
+
+
+def _swept_checkout(fence: Path) -> tuple[Path, Path]:
+    """(repo, the merged, clean checkout `.worktrees/done`): a candidate of the sweep, and one a release removes."""
+    done = fence / "repo" / ".worktrees" / "done"
+    return _merged_checkout(fence, done, fence / "scratch"), done
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+@pytest.mark.parametrize("named", ["outside", "network"])
+@pytest.mark.parametrize("record", list(_RECORDS))
+def test_a_record_that_names_a_path_outside_the_fence_keeps_the_checkout_and_nothing_outside_is_looked_at(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+    record: str, named: str, mode: list[str],
+) -> None:
+    """The in-use check reads every record, and each path a record names went through `lstat` and `realpath` before it
+    was judged unrelated: the preflight fences the configured roots and the registered checkouts, not these. Now the
+    fence decides first, from the path as written (no look at it, so a network path is never contacted), and a path it
+    refuses keeps the checkout and says that the record names a path outside the fence: never read as unrelated."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    _write_named(repo, record, _record_path(named, tmp_path))
+    looked = _looked_at(monkeypatch, _NAMED_MARK, _NETWORK_MARK)
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert looked == [], f"a path outside the fence was looked at: {looked}"
+    assert (done / ".git").exists() and str(done) in _git(repo, "worktree", "list").replace("/", os.sep), text
+    assert "names a path outside the fence" in text and "kept" in text.lower(), text
+    assert rc in (0, 1), text  # a kept checkout is a refusal, not a crash
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+def test_a_record_that_names_a_path_inside_the_fence_that_is_not_the_checkout_frees_it_as_before(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: list[str],
+) -> None:
+    """The control: an active lane and a launch request that name some other folder inside the fence are placed as
+    ever (and looked at: the fence allows it); the checkout is released or swept, with no refusal."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    elsewhere = fence / "elsewhere"
+    elsewhere.mkdir()
+    _write_named(repo, "lane-cwd", str(elsewhere))
+    _write_named(repo, "launch-cwd", str(elsewhere))
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert "outside the fence" not in text and f"REFUSED (kept) {done}" not in text and f"KEPT {done}" not in text, text
+    assert not report.exists()
+    if "--release-report" in mode:
+        assert f"WOULD RELEASE {done}" in text, text
+    elif "--apply" in mode or "--release" in mode:
+        assert not done.exists() and rc == 0, text
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+@pytest.mark.parametrize("record", ["lane-worktree_path", "launch-cwd"])
+def test_a_record_that_names_the_checkout_inside_the_fence_still_keeps_it(
+    fenced, tmp_path: Path, capsys: pytest.CaptureFixture, record: str, mode: list[str],
+) -> None:
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    _write_named(repo, record, str(done))
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert (done / ".git").exists(), text
+    assert ("names this checkout" in text or "REFUSED (kept)" in text or "KEPT" in text), text
+    assert "outside the fence" not in text, text
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+def test_a_record_that_names_an_in_fence_link_to_an_outside_folder_keeps_the_checkout(
+    fenced, tmp_path: Path, capsys: pytest.CaptureFixture, mode: list[str],
+) -> None:
+    """A path that is inside the fence as written but leads outside through a link: the fence's own resolution follows
+    the link before it refuses (#913), and then the checkout is kept, with the same reason."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    outside = tmp_path / "elsewhere-outside"
+    outside.mkdir()
+    link = fence / "link-to-outside"
+    _dir_link(link, outside)
+    _write_named(repo, "lane-cwd", str(link / "x"))
+    try:
+        cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+    finally:
+        _unlink_dir(link)
+
+    text = capsys.readouterr().out
+    assert (done / ".git").exists() and "names a path outside the fence" in text, text
+
+
+# --- #858 fix round 17: no look at a record-named path outside the fence on ANY in-use route, advice code included ----
+
+_GUARD_FOLDER = "zz-guard-outside"  # in the name of the folder outside the fence that records name (lower case)
+_GUARD_HOST = "server-858g"  # in the name of the network host of a UNC value
+
+
+class _OutsideGuard:
+    """What the guard saw. Every path is classified by the FENCE itself, never by where a test put things: a path is
+    inside when, made absolute (a string operation), it is the fence or below it, as the fence is written or as it
+    resolves; every other path is OUTSIDE, whatever it is and whichever host a network path names. An outside path is
+    never forwarded to the real call: the guard records it in `outside` and answers an error, so nothing there (or
+    on the network) is read.
+
+    A path that is inside as written is judged by where the operating system would really go with it: the folders on
+    its way are looked at (they are inside the fence) and, when one of them is a link whose target lies outside the
+    fence, the look is an outside look, whichever call makes it (`lstat` of `link/x` follows `link`).
+
+    `outside` also holds a resolution of an inside-as-written path that LED outside (`os.path.realpath` answered a path
+    outside the fence: that is a link followed to its target, whether or not the platform's own resolver makes visible
+    calls), and a second resolution inside one fence check.
+
+    The one allowance is the fence's own resolution (#913): when `check_folder_fence` is given a path that is inside as
+    written, ONE `os.path.realpath` of exactly that path is let through, and the calls that resolver makes inside it are
+    not counted. It is recorded in `resolved_by_the_fence`, once per fence check, and a test asserts that list."""
+
+    def __init__(self) -> None:
+        self.outside: list[tuple[str, str]] = []
+        self.resolved_by_the_fence: list[tuple[str, str]] = []
+        self.fence_checks: list[str] = []
+        self.looks: list[tuple[str, str]] = []  # every look at a path inside the fence, as written: (call, path)
+
+
+def _install_guard(monkeypatch: pytest.MonkeyPatch, fence: Path) -> _OutsideGuard:
+    """Replace every call that asks the file system about a path, and the Git runners, with a spy that classifies the
+    path by the fence (see `_OutsideGuard`). Git itself is found once, before the spies, so that the search of the
+    program folders is not read as a look outside."""
+    import pathlib
+
+    from agenttalk import janitor, worktree_release
+
+    guard = _OutsideGuard()
+    # The standard library looks for message catalogues of the system's language (`/usr/share/locale/...`) whenever
+    # an error text or help is built, on systems that have one: that is the interpreter's own business, not the code
+    # under test. The plain "C" language has no catalogue to look for, so the guard needs no allowance for them.
+    for name in ("LANG", "LANGUAGE", "LC_MESSAGES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LC_ALL", "C")
+    inside_roots = {os.path.normcase(os.path.abspath(fence)), os.path.normcase(os.path.realpath(fence))}
+    # The folders ABOVE the fence are looked at (never listed) by the check of the configured roots, which walks every
+    # parent from the drive root down ("a linked parent is refused"): a look at one of them is a look at the way to the
+    # fence, not at a place a record names. Only those exact paths, and only by the calls that ask about one path.
+    roots = (fence, Path(os.path.realpath(fence)))
+    ancestors = {os.path.normcase(str(parent)) for root in roots for parent in root.parents}
+    git_exe = shutil.which("git")
+    real_realpath, real_which = os.path.realpath, shutil.which
+    # "roots": the janitor's own identity checks of the configured roots and their parents are running; "resolving": a
+    # resolver is working on a path inside the fence (on Linux it looks at each parent on its way, the fence's own).
+    state = {"approved": 0, "scope": None, "scope_used": False, "roots": 0, "resolving": 0}
+    real_lstat, real_readlink = os.lstat, os.readlink
+    root_paths = [Path(root) for root in inside_roots]
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    def is_link_status(status) -> bool:
+        return stat.S_ISLNK(status.st_mode) or bool(getattr(status, "st_file_attributes", 0) & reparse)
+
+    def where_it_goes(text: str, *, follow_last: bool, depth: int = 0) -> tuple[str, str] | None:
+        """(the link, where it leads) when the way from the fence to `text` meets a link whose target is outside the
+        fence, else None. Only the folders on the way are looked at (all inside the fence, with the real calls); a link
+        is read, never followed by the guard. A link that leads inside is followed on paper (the rest of the way is
+        judged from its target). The last part is not followed unless `follow_last` (a call like `lstat`)."""
+        path = Path(os.path.abspath(text))
+        root = next((r for r in root_paths if os.path.normcase(str(path)).startswith(os.path.normcase(str(r)))), None)
+        if root is None or depth > 8:
+            return None
+        parts = path.parts[len(root.parts):]
+        current = root
+        for index, part in enumerate(parts):
+            current = current / part
+            if index == len(parts) - 1 and not follow_last:
+                break
+            try:
+                status = real_lstat(current)
+            except OSError:
+                return None  # nothing there: nothing is followed beyond it
+            if is_link_status(status):
+                target = real_readlink(current)
+                if target.startswith("\\\\?\\"):  # the extended form Windows gives for a junction's target
+                    target = target[4:]
+                goes = Path(os.path.abspath(os.path.join(os.path.dirname(current), target)))
+                if not any(
+                    os.path.normcase(str(goes)) == os.path.normcase(str(r))
+                    or os.path.normcase(str(goes)).startswith(os.path.normcase(str(r)) + os.sep)
+                    for r in root_paths
+                ):
+                    return str(current), str(goes)
+                rest = Path(*parts[index + 1:]) if parts[index + 1:] else Path()
+                return where_it_goes(str(goes / rest), follow_last=follow_last, depth=depth + 1)
+        return None
+
+    def inside(text: str) -> bool:
+        norm = os.path.normcase(os.path.abspath(text))
+        return any(norm == root or norm.startswith(root + os.sep) for root in inside_roots)
+
+    def text_of(value) -> str | None:
+        try:
+            return os.fsdecode(os.fspath(value))
+        except TypeError:  # a file descriptor, or no path at all
+            return None
+
+    def refuse(name: str, text: str) -> None:
+        guard.outside.append((name, text))
+        raise OSError(errno.EIO, "a path outside the fence was looked at (guard)")
+
+    # Git's own options, with Git's meaning: the guard knows these and nothing else. "switch": takes no value; "value":
+    # may carry a value after "=" (judged like an argument; a value given as the next argument is judged as that
+    # argument); "path": a path, after "=" or as the next argument; "folder": `-C`, a change of folder; "config": `-c`,
+    # a `key=value` setting as the next argument; "git-path": `rev-parse --git-path P`, a path that Git reads against
+    # its own Git folder, as the next argument (so only a plain word or an absolute path inside passes). The options
+    # before the command (`git <options> <command>`) are not the command's: `-C` after the command is not a change of
+    # folder (`git commit -C <commit>`). Any option not in these tables is recorded, with or without a value.
+    before_command = {"-C": "folder", "-c": "config", "--git-dir": "path", "--work-tree": "path",
+                      "--no-optional-locks": "switch", "--no-pager": "switch", "--no-replace-objects": "switch"}
+    after_command = {
+        **dict.fromkeys(("-z", "-v", "-q", "--quiet", "-f", "--force", "--others", "--ignored", "--exclude-standard",
+                         "--symref", "--no-tags", "--no-prune", "--no-recurse-submodules", "--verify", "--get",
+                         "--get-regexp", "--get-url", "--name-only", "--stdin", "--stdin-paths", "--no-filters",
+                         "--stage", "--show-toplevel", "--is-ancestor", "--detach"), "switch"),
+        **dict.fromkeys(("--porcelain", "--untracked-files", "--ignore-submodules", "--type", "--abbrev-ref",
+                         "--contains", "--format"), "value"),
+        "--separate-git-dir": "path",
+        "--git-path": "git-path",
+    }
+    separators = os.sep + (os.altsep or "")
+
+    def unplaceable(text: str, base: str | None) -> bool:
+        """True unless `text` is provably a plain word (a name with no folder in it: a command, a branch, a remote, a
+        ref) or a path inside the fence. Read as text only, nothing is looked at: a relative path is read against the
+        folder Git is in (`base`), lexically, so `../../elsewhere` from `fence/repo` is beside the fence."""
+        if not text:
+            return False
+        if "://" in text or "::" in text or text.startswith("~"):
+            return True  # an address, a remote helper, a home folder Git expands: no place the guard can judge
+        if os.path.isabs(text):
+            return not inside(text)
+        if os.path.splitdrive(text)[0]:
+            return True  # a drive with no folder after it (`C:x`): read against that drive's own current folder
+        first = re.split(f"[{re.escape(separators)}]", text, maxsplit=1)[0]
+        if ":" in first:
+            return True  # `host:path`, Git's short form for an address, or pathspec magic (`:/`)
+        if not any(s in text for s in separators) and text != "..":
+            return False  # a plain word
+        return base is None or not inside(os.path.join(base, text))  # lexical: normalised by `inside`
+
+    def unplaceable_setting(setting: str) -> bool:
+        """A `-c key=value` setting: the key must be a plain setting name, and the value a plain word or an absolute
+        path inside the fence. A relative path is not placeable: Git reads some settings (`core.worktree`) against
+        its own folder, not against the folder it runs in."""
+        key, _, value = setting.partition("=")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", key):
+            return True
+        return unplaceable(value, None)  # no folder to read a relative value against
+
+    def outside_argument(repo_text: str | None, args: tuple) -> str | None:
+        """The first argument of a Git runner that the guard cannot prove harmless, as written, or None. FAIL CLOSED:
+        an argument passes only when it is a known option (see the tables above), a plain word, or a path inside the
+        fence; an unknown option (with or without a value), a value given to a switch, an argument that is not text,
+        and anything the guard cannot place are recorded. Git's order is followed: each `-C` before the command (as
+        `-C P` or `-CP`) moves the folder that every later relative path is read against. After `--` every argument
+        is a path. Read as text only: no path is looked at; a path object is read with `os.fspath`."""
+        base = repo_text
+        command = only_paths = False
+        rest = list(args)
+        while rest:
+            argument = rest.pop(0)
+            try:
+                text = os.fsdecode(os.fspath(argument))
+            except TypeError:
+                return repr(argument)  # not text and not a path: the guard cannot read it
+            if only_paths or not text.startswith("-") or text == "-":
+                if unplaceable(text, base):
+                    return text
+                command = True  # the first plain word is the command
+                continue
+            if text == "--":
+                only_paths = True
+                continue
+            if not command and text.startswith("-C") and text != "-C":
+                name, value = "-C", text[2:]  # `-CP`, one argument
+            else:
+                name, equals, value = text.partition("=")
+                value = value if equals else None
+            kind = (after_command if command else before_command).get(name)
+            if kind is None or (kind == "switch" and value is not None):
+                return text if value is None else value  # unknown, or a switch given a value: the guard cannot tell
+            if kind == "switch":
+                continue
+            if kind == "value":
+                if value is not None and unplaceable(value, base):
+                    return value
+                continue
+            if value is None:  # "path", "folder", "config" and "git-path" take the next argument
+                if not rest:
+                    return text  # the value is missing
+                try:
+                    value = os.fsdecode(os.fspath(rest.pop(0)))
+                except TypeError:
+                    return text
+            elif kind in ("config", "git-path"):
+                return text  # `-c=...` and `--git-path=...` are not Git's forms
+            if kind == "config":
+                if unplaceable_setting(value):
+                    return value
+                continue
+            if kind == "git-path":
+                if unplaceable(value, None):  # read against the Git folder, which the guard does not know
+                    return value
+                continue
+            if unplaceable(value, base):
+                return value
+            if kind == "folder" and value:  # Git leaves the folder as it is for an empty `-C ""`
+                if base is None and not os.path.isabs(value):
+                    return value
+                base = os.path.abspath(os.path.join(base or "", value))
+        return None
+
+    def on_the_way(text: str) -> bool:
+        """An exact ancestor of the fence, looked at by one of the two things that expect to: the identity checks of the
+        configured roots (`_ancestor_ids`, `_ancestor_change_reason`) and a resolution of a path inside the fence. A
+        look at an ancestor from anything else, a reader that was handed one by a record, is an outside look."""
+        if not (state["roots"] or state["resolving"]):
+            return False
+        return os.path.normcase(os.path.abspath(text)) in ancestors
+
+    def judge(name: str, text: str, *, way_ok: bool, follow_last: bool) -> None:
+        if state["approved"]:
+            return
+        if not inside(text):
+            if not (way_ok and on_the_way(text)):
+                refuse(name, text)
+            return
+        guard.looks.append((name, text))
+        led = where_it_goes(text, follow_last=follow_last)
+        if led is not None:  # inside as written, but the system follows a link on the way to a place outside
+            guard.outside.append((f"{name} follows a link outside", f"{text} -> {led[1]} (through {led[0]})"))
+            raise OSError(errno.EIO, "a link inside the fence leads outside (guard)")
+
+    def watch(name: str, real, *, way_ok: bool = True, follow_last: bool = True):
+        def spy(path, *args, **kwargs):
+            text = text_of(path)
+            if text is not None:
+                judge(name, text, way_ok=way_ok, follow_last=follow_last)
+            return real(path, *args, **kwargs)
+
+        return spy
+
+    def realpath_spy(path, *args, **kwargs):
+        text = text_of(path)
+        if text is None or state["approved"]:
+            return real_realpath(path, *args, **kwargs)
+        if not inside(text) and not on_the_way(text):
+            refuse("os.path.realpath", text)
+        if state["scope"] is not None and os.path.normcase(os.path.abspath(text)) == state["scope"]:
+            if state["scope_used"]:
+                refuse("a second resolution inside one fence check", text)
+            state["scope_used"] = True
+            state["approved"] += 1
+            try:
+                result = real_realpath(path, *args, **kwargs)
+            finally:
+                state["approved"] -= 1
+            if not inside(result):
+                guard.resolved_by_the_fence.append(("os.path.realpath", text))
+            return result
+        state["resolving"] += inside(text)
+        try:
+            result = real_realpath(path, *args, **kwargs)
+        finally:
+            state["resolving"] -= inside(text)
+        if not inside(result):  # a link inside the fence was followed to a place outside it
+            guard.outside.append(("os.path.realpath led outside", f"{text} -> {result}"))
+        return result
+
+    calls = [(os, "lstat"), (os, "stat"), (os, "scandir"), (os, "listdir"), (os, "readlink"), (os.path, "exists"),
+             (os.path, "lexists"), (os.path, "isdir"), (os.path, "isfile"), (os.path, "samefile")]
+    if os.name == "nt":
+        import nt
+
+        calls.append((nt, "_getfinalpathname"))
+    for owner, name in calls:
+        listing = name in ("scandir", "listdir", "readlink")  # these would show what is NEXT to the way, or beyond it
+        no_follow = name in ("lstat", "readlink")  # the last part of the path is not followed by these
+        monkeypatch.setattr(
+            owner, name,
+            watch(f"{owner.__name__}.{name}", getattr(owner, name), way_ok=not listing, follow_last=not no_follow))
+    monkeypatch.setattr(os.path, "realpath", realpath_spy)
+    for method in ("exists", "is_dir", "stat", "lstat", "iterdir", "resolve"):
+        real_method = getattr(pathlib.Path, method)
+
+        def path_spy(self, *args, _name=f"Path.{method}", _real=real_method, **kwargs):
+            text = text_of(self)
+            if text is not None:
+                judge(_name, text, way_ok=_name != "Path.iterdir", follow_last=_name != "Path.lstat")
+            if _name == "Path.resolve" and text is not None and inside(text):
+                state["resolving"] += 1  # a resolver on a path inside the fence looks at the fence's parents on Linux
+                try:
+                    return _real(self, *args, **kwargs)
+                finally:
+                    state["resolving"] -= 1
+            return _real(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, method, path_spy)
+    for owner, name in (
+        (janitor, "_run_git_checked"), (janitor, "_run_git"),
+        (worktree_release, "_read_git"), (worktree_release, "_git"),
+    ):
+        real_git = getattr(owner, name)
+
+        def git_spy(repo, *args, _name=f"{owner.__name__}.{name}", _real=real_git, **kwargs):
+            text = text_of(repo)
+            if text is not None and not inside(text):
+                refuse(_name, text)
+            where = outside_argument(text, args)  # a path outside the fence handed to Git is a look at it too
+            if where is not None:
+                refuse(f"{_name} argument", where)
+            return _real(repo, *args, **kwargs)
+
+        monkeypatch.setattr(owner, name, git_spy)
+    monkeypatch.setattr(shutil, "which", lambda cmd, *a, **k: git_exe if cmd == "git" else real_which(cmd, *a, **k))
+    for name in ("_ancestor_ids", "_ancestor_change_reason"):  # the checks of the configured roots: they expect to look
+        real_roots_check = getattr(janitor, name)
+
+        def roots_spy(*args, _real=real_roots_check, **kwargs):
+            state["roots"] += 1
+            try:
+                return _real(*args, **kwargs)
+            finally:
+                state["roots"] -= 1
+
+        monkeypatch.setattr(janitor, name, roots_spy)
+
+    real_check = cli.store_mod.check_folder_fence
+
+    def check(folder):
+        text = text_of(folder)
+        guard.fence_checks.append(str(text))
+        state["scope"] = os.path.normcase(os.path.abspath(text)) if text is not None and inside(text) else None
+        state["scope_used"] = False
+        try:
+            return real_check(folder)
+        finally:
+            state["scope"] = None
+
+    monkeypatch.setattr(cli.store_mod, "check_folder_fence", check)
+    return guard
+
+
+def _guard_value(kind: str, tmp_path: Path, fence: Path) -> str:
+    """An absolute path a record can name: a folder beside the fence, a network path (UNC), or a link inside the fence
+    that leads to a folder outside it."""
+    if kind == "outside":
+        folder = tmp_path / _GUARD_FOLDER
+        folder.mkdir(exist_ok=True)
+        return str(folder.resolve() / "x")
+    if kind == "network":
+        return f"\\\\{_GUARD_HOST}\\share\\x" if os.name == "nt" else f"//{_GUARD_HOST}/share/x"
+    target = tmp_path / "zz-guard-link-target"
+    target.mkdir(exist_ok=True)
+    _dir_link(fence / "link-to-outside", target)
+    return str(fence / "link-to-outside" / "x")
+
+
+# Every shape of record that the in-use check reads, with every field that names a folder filled with the value `v`, and
+# the neighbours of a damaged row blank or damaged: (where it is written, what is written).
+_GUARD_SHAPES = {
+    "lane-every-field": ("lane", lambda v: {
+        "status": "active", "worktree_path": v, "worktree_toplevel_canonical": v, "cwd": v, "launch_cwd": v,
+        "workspace_path": v}),
+    "lane-worktree-path-blank": ("lane", lambda v: {
+        "status": "active", "worktree_path": "", "worktree_toplevel_canonical": v}),
+    "lane-canonical-blank": ("lane", lambda v: {
+        "status": "active", "worktree_path": v, "worktree_toplevel_canonical": ""}),
+    "lane-worktree-path-relative": ("lane", lambda v: {
+        "status": "active", "worktree_path": "relative/folder", "worktree_toplevel_canonical": v}),
+    "lane-pending-delivery-copy": ("lane", lambda v: {
+        "status": "delivered", "publish_pending": {"lane": {"worktree_path": "", "worktree_toplevel_canonical": v}},
+        "occupancy_worktrees": [v]}),
+    "lane-retained-occupancy": ("lane", lambda v: {"status": "abandoned", "occupancy_worktrees": [v]}),
+    # A saved copy that sits inside a row that is NOT a pending delivery (a hand-edited or damaged record): its advice
+    # is not cut short by "recover the delivery first", so it is the case that reaches the look at the other path.
+    "lane-saved-copy-in-an-active-row": ("lane", lambda v: {
+        "status": "active", "saved": {"worktree_path": "", "worktree_toplevel_canonical": v}}),
+    "launch-request": ("launch", lambda v: {
+        "state": "pending", "cwd": v, "launch_cwd": v, "workspace_path": v, "worktree_path": v}),
+    "supervisor-state": ("supervisor-state", lambda v: {"agents": {"seat": {"cwd": v, "launch_cwd": v}}}),
+    "store-supervisor": ("store-supervisor", lambda v: {"agents": {"seat": {"launch_cwd": v}}}),
+}
+
+
+def _write_guard_record(repo: Path, shape: str, value: str) -> None:
+    where, build = _GUARD_SHAPES[shape]
+    store = repo / ".agenttalk"
+    state = store / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    row = build(value)
+    if where == "lane":
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}), encoding="utf-8")
+    elif where == "launch":
+        (state / "launch-requests").mkdir(exist_ok=True)
+        (state / "launch-requests" / "r.json").write_text(json.dumps(row), encoding="utf-8")
+    elif where == "supervisor-state":
+        (state / "supervisor-state.json").write_text(json.dumps(row), encoding="utf-8")
+    else:
+        (store / "supervisor.json").write_text(json.dumps(row), encoding="utf-8")
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+@pytest.mark.parametrize("kind", ["outside", "network", "link-out"])
+@pytest.mark.parametrize("shape", list(_GUARD_SHAPES))
+def test_no_in_use_route_looks_at_a_record_named_path_outside_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+    shape: str, kind: str, mode: list[str],
+) -> None:
+    """The structural guard (rounds 14 to 17 each found one more unfenced read, one reader at a time). Every in-use
+    route (the report, `--apply`, `--release-report`, `--release`) is driven with each shape of record, every field that
+    names a folder filled with an outside path, a network path or an in-fence link that leads out, and damaged or blank
+    neighbours; the calls that ask the file system about a path, and the two Git runners, are spies that record any look
+    at a path outside the fence (every path is classified by the fence itself and an outside path is never forwarded;
+    a link followed to a target outside is a look too). Zero looks outside; the checkout is kept. For the link, the
+    fence's own resolution (#913) is the one allowed look: exactly one per fence check, counted and asserted."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    value = _guard_value(kind, tmp_path, fence)
+    _write_guard_record(repo, shape, value)
+    guard = _install_guard(monkeypatch, fence)
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert guard.outside == [], f"a path outside the fence was looked at: {guard.outside}"
+    assert (done / ".git").exists() and str(done) in _git(repo, "worktree", "list").replace("/", os.sep), text
+    if kind == "link-out" and mode == ["--apply"]:
+        # A record path that leads outside the fence is a refusal by the fence itself: the checkout is kept, as a
+        # failure that stops the sweep (no prune), not as an ordinary "in use" keep.
+        assert "worktree prune skipped" in text and "store fence refused" in text, text
+    else:
+        assert "REFUSED (kept)" in text or "KEPT" in text, text  # the checkout is kept, with a reason
+    named = os.path.normcase(os.path.abspath(value))
+    given = [c for c in guard.fence_checks if os.path.normcase(os.path.abspath(c)) == named]
+    if kind == "link-out":
+        # The accepted resolution (#913), counted: exactly one `realpath` of the link path per fence check that was
+        # handed it, and nothing else. An extra look outside, or a second resolution, is in `outside` and fails above.
+        assert given, "the fence was never asked about the link"
+        expected = [("os.path.realpath", c) for c in given]
+        assert guard.resolved_by_the_fence == expected, (given, guard.resolved_by_the_fence)
+    else:
+        assert guard.resolved_by_the_fence == [], guard.resolved_by_the_fence  # the fence resolved nothing outside
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+@pytest.mark.parametrize(
+    "where, advice",
+    [("elsewhere", "names a folder that still exists"), ("missing-folder", "to retire this lane without using")],
+    ids=["a-folder-that-is-there", "a-folder-that-is-gone"],
+)
+def test_a_damaged_record_that_names_an_in_fence_path_still_gets_its_recovery_advice(
+    fenced, tmp_path: Path, capsys: pytest.CaptureFixture, mode: list[str], where: str, advice: str,
+) -> None:
+    """The control: the same damaged row (`worktree_path` blank, an absolute `worktree_toplevel_canonical`) with a path
+    INSIDE the fence is still looked at and still gets the advice that says what is there (the other saved path names a
+    folder that exists, or nothing is there), in every mode, with the checkout kept."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    named = fence / where
+    if where == "elsewhere":
+        named.mkdir()
+    row = {"status": "active", "worktree_path": "", "worktree_toplevel_canonical": str(named)}
+    state = repo / ".agenttalk" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}), encoding="utf-8")
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = " ".join(capsys.readouterr().out.split())
+    assert (done / ".git").exists(), text
+    assert advice in text and "outside the fence" not in text, text
+
+
+@pytest.mark.parametrize("network", [False, True], ids=["local", "network"])
+def test_the_recovery_advice_of_a_damaged_lane_row_does_not_look_at_its_other_outside_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, network: bool,
+) -> None:
+    """The review's probe, kept: a row with `worktree_path` empty and an absolute `worktree_toplevel_canonical` outside
+    the fence reached the advice (which looks at that other path to say whether something is still there) before the
+    path was fenced."""
+    from agenttalk import worktree_release
+
+    fence = tmp_path / "fence"
+    repo = fence / "repo"
+    repo.mkdir(parents=True)
+    value = (f"\\\\{_GUARD_HOST}\\share\\x" if os.name == "nt" else f"//{_GUARD_HOST}/share/x") if network else str(
+        tmp_path / _GUARD_FOLDER / "x")
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
+    guard = _install_guard(monkeypatch, fence)
+    row = {"status": "active", "worktree_path": "", "worktree_toplevel_canonical": value}
+
+    with pytest.raises(worktree_release.Refused, match="outside the fence"):
+        worktree_release._names_checkout(row, repo / "checkout", repo, lane_id="one", lane=True)
+
+    assert guard.outside == [], guard.outside
+
+
+@pytest.mark.parametrize(
+    "mode", [pytest.param(["--apply"], id="apply"), pytest.param(["--release", "{done}"], id="release")]
+)
+@pytest.mark.parametrize("kind", ["outside", "network"])
+@pytest.mark.parametrize("shape", ["lane-worktree-path-blank", "launch-request"])
+def test_a_record_written_after_the_first_look_is_fenced_at_the_last_look_too(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+    shape: str, kind: str, mode: list[str],
+) -> None:
+    """The first look finds nothing; the record that names an outside path appears just before the last look (the
+    re-read under the lane writers' lock, made by the sweep and by a release before the removal). That look goes through
+    the same reader and the same fence: nothing outside is looked at and the checkout is kept, not removed."""
+    from agenttalk import worktree_release
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    value = _guard_value(kind, tmp_path, fence)
+    guard = _install_guard(monkeypatch, fence)
+    real_reread = worktree_release.RemovalGuard.reread
+
+    def late(self):
+        _write_guard_record(repo, shape, value)
+        return real_reread(self)
+
+    monkeypatch.setattr(worktree_release.RemovalGuard, "reread", late)
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert guard.outside == [], f"a path outside the fence was looked at: {guard.outside}"
+    assert (done / ".git").exists() and (done / "source.txt").exists(), text  # kept, not removed
+    assert "REFUSED (kept)" in text or "KEPT" in text, text
+
+
+def test_the_guard_never_forwards_a_path_outside_the_fence_whatever_it_is(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard answers for ANY path outside the fence, not only for the ones a fixture made: a folder beside the
+    fence, a place on the drive root (beyond the folder of the test), a network path on one host and on ANOTHER host, a
+    relative path (the working folder is outside the fence). Each is recorded and answered with an error (`EIO`, which
+    the real call would never give for these), so the path is never touched and no network host is contacted."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    guard = _install_guard(monkeypatch, fence)
+    anchor = Path(tmp_path.anchor)
+    network = ("\\\\other-host-858\\share\\x", "\\\\" + _GUARD_HOST + "\\share\\x") if os.name == "nt" else (
+        "//other-host-858/share/x", "//" + _GUARD_HOST + "/share/x")
+    outside = [str(tmp_path / "beside-the-fence"), str(anchor / "zz-beyond-the-test-folder"), *network, "relative-name"]
+    looks = [os.lstat, os.stat, os.path.exists, os.path.realpath, os.scandir, lambda place: Path(place).exists()]
+    for place in outside:
+        for look in looks:
+            try:
+                look(place)
+            except OSError as exc:
+                assert exc.errno == errno.EIO, (place, exc)  # the guard's own answer, not the file system's
+            else:
+                raise AssertionError(f"a look was let through for {place}")
+    assert len(guard.outside) == len(outside) * 6, guard.outside
+    inside_place = fence / "inside-the-fence"
+    inside_place.mkdir()
+    assert os.path.exists(inside_place) and os.path.realpath(inside_place) == str(inside_place)  # inside: forwarded
+    assert len(guard.outside) == len(outside) * 6 and guard.resolved_by_the_fence == []
+
+
+def test_the_guard_bounds_what_the_fence_may_resolve(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one allowance is the fence's own resolution of the ONE path it is given. A fence check that also makes an
+    extra read of an outside path, or resolves a second time, is not let through: both are recorded as outside looks."""
+    from agenttalk import store as store_mod
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    target = tmp_path / "zz-guard-self-test-target"
+    target.mkdir()
+    link = fence / "self-test-link"
+    _dir_link(link, target)
+    extra = tmp_path / "zz-guard-self-test-extra"
+
+    def greedy_check(folder):
+        os.path.realpath(folder)  # the accepted resolution
+        for extra_look in (lambda: os.path.realpath(folder), lambda: os.lstat(extra)):
+            try:
+                extra_look()  # a second resolution in the same check; an extra read of another outside path
+            except OSError:
+                pass
+
+    monkeypatch.setattr(store_mod, "check_folder_fence", greedy_check)
+    guard = _install_guard(monkeypatch, fence)
+
+    store_mod.check_folder_fence(link / "x")
+
+    assert guard.resolved_by_the_fence == [("os.path.realpath", str(link / "x"))], guard.resolved_by_the_fence
+    names = [name for name, _ in guard.outside]
+    assert "a second resolution inside one fence check" in names, guard.outside
+    assert ("os.lstat", str(extra)) in guard.outside, guard.outside
+
+
+def test_the_guard_counts_a_link_followed_outside_by_anything_but_the_fence_check(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resolution of an inside-as-written link that ends outside the fence is a look at the target, whether or not the
+    platform's resolver makes calls the guard can see (on Windows it does not): outside a fence check it is recorded."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    target = tmp_path / "zz-guard-self-test-target2"
+    target.mkdir()
+    link = fence / "self-test-link2"
+    _dir_link(link, target)
+    guard = _install_guard(monkeypatch, fence)
+
+    os.path.realpath(link)  # not inside a fence check, as the preflight's walk did
+
+    # Where the resolver is written in Python (Linux, macOS) the outside target is looked at by visible calls as well,
+    # and those are recorded too; where it is not (Windows) the result of the resolution is the only evidence.
+    assert "os.path.realpath led outside" in [name for name, _ in guard.outside], guard.outside
+    assert guard.resolved_by_the_fence == []
+
+
+@pytest.mark.parametrize(
+    "mode", [pytest.param(["--apply"], id="apply"), pytest.param(["--release", "{done}"], id="release")]
+)
+@pytest.mark.parametrize("shape", ["lane-every-field", "launch-request"])
+def test_a_valid_in_fence_record_of_a_missing_folder_reaches_the_final_recheck_and_looks_only_inside(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+    shape: str, mode: list[str],
+) -> None:
+    """The last recheck (`_still_absent`: a name that was read as absent is looked at again just before the removal) is
+    reached only by a record that names a place that is not there. Here the record names one inside the fence: the
+    recheck runs (the test shows that it did, and for which name), looks only inside the fence, and the checkout, which
+    nothing uses, is released or swept. A planted outside look there is caught by this guard."""
+    from agenttalk import worktree_release
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    missing = fence / "zz-missing-folder" / "deeper"  # inside the fence, and not there
+    _write_guard_record(repo, shape, str(missing))
+    guard = _install_guard(monkeypatch, fence)
+    rechecked: list[list[str]] = []
+    real_recheck = worktree_release._still_absent
+    monkeypatch.setattr(
+        worktree_release, "_still_absent", lambda seen: rechecked.append(list(seen)) or real_recheck(seen)
+    )
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert guard.outside == [], f"a path outside the fence was looked at: {guard.outside}"
+    names = {os.path.normcase(entry) for seen in rechecked for entry in seen}
+    assert os.path.normcase(str(fence / "zz-missing-folder")) in names, (rechecked, text)  # the recheck was reached
+    assert not done.exists(), text  # nothing uses the checkout: it is released or swept
+
+
+LINE_SEPARATOR_NAME = f"a{LINE_SEPARATOR}b"
+
+
+@pytest.mark.parametrize("mode", [pytest.param(["--release-report"], id="release-report"),
+                                  pytest.param(["--release", "{done}"], id="release")])
+def test_a_checkout_named_with_a_line_separator_reaches_the_release_walk_and_no_link_is_resolved(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: list[str],
+) -> None:
+    """Master's text reader cut a name with a line separator short (`a` for `a<U+2028>b`), a path that does not exist,
+    and the release preflight refused. The exact reader of round 14 names the checkout correctly, so the preflight
+    passes and the release reaches the walk that looks for the other names of the origin's hard-linked files. That walk
+    must not resolve a link inside the fence that leads outside (the guard records any such look). The exposure is
+    therefore not one that master already had: it came with the exact reader, which stays."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    scratch = fence / "scratch"
+    done = scratch / LINE_SEPARATOR_NAME
+    repo = _merged_checkout(fence, done, scratch)
+    target = tmp_path / "zz-guard-link-target-2028"
+    target.mkdir()
+    _dir_link(fence / "link-to-outside", target)
+    exact = janitor._registered_worktrees_listed(repo)
+    if all(path in exact for path in janitor.get_registered_worktrees(repo)):
+        pytest.skip("this platform's text reader reads the name correctly: there is no cut-short path to compare")
+    objects = [p for p in (fence / "remote.git" / "objects").rglob("*") if p.is_file()]
+    if not any(os.stat(p).st_nlink > 1 for p in objects):
+        pytest.skip("this file system gave the local origin no hard-linked objects: the walk has nothing to look for")
+    walks: list[bool] = []
+    real_walk = cli.store_mod.check_second_names
+    monkeypatch.setattr(
+        cli.store_mod, "check_second_names",
+        lambda files, *, follow_links=True: walks.append(follow_links) or real_walk(files, follow_links=follow_links),
+    )
+    guard = _install_guard(monkeypatch, fence)
+
+    cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    text = capsys.readouterr().out
+    assert walks and not any(walks), "the release never reached the walk that follows no link (the hard-linked files)"
+    assert guard.outside == [], f"a path outside the fence was looked at: {guard.outside}"
+    shown = cli.store_mod.escape_controls(str(done))  # the report writes a line separator out as \u2028
+    assert f"WOULD RELEASE {shown}" in text or f"REMOVED {shown}" in text, text
+
+
+def test_the_guard_lets_a_fence_ancestor_through_only_for_the_checks_that_expect_it(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's P2 on the guard: it let any look at an exact ancestor of the fence through, whatever asked. A
+    record that names an ancestor, read by a reader that regressed, would not have been recorded. Now an ancestor is
+    looked at freely only by the identity checks of the configured roots (which are expected to) and by the resolution
+    of a path inside the fence; the same look from anything else is an outside look, recorded and answered with an
+    error."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    parent = fence.parent
+    status = os.lstat(parent)
+    identities = {parent: (status.st_dev, status.st_ino)}
+    guard = _install_guard(monkeypatch, fence)
+
+    assert janitor._ancestor_change_reason(identities) is None  # the expected look: allowed
+    assert guard.outside == [], guard.outside
+    for place in (parent, tmp_path.parent):  # a record names an ancestor; a reader asks about it
+        looks = (os.stat, os.lstat, os.path.exists, os.path.isdir, os.path.realpath, lambda name: Path(name).stat())
+        for look in looks:
+            try:
+                look(place)
+            except OSError as exc:
+                assert exc.errno == errno.EIO, (place, exc)
+            else:
+                raise AssertionError(f"a look at the ancestor {place} was let through")
+    assert len(guard.outside) == 12, guard.outside
+
+
+@pytest.mark.parametrize("shape", ["second-name-behind-a-link-out", "second-name-inside-behind-a-link-in"])
+def test_the_walk_that_follows_no_link_gives_the_same_verdict_as_the_one_that_does(
+    fenced, tmp_path: Path, shape: str
+) -> None:
+    """The zteam lead's condition on the store.py keyword: the verdict is the same with `follow_links` true and false,
+    shown by a test. A hard-linked file whose second name sits under an in-fence link that points outside (refused
+    in both: that name is not inside the fence), and one whose second name sits inside the fence, behind an in-fence
+    link to another in-fence folder (passed in both: the folder is walked as itself)."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    first = fence / "objects-a"
+    first.mkdir()
+    file = first / "obj"
+    file.write_text("same file\n", encoding="utf-8")
+    try:
+        if shape == "second-name-behind-a-link-out":
+            elsewhere = tmp_path / "zz-second-name-outside"
+            elsewhere.mkdir()
+            os.link(file, elsewhere / "obj2")
+            _dir_link(fence / "link-out", elsewhere)
+            expected = "refused"
+        else:
+            second = fence / "objects-b"
+            second.mkdir()
+            os.link(file, second / "obj2")
+            _dir_link(fence / "link-in", second)
+            expected = "passed"
+    except OSError as exc:
+        pytest.skip(f"this file system cannot make the hard link or the folder link: {exc}")
+
+    def verdict(follow: bool) -> str:
+        try:
+            cli.store_mod.check_second_names([file], follow_links=follow)
+        except cli.store_mod.StoreFenceError as exc:
+            return f"refused: {exc}"
+        return "passed"
+
+    assert verdict(True) == verdict(False)
+    assert verdict(False).startswith(expected), verdict(False)
+
+
+def _network_origin(tmp_path: Path) -> str:
+    if os.name == "nt":
+        return "\\\\" + _GUARD_HOST + "\\share\\origin"
+    return f"//{_GUARD_HOST}/share/origin"
+
+
+_ORIGINS = {
+    "outside": lambda tmp_path: str(tmp_path / "zz-guard-origin-outside" / "origin.git"),
+    "network": _network_origin,
+}
+
+
+@pytest.mark.parametrize("mode", [pytest.param(["--release-report"], id="release-report"),
+                                  pytest.param(["--release", "{done}"], id="release")])
+@pytest.mark.parametrize("origin", list(_ORIGINS))
+def test_an_origin_outside_the_fence_is_refused_before_anything_resolves_it(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str, mode: list[str],
+) -> None:
+    """The release preflight built the forms of the origin's folder with `resolve()` before it asked the fence, so
+    an origin outside the fence, or a network path, was resolved (looked at, or contacted) before it was refused. The
+    origin as written is compared with the fence first, as a string: outside is refused at once. The spies (every
+    resolver and every look, answered with an error, never forwarded) see nothing outside, for the report and the
+    release."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    (tmp_path / "zz-guard-origin-outside").mkdir()
+    url = _ORIGINS[origin](tmp_path)
+    _git(repo, "remote", "set-url", "origin", url)
+    guard = _install_guard(monkeypatch, fence)
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    assert guard.outside == [], f"the origin outside the fence was looked at: {guard.outside}"
+    assert rc == 2
+    assert report.read_text(encoding="utf-8").splitlines() == [str(Path(url))]  # refused as written, nothing resolved
+    assert (done / ".git").exists()  # nothing was released
+
+
+def test_a_late_fence_refusal_stops_the_sweep_before_the_prune_and_before_anything_else_runs(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The review bot's P1 and the zteam lead's widening of it. After the preflight, Git's list names a checkout
+    outside the fence; the sweep's last look refuses it (`StoreFenceError`). That was read as one failed candidate, and
+    the sweep went on: the next candidates, then `git worktree prune`, which reads every registration, the outside one
+    too. Now the refusal stops the sweep: one spy test across every step the sweep takes after it (each Git runner,
+    the listing, the probes, the commit, the removal, the ancestry check, the prune), none is called; nothing is
+    removed; the exit code is 1 and the report says why."""
+    from agenttalk import janitor
+
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    leftover = _stale_leftover(fence / "temp")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    calls = _register_outside_after(monkeypatch, stranger)
+    looked = _watch_looks_at(monkeypatch, stranger)
+    state = {"refused": False}
+    after: list[str] = []
+    prunes: list[tuple] = []
+    real_changed = janitor._checkouts_changed
+
+    def changed(*args, **kwargs):
+        try:
+            return real_changed(*args, **kwargs)
+        except cli.store_mod.StoreFenceError:
+            state["refused"] = True
+            raise
+
+    monkeypatch.setattr(janitor, "_checkouts_changed", changed)
+    for name in ("_run_git", "_run_git_checked", "get_registered_worktrees", "_registered_worktrees_listed",
+                 "is_dirty_worktree", "wip_commit_dirty_worktree", "worktree_branch", "remove_plainly",
+                 "_ancestor_change_reason"):
+        real_step = getattr(janitor, name)
+
+        def step(*args, _name=name, _real=real_step, **kwargs):
+            if state["refused"]:
+                after.append(_name)
+            if _name == "_run_git" and args[1:3] == ("worktree", "prune"):
+                prunes.append(args)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(janitor, name, step)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--apply"])
+
+    text = capsys.readouterr().out
+    assert calls["sweep"] >= 2 and state["refused"], "the late refusal never happened, so nothing was tested"
+    assert looked == [], f"the outside checkout was looked at: {looked}"
+    assert prunes == [], "git worktree prune ran after the fence refused a registration"
+    assert after == [], f"steps that ran after the refusal: {after}"
+    assert rc == 1, text
+    assert "worktree prune skipped" in text and "store fence refused" in text, text
+    assert (done / ".git").exists() and (leftover / "note.txt").exists()  # nothing was removed
+    assert str(stranger) in report.read_text(encoding="utf-8").split("\n")
+
+
+# --- round 18c: the fence's refusal of a record path keeps its type all the way up, so the sweep stops ----------
+
+
+def _sweep_with_step_spies(
+    monkeypatch: pytest.MonkeyPatch, *, real_prune: bool = True
+) -> tuple[dict, list[str], list[tuple]]:
+    """Wrap every step `apply` takes (each Git runner, the listing, the probes, the commit, the removal, the ancestry
+    check) so that a call made after the fence's refusal is noted. Returns (the state, the steps taken after the
+    refusal, the prune calls). The refusal is noticed where a record path is fenced (`_fence_record_path` raising a
+    `Refused` whose cause is the fence's own error: the translated case) and where the last look reads the list
+    (`_checkouts_changed` raising the fence's error itself: the direct case)."""
+    from agenttalk import janitor, worktree_release
+
+    state = {"refused": False}
+    after: list[str] = []
+    prunes: list[tuple] = []
+    real_changed, real_record = janitor._checkouts_changed, worktree_release._fence_record_path
+
+    def changed(*args, **kwargs):
+        try:
+            return real_changed(*args, **kwargs)
+        except cli.store_mod.StoreFenceError:
+            state["refused"] = True
+            raise
+
+    def record(*args, **kwargs):
+        try:
+            return real_record(*args, **kwargs)
+        except worktree_release.Refused as exc:
+            fence_error = isinstance(exc.__cause__ or exc.__context__, cli.store_mod.StoreFenceError)
+            if fence_error or "outside the fence" in str(exc):
+                state["refused"] = True  # the fence refused this path, whatever the refusal is called now
+            raise
+
+    real_apply = janitor.apply
+
+    def apply(*args, **kwargs):
+        state["refused"] = False  # the report that came first reads the records too; only what apply does is counted
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(janitor, "apply", apply)
+    monkeypatch.setattr(janitor, "_checkouts_changed", changed)
+    monkeypatch.setattr(worktree_release, "_fence_record_path", record)
+    for name in ("_run_git", "_run_git_checked", "get_registered_worktrees", "_registered_worktrees_listed",
+                 "is_dirty_worktree", "wip_commit_dirty_worktree", "worktree_branch", "remove_plainly",
+                 "_ancestor_change_reason"):
+        real_step = getattr(janitor, name)
+
+        def step(*args, _name=name, _real=real_step, **kwargs):
+            if state["refused"]:
+                after.append(_name)
+            if _name == "_run_git" and args[1:3] == ("worktree", "prune"):
+                prunes.append(args)
+                if not real_prune:
+                    return ""  # recorded, not run: the call is what is shown, and nothing real is pruned
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(janitor, name, step)
+    return state, after, prunes
+
+
+@pytest.mark.parametrize("how", ["translated", "translated-last-look", "late-inventory"])
+def test_a_refusal_by_the_fence_stops_the_sweep_however_it_reaches_apply(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, how: str
+) -> None:
+    """The fence refuses a path in the middle of a sweep in two ways. DIRECT: Git's list names a checkout outside the
+    fence (the fence's own error comes out of the last look). TRANSLATED: an activity record names a path inside the
+    fence that is a link leading outside; the record reader fences it and turns the fence's error into a `Refused`
+    (its type is `FenceRefused`), at the first look or, for "translated-last-look", only at the last look (the record
+    appears just before the re-read under the lane writers' lock). The translated cases used to be read as an ordinary
+    kept checkout: the sweep went on and ran `git worktree prune`, which reads every registration. All stop it: the
+    steps after the refusal (each Git runner, the listing, the probes, the commit, the removal, the ancestry check,
+    the prune) are not called, nothing is removed, the report says why and the exit code is 1."""
+    from agenttalk import worktree_release
+
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    leftover = _stale_leftover(fence / "temp")
+    stranger = (tmp_path / "outside-checkout").resolve()
+    stranger.mkdir()
+    if how == "late-inventory":
+        calls = _register_outside_after(monkeypatch, stranger)
+    else:
+        calls = {"sweep": 2}
+        target = tmp_path / "zz-link-target"
+        target.mkdir()
+        _dir_link(fence / "link-to-outside", target)
+        value = str(fence / "link-to-outside" / "x")
+        if how == "translated":
+            _write_guard_record(repo, "lane-every-field", value)
+        else:
+            real_reread = worktree_release.RemovalGuard.reread
+
+            def late(self):
+                _write_guard_record(repo, "lane-every-field", value)
+                return real_reread(self)
+
+            monkeypatch.setattr(worktree_release.RemovalGuard, "reread", late)
+    state, after, prunes = _sweep_with_step_spies(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--apply"])
+
+    text = capsys.readouterr().out
+    assert calls["sweep"] >= 2 and state["refused"], "the refusal never happened, so nothing was tested"
+    assert prunes == [], "git worktree prune ran after the fence refused a path"
+    assert after == [], f"steps that ran after the refusal: {after}"
+    assert rc == 1, text
+    assert "worktree prune skipped" in text and "store fence refused" in text, text
+    assert (done / ".git").exists(), text  # the checkout was kept
+    if how == "late-inventory":
+        assert (leftover / "note.txt").exists()  # nor was any later candidate looked at, let alone removed
+        assert str(stranger) in report.read_text(encoding="utf-8").split("\n")
+
+
+def test_an_ordinary_in_use_refusal_still_just_keeps_the_checkout_and_the_sweep_goes_on(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The control: an active lane names the checkout (a path inside the fence, nothing refused by the fence). The
+    checkout is kept and said to be in use, the sweep does not stop: the stale leftover is removed, the prune runs, and
+    the exit code is 0 (a kept checkout is not a failure)."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    leftover = _stale_leftover(fence / "temp")
+    lanes_file = repo / ".agenttalk" / "state" / "lanes.json"
+    lanes_file.parent.mkdir(parents=True, exist_ok=True)
+    lanes_file.write_text(json.dumps({"lanes": {"one": {"status": "active", "worktree_path": str(done)}}}),
+                          encoding="utf-8")
+    state, after, prunes = _sweep_with_step_spies(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--apply"])
+
+    text = capsys.readouterr().out
+    assert not state["refused"]
+    assert (done / ".git").exists() and "REFUSED (kept)" in text, text
+    assert not leftover.exists(), text  # the sweep went on to the next candidate
+    assert prunes, "the prune did not run"
+    assert rc == 0 and "store fence refused" not in text, text
+
+
+@pytest.mark.parametrize("late", [
+    "outside-git-absent", "outside-git-present", "relative-outside-git-absent", "relative-outside-git-present",
+    "then-a-later-candidate", "none",
+])
+def test_a_registration_made_after_the_preflight_for_a_refused_record_path_stops_the_sweep_before_the_real_prune(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, late: str
+) -> None:
+    """An activity record names a local folder outside the fence, so its checkout is kept from the text alone (no look).
+    After the preflight and the preview, at the start of the real `--apply`, Git gets a registration of that same
+    folder (`.git/worktrees/late-registration`, its `gitdir` naming the folder's `.git`, an old time on it). Git's
+    REAL prune reads every registration and looks at the path it names: with the folder's `.git` absent it removes the
+    entry, with it present it keeps it; either way it has looked outside the fence. So the registrations prune would
+    read are fenced, from Git's own files and as written, before the prune: the sweep stops, the prune does not run (the
+    entry is still there), nothing outside is touched, and the exit code is 1. "then-a-later-candidate": a stale
+    leftover comes after the kept checkout; its last look (Git's list, which looks at every registration too) is
+    fenced the same way first, so the sweep stops there and the leftover is kept. "none", the control: the same kept
+    checkout with no late registration; the sweep goes on, the real prune runs, and the exit code is 0.
+    "relative-...": the registration's `gitdir` names the same folder by a RELATIVE path, `../../<folder>/.git`. Git
+    versions read such a path from different folders (Git 2.39 from the folder it runs in, which leads to the folder
+    beside the fence; Git 2.56 from the registration's own folder), so under the fence a relative `gitdir` is refused
+    as it is, by the maintainers' lead's decision of 2026-11-25 13:20 UTC: the same stop before the prune, exit 1."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    leftover = _stale_leftover(fence / "temp") if late == "then-a-later-candidate" else None
+    refused = (tmp_path / "zz-refused-folder").resolve()  # beside the fence, inside this test's own folder
+    refused.mkdir()
+    if late.endswith("outside-git-present"):
+        (refused / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+    _write_guard_record(repo, "lane-every-field", str(refused))
+    admin = repo / ".git" / "worktrees" / "late-registration"
+    real_apply = janitor.apply
+
+    def apply(*args, **kwargs):
+        if late != "none":
+            _write_late_registration(admin, refused, relative=late.startswith("relative"))
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(janitor, "apply", apply)
+    state, _, prunes = _sweep_with_step_spies(monkeypatch)  # the prune is the real one
+    listed_with_it: list[tuple] = []  # Git's list of checkouts, asked for while the late registration exists
+    spied_run = janitor._run_git_checked
+
+    def run(repo_arg, *args, **kwargs):
+        if args[:2] == ("worktree", "list") and admin.exists():
+            listed_with_it.append(args)
+        return spied_run(repo_arg, *args, **kwargs)
+
+    monkeypatch.setattr(janitor, "_run_git_checked", run)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--apply"])
+
+    text = capsys.readouterr().out
+    assert state["refused"], "the record path was never refused, so nothing was tested"
+    assert (done / ".git").exists() and "REFUSED (kept)" in text, text
+    assert sorted(p.name for p in refused.iterdir()) == ([".git"] if late.endswith("git-present") else []), text
+    if late == "none":
+        assert prunes and rc == 0 and "store fence refused" not in text, text
+        return
+    assert admin.is_dir() and (admin / "gitdir").exists(), "the registration was pruned: Git looked at it"
+    assert rc == 1, text
+    assert prunes == [], "git worktree prune ran, and read a registration outside the fence"
+    assert listed_with_it == [], "Git listed the checkouts, and so looked at the registration outside the fence"
+    assert "worktree prune skipped" in text and "store fence refused" in text, text
+    if late.startswith("relative"):
+        assert "a relative path" in text and f"../../{refused.name}/.git" in text, text
+    else:
+        assert str(refused) in text, text
+    if leftover is not None:
+        assert (leftover / "note.txt").exists(), text  # the later candidate was not removed: the sweep stopped
+
+
+def _write_late_registration(admin: Path, folder: Path, *, relative: bool = False) -> None:
+    """A registration of `folder` as Git writes one (`gitdir`, `HEAD`, `commondir`), with an old time on `gitdir`.
+    `relative`: `gitdir` names the folder's `.git` relative to the repository (`../../<folder>/.git` for a folder
+    beside the fence), the form Git 2.39 reads from the folder it runs in."""
+    admin.mkdir(parents=True)
+    named = f"../../{folder.name}/.git" if relative else str(folder / ".git")
+    (admin / "gitdir").write_text(f"{named}\n", encoding="utf-8")
+    (admin / "HEAD").write_text("ref: refs/heads/late-registration\n", encoding="utf-8")
+    (admin / "commondir").write_text("../..\n", encoding="utf-8")
+    os.utime(admin / "gitdir", (1, 1))
+
+
+def _git_asked_for_every_registration(monkeypatch: pytest.MonkeyPatch, admin: Path) -> list[tuple]:
+    """Every Git call, by any runner of the sweep or of release, that reads every registration (`worktree list`,
+    `worktree prune`, `worktree remove`), made while the registration `admin` exists."""
+    from agenttalk import janitor, worktree_release
+
+    asked: list[tuple] = []
+    for owner, name in ((janitor, "_run_git_checked"), (worktree_release, "_git")):
+        real = getattr(owner, name)
+
+        def spy(repo, *args, _real=real, **kwargs):
+            if args[:1] == ("worktree",) and args[1:2] in (("list",), ("prune",), ("remove",)) and admin.exists():
+                asked.append(args)
+            return _real(repo, *args, **kwargs)
+
+        monkeypatch.setattr(owner, name, spy)
+    return asked
+
+
+def test_a_registration_made_after_the_preflight_is_fenced_before_release_asks_git_about_the_registrations(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Release reads Git's list of checkouts again inside the release (the main-repository check, each checkout's own
+    check) and asks Git to remove the checkout; each of these reads every registration and looks at the path it names.
+    A registration of a folder outside the fence, made after the preflight (at the start of the release itself), is
+    refused from Git's own files before Git is asked anything about the registrations: no list, no removal, the
+    checkout is kept, exit 1."""
+    from agenttalk import worktree_release
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    outside = (tmp_path / "zz-late-release").resolve()  # beside the fence, inside this test's own folder
+    outside.mkdir()
+    admin = repo / ".git" / "worktrees" / "late-registration"
+    real_release = worktree_release.release
+
+    def release(*args, **kwargs):
+        _write_late_registration(admin, outside)
+        return real_release(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "release", release)
+    asked = _git_asked_for_every_registration(monkeypatch, admin)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--release", str(done)])
+
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert admin.is_dir(), "the registration was never made, so nothing was tested"
+    assert asked == [], f"Git was asked about every registration, the outside one too: {asked}"
+    assert rc == 1, text
+    assert (done / ".git").exists() and "REMOVED" not in text, text
+    assert str(outside) in text, text
+    assert list(outside.iterdir()) == [], text
+
+
+def _file_link(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link)
+    except OSError as exc:  # Windows without the privilege to make a file link
+        pytest.skip(f"this system cannot make a file link: {exc}")
+
+
+# Every form of a `gitdir` value, and whether it is fully qualified under Windows rules and under POSIX rules.
+_GITDIR_FORMS = [
+    (r"C:\x\.git", True, False), ("C:/x/.git", True, False),
+    (r"\\server\share\x\.git", True, False), ("//server/share/x/.git", True, True),
+    (r"\\?\C:\x\.git", False, False), (r"\\.\C:\x\.git", False, False), ("//?/C:/x/.git", False, True),
+    ("C:x", False, False), (r"\x\.git", False, False), ("/x/.git", False, True),
+    (r".\x\.git", False, False), (r"..\x\.git", False, False), ("../x/.git", False, False), ("x", False, False),
+    ("", False, False),
+]
+
+
+@pytest.mark.parametrize("text, windows, posix", _GITDIR_FORMS)
+def test_a_gitdir_value_is_fully_qualified_by_the_same_rule_on_every_python(
+    text: str, windows: bool, posix: bool
+) -> None:
+    """The rule that decides whether a registration's `gitdir` names one place for every Git, independent of the running
+    Python's `isabs` (which, on Windows before Python 3.13, also called `\\x` and `/x` absolute): under Windows rules a
+    drive with a root, or a UNC share; the `\\\\?\\` and `\\\\.\\` forms are refused; under POSIX rules a leading `/`.
+    Both rules are checked here on any platform."""
+    from agenttalk import janitor
+
+    assert janitor._fully_qualified(text, windows=True) is windows
+    assert janitor._fully_qualified(text, windows=False) is posix
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a value with a root and no drive is a Windows form")
+@pytest.mark.parametrize("separator", ["\\", "/"])
+def test_a_rooted_gitdir_without_a_drive_is_refused_even_where_python_calls_it_absolute(
+    fenced, monkeypatch: pytest.MonkeyPatch, separator: str
+) -> None:
+    """A `gitdir` of `\\<path>` or `/<path>`, with a root and no drive, names a place on whatever drive is current for
+    the program that reads it, so Git and the check could read it on different drives. Python before 3.13 calls it
+    absolute on Windows; that answer is emulated here (so the test shows the rule on any Python), and the value names a
+    place INSIDE the fence on this drive: the check still refuses it, before Git is asked anything."""
+    import ntpath
+
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    rooted = str(done / ".git")[2:]  # the drive taken off: `\...\done\.git`
+    if separator == "/":
+        rooted = rooted.replace("\\", "/")
+    _write_late_registration(repo / ".git" / "worktrees" / "rooted-registration", done)
+    (repo / ".git" / "worktrees" / "rooted-registration" / "gitdir").write_text(f"{rooted}\n", encoding="utf-8")
+
+    def isabs_before_313(path) -> bool:  # Python 3.10-3.12 on Windows: a root is enough
+        tail = ntpath.splitdrive(os.fspath(path))[1]
+        return len(tail) > 0 and tail[0] in "\\/"
+
+    monkeypatch.setattr(ntpath, "isabs", isabs_before_313)
+    assert os.path.isabs(rooted), "the older answer was not emulated, so nothing was tested"
+
+    with pytest.raises(cli.store_mod.StoreFenceError, match="relative path"):
+        janitor._fence_registrations(repo)
+
+
+@pytest.mark.parametrize("where", ["worktrees-folder", "entry-folder", "gitdir-file", "commondir-file"])
+def test_the_registration_check_fences_each_git_file_before_it_looks_through_a_link_that_leads_outside(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """The check of Git's registration files reads Git's own folder: `commondir`, the `worktrees` folder, each entry
+    folder and each entry's `gitdir` file. Any of them can be a link (a junction on Windows for a folder) that leads to
+    a folder beside the fence. Each is fenced, by the fence's own check, BEFORE anything looks at it or through it: the
+    check is refused and the guard over every file-system look saw no look outside the fence."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    git_dir = repo / ".git"
+    away = (tmp_path / "zz-git-files-away").resolve()  # beside the fence, inside this test's own folder
+    away.mkdir()
+    if where == "worktrees-folder":
+        (git_dir / "worktrees").rename(away / "worktrees")
+        _dir_link(git_dir / "worktrees", away / "worktrees")
+    elif where == "entry-folder":
+        (away / "entry").mkdir()
+        (away / "entry" / "gitdir").write_text(f"{done / '.git'}\n", encoding="utf-8")
+        _dir_link(git_dir / "worktrees" / "zz-entry", away / "entry")
+    elif where == "gitdir-file":
+        (away / "gitdir").write_text(f"{done / '.git'}\n", encoding="utf-8")
+        (git_dir / "worktrees" / "zz-entry").mkdir()
+        _file_link(git_dir / "worktrees" / "zz-entry" / "gitdir", away / "gitdir")
+    else:
+        (away / "commondir").write_text(".\n", encoding="utf-8")
+        _file_link(git_dir / "commondir", away / "commondir")
+    guard = _install_guard(monkeypatch, fence)
+
+    with pytest.raises(cli.store_mod.StoreFenceError):
+        janitor._fence_registrations(repo)
+
+    assert guard.outside == [], f"a look outside the fence: {guard.outside}"
+
+
+def test_under_the_store_fence_a_failed_strict_list_is_not_replaced_by_the_old_git_list(
+    fenced, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The report keeps a best-effort list of checkouts for its counts when the strict list fails. Under the store
+    fence it does not ask Git for it: that list was never fenced, and Git's listing looks at every registration."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, _ = _swept_checkout(fence)
+    cfg = janitor.JanitorConfig.load(repo)
+    asked = _git_asked_for_every_registration(monkeypatch, repo / ".git")
+
+    report = janitor.build_report(cfg, (None, "the strict list failed (test)"))
+
+    assert asked == [], asked
+    assert report.registered_worktrees == [] and not report.registered_strict
+
+
+def test_the_guard_notes_an_outside_path_handed_to_a_git_runner_as_an_argument(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Condition (2): the path a record names is never in any Git runner's arguments. The guard's runner spies check
+    the repository AND every argument: an absolute path outside the fence (a UNC one included) is recorded and answered
+    with an error; a path inside is let through. No Git is started."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = _guard_value("outside", tmp_path, fence)  # made before the guard: it would answer a look at the folder
+    network = _guard_value("network", tmp_path, fence)
+    guard = _install_guard(monkeypatch, fence)
+
+    for path in (outside, network):
+        with pytest.raises(OSError) as raised:
+            janitor._run_git(fence, "worktree", "remove", "--", path)
+        assert raised.value.errno == errno.EIO
+    assert [name for name, _ in guard.outside] == ["agenttalk.janitor._run_git argument"] * 2, guard.outside
+    assert [text for _, text in guard.outside] == [outside, network], guard.outside
+
+
+class _PathLike:
+    """Anything with `__fspath__` that is not a `str` or a `Path`: a Git runner is handed such an argument too."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __fspath__(self) -> str:
+        return self.text
+
+
+def _fake_git_runner(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    """Put a fake in place of `janitor._run_git` BEFORE the guard is installed, so that the guard's spy wraps the fake:
+    what reaches the fake was let through. No Git is started, and nothing real is looked at."""
+    from agenttalk import janitor
+
+    forwarded: list[tuple] = []
+    monkeypatch.setattr(janitor, "_run_git", lambda repo, *args, **kwargs: forwarded.append(args) or "")
+    return forwarded
+
+
+# The forms in which a path reaches a Git runner as an argument, each built around the text `where`.
+_GIT_ARGUMENT_FORMS = {
+    "a-path-object": lambda where: ("worktree", "remove", Path(where)),
+    "an-os-pathlike": lambda where: ("worktree", "remove", _PathLike(where)),
+    "a-plain-string": lambda where: ("worktree", "remove", "--", where),
+    "git-dir-equals": lambda where: (f"--git-dir={where}", "status"),
+    "work-tree-equals": lambda where: (f"--work-tree={where}", "status"),
+    "any-option-equals": lambda where: (f"--some-option={where}", "status"),
+    "dash-C-then-path": lambda where: ("-C", where, "status"),
+    "git-dir-then-path": lambda where: ("--git-dir", where, "status"),
+}
+
+
+def _try_git_forms(monkeypatch: pytest.MonkeyPatch, fence: Path, forms: dict, make_where) -> tuple:
+    """(the guard, what the fake runner received, the refusals) for each form in `forms` handed to the runner, with the
+    runner's repository `fence/repo`: a refusal is the guard's own error (`EIO`), which the real call never gives."""
+    from agenttalk import janitor
+
+    forwarded = _fake_git_runner(monkeypatch)
+    guard = _install_guard(monkeypatch, fence)
+    refused: list[str] = []
+    for name, build in forms.items():
+        try:
+            janitor._run_git(fence / "repo", *build(make_where(name)))
+        except OSError as exc:
+            assert exc.errno == errno.EIO, (name, exc)
+            refused.append(name)
+    return guard, forwarded, refused
+
+
+def test_the_guard_notes_a_path_object_handed_to_a_git_runner(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(a) A path object (`pathlib.Path`, any `os.PathLike`) outside the fence, as an argument, is read with
+    `os.fspath`: recorded, answered with an error and never forwarded to the runner."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = str(tmp_path.resolve() / "zz-outside-object")
+    forms = {name: _GIT_ARGUMENT_FORMS[name] for name in ("a-path-object", "an-os-pathlike")}
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: outside)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert [text for _, text in guard.outside] == [outside] * 2, guard.outside
+
+
+def test_the_guard_notes_a_relative_path_that_leads_outside_the_fence_in_a_git_runners_arguments(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(b) A relative argument is read against the runner's repository, as text (nothing is looked at): from
+    `fence/repo`, `../../zz-outside-relative` is a folder beside the fence. Recorded, answered with an error and never
+    forwarded, as a string, as a path object and inside an option."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    relative = os.path.join("..", "..", "zz-outside-relative")
+    forms = {
+        "a-plain-string": _GIT_ARGUMENT_FORMS["a-plain-string"],
+        "a-path-object": _GIT_ARGUMENT_FORMS["a-path-object"],
+        "git-dir-equals": _GIT_ARGUMENT_FORMS["git-dir-equals"],
+        "dash-C-then-path": _GIT_ARGUMENT_FORMS["dash-C-then-path"],
+    }
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: relative)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert len(guard.outside) == len(forms), guard.outside
+
+
+def test_the_guard_notes_an_outside_path_inside_a_git_option(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(c) A path outside the fence inside an option: `--git-dir=P`, `--work-tree=P`, any `--opt=P`, `-C P` and
+    `--git-dir P`. The value is split out and judged like any other argument."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = str(tmp_path.resolve() / "zz-outside-option")
+    forms = {
+        name: _GIT_ARGUMENT_FORMS[name]
+        for name in ("git-dir-equals", "work-tree-equals", "any-option-equals", "dash-C-then-path", "git-dir-then-path")
+    }
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: outside)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert [text for _, text in guard.outside] == [outside] * len(forms), guard.outside
+
+
+def test_the_guard_notes_an_outside_path_in_a_config_value_a_combined_dash_c_and_after_a_change_of_folder(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(1) `-c core.worktree=P`: the value of a configuration setting is split out and judged. (2) `-CP`, written as one
+    argument, is a change of folder like `-C P`. (3) Git applies each `-C` in order, so a relative argument after it
+    is read against the NEW folder: from `fence/repo`, `-C <fence> --git-dir=../P` names a folder beside the fence.
+    Each is recorded, answered with an error and never forwarded."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = str(tmp_path.resolve() / "zz-outside-form")
+    beside = "zz-outside-form"  # tmp_path/fence is the fence, so ../<beside> from the fence is the folder above
+    assert (fence.parent / beside) == Path(outside), "the fence is expected one level below tmp_path"
+    forms = {
+        "config-value": lambda where: ("-c", f"core.worktree={where}", "status"),
+        "dash-C-combined": lambda where: (f"-C{where}", "status"),
+        "relative-after-dash-C": lambda where: ("-C", str(fence), f"--git-dir=../{beside}", "status"),
+        "relative-after-dash-C-combined": lambda where: (f"-C{fence}", "worktree", "remove", "--", f"../{beside}"),
+    }
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: outside)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert len(guard.outside) == len(forms), guard.outside
+
+
+def test_the_guard_notes_an_unknown_git_option_that_carries_a_value(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: an option the guard does not know, with a value, is recorded whatever the value (the guard cannot
+    tell what Git reads from it), as `--opt=V` before or after the command and as a short option with its value
+    joined (`-OV`). The same holds for an option the guard knows to take no value, given one anyway, and for an
+    unknown option with no value (the guard cannot tell whether Git reads the next argument as its value)."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    outside = str(tmp_path.resolve() / "zz-outside-unknown")
+    inside = str(fence / "inside")
+    forms = {
+        "unknown-before-the-command-inside": lambda where: (f"--some-option={inside}", "status"),
+        "unknown-after-the-command-inside": lambda where: ("status", f"--some-option={inside}"),
+        "unknown-short-joined-outside": lambda where: ("status", f"-O{where}"),
+        "unknown-short-joined-inside": lambda where: ("status", f"-O{inside}"),
+        "a-switch-given-a-value": lambda where: ("worktree", "list", f"-z={inside}"),
+        "dash-C-after-the-command": lambda where: ("commit", "-C", inside),
+        "unknown-with-no-value": lambda where: ("status", "--some-switch"),
+        "unknown-then-an-outside-path": lambda where: ("status", "--some-option", where),
+    }
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: outside)
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert len(guard.outside) == len(forms), guard.outside
+
+
+def test_the_guard_notes_a_git_argument_it_cannot_place(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: an argument that is neither provably a plain word nor provably a path inside the fence is
+    recorded: an address (`file:///...`, `host:path`), a home folder Git expands (`~/...`), a relative path in a
+    configuration value or after `--git-path` (Git reads those against its own folder, not the working one), a drive
+    with no folder after it (Windows), and an argument that is not text at all."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    forms = {
+        "a-file-address": lambda where: ("ls-remote", "file:///zz-outside-address"),
+        "a-host-and-path": lambda where: ("ls-remote", "zz-host:zz/outside"),
+        "a-home-folder": lambda where: ("worktree", "remove", "--", "~/zz-outside-home"),
+        "a-relative-config-value": lambda where: ("-c", "core.worktree=sub/folder", "status"),
+        "a-relative-git-path": lambda where: ("rev-parse", "--git-path", os.path.join("..", "zz-outside-git-path")),
+        "not-text": lambda where: ("worktree", "remove", 858),
+    }
+    if os.name == "nt":
+        forms["a-drive-with-no-folder"] = lambda where: ("worktree", "remove", "--", "Z:zz-outside-drive")
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: "")
+
+    assert refused == list(forms) and forwarded == [], (refused, forwarded)
+    assert len(guard.outside) == len(forms), guard.outside
+
+
+@pytest.mark.parametrize(
+    "kind", ["absolute", "relative-below", "relative-beside"]
+)
+def test_the_guard_lets_an_inside_path_through_in_every_form_of_a_git_runners_arguments(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """The control: the same forms with a path INSIDE the fence (absolute, relative below the repository, relative
+    beside it that stays inside the fence) are forwarded to the runner and not recorded, so the wider check makes no
+    false hit: also as `-CP` written as one argument, after a change of folder (`-C sub`, so `..` from there is the
+    repository), after `ls-remote --get-url`, beside the known switches and a plain `--git-path` word, and, for an
+    absolute path, as a configuration value (`-c core.worktree=P`). An unknown option
+    (`--some-option=P`) is not in the control: it is recorded whatever its value (see the test of unknown options)."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    place = {
+        "absolute": str(fence / "inside"),
+        "relative-below": os.path.join("sub", "folder"),
+        "relative-beside": os.path.join("..", "inside-sibling"),
+    }[kind]
+    forms = {name: build for name, build in _GIT_ARGUMENT_FORMS.items() if name != "any-option-equals"}
+    forms["dash-C-combined"] = lambda where: (f"-C{where}", "status")
+    forms["after-dash-C"] = lambda where: ("-C", "sub", "worktree", "remove", "--", where)
+    forms["after-dash-C-combined"] = lambda where: ("-Csub", "--git-dir", where, "status")
+    forms["known-options-and-words"] = lambda where: (
+        "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=all", "-z", "--", where)
+    forms["git-path-a-plain-word"] = lambda where: ("rev-parse", "--git-path", "objects")
+    forms["get-url"] = lambda where: ("ls-remote", "--get-url", where)
+    if kind == "absolute":
+        forms["config-value"] = lambda where: ("-c", f"core.worktree={where}", "status")
+
+    guard, forwarded, refused = _try_git_forms(monkeypatch, fence, forms, lambda name: place)
+
+    assert refused == [] and guard.outside == [], (place, refused, guard.outside)
+    assert len(forwarded) == len(forms), (place, forwarded)
+
+
+@pytest.mark.parametrize("route", ["release", "apply"])
+def test_under_the_store_fence_a_unc_record_is_kept_and_never_looked_at_on_release_and_apply(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, route: str
+) -> None:
+    """Conditions (1), (2) and (4), with the suite's fence on. An activity record names a UNC (network) path. It is
+    refused from its text alone: the checkout is KEPT on both routes, and the path is never looked at. ONE guard watches
+    the whole run (every file-system look, and every Git runner's repository and arguments): it records any look at a
+    path outside the fence and answers it with an error, so the test fails if one happens, on release and apply alike.
+    RELEASE: exit 1, `KEPT <checkout>: ... the record names a path outside the fence ... the checkout was kept`.
+    APPLY: the checkout is `REFUSED (kept)`, the sweep GOES ON (it does not stop): the ancestry check, the prune (shown
+    as called, not run) and the list of checkouts after it all run, and none of them looks at the path; exit 0."""
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, done = _swept_checkout(fence)
+    _write_guard_record(repo, "lane-every-field", _guard_value("network", tmp_path, fence))
+    guard = _install_guard(monkeypatch, fence)
+    state, after, prunes = _sweep_with_step_spies(monkeypatch, real_prune=False)
+
+    rc = cli.main(["--root", str(repo), "janitor", *(["--release", str(done)] if route == "release" else ["--apply"])])
+
+    text = capsys.readouterr().out
+    assert guard.outside == [], f"the path was looked at: {guard.outside}"
+    assert (done / ".git").exists() and (done / "source.txt").exists(), text  # kept, not released
+    assert "store fence refused" not in text and "REMOVED" not in text, text
+    if route == "release":
+        assert rc == 1, text
+        assert f"KEPT {done}: " in text and "the record names a path outside the fence" in text, text
+        assert "the checkout was kept" in text, text
+    else:
+        assert state["refused"], "the refusal never happened, so nothing was tested"
+        assert "REFUSED (kept)" in text and "the record names a path outside the fence" in text, text
+        assert rc == 0, text
+        # The sweep went on: the steps after the refusal really ran, and none of them looked at the path.
+        assert prunes, "the prune was not called: the sweep stopped"
+        assert {"_ancestor_change_reason", "get_registered_worktrees"} <= set(after), after
