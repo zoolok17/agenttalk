@@ -23,6 +23,8 @@ security = [
 [tool.pytest.ini_options]
 markers = [
     "subprocess: tests that spawn real subprocesses (e.g. the enforcement canary's stub CLI); deselect with -m 'not subprocess'",
+    "windows_capability: host checks (is Git startable paused in a Windows job here?); their facts show in the warnings summary",
+    "real_git_job: tests that use the real Windows job layer of agenttalk.git_job (every other test runs without a job)",
 ]
 
 [tool.ruff]
@@ -107,6 +109,7 @@ include = [
     "/docs/supervisor-hosting.md",
     "/docs/supervisor-liveness-design.md",
     "/docs/supervisor-tutorial.md",
+    "/docs/verification/907/faults.ps1",
     "/hatch_build.py",
     "/pyproject.toml",
     "/src",

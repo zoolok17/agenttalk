@@ -1,0 +1,189 @@
+red first, in two parts. A failing test is counted apart when it fails only because a name, a mode or a wording does not exist in the old code (it is then a guard or a new interface, not evidence of a behaviour).
+
+PART A. The new job tests against the OLD time-out code (the write code of the commit before this change put back, the job module kept)
+command: python -m pytest tests/test_git_job.py tests/test_git_write_job_907.py tests/test_git_job_windows.py tests/test_git_job_capability.py -q
+result: 56 failed, 69 passed, 1 skipped, 1 warning in 30.97s
+the nine 'unrelated process' guards there (they pass by design): 9 passed, 63 deselected in 0.31s
+failing tests: 56; of these, because of behaviour: 55; because a name or a mode is missing, or a wording changed: 1
+    tests/test_git_job.py::test_the_job_code_never_names_a_call_that_walks_processes  [a name is missing]
+    tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[reuse_at_genuine_descendant]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[cancelled_steps_during_command]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[below_tolerance_step_during_command]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_real_children_in_a_history_are_stopped_with_the_job[step_after_stop_sample]  [behaviour]
+    tests/test_git_write_job_907.py::test_job_members_are_stopped[git]  [behaviour]
+    tests/test_git_write_job_907.py::test_job_members_are_stopped[hook_grandchild]  [behaviour]
+    tests/test_git_write_job_907.py::test_job_members_are_stopped[member_whose_parent_exited]  [behaviour]
+    tests/test_git_write_job_907.py::test_a_normal_write_closes_the_job_and_never_stops_it  [behaviour]
+    tests/test_git_write_job_907.py::test_a_nonzero_git_exit_closes_without_stopping  [behaviour]
+    tests/test_git_write_job_907.py::test_an_ordinary_communicate_error_closes_without_stopping  [behaviour]
+    tests/test_git_write_job_907.py::test_an_interruption_before_any_timeout_closes_without_stopping  [behaviour]
+    tests/test_git_write_job_907.py::test_a_missing_resume_symbol_is_a_start_failure_of_the_write  [behaviour]
+    tests/test_git_write_job_907.py::test_a_popen_failure_closes_the_job_and_is_a_start_failure_of_the_write  [behaviour]
+    tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[1]  [behaviour]
+    tests/test_git_write_job_907.py::test_a_refused_resume_is_a_start_failure_and_the_paused_launcher_is_stopped[-1073741790]  [behaviour]
+    tests/test_git_write_job_907.py::test_an_interruption_right_after_the_resume_stops_the_job_git_already_runs_in  [behaviour]
+    tests/test_git_write_job_907.py::test_an_interruption_at_the_real_hand_over_through_the_write_stops_the_job_git_runs_in  [behaviour]
+    tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes  [behaviour]
+    tests/test_git_write_job_907.py::test_a_late_sleep_in_the_final_count_does_not_say_stopped  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[normal-before-ordinary]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[timeout-before-ordinary]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-ordinary]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[fallback_error-before-ordinary]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-ordinary]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_before_timeout-before-ordinary]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[normal-before-first]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[normal-after-first]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[timeout-before-first]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[timeout-after-first]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[ordinary_error-before-first]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[ordinary_error-after-first]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[fallback_error-before-first]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[fallback_error-after-first]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-before-second]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_after_timeout-after-second]  [behaviour]
+    tests/test_git_write_job_907.py::test_the_close[interrupt_before_timeout-after-second]  [behaviour]
+    tests/test_git_write_job_907.py::test_normal_timeout_stops_the_job_then_kills_reaps_and_counts  [behaviour]
+    tests/test_git_write_job_907.py::test_reap_timeout_after_a_job_stop  [behaviour]
+    tests/test_git_write_job_907.py::test_ordinary_error_fallback_stops_the_job_first  [behaviour]
+    tests/test_git_write_job_907.py::test_ordinary_error_fallback_counts_before_it_closes  [behaviour]
+    tests/test_git_write_job_907.py::test_interruption_fallback_stops_the_job  [behaviour]
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[stop]  [behaviour]
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[reap]  [behaviour]
+    tests/test_git_write_job_907.py::test_first_interruption_wins_and_a_second_is_absorbed[count]  [behaviour]
+    tests/test_git_write_job_907.py::test_an_exhausted_deadline_skips_waits_and_the_count_and_keeps_the_warning  [behaviour]
+    tests/test_git_write_job_907.py::test_no_wait_runs_past_the_deadline  [behaviour]
+    tests/test_git_write_job_907.py::test_a_count_above_zero_keeps_the_warning  [behaviour]
+    tests/test_git_write_job_907.py::test_a_count_that_goes_from_above_zero_to_zero_within_the_deadline_gives_the_success_wording  [behaviour]
+    tests/test_git_write_job_907.py::test_success_wording_keeps_output_and_recovery_advice  [behaviour]
+    tests/test_git_write_job_907.py::test_the_no_job_and_posix_timings_are_unchanged  [behaviour]
+    tests/test_git_write_job_907.py::test_fallback_rows[refused_assignment_keeps_the_warning]  [behaviour]
+    tests/test_git_write_job_907.py::test_a_failed_resume_runs_the_bounded_launcher_cleanup  [behaviour]
+    tests/test_git_job_windows.py::test_a_ready_hook_is_stopped_with_git_on_a_timeout  [behaviour]
+    tests/test_git_job_windows.py::test_a_git_filter_is_stopped_with_git_on_a_windows_timeout  [behaviour]
+    tests/test_git_job_windows.py::test_a_plain_write_through_the_product_runs_in_a_job_and_ends_with_it_closed  [behaviour]
+
+PART B. The tests added or changed in the fix round against the code and script of the previous head (8ee4e0b0 put back: the job module, the write code, the scheduled-task script and the test configuration)
+command: python -m pytest tests/test_git_job.py tests/test_git_write_job_907.py tests/test_git_job_scheduled_task_check.py and the two real lane tests -q
+result: 33 failed, 134 passed, 2 errors in 38.09s
+failing tests: 35; of these, because of behaviour: 9; because a name or a mode is missing, or a wording changed: 26
+    tests/test_git_job.py::test_an_interruption_at_the_real_hand_over_return_stops_the_job_and_the_launcher  [behaviour]
+    tests/test_git_job.py::test_a_caller_given_cleanup_is_used_for_an_interruption_at_the_real_hand_over_too  [behaviour]
+    tests/test_git_job.py::test_a_sleep_that_resumes_late_does_not_let_a_count_read_after_the_deadline_say_zero  [behaviour]
+    tests/test_git_job.py::test_a_query_that_returns_after_the_deadline_is_not_accepted  [behaviour]
+    tests/test_git_write_job_907.py::test_an_interruption_at_the_real_hand_over_through_the_write_stops_the_job_git_runs_in  [behaviour]
+    tests/test_git_write_job_907.py::test_an_interruption_of_the_clock_that_starts_the_cleanup_still_stops_and_closes  [behaviour]
+    tests/test_git_write_job_907.py::test_a_late_sleep_in_the_final_count_does_not_say_stopped  [behaviour]
+    tests/test_git_write_job_907.py::test_a_query_that_returns_late_in_the_final_count_does_not_say_stopped  [behaviour]
+    tests/test_git_job_scheduled_task_check.py::test_the_dry_run_registers_nothing_and_shows_the_two_registrations[powershell]  [wording changed]
+    tests/test_git_job_scheduled_task_check.py::test_the_dry_run_registers_nothing_and_shows_the_two_registrations[pwsh]  [wording changed]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-and-a-good-log-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-and-a-good-log-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[running-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[running-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[queued-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[queued-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[disabled-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[unknown-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[unknown-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[no-state-at-all-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[no-state-at-all-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[the-scheduler-cannot-see-the-task-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[the-scheduler-cannot-see-the-task-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-but-the-log-is-partial-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-but-the-log-is-partial-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-but-another-runs-log-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-but-another-runs-log-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-but-a-non-zero-exit-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-but-a-non-zero-exit-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-but-no-facts-line-powershell]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_is_complete_only_when_the_log_is_finished_and_the_task_is_ready[ready-but-no-facts-line-pwsh]  [a name is missing (the mode did not exist)]
+    tests/test_git_job_scheduled_task_check.py::test_a_line_on_stderr_does_not_stop_the_task_mode_before_it_writes_its_last_line[powershell]  [behaviour]
+    tests/test_lanes.py::test_m6_assign_provisions_worktree_by_default_and_workspace  [a name is missing]
+    tests/test_lanes.py::test_786_successful_rollback_removes_worktree_and_branch  [a name is missing]
+
+
+PART C. The tests added in the second delta round (the fault runner, the arguments file, the deletion of the task) against the previous head's tools (b297eb0e put back), in three runs
+
+C1. The runner tests against the previous runner (it checked only the two product files and not git itself)
+command: python -m pytest tests/test_git_job_fault_runner.py -q
+result: 8 failed, 4 passed in 14.26s
+failing tests: 8 (all because of behaviour: the old runner started and discarded edits, or did not refuse)
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[script-powershell]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[script-pwsh]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[test-config-powershell]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[test-config-pwsh]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[all-faults-powershell]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_a_file_a_fault_changes_has_uncommitted_edits[all-faults-pwsh]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_git_cannot_be_read[powershell]
+    tests/test_git_job_fault_runner.py::test_the_runner_refuses_to_start_when_git_cannot_be_read[pwsh]
+
+C2. The new script tests against the previous script with only a test seam added (the stand-in hook and a mode that writes the arguments file the old way, as ASCII)
+command: python -m pytest <the five new script tests> -q
+result: 6 failed, 4 passed in 20.76s
+failing tests: 6 (all because of behaviour: the arguments file lost the accent; a failed deletion returned 0)
+    tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[pwsh]
+
+C3. The same tests against the previous script as it was
+command: python -m pytest <the five new script tests> -q
+result: 10 failed in 8.39s
+failing tests: 10 (all because a mode or a parameter did not exist there)
+    tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_the_arguments_file_keeps_a_folder_name_with_an_accent[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_task_mode_finds_its_repository_when_the_folder_name_has_an_accent[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_whose_task_is_deleted_is_accepted_and_copied[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_run_whose_task_is_deleted_is_accepted_and_copied[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_failed_deletion_of_the_task_is_not_a_success[pwsh]
+    tests/test_git_job_scheduled_task_check.py::test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running[powershell]
+    tests/test_git_job_scheduled_task_check.py::test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running[pwsh]
+
+
+PART D. The test for the product change of this round (an ordinary error from the clock call that starts the cleanup) against the previous head's src/agenttalk/cli.py (b297eb0e put back)
+
+command: python -m pytest tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout -q   (old cli.py)
+  E   AttributeError: 'NoneType' object has no attribute 'cut'
+  <path>:189: AttributeError: 'NoneType' object has no attribute 'cut'
+  FAILED tests/test_git_write_job_907.py::test_an_ordinary_error_from_the_cleanup_clock_is_still_the_timeout
+  1 failed in 3.31s
+the failure is a behaviour: the write ends with an AttributeError (no deadline to cut) instead of its own time-out error
+command: the same test with the change: 1 passed in 3.29s
+
+PART E (round 14). The new tests against the previous head's tools (fc6c645b put back), two PowerShell editions each
+
+E1. The 18 new scheduler tests (cleanup with an unreadable scheduler after a failed or an accepted delete, an unreadable scheduler before registering, the combined cases, the two kinds of "no" from the scheduler, the real scheduler asked read-only) against the previous script:
+    result: 14 failed, 4 passed
+    8 fail because of behaviour: an unreadable scheduler after the delete read as a task that is gone (4: exit 0 and "task deleted: True" instead of 4 and TASK NOT CONFIRMED DELETED), a run was registered although the scheduler could not be read (2), a rejected run lost the warning about the unreadable scheduler (2)
+    6 fail only because the mode that asks the scheduler (`-Mode Facts`) did not exist there (the two kinds of "no" from a stand-in, 4; the real scheduler asked read-only, 2)
+    4 pass on the previous script and pin a rule that was already right and had no test: a run that failed (3) or has no completion evidence (2) keeps its own code when its task is also still there, and the warning is printed (2 cases x 2 editions)
+
+E2. The new runner test (a fault that fails six tests must show six rows) against the previous runner (it kept the first four): 2 of 2 fail (both editions); with the change both pass.
+
+E3. Not red first: the CHANGELOG, dossier and PR text (a history correction and a named product change are text, not behaviour).
+
+PART F (round 15). The tests added or changed, against the previous head's script (1eb69ffa put back), two PowerShell editions each
+
+F1. 20 tests (the two-kinds-of-no test with its two new answers, a missing Get-ScheduledTask command before registering and after the delete, the colour test, the normalizer, and the preflight test that now strips colour):
+    result: 10 failed, 9 passed, 1 skipped
+    10 fail because of behaviour: a Get-ScheduledTask that does not exist, answered with the category ObjectNotFound (what PowerShell gives for a missing command or module), was read as a confirmed absence (the two-kinds test, 2), and a call that answers nothing was read as one too (2); a run with that missing command went on to /Create (2); after the delete the same missing command was read as "task deleted: True" and exit 0 instead of exit 4 (4)
+    9 pass on the previous script: the stand-ins that already behaved (a real not-found error with its id, an access-denied error), the normalizer, the preflight test with its unreadable stand-in
+    1 is skipped: the colour test (on the previous script nothing is refused, so there is no error text for the terminal to colour)
+
+F2. The colour of PowerShell 7's error text (a probe, `verifier-probes.txt` part 7): with colour forced on, the previous way of comparing (whitespace and the error frame only) does not find "Nothing was registered" in the text; the new normalization does.
+
+F3. The real scheduler with a made-up task name is checked read-only under both editions (part 7); the reviewer's machine answered `unreadable=true` there. On this machine both editions answer the task-not-found id, so `unreadable=false`; the previous category match gave the same answer, so the new match does not explain the reviewer's result: the scheduler query most likely failed there with another error (a sandbox that denies the query), which is the right answer for it. The test now skips, saying so, when the scheduler cannot be read on a machine; the classification itself is covered by the stand-ins.
+
+PART G (round 16, tests only). The real-scheduler test, against the previous head's test (53c07303), with a planted wrong error id
+
+G1. With the wrong error id in the script (fault F51) the previous test SKIPPED on this machine (it read "unreadable=true" as a scheduler that cannot be read), so the regression passed unseen. The new test asks the real scheduler on its own first, finds that it answers "no such task" (error id `CmdletizationQuery_NotFound_TaskName,Get-ScheduledTask`) and FAILS under both editions: "the real scheduler's not-found id is ...; the script expects ...". Without the fault it passes under both editions (not skipped).
+G2. The independent question is a pure function with six raw answers tested (a real not-found, another id still a not-found, a missing command, access denied, a found task, no answer): it says "scheduler cannot be read" only for the last four.
+
+PART H (round 16, the further read). The new tests against the previous runner and script (3fe95b9b put back), both editions
+
+H1. 8 new tests, all 8 fail on the previous runner and script: a target marked assume-unchanged or skip-worktree with an uncommitted edit (the previous runner did not refuse: 4), a file that git checkout does not restore because a flag is set while the fault is planted (the previous runner said that everything was put back and left the planted text: 2), and a failed delete with the task confirmed absent (it printed "task deleted: True": 2). With the change all 8 pass under both editions.

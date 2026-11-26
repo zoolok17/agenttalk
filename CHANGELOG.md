@@ -76,8 +76,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kill and reap the launcher, step by step (it may not succeed if the kill and the reap keep failing), and
   raises the original interruption; a failing clean-up step or a second Ctrl-C from the keyboard is not
   meant to replace it (best effort, with limits stated in the code); this stronger clean-up applies on
-  every platform, while the timeout message itself is unchanged outside Windows. A partial checkout or lock may still need recovery. Stopping the programs Git started, by making
-  them members of a job that ends with the launcher, is a planned follow-up (#907).
+  every platform, while the timeout message itself is unchanged outside Windows. A partial checkout or lock may still need recovery. Stopping the programs Git started on a time-out is done in the next entry (#907).
+
+- **On Windows, a Git write that runs out of time now stops the programs Git started too (#907).**
+  A changing Git command is now started inside a Windows job of its own: a group that Windows keeps the
+  list of itself, which every program Git starts (hooks, content filters and their children) joins. If the
+  command runs past its time limit, agenttalk stops the whole group in one step, collects the launcher, checks
+  that nothing in the group is left, closes the group, and only then says that Git and the programs in its
+  Windows job were stopped. If the group could not be made, or Windows would not put Git in it, or it could not
+  be shown empty, the error keeps the earlier warning that a program may still be running. If the paused Git cannot
+  be let go (a missing, failing or refused system call to resume it), the write now fails to start instead of running
+  Git as the earlier code did; the paused Git is stopped and nothing is left running. A normal run is never stopped:
+  nothing in the group ends with it, so a helper that Git starts on purpose, such as its file-system monitor, keeps running.
+  A program in the group that asks to break away from it stays in it. Nothing is launched while the time-out is
+  handled, and no process list, process id or start time is read to decide whom to stop. With a job, all of the
+  time-out clean-up shares one 30 second limit (a count read after that limit has passed is not taken as proof,
+  and an interruption during the start, right after Git was let go included, or during the time-out handling still
+  stops the job); a write without a job keeps
+  the earlier waits. If the clock reading that starts that shared limit itself fails with an ordinary error, the write ends
+  with its own time-out error and the earlier warning, as for any other failure of the clean-up, instead of failing with an
+  internal `AttributeError` (the final check was asked for a limit that did not exist; fixed in round 13). A program that another process starts on Git's behalf (a
+  service or a scheduled task) was never in the group and is not covered. A partial checkout or a Git lock may
+  still need recovery.
 
 - **The release checklist now names the README as the only install pin.** Since the user manuals
   stopped carrying their own install line (#835), step 1 of the release ritual in
@@ -100,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do not add up to the whole suite, or when the two wheel pieces tested different wheels. Linux
   and macOS are unchanged.
   `agenttalk dev-gate --ci-leg windows/<python> --part <part>` runs one piece.
+- **macOS test jobs in CI may now run for 120 minutes instead of 90 (#378).** On 23 November
+  2026, eight macOS jobs on master and three pull requests were stopped at the 90-minute limit
+  without a failing test, while passing macOS jobs took 81 to 89 minutes; these stops caused
+  repeated reruns and held merges. The test run's own limit inside the job (7,200 seconds) is
+  unchanged, and Linux keeps 90 minutes.
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
@@ -134,6 +159,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text.
 
 ### Fixed
+
+- **Windows process-list failures now stop supervisor operations (#905).**
+  Selecting or validating the PowerShell host, preparing or committing its scheduled task, and claiming the supervisor now stop with exit 3 and name the failing Windows call if Windows cannot list processes, even where the list is not needed.
+
+- Three journal tests now allow a slow writer to finish before checking its events, and check the close ended cleanly (#906).
 
 - **Close checks no longer report hidden submodule work as clean (#796).**
   Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.
@@ -204,6 +234,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   period right before a closing quote or bracket now ends it. A Windows drive path, including
   the drive-relative kind like `<drive>:file`, no longer counts as the end of a sentence part.
   The bundled skills are unchanged: the check gives the same answer for all of them.
+
+- **One message file nested too deeply no longer stops every command (#874).** A file in the message
+  folder holding JSON nested so deeply that Python cannot read it used to stop `status`, `doctor`,
+  `threads`, `drain`, `recv`, `send` and `prune --invalid`, the dashboard's message list, checkpoints and
+  the archive step with a Python error, so one damaged file stopped the whole team from talking. Now
+  such a file is treated like any other invalid message file: the good messages beside it are still
+  delivered, `send` works, and `status --json` lists it under `invalid_messages` with the reason
+  `invalid JSON: nested too deeply` (the same `invalid JSON` start as before, so the
+  `message_json_invalid` code is unchanged). `prune --invalid` moves it into the quarantine folder
+  like any invalid file; it never deletes. The same fix covers three more readers that had the same
+  weakness: `dead-letter show` (prints `<unreadable payload>`), `dead-letter requeue` (refuses, and
+  publishes nothing, for a damaged stored message, or for a damaged requeue record of a task, which an explicit
+  `--again --reason TEXT` replaces, a too-deep record included) and the note file that
+  `dead-letter list` reads beside a dead letter (the letter is still listed). No exit code and no
+  `--json` shape changes. Not changed here: the message scan has no file size limit
+  (checkpoints do), and a message that parses but has a deeply nested field is handled as before.
+
 - **A wrapped Claude seat in a strict permission mode can now send its replies by command (#828).** In a Claude
   Code mode other than `bypassPermissions` (`dontAsk` was measured), a command that starts with a
   variable is refused even when an allow rule matches it, and the wrapper told every Claude seat to run
@@ -611,6 +658,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `skill_currency` now says that bundled skills last reviewed against an older version are a note
   for the maintainers and nothing to do for the reader; with blocking findings, its fix says to report
   it to the agenttalk maintainers and that the maintenance advice is for them.
+
+### CI
+
+- **One slow file of tests moves from the second Windows test group to the first, so the second
+  group is no longer close to its time limit.** On Windows, CI splits the tests into two groups, A
+  and B, and runs each group in its own job, once from the source code and once from the built
+  package, with 150 minutes allowed per group. Group B had grown far larger than A: on the master
+  branch, in run 45070700353, it took 132.3 of its 150 minutes on Python 3.10. Over four recent
+  runs, B took on average 113.5 minutes against A's 64.4 on Python 3.10, 105.8 against 57.9 on 3.11,
+  99.6 against 64.8 on 3.12 and 99.3 against 68.8 on 3.13. One file, the lane checkout path tests,
+  is a fifth of group B's time (about 21 minutes per job) and varies less between runs than the
+  other slow files, so it now runs in group A.
+  What you will notice: before this, group B took on average 31 to 49 minutes longer than group A,
+  depending on the Python version. Now the Windows A jobs take about 20 minutes longer and the B
+  jobs about 20 minutes shorter. From the same four runs, the expected averages are A 86.6 and B
+  91.3 minutes on 3.10, 79.1 and 84.6 on 3.11, 84.9 and 79.6 on 3.12, and 88.3 and 79.8 on 3.13,
+  and the slowest group would have taken 108.1 minutes instead of 132.3. Every test still runs
+  once in each mode on every Python version; Linux and macOS are unchanged. Nothing to do.
+  These figures are projections from four runs, and whether the file runs faster or slower after
+  group A's other files was not measured.
+  The file is `tests/test_lane_checkout_paths.py` (follow-up to #378). The group A list is pinned
+  in four places, which all name it now: `checks.pytest.windows_group_a` in `dev-gate.json`,
+  `WINDOWS_GROUP_A` in `src/agenttalk/dev_gate.py`, `GROUP_A` in `tests/test_dev_gate_groups.py`
+  and the group A sentence in `docs/DEV-GATE.md`.
 
 ## [0.105.0] - 2026-11-13
 

@@ -143,8 +143,14 @@ def test_windows_ci_job_ceiling_matches_the_windows_capacity_stopgap() -> None:
             f"            {ceiling}\n" in matrix
     assert matrix.count("- id: windows") == len(parts) == 4
     assert matrix.count(ceiling) == len(parts)
-    assert workflow.count("timeout_minutes: 90") == 2
-    for stale in ("timeout_minutes: 360", "timeout_minutes: 270", "timeout_minutes: 180", "timeout_minutes: 120"):
+    # Linux keeps 90 minutes; macOS has 120 (#378: 8 macOS stops at 90 on 23 November 2026, passing
+    # jobs 81 to 89 minutes). Both are pinned exactly, so neither drifts silently.
+    assert "          - id: linux\n            runner: ubuntu-latest\n            timeout_minutes: 90\n" in matrix
+    macos = "timeout_minutes: 120  # #378: passing macOS jobs take 81 to 89 minutes"
+    assert f"          - id: macos\n            runner: macos-latest\n            {macos}\n" in matrix
+    assert workflow.count("timeout_minutes: 90") == 1
+    assert workflow.count("timeout_minutes: 120") == 1
+    for stale in ("timeout_minutes: 360", "timeout_minutes: 270", "timeout_minutes: 180"):
         assert stale not in workflow
     assert "${{ matrix.os.part && format('--part {0}', matrix.os.part) || '' }}" in legs
     assert "Linux/macOS keep one run per mode" in workflow
