@@ -13575,7 +13575,7 @@ def cmd_janitor(args: argparse.Namespace) -> int:
         print(janitormod.apply(cfg, report))
     else:
         print(janitormod.format_report(report, cfg, apply=False))
-    return 1 if report.access_errors or report.apply_failed else 0
+    return 1 if report.access_errors or report.apply_failed or report.check_failures else 0  # #909: a check broke
 
 
 def cmd_install_skills(args: argparse.Namespace) -> int:
@@ -21429,7 +21429,9 @@ def build_parser() -> argparse.ArgumentParser:
         "janitor",
         help="Report (default) or clean up (--apply) scratch sprawl: config-driven "
              "allow-listed name families in the repo root, .worktrees/, the OS temp "
-             "root, and stale per-agent scratch directories (#148).",
+             "root, and stale per-agent scratch directories (#148). Exit 1 can mean that a check broke "
+             "(`KEPT <path>: could not check (<type>): ...`, counted in `could not check: N`); read the reasons. A "
+             "record that cannot be read keeps its checkout as an ordinary refusal, which alone does not exit 1.",
     )
     janitor_action = pjanitor.add_mutually_exclusive_group()
     janitor_action.add_argument("--release", metavar="WORKTREE",
@@ -21437,12 +21439,14 @@ def build_parser() -> argparse.ArgumentParser:
                                      "is on origin's fetched default branch. Keeps the branch; never forces removal.")
     janitor_action.add_argument("--release-report", action="store_true",
                                 help="Fetch origin and list registered worktrees eligible for release, with sizes; "
-                                     "remove nothing.")
+                                     "remove nothing. Exits 1 when a check of a worktree broke.")
     janitor_action.add_argument("--apply", action="store_true",
                           help="WIP-commit dirty registered worktrees on their own "
                                "branch (never the default branch), remove allow-listed "
                                "paths, and prune stale worktree registrations. Default "
-                               "is report-only.")
+                               "is report-only. A candidate whose check broke in the preview is kept and listed "
+                               "as not checked; `could not check: N` counts checkouts, the not-checked list "
+                               "counts candidates, so the two can differ.")
     pjanitor.add_argument("--keep-days", type=int, default=None,
                           help="Override the scratch-root staleness window "
                                "(default: config's scratch.keep_days, else 3)")

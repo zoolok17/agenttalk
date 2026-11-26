@@ -3088,3 +3088,58 @@ def test_an_ended_lane_named_only_at_the_last_read_with_a_free_token_is_claimed_
         assert seen.get("token") is not None, "the newly named lane's token was free during the removal"
     finally:
         _unlink(gone)
+
+
+# --- #909: a check that breaks is "could not check", counted, and the report fails --------------------------------
+
+UNEXPECTED = [OSError(5, "denied\x1b[31m\nFAILED forged"), ValueError("a bad value"), TypeError("a bad type")]
+
+
+def _break_for_the_checkout(monkeypatch, cfg, name, error):
+    """`worktree_release.<name>` raises `error` for every checkout but the main repository."""
+    real = getattr(worktree_release, name)
+
+    def broken(cfg_, target, *rest):
+        first = target[0] if isinstance(target, list) else target
+        if not janitor._same_worktree(Path(first), cfg.repo):
+            raise error
+        return real(cfg_, target, *rest)
+
+    monkeypatch.setattr(worktree_release, name, broken)
+
+
+@pytest.mark.parametrize("error", UNEXPECTED, ids=["OSError", "ValueError", "TypeError"])
+@pytest.mark.parametrize("name", ["check_unused", "_check_worktree"])
+def test_release_report_unexpected_check_errors(estate, monkeypatch, name, error):
+    """The release preview used to print a broken check as an ordinary KEPT and exit 0. Now it says it could not check,
+    with the error's type and a one-line detail, counts it once and exits 1; the checkout is not touched."""
+    repo, wt, cfg = estate
+    _break_for_the_checkout(monkeypatch, cfg, name, error)
+
+    code, text = run(cfg, None)
+
+    assert code == 1, text
+    assert f"KEPT {wt}: could not check ({type(error).__name__}): " in text, text
+    assert "could not check: 1" in text and "WOULD RELEASE" not in text, text
+    assert "\x1b" not in text and "\nFAILED forged" not in text, text
+    assert (wt / "source.txt").exists()
+
+
+def test_release_report_keeps_an_ordinary_refusal_uncounted(estate, monkeypatch):
+    repo, wt, cfg = estate
+    _break_for_the_checkout(monkeypatch, cfg, "check_unused", worktree_release.Refused("lane one is active (test)"))
+
+    code, text = run(cfg, None)
+
+    assert code == 0, text
+    assert f"KEPT {wt}: lane one is active (test)" in text and "could not check" not in text, text
+
+
+def test_release_of_one_checkout_keeps_its_old_wording_when_a_check_breaks(estate, monkeypatch):
+    repo, wt, cfg = estate
+    _break_for_the_checkout(monkeypatch, cfg, "_check_worktree", OSError(5, "denied"))
+
+    code, text = run(cfg, wt)
+
+    assert code == 1 and f"KEPT {wt}: " in text and "denied" in text, text
+    assert "could not check" not in text and (wt / "source.txt").exists(), text

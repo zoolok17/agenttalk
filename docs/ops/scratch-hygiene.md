@@ -93,7 +93,8 @@ directory under it belongs to nobody just because it isn't yours.
 For the lead: after merging and running `agenttalk board verify-merges`, confirm
 that nobody is still using the worktree. From the main repository, first read
 `agenttalk janitor --release-report`. It shows `WOULD RELEASE` with a size in bytes
-for eligible checkouts, and `KEPT` with a reason for the others. Then run
+for eligible checkouts, and `KEPT` with a reason for the others (`KEPT ... could not check`
+means the check itself broke, and the report then exits 1). Then run
 `agenttalk janitor --release <worktree-path>` for the one checkout you have finished
 with (replace the placeholder with its path). Read the report again on the daily tick.
 The report is a list to read, not a to-do list: a newly created checkout at the
