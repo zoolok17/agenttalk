@@ -456,12 +456,6 @@ def _placed(path: Path) -> str:
             missing.append(name)
             current = parent
     token = lanes.canonical_host_path_checked(current)
-    if os.name != "nt":
-        # The shared token turns a literal backslash of a POSIX name into "/": `co\\` and `co/` become one token, and a
-        # name that ends in a backslash gets a trailing "/", so nothing placed below it starts with `token + "/"` and
-        # a missing child was judged unrelated. Here the exact POSIX path is compared, as master does with its path
-        # ancestry. The shared function has just resolved this same part and made its checks, so this cannot differ.
-        token = os.path.realpath(current, strict=True)
     if missing:
         if not stat.S_ISDIR(os.stat(current).st_mode):
             raise NotADirectoryError(errno.ENOTDIR, "cannot be placed: the part that exists is not a folder", current)
@@ -565,6 +559,10 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
         # dictionary order, or an acknowledged retirement must not hide it). Only the canonical field has it.
         canonical = lanes.canonical_checkout_problem(value, root=repo)
         if canonical is not None:
+            if "older version" in canonical[1]:
+                recovery = lanes.checkout_path_recovery(lane_id=lane_id or "", lane=value, owner=owner, root=repo)
+                raise Refused(f"{source}: activity path {canonical[0]} {canonical[1]}; "
+                              f"set it to the checkout's real absolute folder; {recovery}")
             if "NUL" in canonical[1] or "surrogate" in canonical[1]:
                 # keep the shared reason: it is not a relative path, it is not a path at all
                 raise Refused(f"{source}: activity path {canonical[0]} {canonical[1]}; record an absolute path first")
@@ -655,6 +653,9 @@ def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
         retained = row.get("occupancy_worktrees", [])
         if not isinstance(retained, list) or any(not isinstance(p, str) or not p.strip() for p in retained):
             raise Refused(f"{source}: could not read retained occupancy worktrees")
+        if any(lanes.old_backslash_path(p, root=cfg.repo) for p in retained):
+            raise Refused(f"{source}: a retained occupancy worktree was saved by an older version for a folder whose "
+                          "name ends in a backslash; set it to the checkout's real absolute folder")
         if _names_checkout(row, target, cfg.repo, lane_id=lane_id, source=source, lane=True) or any(
                 _names_checkout({"worktree_path": p}, target, cfg.repo, lane_id=lane_id, source=source, lane=True)
                 for p in retained):

@@ -35,6 +35,88 @@ SHA = "a" * 40
 OTHER = "b" * 40
 
 
+@pytest.mark.parametrize("form", ["posix_standin", "native"])
+def test_a_backslash_b_and_a_slash_b_have_different_tokens(tmp_path, monkeypatch, form):
+    if form == "posix_standin":
+        import posixpath
+
+        fake_os = SimpleNamespace(name="posix", path=posixpath, fspath=os.fspath)
+        monkeypatch.setattr(lanes, "os", fake_os)
+        first, second = r"/x/a\b", "/x/a/b"
+    else:
+        if os.name == "nt":
+            pytest.skip("literal backslash names need a POSIX file system")
+        first, second = tmp_path / r"a\b", tmp_path / "a" / "b"
+        first.mkdir()
+        second.mkdir(parents=True)
+    assert lanes.canonical_host_path(first) != lanes.canonical_host_path(second)
+
+
+@pytest.mark.parametrize("value", ["/", "//p", "///p", "/p/./q", "/p/../q", "/p/q/", "/p//q", "q", r"/p/a\b"])
+def test_posix_token_keeps_path_spelling_after_abspath(monkeypatch, value):
+    import posixpath
+
+    monkeypatch.setattr(os, "getcwd", lambda: "/work")
+    assert lanes._canonical_token(value, windows=False, pathmod=posixpath) == posixpath.abspath(value)
+
+
+@pytest.mark.parametrize("value", [r"C:\P\Q", r"\\server\share\P", "C:/P\\Q/", "C:\\", r"C:\p\.", r"C:\p\..\q", "C:q"])
+def test_windows_token_keeps_the_previous_formula(monkeypatch, value):
+    import ntpath
+
+    monkeypatch.setattr(os, "getcwd", lambda: r"C:\work")
+    expected = ntpath.normcase(ntpath.abspath(value)).replace("\\", "/")
+    assert lanes._canonical_token(value, windows=True, pathmod=ntpath) == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows path behavior")
+def test_windows_native_token_keeps_the_previous_formula(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for value in (str(tmp_path), str(tmp_path.anchor), "x", ".\\a\\..\\b", str(tmp_path).replace("\\", "/")):
+        assert lanes._canonical_token(value) == os.path.normcase(os.path.abspath(value)).replace("\\", "/")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="literal backslash names need a POSIX file system")
+def test_a_sibling_folder_ending_in_a_backslash_is_not_accepted_as_the_worktrees_root(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    sibling = tmp_path / "repo\\"
+    sibling.mkdir()
+    with pytest.raises(lanes.LaneError, match="outside the store"):
+        cli._prepare_worktrees_root(Store(root), str(sibling))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="literal backslash names need a POSIX file system")
+def test_a_checkout_under_a_backslash_folder_keeps_its_canonical_path(tmp_path):
+    root = tmp_path / "repo\\" / "inner"
+    root.mkdir(parents=True)
+    root, base = _repo(root)
+    row = _assign_worktree(root, base, "backslash")
+    worktree = Path(row["worktree_path"])
+    assert row["worktree_toplevel_canonical"] == str(worktree.resolve())
+    assert cli._verify_lane_worktree(Store(root), row, lane_id="backslash")["head"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="literal backslash names need a POSIX file system")
+def test_a_delivery_file_in_a_sibling_alias_of_the_deliveries_folder_is_refused(tmp_path):
+    store = Store(tmp_path)
+    managed = store.dir / "lane-deliveries"
+    sibling = tmp_path / ".agenttalk\\lane-deliveries"
+    managed.mkdir(parents=True)
+    sibling.mkdir()
+    data = {"schema_version": lanes.SCHEMA_VERSION, "lane_id": "one", "delivered_head": SHA,
+            "verdict": "GO", "holds": []}
+    good, bad = managed / "one.json", sibling / "one.json"
+    for path in (good, bad):
+        path.write_text(json.dumps(data), encoding="utf-8")
+    assert lanes.validate_delivery_artifact(good, lane_id="one", head_sha=SHA, store=store) == data
+    assert cli._lane_recovery_final_candidate(store, "one", {"delivery_artifact": str(good)}, None) == good
+    with pytest.raises(lanes.LaneError, match="outside"):
+        lanes.validate_delivery_artifact(bad, lane_id="one", head_sha=SHA, store=store)
+    with pytest.raises(lanes.LaneError, match="outside"):
+        cli._lane_recovery_final_candidate(store, "one", {"delivery_artifact": str(bad)}, None)
+
+
 # --------------------------------------------------------------- pure: bounds
 
 def test_segment_bounds_not_string_prefix() -> None:
