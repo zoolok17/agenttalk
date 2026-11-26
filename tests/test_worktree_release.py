@@ -2898,6 +2898,18 @@ def test_release_refuses_a_guarded_saved_path(tmp_path, monkeypatch, field):
         worktree_release._free_lanes(cfg, tmp_path, lambda *args: None)
 
 
+def test_healthy_retained_claim_names_checkout_beside_guarded_canonical(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE", raising=False)
+    world = _FakePosixFolders(monkeypatch, tmp_path, ["/w", "/w/target"])
+    row = {"worktree_toplevel_canonical": "/w/old//checkout", "occupancy_worktrees": ["/w/target"]}
+    monkeypatch.setattr(worktree_release, "_activity", lambda cfg, target: {"earlier": row})
+    cfg, target = types.SimpleNamespace(repo=world.purepath("/w/repo")), world.purepath("/w/target")
+    with pytest.raises(worktree_release.Refused, match="older version"):
+        worktree_release._free_lanes(cfg, target, lambda *args: None)
+    row.pop("worktree_toplevel_canonical")
+    assert worktree_release._free_lanes(cfg, target, lambda *args: None) == ["earlier"]
+
+
 def test_an_old_inside_backslash_claim_is_the_documented_limit(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # the stand-in paths are not real
     world = _FakePosixFolders(monkeypatch, tmp_path, ["/w", "/w/a\\b", "/w/a", "/w/a/b"])

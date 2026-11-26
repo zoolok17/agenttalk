@@ -1059,7 +1059,7 @@ def test_damaged_acknowledgement_refuses_a_surviving_real_folder(damaged_lane, c
     assert evidence.read_text() == "unfinished work"
 
 
-def test_retired_damaged_lane_assignment_reaches_domain_check(damaged_lane, capsys):
+def test_retired_damaged_lane_assignment_advises_a_new_id(damaged_lane, capsys):
     store = damaged_lane("worktree_path", "\t")
     _follow_the_whitespace_advice(store, capsys, "worktree_path", "\t")
     assert (
@@ -1093,9 +1093,20 @@ def test_retired_damaged_lane_assignment_reaches_domain_check(damaged_lane, caps
         == 2
     )
     advice = capsys.readouterr().err
-    assert "unknown domain 'core'" in advice
+    assert "use a new lane id" in advice
     assert "--acknowledge-missing-worktree" not in advice
     assert lanes.lanes_path(store).read_bytes() == before
+
+
+def test_healthy_missing_checkout_acknowledgement_does_not_read_git_list(tmp_path, damaged_lane, monkeypatch):
+    store = damaged_lane("worktree_path", str(tmp_path / "gone"))
+    _update_row(store, "damaged", worktree_toplevel_canonical=str(store.root / "gone"))
+    monkeypatch.setattr(cli, "_worktree_records_strict", lambda *_: pytest.fail("Git list must not be read"))
+    real_git = cli._git
+    monkeypatch.setattr(cli, "_git", lambda root, argv, **kw: pytest.fail("Git list must not be read")
+                        if argv[:2] == ["worktree", "list"] else real_git(root, argv, **kw))
+    assert cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged",
+                     "--acknowledge-missing-worktree"]) == 0
 
 
 def test_acknowledgement_help_names_damaged_paths(capsys):
@@ -2135,7 +2146,8 @@ def test_damaged_acknowledgement_refuses_registered_or_unreliable_listing(keyed,
     monkeypatch.setattr(cli, "_git", git)
     monkeypatch.setattr(cli.janitormod, "_fence_registrations", lambda root: None)
     assert _run(store, "lane", "abandon", "--id", BAD, ACK_HINT) == 2
-    assert "nothing was acknowledged" in capsys.readouterr().err.lower()
+    error = capsys.readouterr().err.lower()
+    assert "nothing was acknowledged" in error and "sweep" not in error
     assert lanes.lanes_path(store).read_bytes() == before
 
 
@@ -3051,6 +3063,7 @@ def test_an_absolute_canonical_that_really_differs_is_refused_on_the_committed_s
     with pytest.raises(lanes.LaneError, match="no longer matches git") as caught:
         cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
     assert "worktree_toplevel_canonical" in str(caught.value) and "real absolute folder" in str(caught.value)
+    assert "it must be an absolute path" not in str(caught.value)
     row["worktree_toplevel_canonical"] = lanes.canonical_host_path(worktree)  # the right absolute one still passes
     assert cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)["head"]
 
@@ -4983,7 +4996,7 @@ def test_reassignment_preserves_or_refuses_the_previous_checkout(tmp_path, capsy
                      "--domain", "core", "--base", base, "--target", _branch(root), "--path", "src/other", "--force",
                      "--advisory", "--no-worktree", "--worktree-waiver-reason", "test"])
     text = capsys.readouterr().err
-    if case in {"relative-without-canonical", "damaged", "retired-hidden-damage"}:
+    if case in {"relative-without-canonical", "damaged", "retired", "retired-hidden-damage"}:
         assert code != 0 and ("real absolute folder" in text or "NUL" in text or "retired" in text), text
     else:
         assert code == 0, text
@@ -4991,6 +5004,47 @@ def test_reassignment_preserves_or_refuses_the_previous_checkout(tmp_path, capsy
         expected = ([canonical] if case == "relative-with-canonical" else
                     [str(root / "earlier")] if case == "no-checkout-existing" else [])
         assert claims == expected
+
+
+@pytest.mark.parametrize("case", ["doubled_slash_canonical"])
+def test_forced_reassignment_with_a_damaged_earlier_field_is_refused_as_before(tmp_path, monkeypatch, capsys, case):
+    import posixpath
+    from test_lanes import _assign_worktree, _branch, _repo
+
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "first")
+    _update_row(Store(root), "first", worktree_toplevel_canonical="/p/co//wt")
+    monkeypatch.setattr(lanes, "os", types.SimpleNamespace(name="posix", path=posixpath))
+    assert "older version" in lanes.canonical_checkout_problem({"worktree_toplevel_canonical": "/p/co//wt"}, root="")[1]
+    code = cli.main(["--root", str(root), "lane", "assign", "--id", "first", "--from", "lead", "--assignee", "dev2",
+                     "--domain", "core", "--base", base, "--target", _branch(root), "--path", "src/other", "--force",
+                     "--advisory", "--no-worktree", "--worktree-waiver-reason", "test"])
+    assert code == 2 and "worktree_toplevel_canonical" in capsys.readouterr().err
+
+
+def test_a_raw_path_with_a_doubled_slash_is_not_kept_as_the_claim(tmp_path, monkeypatch):
+    import posixpath
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "first")
+    _update_row(Store(root), "first", worktree_path="/p/co//wt", worktree_toplevel_canonical="/p/canonical")
+    monkeypatch.setattr(lanes, "os", types.SimpleNamespace(name="posix", path=posixpath))
+    _reassign_without_a_checkout(root, base, "first")
+    assert lanes.load_lanes(Store(root))["lanes"]["first"]["occupancy_worktrees"] == ["/p/canonical"]
+
+
+def test_guarded_absolute_raw_without_canonical_is_not_called_relative(tmp_path, monkeypatch, capsys):
+    import posixpath
+    from test_lanes import _assign_worktree, _branch, _repo
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "first")
+    _update_row(Store(root), "first", worktree_path="/p/co//wt", worktree_toplevel_canonical=None)
+    monkeypatch.setattr(lanes, "os", types.SimpleNamespace(name="posix", path=posixpath))
+    code = cli.main(["--root", str(root), "lane", "assign", "--id", "first", "--from", "lead", "--assignee", "dev2",
+                     "--domain", "core", "--base", base, "--target", _branch(root), "--force", "--advisory",
+                     "--no-worktree", "--worktree-waiver-reason", "test"])
+    assert code == 2 and "relative path" not in capsys.readouterr().err
 
 
 def _retained_claim_case(tmp_path, monkeypatch, command):

@@ -3235,7 +3235,7 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _git(root, argv: list[str], *, raw=False):
+def _git(root, argv: list[str], *, raw=False) -> tuple[int, str | bytes]:
     """Run a read-only git command in ``root``; (rc, stdout) or (-1, "") on any
     failure. argv is a fixed list (never shell); git is the only tool invoked."""
     import subprocess  # nosec B404  # local import keeps the dependency optional
@@ -5758,7 +5758,7 @@ def _verify_lane_worktree(
     )
     if stored_c and not ambiguous and lane_mod.canonical_host_path(stored_c) != toplevel_c:
         raise lane_mod.LaneError(f"stored worktree canonical path no longer matches git in lane {lane_id!r}; "
-                                 f"{lane_mod._CANONICAL_ADVICE}")
+                                 f"{lane_mod._CANONICAL_ADVICE.removeprefix('it must be an absolute path. ')}")
     repo_common = _common_git_dir(store.root)
     wt_common = _common_git_dir(wt)
     if repo_common != wt_common:
@@ -6236,12 +6236,12 @@ def _worktree_records_strict(root):
             else:
                 row[key] = value
         path, head, bare = row.get("worktree", ""), row.get("HEAD", ""), "bare" in row
-        if (not lane_mod.path_is_absolute(path) or
-                bare and (index != 0 or row["bare"] or any(k in row for k in ("HEAD", "branch", "detached"))) or
-                not bare and (not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) or
-                              ("branch" in row) == ("detached" in row) or
-                              "branch" in row and (not row["branch"].startswith("refs/") or len(row["branch"]) <= 5) or
-                              "detached" in row and row["detached"])):
+        bad_bare = bare and (index != 0 or row["bare"] or any(k in row for k in ("HEAD", "branch", "detached")))
+        bad_branch = "branch" in row and (not row["branch"].startswith("refs/") or len(row["branch"]) <= 5)
+        bad_detached = "detached" in row and row["detached"]
+        bad_identity = (not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) or
+                        ("branch" in row) == ("detached" in row))
+        if not lane_mod.path_is_absolute(path) or bad_bare or not bare and (bad_identity or bad_branch or bad_detached):
             raise janitormod._listing_failure("invalid checkout identity")
         store_mod.check_folder_fence(Path(path))
         records.append(row)
@@ -7451,8 +7451,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 return 2
             issue = (lane_mod.checkout_issue_advice(previous, lane_id=lane_id, root=store.root)
                      if isinstance(previous, dict) else None)
-            if issue is not None and not (issue[1] == "is blank" and lane_mod.checkout_damage_acknowledged(previous)
-                    and isinstance(previous.get("worktree_toplevel_canonical"), (str, type(None)))):
+            if issue is not None:
                 sys.stderr.write(
                     f"agenttalk lane assign: lanes.json lane {lane_id}: "
                     f"could not read current checkout path {issue[0]}; {issue[2]}\n")
@@ -7524,21 +7523,15 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     raise lane_mod.LaneError("could not read retained occupancy worktrees")
                 issue = (lane_mod.checkout_issue_advice(previous, lane_id=lane_id, root=store.root)
                          if isinstance(previous, dict) else None)
-                if issue is not None and not (issue[1] == "is blank" and lane_mod.checkout_damage_acknowledged(previous)
-                        and isinstance(previous.get("worktree_toplevel_canonical"), (str, type(None)))):
+                if issue is not None:
                     raise lane_mod.LaneError(
                         f"lanes.json lane {lane_id}: could not read current checkout path {issue[0]}; {issue[2]}")
                 raw = previous.get("worktree_path") if isinstance(previous, dict) else None
                 canonical = previous.get("worktree_toplevel_canonical") if isinstance(previous, dict) else None
-                if isinstance(previous, dict) and lane_mod.checkout_damage_acknowledged(previous):
-                    if lane_mod.acknowledgement_retires("worktree_path", raw):
-                        raw = None
-                    if isinstance(canonical, str) and not canonical.strip():
-                        canonical = None
                 old_checkout = raw if raw and lane_mod.path_is_absolute(raw) and not lane_mod.old_backslash_path(
                     raw, root=store.root) else canonical
                 if not old_checkout and raw:
-                    raise lane_mod.LaneError(f"lanes.json lane {lane_id}: its saved checkout is a relative path and no "
+                    raise lane_mod.LaneError(f"lanes.json lane {lane_id}: its saved checkout cannot be used and no "
                                              "full canonical path settles it; set worktree_path to the checkout's real "
                                              "absolute folder, then reassign")
                 retained = [*retained, *([old_checkout] if old_checkout else [])]
@@ -8264,7 +8257,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                             records = _worktree_records_strict(store.root)
                         except (janitormod._UseCheckFailed, store_mod.StoreFenceError) as exc:
                             raise lane_mod.LaneError(
-                                f"Git's list of checkouts could not be checked ({pc.line(str(exc))}); "
+                                f"Git's list could not be checked ({pc.line(getattr(exc, 'why', str(exc)))}); "
                                 "nothing was acknowledged") from exc
                         for record in records:
                             if record.get("branch") == lane_mod.lane_ref(lane_id):
