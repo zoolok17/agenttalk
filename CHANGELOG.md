@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Drift visibility: warnings when work is ordered without a challenge, and a read-only report (#923).**
+  Teams sometimes did more work than was agreed. `agenttalk task` now prints advisory lines before it stores
+  a design, build or fix order that has no answered challenge verdict behind it, an exemption outside a fixed
+  list, or a work item that passed its agreed time allowance or two fix rounds without a recorded decision
+  (`narrow`, `stop` or `continue`). Nothing is refused and delivery is unchanged. `agenttalk overview --drift`
+  shows the same picture for the whole store. The time shown is elapsed task-hours, a proxy that includes
+  waiting, not effort. The check reads the store once more: about +0.4 s at 5,000 and +2.1 s at 20,000
+  messages (medians); a stored index is the follow-up if that hurts. Older orders are shown as unknown. Both copies of the challenge skill describe the
+  new meta keys (`allowance`, `decision`, `decision_reason`).
+
 - **The lead setup brief explains how to run a Claude seat in a strict permission mode (#826).**
   Before this, the brief said that a wrapped Claude seat runs with no approval prompts and no
   sandbox unless you choose another mode, and left the rest to the team. Now its step 10a gives a
@@ -161,6 +171,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **A failed list of checkouts is now "unknown", not "zero", in the janitor and in `doctor` (#901).** When Git could not list the registered checkouts (Git missing or not runnable, a failed or cut-short answer, text that cannot be read), the report printed `registered worktrees: 0` as if it were a fact, and the sweep treated the folders of a failed list as free to remove (a link could still be unlinked, and an empty sweep still pruned). Now the report prints `registered worktrees: unknown (<Git's reason>)` and an unknown dirty count, still lists the folders it can safely find, and says what to do: fix Git for that repository, review the `safe.directory` setting for one you trust, or upgrade Git (the list needs Git 2.36 or newer, with `git worktree list --porcelain -z`). `janitor --apply` then keeps every folder, links included, commits nothing, prunes nothing and exits 1, even when there is nothing to remove; the count after the prune says `unknown` and fails the sweep when it cannot be read. Git's own words are shown on one line, cut, with control characters written out. `agenttalk doctor` warns that the checkouts could not be checked instead of staying silent, and in its JSON output `scratch_hygiene.data.outside_worktrees` is `null` (not `0`) in that case; a list that can be read gives the same number as before and no key is added or removed. The report, the sweep's first list, the store fence and doctor now share one reading of the list; nothing retries it or falls back to the older text form. A Git that fails to run in any way is an unknown list like the others (before, such a failure that was not a system error stopped the command with an internal error instead). The janitor sets no time limit on Git, so a Git that hangs still makes the janitor and `doctor` wait (#931). The report still exits 0 when it gives a useful partial report and no scan root had an access error; an access error gives 1, `--apply` with a failed item gives 1, and a refusal by the store fence before the work starts gives 2; a refusal during `--apply` (at the sweep's later checks, or at the count after the prune) fails the sweep with 1 and the report and its summary are still printed. The check made at the delete still looks only at the checkouts under a folder, so a checkout registered after the first list whose path contains the folder, or registered during the delete itself, is not seen.
+
+- **The setup brief installs the release the README installs, and the README says what to do when Windows refuses
+  to start agenttalk (#716, items 6 and 7).** Before this, the brief's step 2a still installed v0.101.1. Now it copies
+  its tag from the README, and its record of the v0.101.1 checks is unchanged. If a policy such as Device Guard refuses
+  `agenttalk.exe` or `pip.exe` (exit code 4551), the README now says to keep using the `python -m` forms.
 
 - **Windows process-list failures now stop supervisor operations (#905).**
   Selecting or validating the PowerShell host, preparing or committing its scheduled task, and claiming the supervisor now stop with exit 3 and name the failing Windows call if Windows cannot list processes, even where the list is not needed.
