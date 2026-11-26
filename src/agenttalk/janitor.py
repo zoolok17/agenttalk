@@ -1481,7 +1481,7 @@ def _fence_registrations(repo: Path) -> None:
     refuses one that leads out (#913), so a link or junction among Git's files that leads outside is refused, never
     followed. A `gitdir` that names a relative path is refused as it is: Git versions read it from different folders.
     An entry Git drops without a look (no `gitdir` file, or an empty one) is passed over. A file that cannot be read
-    keeps the list from being trusted (`_UseCheckFailed`). Outside a fence nothing is done."""
+    or names a path with a NUL, keeps the list untrusted (`_UseCheckFailed`). Outside a fence nothing is done."""
     allowed = store_mod._fence()
     if allowed is None:
         return
@@ -1495,6 +1495,8 @@ def _fence_registrations(repo: Path) -> None:
 
     def text_of(file: Path) -> str:  # `file` is fenced by the caller
         data = file.read_bytes().strip()
+        if b"\0" in data:  # a path with a NUL cannot be looked at: the list is not reliable (#928)
+            raise _listing_failure(f"the registration file {file} names a path with a NUL character")
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError:

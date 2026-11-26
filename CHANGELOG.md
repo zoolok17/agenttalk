@@ -160,6 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Under a store fence, a Git registration file (a checkout's `gitdir`, its `.git` file or `commondir`) that names a path with a NUL character now gives the janitor's usual "could not list the registered checkouts" failure, and the checkout is kept, instead of being trusted or ending in an internal error (#928).
 - **Windows process-list failures now stop supervisor operations (#905).**
   Selecting or validating the PowerShell host, preparing or committing its scheduled task, and claiming the supervisor now stop with exit 3 and name the failing Windows call if Windows cannot list processes, even where the list is not needed.
 
