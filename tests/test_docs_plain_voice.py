@@ -13,6 +13,7 @@ REPO = Path(__file__).resolve().parents[1]
 README = REPO / "README.md"
 MANUAL = REPO / "docs" / "AGENTTALK-NEW-USER-MANUAL.md"
 OPERATOR_MANUAL = REPO / "docs" / "USER-MANUAL.md"
+BRIEF = REPO / "docs" / "LEAD-SETUP-BRIEF.md"
 PDF = "docs/AGENTTALK-NEW-USER-MANUAL.pdf"
 PIN = re.compile(r'pip install "git\+https://github\.com/zoolok17/agenttalk\.git@(v\d+\.\d+\.\d+)"')
 
@@ -121,9 +122,11 @@ def test_no_fenced_line_anywhere_in_a_manual_is_the_old_bare_pip_install(path: P
 
 
 def test_the_manuals_name_no_install_pin_only_the_readme_does() -> None:
-    """A pin in a manual is a second version to bump at every release; the manuals point to the README instead."""
-    for path in (MANUAL, OPERATOR_MANUAL):
+    """A pin in a manual or the setup brief (#716) is a second version to bump at every release; the README holds it."""
+    for path in (MANUAL, OPERATOR_MANUAL, BRIEF):
         assert ANY_PIN.findall(path.read_text(encoding="utf-8")) == [], path.name
+    # the brief's expected `--version` output follows `<tag>` too, never a fixed version
+    assert not re.search(r"Expected last line: `?agenttalk v?\d", BRIEF.read_text(encoding="utf-8"))
 
 
 def test_the_readme_pins_the_release_this_tree_ships() -> None:
@@ -133,6 +136,14 @@ def test_the_readme_pins_the_release_this_tree_ships() -> None:
     assert readme_pins
     version = re.search(r'^version = "([^"]+)"', (REPO / "pyproject.toml").read_text(encoding="utf-8"), re.M).group(1)
     assert readme_pins == {f"v{version}"}
+
+
+def test_get_started_says_what_to_do_when_windows_refuses_agenttalk_exe() -> None:
+    """#716 item 6: a policy such as Device Guard can refuse agenttalk.exe and pip.exe (exit 4551); python -m works."""
+    started = README.read_text(encoding="utf-8").split("## Get started\n", 1)[1]
+    note = started.split("```powershell\n", 1)[1].split("```\n", 1)[1].split("Linux and macOS (sh):", 1)[0]
+    for words in ("agenttalk.exe", "pip.exe", "4551", "-m pip", "-m agenttalk", "administrator"):
+        assert words in " ".join(note.split()), words
 
 
 def test_readme_links_the_lead_setup_brief_at_the_release_it_installs() -> None:

@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Drift visibility: warnings when work is ordered without a challenge, and a read-only report (#923).**
+  Teams sometimes did more work than was agreed. `agenttalk task` now prints advisory lines before it stores
+  a design, build or fix order that has no answered challenge verdict behind it, an exemption outside a fixed
+  list, or a work item that passed its agreed time allowance or two fix rounds without a recorded decision
+  (`narrow`, `stop` or `continue`). Nothing is refused and delivery is unchanged. `agenttalk overview --drift`
+  shows the same picture for the whole store. The time shown is elapsed task-hours, a proxy that includes
+  waiting, not effort. The check reads the store once more: about +0.4 s at 5,000 and +2.1 s at 20,000
+  messages (medians); a stored index is the follow-up if that hurts. Older orders are shown as unknown. Both copies of the challenge skill describe the
+  new meta keys (`allowance`, `decision`, `decision_reason`).
+
 - **The lead setup brief explains how to run a Claude seat in a strict permission mode (#826).**
   Before this, the brief said that a wrapped Claude seat runs with no approval prompts and no
   sandbox unless you choose another mode, and left the rest to the team. Now its step 10a gives a
@@ -159,6 +169,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text.
 
 ### Fixed
+
+- **The setup brief installs the release the README installs, and the README says what to do when Windows refuses
+  to start agenttalk (#716, items 6 and 7).** Before this, the brief's step 2a still installed v0.101.1. Now it copies
+  its tag from the README, and its record of the v0.101.1 checks is unchanged. If a policy such as Device Guard refuses
+  `agenttalk.exe` or `pip.exe` (exit code 4551), the README now says to keep using the `python -m` forms.
 
 - **Windows process-list failures now stop supervisor operations (#905).**
   Selecting or validating the PowerShell host, preparing or committing its scheduled task, and claiming the supervisor now stop with exit 3 and name the failing Windows call if Windows cannot list processes, even where the list is not needed.
