@@ -2601,25 +2601,69 @@ def test_a_saved_unc_share_root_does_not_stop_a_lane_command(keyed, capsys, cano
 
 @pytest.mark.skipif(os.name != "nt", reason="a UNC path is only absolute on Windows")
 def test_worktree_release_accepts_a_unc_share_root_as_absolute_too(tmp_path, monkeypatch):
-    """Release must not call a share root ambiguous. Its physical matching (`Path.resolve`) is kept in production but
-    replaced here by a stand-in that looks at nothing, so this test never touches a share or the network; it records
-    what release asked to resolve, which shows that release got past the classification and reached the matching."""
-    import pathlib
-
+    """Release must not call a share root ambiguous. Its physical matching (`worktree_release._placed`) is kept in
+    production but replaced here by a stand-in that looks at nothing, so this test never touches a share or the
+    network; it records what release asked to place, which shows that release got past the classification and
+    reached the matching. The suite's store fence is lifted for this test (the way `tests/test_probe_store.py` models
+    an unfenced shell): under a fence a record's path outside it is refused first, as a string, which is another
+    test's business (`tests/test_store_fence.py`); this one is about the classification and the matching."""
     from agenttalk import worktree_release
 
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE", raising=False)
     asked = []
 
-    def resolve_nothing(self, strict=False):
-        asked.append(str(self))
-        return self
+    def place_nothing(path):
+        asked.append(str(path))
+        return "//server/share" if str(path).rstrip("\\") == r"\\server\share" else "c:/elsewhere"
 
-    monkeypatch.setattr(pathlib.Path, "resolve", resolve_nothing)
+    monkeypatch.setattr(worktree_release, "_placed", place_nothing)
     row = {"lane_id": OTHER, "worktree_toplevel_canonical": r"\\server\share"}
     assert not worktree_release._names_checkout(
         row, tmp_path / "elsewhere", tmp_path, lane_id=BAD, source="lanes.json lane bad", lane=True
     )
     assert any(path.rstrip("\\") == r"\\server\share" for path in asked)  # reached the matching, looked at nothing
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a UNC path is only absolute on Windows")
+def test_under_the_store_fence_a_unc_record_path_keeps_the_checkout_and_nothing_looks_at_it(tmp_path, monkeypatch):
+    """The fenced twin of the test above, with the suite's own store fence ON (not lifted): the same UNC record is
+    refused (`Refused`: the checkout is kept, never released), and no `lstat`, `stat`, `realpath` or placing of that
+    path happens first. Every look at it is answered with an error and noted, so the share is never contacted."""
+    import errno
+
+    from agenttalk import worktree_release
+
+    assert os.environ.get("AGENTTALK_STORE_FENCE"), "this test is about the fence the suite sets for every test"
+    unc = r"\\server\share"
+    looked = []
+
+    def is_unc(path) -> bool:
+        try:
+            return os.fspath(path).rstrip("\\").lower() == unc
+        except TypeError:
+            return False
+
+    def watch(name, real):
+        def spy(path, *args, **kwargs):
+            if is_unc(path):
+                looked.append(name)
+                raise OSError(errno.EIO, "the share was looked at (test)")
+            return real(path, *args, **kwargs)
+
+        return spy
+
+    for owner, name in ((os, "lstat"), (os, "stat"), (os.path, "realpath"), (os.path, "exists")):
+        monkeypatch.setattr(owner, name, watch(f"{owner.__name__}.{name}", getattr(owner, name)))
+    monkeypatch.setattr(worktree_release, "_placed", lambda path: looked.append("_placed") or "c:/elsewhere")
+    row = {"lane_id": OTHER, "worktree_toplevel_canonical": unc}
+
+    with pytest.raises(worktree_release.Refused, match="outside the fence") as refused:
+        worktree_release._names_checkout(
+            row, tmp_path / "elsewhere", tmp_path, lane_id=BAD, source="lanes.json lane bad", lane=True
+        )
+
+    assert "the checkout was kept" in str(refused.value)
+    assert looked == [], f"the share was looked at: {looked}"
 
 
 # ---------------------------------------- the committed-publication exception is kept for a relative canonical too
@@ -5566,3 +5610,356 @@ def test_a_delivery_is_still_refused_when_the_prefixed_record_names_another_fold
 
     assert rc == 3 and "Git's own record of this checkout says it lives at" in capsys.readouterr().err
     _nothing_was_published(Store(root), "mine")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# #843: the prepared copy is deleted through the folders that were checked, not through their names again. The removal
+# checked that `lane-deliveries` and `.prepared` were real folders and then deleted by name, so another program of the
+# same user could swap `.prepared` for a link in between and the delete followed it. The seams below make the swap
+# happen at an exact step instead of relying on timing.
+
+
+def _hook_unlink(monkeypatch, wrapper):
+    """Replace `os.unlink` by `wrapper`, which passes everything on (`dir_fd` included). The held-folder delete is only
+    made when `os.unlink` is listed in `os.supports_dir_fd`, a set of the original function objects; a plain wrapper is
+    not in it, the delete was refused before it was reached, and the seam never ran (Linux, Python 3.10 and 3.11, in
+    CI). So the wrapper is listed too: it does take `dir_fd`."""
+    monkeypatch.setattr(os, "unlink", wrapper)
+    monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) | {wrapper})
+
+
+def _prepared_copy_with_a_swap_ready(tmp_path, monkeypatch, seam):
+    """A committed delivery whose own prepared copy exists, an unrelated file with the same name in another folder,
+    and a `swap()` that moves the real `.prepared` folder aside and puts a link to the other folder in its place at
+    `seam`: "after-the-last-folder-check" (right after the check of the `.prepared` folder says it is a real folder) or
+    "inside-the-delete-call" (just before the real delete runs, whether by `os.unlink` or `Path.unlink`)."""
+    store, lane_id, _checkout, _head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    pending = lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]
+    own = lanes.prepared_delivery_artifact_path(store, pending["lane_id"], pending["transaction_id"])
+    assert own.exists()
+    independent = tmp_path.parent / f"{tmp_path.name}-independent-843"
+    independent.mkdir()
+    victim = independent / own.name
+    victim.write_text("not part of any delivery\n", encoding="utf-8")
+    moved = own.parent.with_name(".prepared-original")
+    state = {"swapped": False, "refused": None, "calls": 0}
+
+    def swap():
+        state["calls"] += 1
+        if state["swapped"] or state["refused"] is not None:
+            return
+        try:
+            own.parent.rename(moved)
+        except OSError as exc:  # a held folder cannot be renamed on Windows
+            state["refused"] = exc
+            return
+        _link_directory(own.parent, independent)
+        state["swapped"] = True
+
+    if seam == "inside-the-delete-call":
+        real_unlink, real_path_unlink = os.unlink, Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)) == own.name:
+                swap()
+            return real_unlink(path, *args, **kwargs)
+
+        def path_unlink(self, *args, **kwargs):
+            if self.name == own.name:
+                swap()
+            return real_path_unlink(self, *args, **kwargs)
+
+        _hook_unlink(monkeypatch, unlink)
+        monkeypatch.setattr(Path, "unlink", path_unlink)
+    else:
+        real_is_link = lanes._is_link
+        wanted = os.path.normcase(os.fspath(own.parent))
+
+        def is_link(path):
+            answer = real_is_link(path)
+            if not answer and os.path.normcase(os.fspath(path)) == wanted:
+                swap()
+            return answer
+
+        monkeypatch.setattr(lanes, "_is_link", is_link)
+    return store, lane_id, pending, own, victim, moved, state, artifact
+
+
+@pytest.mark.parametrize("seam", ["inside-the-delete-call", "after-the-last-folder-check"])
+def test_a_swapped_prepared_folder_cannot_redirect_the_delete_of_a_committed_retry(tmp_path, monkeypatch, capsys, seam):
+    store, lane_id, _pending, own, victim, moved, state, artifact = _prepared_copy_with_a_swap_ready(
+        tmp_path, monkeypatch, seam
+    )
+    signed = artifact.read_bytes()
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+
+    assert state["calls"] >= 1, "the swap seam never ran"
+    assert victim.read_text(encoding="utf-8") == "not part of any delivery\n"
+    assert artifact.read_bytes() == signed
+    if seam == "after-the-last-folder-check":
+        # the link is found when the folders are opened: nothing is deleted and the existing message says so
+        assert state["swapped"] and (moved / own.name).exists()
+        assert "left in place" in capsys.readouterr().err
+    elif os.name == "nt":
+        # the checked folders are held open: the swap itself is refused and the real copy goes
+        assert state["refused"] is not None and not state["swapped"] and not own.exists()
+    else:
+        # the swap goes through, but the delete is made in the folder that was opened: the real copy goes
+        assert state["swapped"] and not (moved / own.name).exists()
+
+
+@pytest.mark.parametrize("seam", ["inside-the-delete-call", "after-the-last-folder-check"])
+def test_a_swapped_prepared_folder_cannot_redirect_the_direct_removal(tmp_path, monkeypatch, capsys, seam):
+    """The other callers (rollback, a failed save, a competing delivery, a refused final check) ask the same remover."""
+    store, _lane_id, pending, own, victim, moved, state, _artifact = _prepared_copy_with_a_swap_ready(
+        tmp_path, monkeypatch, seam
+    )
+    capsys.readouterr()
+
+    cli._lane_remove_prepared(store, pending)
+
+    assert state["calls"] >= 1
+    assert victim.read_text(encoding="utf-8") == "not part of any delivery\n"
+    if seam == "after-the-last-folder-check":
+        assert "left in place" in capsys.readouterr().err
+    elif os.name == "nt":
+        assert state["refused"] is not None and not own.exists()
+    else:
+        assert state["swapped"] and not (moved / own.name).exists()
+
+
+def _managed_folders(tmp_path):
+    from test_lanes import _repo
+
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    own = lanes.prepared_delivery_artifact_path(store, "lane-a", "cd" * 16)
+    own.parent.mkdir(parents=True)
+    own.write_text("{}", encoding="utf-8")
+    return store, lanes.deliveries_dir(store), own
+
+
+def test_the_helper_removes_the_copy_and_reports_what_it_did(tmp_path):
+    _store, deliveries, own = _managed_folders(tmp_path)
+    assert lanes._remove_in_managed_folders(deliveries, own) == "removed"
+    assert not own.exists() and own.parent.is_dir()
+    assert lanes._remove_in_managed_folders(deliveries, own) == "absent"  # the file is already gone
+    own.parent.rmdir()
+    assert lanes._remove_in_managed_folders(deliveries, own) == "absent"  # so is the folder
+
+
+@pytest.mark.parametrize("which", ["prepared-folder", "deliveries-folder"])
+def test_the_helper_refuses_a_linked_managed_folder(tmp_path, which):
+    _store, deliveries, own = _managed_folders(tmp_path)
+    independent = tmp_path.parent / f"{tmp_path.name}-linked-843"
+    independent.mkdir()
+    if which == "prepared-folder":
+        (independent / own.name).write_text("not part of any delivery\n", encoding="utf-8")
+        original = own.parent.rename(own.parent.with_name(".prepared-original"))
+        _link_directory(own.parent, independent)
+        victim = independent / own.name
+    else:
+        (independent / ".prepared").mkdir()
+        victim = independent / ".prepared" / own.name
+        victim.write_text("not part of any delivery\n", encoding="utf-8")
+        original = deliveries.rename(deliveries.with_name("lane-deliveries-original"))
+        _link_directory(deliveries, independent)
+
+    assert lanes._remove_in_managed_folders(deliveries, own) == "refused"
+
+    assert victim.read_text(encoding="utf-8") == "not part of any delivery\n"
+    assert any(original.rglob(own.name))  # the real copy was not touched either
+
+
+def test_the_helper_refuses_a_file_that_is_not_in_the_prepared_folder(tmp_path):
+    _store, deliveries, own = _managed_folders(tmp_path)
+    stray = deliveries / own.name
+    stray.write_text("{}", encoding="utf-8")
+    assert lanes._remove_in_managed_folders(deliveries, stray) == "refused"
+    assert stray.exists() and own.exists()
+
+
+def test_the_prepared_copy_is_left_in_place_when_the_held_folder_delete_is_not_available(
+    tmp_path, monkeypatch, capsys
+):
+    """No folder-relative delete (POSIX) or no way to hold the folders (Windows): the copy stays and the existing
+    message is printed. It is never deleted by name instead: a leftover prepared copy is never accepted as a
+    delivery."""
+    store, deliveries, own = _managed_folders(tmp_path)
+    pending = {"lane_id": "lane-a", "transaction_id": "cd" * 16, "prepared_artifact": str(own)}
+    if os.name == "nt":
+        import ctypes
+
+        def unavailable(*_args, **_kwargs):
+            raise OSError("no kernel32 here")
+
+        monkeypatch.setattr(ctypes, "WinDLL", unavailable)
+    else:
+        monkeypatch.setattr(os, "supports_dir_fd", set())
+    capsys.readouterr()
+
+    cli._lane_remove_prepared(store, pending)
+
+    assert own.exists()
+    assert "left in place" in capsys.readouterr().err
+
+
+def test_the_prepared_copy_remover_no_longer_deletes_by_name():
+    import inspect
+
+    source = inspect.getsource(cli._lane_remove_prepared)
+    assert "own.unlink" not in source and ".unlink(" not in source
+    assert "_remove_in_managed_folders" in source
+
+
+@pytest.mark.parametrize("missing", ["prepared-folder", "file"])
+def test_the_posix_helper_closes_every_descriptor_it_opened_on_an_early_return(tmp_path, monkeypatch, missing):
+    """A missing `.prepared` folder (or a missing file in it) is "absent", and every descriptor opened by then is
+    closed. The helper is exercised through stand-ins for the folder-relative calls, so this runs on every system."""
+    opened, closed = [], []
+    real_close = os.close
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and missing == "prepared-folder":
+            raise FileNotFoundError(2, "no .prepared", path)
+        descriptor = 1000 + len(opened)
+        opened.append(descriptor)
+        return descriptor
+
+    def fake_close(descriptor):
+        if descriptor in opened:
+            closed.append(descriptor)
+            return None
+        return real_close(descriptor)
+
+    def fake_unlink(name, *, dir_fd=None):
+        raise FileNotFoundError(2, "no file", name)
+
+    monkeypatch.setattr(os, "O_DIRECTORY", 0o200000, raising=False)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0o400000, raising=False)
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "unlink", fake_unlink)
+    monkeypatch.setattr(os, "close", fake_close)
+    monkeypatch.setattr(os, "supports_dir_fd", {fake_open, fake_unlink})
+
+    answer = lanes._remove_held_posix(str(tmp_path / "lane-deliveries"), ".prepared", "x.prepared.json")
+
+    assert answer == "absent"
+    assert opened and sorted(closed) == sorted(opened), (opened, closed)
+
+
+def _hold_stand_ins(monkeypatch):
+    """Stand-ins for the folder-relative calls (so this runs on every host): returns the list of `(name, dir_fd)`
+    that the held-folder delete made, and the list of folders it opened as `(path, dir_fd)`."""
+    opened, deleted = [], []
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        opened.append((path, dir_fd))
+        return 1000 + len(opened)
+
+    def fake_unlink(name, *, dir_fd=None):
+        deleted.append((name, dir_fd))
+
+    monkeypatch.setattr(os, "O_DIRECTORY", 0o200000, raising=False)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0o400000, raising=False)
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "close", lambda descriptor: None)
+    monkeypatch.setattr(os, "unlink", fake_unlink)
+    monkeypatch.setattr(os, "supports_dir_fd", {fake_open, fake_unlink})
+    return opened, deleted
+
+
+def test_a_plain_replacement_of_os_unlink_is_refused_before_it_is_reached(tmp_path, monkeypatch):
+    """The cause of the CI failure on Linux (Python 3.10 and 3.11): the held-folder delete only runs when `os.unlink` is
+    one of the functions the platform lists in `os.supports_dir_fd` (that set holds the original function objects).
+    A test that swaps in its own `os.unlink` without listing it is refused before the delete is made, so a hook inside
+    the delete call is never reached, and the copy is left in place. That refusal is the product being careful, and
+    stays."""
+    opened, deleted = _hold_stand_ins(monkeypatch)
+    reached = []
+    monkeypatch.setattr(os, "unlink", lambda name, **kwargs: reached.append(name))  # not listed in supports_dir_fd
+
+    assert lanes._remove_held_posix(str(tmp_path / "lane-deliveries"), ".prepared", "x.prepared.json") == "refused"
+    assert reached == [] and deleted == []
+
+
+def test_a_hook_in_the_delete_call_is_reached_and_the_delete_is_made_in_the_held_folder(tmp_path, monkeypatch):
+    """With the hook listed (`_hook_unlink`, the one the swap seam uses), the held-folder delete reaches it, and the
+    real delete behind it is made relative to the second folder that was opened (the `.prepared` folder), never by
+    name: the swap inside the call cannot redirect it."""
+    opened, deleted = _hold_stand_ins(monkeypatch)
+    real_unlink, reached = os.unlink, []
+
+    def hook(name, *args, **kwargs):
+        reached.append(name)  # a swap of `.prepared` for a link would happen here
+        return real_unlink(name, *args, **kwargs)
+
+    _hook_unlink(monkeypatch, hook)
+
+    answer = lanes._remove_held_posix(str(tmp_path / "lane-deliveries"), ".prepared", "x.prepared.json")
+
+    assert answer == "removed" and reached == ["x.prepared.json"]
+    prepared_descriptor = 1002  # the second folder opened: the first is `lane-deliveries`, the second `.prepared`
+    assert opened[1][0] == ".prepared" and opened[1][1] == 1001
+    assert deleted == [("x.prepared.json", prepared_descriptor)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the held-folder delete is the POSIX route; Windows holds the folders open")
+def test_the_real_os_takes_the_held_folder_route_on_this_platform():
+    """Recorded on every Linux and macOS run: the guard of the POSIX route, asked of the REAL `os` (no stand-in, no
+    patch): both open flags exist and `os.open` and `os.unlink` are listed in `os.supports_dir_fd`. If this fails, the
+    prepared copy is left in place on that platform and the seam tests above cannot reach the delete."""
+    assert lanes._held_folder_delete_available(), (
+        f"O_DIRECTORY={hasattr(os, 'O_DIRECTORY')} O_NOFOLLOW={hasattr(os, 'O_NOFOLLOW')} "
+        f"open_in_supports_dir_fd={os.open in os.supports_dir_fd} "
+        f"unlink_in_supports_dir_fd={os.unlink in os.supports_dir_fd}"
+    )
+
+
+def test_the_seam_s_change_to_os_is_undone_when_its_patch_is_undone():
+    """`_hook_unlink` lists its wrapper in `os.supports_dir_fd` and replaces `os.unlink`; both go back, to the very same
+    objects, when the monkeypatch is undone (the seam tests use the `monkeypatch` fixture, which undoes it after each
+    test)."""
+    original_unlink, original_set = os.unlink, os.supports_dir_fd
+    listed_before = set(original_set)
+
+    def wrapper(name, *args, **kwargs):
+        return original_unlink(name, *args, **kwargs)
+
+    patch = pytest.MonkeyPatch()
+    try:
+        _hook_unlink(patch, wrapper)
+        assert os.unlink is wrapper and wrapper in os.supports_dir_fd and os.supports_dir_fd is not original_set
+    finally:
+        patch.undo()
+    assert os.unlink is original_unlink and os.supports_dir_fd is original_set
+    assert set(os.supports_dir_fd) == listed_before and wrapper not in os.supports_dir_fd
+
+
+def test_the_posix_helper_closes_a_descriptor_when_the_second_open_is_refused(tmp_path, monkeypatch):
+    """The refusal branch (a link, or not a folder) closes what was opened too."""
+    opened, closed = [], []
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None:
+            raise OSError(40, "too many levels of symbolic links", path)
+        opened.append(1000 + len(opened))
+        return opened[-1]
+
+    def fake_close(descriptor):
+        closed.append(descriptor)
+
+    def fake_unlink(name, *, dir_fd=None):
+        raise AssertionError("nothing may be deleted")
+
+    monkeypatch.setattr(os, "O_DIRECTORY", 0o200000, raising=False)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0o400000, raising=False)
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "unlink", fake_unlink)
+    monkeypatch.setattr(os, "close", fake_close)
+    monkeypatch.setattr(os, "supports_dir_fd", {fake_open, fake_unlink})
+
+    assert lanes._remove_held_posix(str(tmp_path / "lane-deliveries"), ".prepared", "x.prepared.json") == "refused"
+    assert opened and sorted(closed) == sorted(opened)

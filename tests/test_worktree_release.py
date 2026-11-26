@@ -642,8 +642,9 @@ def test_stale_fsmonitor_cannot_hide_edits(estate, tmp_path, monkeypatch, when):
 
 
 @pytest.mark.parametrize("report", [False, True])
-def test_unrelated_relative_lanes_do_not_block_release(estate, report):
+def test_unrelated_relative_lanes_do_not_block_release(estate, report, monkeypatch):
     repo, wt, cfg = estate
+    monkeypatch.chdir(repo)  # under the suite's fence a caller-relative spelling must lie inside it: here it does
     state = repo / ".agenttalk/state"
     state.mkdir()
     # Synthetic shape from the review: five relative lanes (three active),
@@ -2130,6 +2131,30 @@ def test_real_git_success_report_escapes_checkout_path(estate, branch, name):
     assert "\x1b" not in message
 
 
+@contextlib.contextmanager
+def _no_use_check():
+    yield
+
+
+class _NoGuard:
+    """The activity check (#858) reads a real config; this test uses a stand-in one and tests the report lines. The
+    check has its own tests (test_janitor_active_lanes.py)."""
+
+    def __init__(self, cfg, targets, **kwargs):
+        pass
+
+    def reread(self):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return None
+
+    final_window = staticmethod(_no_use_check)
+
+
 def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
     from agenttalk import store as store_mod
 
@@ -2186,6 +2211,7 @@ def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
         cfg.default_branches = ["main"]
         report.candidates = [candidates[0]]
         report.registered_worktrees = [path]
+        patch.setattr(worktree_release, "RemovalGuard", _NoGuard)  # a stand-in config: see _NoGuard
         patch.setattr(Path, "exists", lambda *args: True)
         patch.setattr(janitor, "_ancestor_change_reason", lambda *args: None)
         patch.setattr(janitor, "_path_change_reason", lambda *args: None)
@@ -2375,3 +2401,690 @@ def test_status_shows_an_acknowledged_row_that_still_blocks_a_release_and_its_ad
     assert capsys.readouterr().out.strip() == "active lanes: none"
     code, text = run(cfg, wt)
     assert code == 0 and "REMOVED" in text, text
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# #853: a recorded path that cannot be looked at is not "a different path". The activity check named the checkout with a
+# tolerant `Path.resolve()`, which on Windows hands back a partial answer (still naming the link) when following a
+# junction is denied or shared, so a record that names the checkout through that junction was read as unrelated and the
+# checkout was removed. The paths that name activity are now resolved strictly; one that cannot be placed keeps the
+# checkout, and says which record could not be checked.
+
+_RECORD_KINDS = [
+    "active-lane",
+    "pending-lane",
+    "retained-lane",
+    "supervisor-state",
+    "store-supervisor",
+    "launch-request",
+]
+
+
+def _write_record(repo, kind, path):
+    """A record of `kind` that names `path`, in the place the release check reads it from."""
+    store = repo / ".agenttalk"
+    state = store / "state"
+    state.mkdir(exist_ok=True)
+    text = str(path)
+    if kind == "active-lane":
+        row = {"status": "active", "worktree_path": text}
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}))
+    elif kind == "pending-lane":
+        row = {"status": "delivered", "publish_pending": {"x": 1}, "worktree_path": text}
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}))
+    elif kind == "retained-lane":
+        row = {"status": "abandoned", "occupancy_worktrees": [text]}
+        (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}))
+    elif kind == "supervisor-state":
+        (state / "supervisor-state.json").write_text(json.dumps({"agents": {"seat": {"cwd": text}}}))
+    elif kind == "store-supervisor":
+        (store / "supervisor.json").write_text(json.dumps({"agents": {"seat": {"launch_cwd": text}}}))
+    elif kind == "launch-request":
+        (state / "launch-requests").mkdir(exist_ok=True)
+        (state / "launch-requests" / "r.json").write_text(json.dumps({"state": "pending", "cwd": text}))
+    else:
+        raise AssertionError(kind)
+
+
+def _resolver_cannot_follow(monkeypatch, alias, error, *, armed=lambda: True):
+    """Make resolving `alias` fail the way Windows does: a plain call hands back the unresolved path, a strict one
+    raises `error`. Everything else resolves as usual. Returns what each call asked for: True for strict, False for
+    plain."""
+    real = os.path.realpath
+    wanted = os.path.normcase(os.path.normpath(os.fspath(alias)))
+    asked: list[bool] = []
+
+    def realpath(path, *args, strict=False, **kwargs):
+        if armed() and os.path.normcase(os.path.normpath(os.fspath(path))) == wanted:
+            asked.append(bool(strict))
+            if strict:
+                raise error
+            return os.fspath(path)
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    return asked
+
+
+@pytest.fixture
+def alias_to_the_checkout(estate):
+    """A real junction (a symbolic link where there are none) that leads to the checkout, outside the folders
+    the release looks at."""
+    repo, wt, _cfg = estate
+    alias = repo.parent / "alias-to-the-checkout"
+    directory_link(alias, wt)
+    yield alias
+    with contextlib.suppress(OSError):
+        alias.rmdir() if os.name == "nt" else alias.unlink()
+
+
+_DENIED = [PermissionError(13, "access denied", None, 5), OSError(32, "sharing violation"), OSError(5, "I/O error")]
+
+
+@pytest.mark.parametrize("error", _DENIED, ids=["winerror-5", "winerror-32", "other-os-error"])
+@pytest.mark.parametrize("kind", _RECORD_KINDS)
+def test_a_recorded_path_that_cannot_be_followed_keeps_the_checkout(
+    estate, alias_to_the_checkout, monkeypatch, kind, error
+):
+    repo, wt, cfg = estate
+    alias = alias_to_the_checkout
+    _write_record(repo, kind, alias)
+    asked = _resolver_cannot_follow(monkeypatch, alias, error)
+    before = git(repo, "rev-parse", "refs/heads/finished")
+
+    code, text = run(cfg, wt)
+
+    assert True in asked, "the recorded path was never looked up strictly"
+    assert code != 0 and "KEPT" in text, text
+    assert wt.is_dir() and (wt / "source.txt").exists()
+    assert git(repo, "rev-parse", "refs/heads/finished") == before
+    assert "could not establish where activity path" in text and "the checkout was kept" in text, text
+
+
+@pytest.mark.parametrize("kind", _RECORD_KINDS)
+def test_the_report_does_not_offer_a_checkout_when_a_recorded_path_cannot_be_followed(
+    estate, alias_to_the_checkout, monkeypatch, kind
+):
+    repo, wt, cfg = estate
+    alias = alias_to_the_checkout
+    _write_record(repo, kind, alias)
+    asked = _resolver_cannot_follow(monkeypatch, alias, PermissionError(13, "access denied", None, 5))
+
+    code, text = run_report(cfg)
+
+    assert True in asked
+    assert "WOULD RELEASE" not in text and f"KEPT {wt}" in text, text
+    assert wt.is_dir()
+
+
+def run_report(cfg):
+    from agenttalk.worktree_release import release
+
+    return release(cfg, None)
+
+
+def test_the_activity_check_names_the_reason_and_the_record(estate, alias_to_the_checkout, monkeypatch):
+    repo, wt, cfg = estate
+    alias = alias_to_the_checkout
+    _write_record(repo, "active-lane", alias)
+    _resolver_cannot_follow(monkeypatch, alias, PermissionError(13, "access denied", None, 5))
+
+    _code, text = run(cfg, wt)
+
+    assert "lanes.json lane one: could not establish where activity path worktree_path leads" in text, text
+
+
+@pytest.mark.parametrize("kind", [k for k in _RECORD_KINDS if k != "retained-lane"])
+def test_a_junction_to_the_checkout_still_names_it(estate, kind):
+    """The control without a fault: the alias resolves into the checkout, so the record names it. (A retired lane that
+    retains the checkout does not block: it is named, its occupancy token is claimed, and the removal goes on.)"""
+    repo, wt, cfg = estate
+    alias = repo.parent / "alias-to-the-checkout"
+    directory_link(alias, wt)
+    _write_record(repo, kind, alias)
+    try:
+        code, text = run(cfg, wt)
+        assert code != 0 and "KEPT" in text, text
+        assert wt.is_dir()
+    finally:
+        alias.rmdir() if os.name == "nt" else alias.unlink()
+
+
+def test_an_unrelated_existing_path_does_not_block_release(estate):
+    repo, wt, cfg = estate
+    other = repo.parent / "somewhere-else"
+    other.mkdir()
+    _write_record(repo, "active-lane", other)
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+@pytest.mark.parametrize("parts", [1, 2, 3])
+@pytest.mark.parametrize("kind", ["active-lane", "supervisor-state", "retained-lane"])
+def test_a_path_that_is_provably_absent_and_unrelated_does_not_block_release(estate, kind, parts):
+    """One, two or three missing parts: an old record of a folder that is long gone must not hold the checkout."""
+    repo, wt, cfg = estate
+    gone = repo.parent / "long-gone"
+    for number in range(1, parts):
+        gone = gone / f"deeper{number}"
+    _write_record(repo, kind, gone)
+    assert not os.path.lexists(repo.parent / "long-gone")
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+@pytest.mark.parametrize("parts", [1, 2, 3])
+def test_a_missing_path_inside_the_checkout_still_names_it(estate, parts):
+    repo, wt, cfg = estate
+    inside = wt
+    for number in range(parts):
+        inside = inside / f"not-there{number}"
+    _write_record(repo, "active-lane", inside)
+    code, text = run(cfg, wt)
+    assert code != 0 and "KEPT" in text, text
+    assert wt.is_dir()
+
+
+def test_a_missing_path_below_a_junction_into_the_checkout_still_names_it(estate):
+    repo, wt, cfg = estate
+    alias = repo.parent / "alias-to-the-checkout"
+    directory_link(alias, wt)
+    _write_record(repo, "active-lane", alias / "not-there" / "deeper")
+    try:
+        code, text = run(cfg, wt)
+        assert code != 0 and "KEPT" in text, text
+    finally:
+        alias.rmdir() if os.name == "nt" else alias.unlink()
+
+
+def test_a_dangling_link_is_not_proof_that_the_path_is_absent(estate, tmp_path):
+    """A link whose target is gone cannot be placed: it might have led to the checkout, so the checkout is kept."""
+    repo, wt, cfg = estate
+    gone = tmp_path / "gone-target"
+    gone.mkdir()
+    alias = repo.parent / "dangling"
+    directory_link(alias, gone)
+    gone.rmdir()
+    _write_record(repo, "active-lane", alias)
+    try:
+        code, text = run(cfg, wt)
+        assert code != 0 and "KEPT" in text, text
+        assert wt.is_dir()
+    finally:
+        with contextlib.suppress(OSError):
+            alias.rmdir() if os.name == "nt" else alias.unlink()
+
+
+def test_a_file_in_the_way_of_a_recorded_path_is_not_proof_that_the_path_is_absent(estate):
+    repo, wt, cfg = estate
+    blocker = repo.parent / "a-file"
+    blocker.write_text("x")
+    _write_record(repo, "active-lane", blocker / "child")
+    code, text = run(cfg, wt)
+    assert code != 0 and "KEPT" in text, text
+
+
+@pytest.mark.parametrize("kind", ["active-lane", "supervisor-state"])
+def test_a_failure_to_follow_a_recorded_path_at_the_final_reread_keeps_the_checkout(estate, monkeypatch, kind):
+    """The first reads are clean; at the read made under the locks, just before Git removes the checkout, the record
+    cannot be followed. The removal must not go ahead on a tolerant second look."""
+    repo, wt, cfg = estate
+    other = repo.parent / "recorded-but-unrelated"
+    other.mkdir()
+    _write_record(repo, kind, other)
+    calls = []
+    real_activity = worktree_release._activity
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real_activity(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_activity", counting)
+    asked = _resolver_cannot_follow(
+        monkeypatch, other, PermissionError(13, "access denied", None, 5), armed=lambda: len(calls) >= 4
+    )
+
+    code, text = run(cfg, wt)
+
+    assert len(calls) >= 4 and True in asked, (len(calls), asked)
+    assert code != 0 and "KEPT" in text, text
+    assert wt.is_dir()
+
+
+@pytest.mark.parametrize("field", ["cwd", "launch_cwd", "workspace_path", "worktree_path"])
+def test_every_activity_field_is_resolved_strictly_and_a_nested_one_too(
+    estate, alias_to_the_checkout, monkeypatch, field
+):
+    repo, wt, cfg = estate
+    alias = alias_to_the_checkout
+    state = repo / ".agenttalk" / "state"
+    state.mkdir()
+    record = {"agents": {"seat": {"nested": [{"deep": {field: str(alias)}}]}}}
+    (state / "supervisor-state.json").write_text(json.dumps(record))
+    asked = _resolver_cannot_follow(monkeypatch, alias, PermissionError(13, "access denied", None, 5))
+    code, text = run(cfg, wt)
+    assert True in asked and code != 0 and "KEPT" in text, text
+    assert wt.is_dir()
+
+
+@pytest.mark.parametrize("parts", [1, 2])
+@pytest.mark.parametrize("kind", ["active-lane", "supervisor-state"])
+def test_a_missing_recorded_path_that_becomes_a_link_at_the_final_reread_keeps_the_checkout(
+    estate, monkeypatch, kind, parts
+):
+    """The race: at the read made under the locks, the lookup says the recorded name is absent, and the name is created
+    as a junction to the checkout right after that answer. A placement made from the answer alone would call the path
+    unrelated and release would remove a checkout the record now names. The names that were read as absent are looked at
+    again just before Git removes the checkout, and anything that exists by then refuses."""
+    repo, wt, cfg = estate
+    gone = repo.parent / "long-gone"
+    recorded = gone / "deeper" if parts == 2 else gone
+    _write_record(repo, kind, recorded)
+    calls = []
+    real_activity = worktree_release._activity
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real_activity(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_activity", counting)
+    real_lstat = os.lstat
+    fired = []
+    wanted = os.path.normcase(os.fspath(gone))
+
+    def lstat(path, *args, **kwargs):
+        if len(calls) >= 4 and not fired and os.path.normcase(os.fspath(path)) == wanted:
+            fired.append(1)
+            directory_link(gone, wt)  # it appears now, and this lookup has already answered "absent"
+            raise FileNotFoundError(2, "absent", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    try:
+        code, text = run(cfg, wt)
+        assert fired, "the race seam never ran"
+        assert code != 0 and "KEPT" in text, text
+        assert wt.is_dir() and (wt / "source.txt").exists()
+    finally:
+        monkeypatch.undo()
+        if os.path.lexists(gone):
+            gone.rmdir() if os.name == "nt" else gone.unlink()
+
+
+class _OsWithRules:
+    """`worktree_release.os` for another platform's rules (separators, path module), with every other call real. The
+    one name in `appears` is looked at as if it had just been created: the real folder `like` answers for it."""
+
+    def __init__(self, name, sep, altsep, path_module, like):
+        class Path:  # the other platform's path module, whose `realpath` here answers with the path as given
+            def __getattr__(self, key):
+                return getattr(path_module, key)
+
+            @staticmethod
+            def realpath(path, strict=False):
+                return os.fspath(path)
+
+        self.name, self.sep, self.altsep, self.path = name, sep, altsep, Path()
+        self._like, self.appears = like, None
+
+    def __getattr__(self, key):
+        return getattr(os, key)
+
+    def lstat(self, path, *args, **kwargs):
+        if self.appears is not None and os.fspath(path) == self.appears:
+            return os.lstat(self._like)
+        return os.lstat(path, *args, **kwargs)
+
+
+def _watch_a_missing_name(tmp_path, monkeypatch, rules, name):
+    """Place `<tmp>/<name>` (a name that is not there) as the records are read under the locks, and return the watched
+    names and the folder that exists."""
+    shim = _OsWithRules(*rules, like=tmp_path)
+    monkeypatch.setattr(worktree_release, "os", shim)
+    with worktree_release._watching_absent() as seen:
+        worktree_release._placed(f"{tmp_path.as_posix()}/{name}")
+    return shim, list(seen)
+
+
+def test_an_absent_recorded_name_ending_in_a_backslash_is_watched_exactly_on_posix_rules(tmp_path, monkeypatch):
+    """On Linux and macOS a backslash is an ordinary character of a file name. `gone\\` and `gone` are two names, so
+    watching `gone` for `gone\\` lets the real `gone\\` appear as a link to the checkout after the last read and be
+    missed. With POSIX rules simulated (separator `/`, no alternative), the watched entry is the exact name, and when
+    that name appears, the second look refuses, which keeps the checkout."""
+    import posixpath
+
+    shim, seen = _watch_a_missing_name(tmp_path, monkeypatch, ("posix", "/", None, posixpath), "gone\\")
+    assert seen == [f"{tmp_path.as_posix()}/gone\\"]
+    shim.appears = seen[0]  # the exact name is created now, as a link to the checkout
+    with pytest.raises(worktree_release.Refused, match="exists now"):
+        worktree_release._still_absent(seen)
+
+
+def test_an_absent_recorded_name_with_trailing_separators_is_still_watched_without_them_on_posix_rules(
+    tmp_path, monkeypatch
+):
+    import posixpath
+
+    _shim, seen = _watch_a_missing_name(tmp_path, monkeypatch, ("posix", "/", None, posixpath), "gone/")
+    assert seen == [f"{tmp_path.as_posix()}/gone"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the Windows rules need a Windows path module")
+@pytest.mark.parametrize("name", ["gone\\", "gone/"], ids=["backslash", "slash"])
+def test_an_absent_recorded_name_with_a_trailing_separator_is_watched_without_it_on_windows_rules(
+    tmp_path, monkeypatch, name
+):
+    """On Windows both forms are separators, so a trailing one is stripped and the folder named before it is watched."""
+    import ntpath
+
+    _shim, seen = _watch_a_missing_name(tmp_path, monkeypatch, ("nt", "\\", "/", ntpath), name)
+    assert [os.path.normcase(entry) for entry in seen] == [os.path.normcase(os.path.join(os.fspath(tmp_path), "gone"))]
+
+
+# --- a checkout whose name ends in a backslash (a POSIX name): a missing child below it still names it ---------------
+
+
+def _odd_checkout(repo, wt, name):
+    where = wt.parent / name
+    git(repo, "worktree", "add", "-q", "-b", "lane/odd", str(where))
+    return where
+
+
+@pytest.mark.parametrize("name", ["second", pytest.param("second\\", id="trailing-backslash")])
+def test_a_record_naming_a_missing_child_of_a_checkout_keeps_it(estate, name):
+    """The control (an ordinary name) and the shape that Windows cannot make (a name ending in a literal backslash,
+    run natively on Linux and macOS): a record naming a child that is not there still names the checkout below which it
+    would be, so release keeps it."""
+    if name.endswith("\\") and os.name == "nt":
+        pytest.skip("Windows cannot make a folder whose name ends in a backslash")
+    repo, wt, cfg = estate
+    odd = _odd_checkout(repo, wt, name)
+    _write_record(repo, "active-lane", odd / "gone")
+
+    code, text = run(cfg, odd)
+
+    assert code != 0 and "KEPT" in text, text
+    assert odd.is_dir() and (odd / "source.txt").exists()
+
+
+class _FakePosixFolders:
+    """A tiny POSIX file system seen by `worktree_release` and `lanes` (so a folder named `co\\` can be had
+    on any host): `folders` are the paths that exist. Every other call is the real one."""
+
+    def __init__(self, monkeypatch, tmp_path, folders):
+        import pathlib
+        import posixpath
+
+        from agenttalk import lanes
+
+        self.exists = set(folders)
+        some_folder = os.lstat(tmp_path)
+        outer = self
+
+        def lstat(path, *args, **kwargs):
+            if os.fspath(path) in outer.exists:
+                return some_folder
+            raise FileNotFoundError(2, "absent", os.fspath(path))
+
+        class Path:
+            def __getattr__(self, key):
+                return getattr(posixpath, key)
+
+            @staticmethod
+            def realpath(path, strict=False):
+                if strict and os.fspath(path) not in outer.exists:
+                    raise FileNotFoundError(2, "absent", os.fspath(path))
+                return os.fspath(path)
+
+        class FakeOs:
+            name, sep, altsep, path = "posix", "/", None, Path()
+
+            def __getattr__(self, key):
+                return getattr(os, key)
+
+        FakeOs.lstat = staticmethod(lstat)
+        FakeOs.stat = staticmethod(lstat)
+
+        def token(value):  # `lanes._canonical_token` on POSIX: absolute, and every backslash becomes a slash
+            if os.fspath(value) not in outer.exists:
+                raise FileNotFoundError(2, "absent", os.fspath(value))
+            return posixpath.abspath(os.fspath(value)).replace("\\", "/")
+
+        monkeypatch.setattr(worktree_release, "os", FakeOs())
+        monkeypatch.setattr(worktree_release, "Path", pathlib.PurePosixPath)
+        monkeypatch.setattr(lanes, "canonical_host_path_checked", token)
+        self.purepath = pathlib.PurePosixPath
+
+    def names(self, checkout, recorded):
+        """Whether a record naming `recorded` names the checkout `checkout`, by the code under test."""
+        return worktree_release._names_checkout(
+            {"worktree_path": recorded}, self.purepath(checkout), self.purepath("/w/repo"), lane_id=None
+        )
+
+    def master_names(self, checkout, recorded):
+        """What master decides for the same two paths: `resolve()` and path ancestry, no token."""
+        where = self.purepath(recorded)
+        return self.purepath(checkout) in (where, *where.parents)
+
+
+_CHECKOUT_CASES = [
+    # (the checkout, the recorded path, the folders that exist, what master says)
+    ("/w/co\\", "/w/co\\/gone", ["/w", "/w/co\\"], True),  # the shape: a missing child of a name ending in `\`
+    ("/w/co\\", "/w/co\\/a/b", ["/w", "/w/co\\"], True),  # two missing parts
+    ("/w/co\\", "/w/co\\", ["/w", "/w/co\\"], True),  # the checkout itself
+    ("/w/co", "/w/co/gone", ["/w", "/w/co"], True),  # the ordinary name: unchanged
+    ("/w/co\\", "/w/other/gone", ["/w", "/w/co\\", "/w/other"], False),  # unrelated
+    ("/w/co\\", "/w/co/gone", ["/w", "/w/co\\", "/w/co"], False),  # a different folder `co`, not `co\`
+    # round 13: a checkout at the filesystem root. Its token is "/" (it already ends in the one separator), so the
+    # prefix a child starts with is "/" and not "//".
+    ("/", "/gone", ["/"], True),  # a missing child of the root
+    ("/", "/a/b", ["/", "/a"], True),  # an existing folder, then a missing one
+    ("/", "/", ["/"], True),  # the root itself
+    ("/", "/w/co\\/gone", ["/", "/w", "/w/co\\"], True),  # below the root, through a name ending in a backslash
+    ("/w/co\\", "/", ["/", "/w", "/w/co\\"], False),  # the other way round: a record naming the parent
+    ("/w/co", "/w/co2/gone", ["/w", "/w/co", "/w/co2"], False),  # a sibling that only starts with the same letters
+    ("/w/co", "/w/co/gone", ["/w", "/w/co"], True),  # the ordinary name: unchanged
+]
+
+
+@pytest.mark.parametrize("checkout, recorded, folders, expected", _CHECKOUT_CASES)
+def test_a_missing_child_of_a_backslash_named_checkout_is_judged_as_master_judges_it(
+    tmp_path, monkeypatch, checkout, recorded, folders, expected
+):
+    """The comparison, on a stand-in POSIX file system (a real run of this shape is the native test above, on Linux and
+    macOS): the check and master agree on every case, among them the one that was lost, a missing child of a checkout
+    whose name ends in a backslash (the shared token turns that backslash into a slash, so the child was placed beside
+    the checkout and not below it)."""
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # made-up paths on a stand-in file system: the fence is not the point
+    world = _FakePosixFolders(monkeypatch, tmp_path, folders)
+    assert world.master_names(checkout, recorded) is expected
+    assert world.names(checkout, recorded) is expected
+
+
+# --- #858 fix round 13: a checkout registered at a drive root --------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive root with a letter is a Windows thing")
+@pytest.mark.parametrize(
+    "where",
+    ["existing-child", "missing-child", "two-missing", "forward-slashes", "the-root-itself", "just-below-the-root"],
+)
+def test_a_record_naming_a_folder_inside_a_checkout_at_a_drive_root_names_it(tmp_path, where, monkeypatch):
+    """A checkout registered at a drive root has the token `c:/`, which already ends in a slash. Looking for children
+    under `c://` found none, so a record naming a folder inside the drive read as unrelated and release could remove a
+    checkout that was in use. This reads the real root of the drive the test folder is on and only compares paths:
+    nothing is created or removed at the root. (A `subst` letter does not make this shape: Windows resolves it to
+    the folder it points at.)"""
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # only paths are compared; a drive root is outside the suite's fence
+    root = Path(tmp_path.anchor)
+    path = {
+        "existing-child": tmp_path,  # a folder that is there, some levels down
+        "missing-child": tmp_path / "gone",
+        "two-missing": tmp_path / "gone" / "deeper",
+        "forward-slashes": tmp_path.as_posix() + "/gone",
+        "the-root-itself": root,
+        "just-below-the-root": root / "agenttalk-858-no-such-folder",
+    }[where]
+    assert worktree_release._names_checkout({"worktree_path": str(path)}, root, tmp_path, lane_id=None) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive letters are a Windows thing")
+def test_a_record_on_a_sibling_of_a_checkout_that_only_starts_with_its_name_is_unrelated_on_windows(tmp_path):
+    """The control that the fix must not break: with an ordinary checkout `co`, `co/gone` is inside it, and `co2/gone`,
+    which only starts with the same letters, is not."""
+    (tmp_path / "co").mkdir()
+    (tmp_path / "co2").mkdir()
+    checkout = tmp_path / "co"
+    inside = {"worktree_path": str(tmp_path / "co" / "gone")}
+    beside = {"worktree_path": str(tmp_path / "co2" / "gone")}
+    assert worktree_release._names_checkout(inside, checkout, tmp_path, lane_id=None) is True
+    assert worktree_release._names_checkout(beside, checkout, tmp_path, lane_id=None) is False
+
+
+def test_a_recorded_path_that_stays_absent_through_the_final_check_still_lets_release_go_on(estate):
+    """The control for the race test: the same record, nothing created, so the checkout is removed as before."""
+    repo, wt, cfg = estate
+    _write_record(repo, "active-lane", repo.parent / "long-gone" / "deeper")
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+# --- #853 fix round (the maintainers' P1): an ended lane's paths are part of the last look too ---------------------
+
+
+def _ended_lane_naming(repo, field, path):
+    """An abandoned lane whose saved `worktree_path`, or one of its retained `occupancy_worktrees`, names `path`."""
+    state = repo / ".agenttalk" / "state"
+    state.mkdir(exist_ok=True)
+    if field == "worktree_path":
+        row = {"status": "abandoned", "worktree_path": str(path)}
+    else:
+        row = {"status": "abandoned", "occupancy_worktrees": [str(path)]}
+    (state / "lanes.json").write_text(json.dumps({"lanes": {"one": row}}))
+
+
+def _link_or_skip(kind, link, target):
+    """A real folder link of `kind`: a junction (Windows) or a directory symlink (where the runner may make one)."""
+    if kind == "junction":
+        if os.name != "nt":
+            pytest.skip("a junction is a Windows folder link")
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"this runner cannot make a directory symlink ({exc.strerror or exc})")
+
+
+def _can_link(kind, where):
+    probe_target = where / "link-probe-target"
+    probe_target.mkdir()
+    probe = where / "link-probe"
+    _link_or_skip(kind, probe, probe_target)
+    probe.rmdir() if os.name == "nt" else probe.unlink()
+    probe_target.rmdir()
+
+
+def _unlink(link):
+    if os.path.lexists(link):
+        link.rmdir() if os.name == "nt" else link.unlink()
+
+
+@pytest.mark.parametrize("link_kind", ["junction", "symlink"])
+@pytest.mark.parametrize("field", ["worktree_path", "occupancy_worktrees"])
+def test_an_ended_lanes_missing_path_that_becomes_a_link_before_the_last_recheck_keeps_the_checkout(
+    estate, monkeypatch, field, link_kind
+):
+    """The maintainers' probe: a session still holds the token of a lane that ended (abandoned), and the lane's saved
+    path is missing. Right after the last read of the records, before the names read as absent are looked at again,
+    that name becomes a link to the checkout. The ended lane's paths must be part of that second look, or release
+    removes a checkout the running session uses."""
+    repo, wt, cfg = estate
+    _can_link(link_kind, repo.parent)
+    gone = repo.parent / "long-gone"
+    _ended_lane_naming(repo, field, gone)
+    real = worktree_release._still_absent
+    fired = []
+
+    def recheck(seen):
+        if not fired:
+            fired.append(1)
+            _link_or_skip(link_kind, gone, wt)  # it appears now: the last read has already answered "absent"
+        return real(seen)
+
+    monkeypatch.setattr(worktree_release, "_still_absent", recheck)
+    try:
+        with _session_on_lane(repo):
+            assert lane_occupancy.peek(Store(repo), "one") == lane_occupancy.IN_USE  # the token is really held
+            code, text = run(cfg, wt)
+        assert fired, "the recheck seam never ran"
+        assert code != 0 and f"KEPT {wt}" in text, text
+        assert "exists now" in text and "run the release again" in text, text
+        assert wt.is_dir() and (wt / "source.txt").exists()
+    finally:
+        _unlink(gone)
+
+
+@pytest.mark.parametrize("link_kind", ["junction", "symlink"])
+@pytest.mark.parametrize("field", ["worktree_path", "occupancy_worktrees"])
+def test_an_ended_lane_that_names_the_checkout_only_at_the_last_read_keeps_it_while_its_session_runs(
+    estate, monkeypatch, field, link_kind
+):
+    """The same session, but the link appears before the last read (during the checks inside the claims): the last read
+    must see that the ended lane now names the checkout, try its token, and refuse because the session holds it."""
+    repo, wt, cfg = estate
+    _can_link(link_kind, repo.parent)
+    gone = repo.parent / "long-gone"
+    _ended_lane_naming(repo, field, gone)
+    real = worktree_release._check_worktree
+    calls = []
+
+    def check(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:  # the re-check inside the claims, before the last read
+            _link_or_skip(link_kind, gone, wt)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    try:
+        with _session_on_lane(repo):
+            code, text = run(cfg, wt)
+        assert len(calls) >= 2, "the seam never ran"
+        assert code != 0 and lane_occupancy.refusal("one", lane_occupancy.IN_USE) in text, text
+        assert wt.is_dir() and (wt / "source.txt").exists()
+    finally:
+        _unlink(gone)
+
+
+def test_an_ended_lane_named_only_at_the_last_read_with_a_free_token_is_claimed_through_the_removal(
+    estate, monkeypatch
+):
+    """The control: no session, so the newly named ended lane does not keep the checkout, but its token is claimed
+    until the removal is over, so no session can start on it in between."""
+    repo, wt, cfg = estate
+    gone = repo.parent / "long-gone"
+    _ended_lane_naming(repo, "worktree_path", gone)
+    real_check, real_git = worktree_release._check_worktree, worktree_release._read_git
+    calls, seen = [], {}
+
+    def check(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            directory_link(gone, wt)
+        return real_check(*args, **kwargs)
+
+    def read_git(where, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            seen["token"] = lane_occupancy.peek(Store(repo), "one")
+        return real_git(where, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    monkeypatch.setattr(worktree_release, "_read_git", read_git)
+    try:
+        code, text = run(cfg, wt)
+        assert code == 0 and "REMOVED" in text, text
+        assert seen.get("token") is not None, "the newly named lane's token was free during the removal"
+    finally:
+        _unlink(gone)

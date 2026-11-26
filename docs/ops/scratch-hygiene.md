@@ -214,6 +214,26 @@ agenttalk janitor --apply                  # clean up
 agenttalk janitor --apply --keep-days 7    # override the scratch-root staleness window
 ```
 
+Both the report and `--apply` keep a registered checkout that a lane, a launch or a
+supervisor record still names, and a checkout whose lane session is running. They apply the
+same activity rules as `janitor --release` (the eligibility rules differ: `--release` also
+needs a merged branch). The line reads `REFUSED (kept) <path>: <reason>`. A kept checkout is
+not a failure and does not change the exit code; a record that cannot be read is also kept,
+and the reason says it could not be checked. A folder that holds several checkouts is kept
+whole when any one is in use, and no work-in-progress commit is made on any of them. The
+report is a preview: `--apply` reads the records again, takes the lanes' non-waiting
+occupancy claims, and, just before the delete, compares the checkouts under the folder with the
+ones it checked (a folder that held none is compared too, so a checkout registered after the
+report keeps it). From then to the end of that folder's delete it holds the lock that every lane
+writer takes, and makes its last read of the records, with a claim on any lane that names a
+checkout only now. A lane command run during a large delete therefore waits for it (it gives up
+after 10 seconds). The preview lists every kept checkout, even past the 15 it lists by age. Each `REFUSED (kept)` line for a checkout in use ends with what to do next: leave it until what uses it has finished (or the record that names it is retired), then run the sweep again. The list of checkouts compared at the delete is read as bytes with NUL boundaries, so non-ASCII names are handled; a list that cannot be read reliably keeps the candidate as FAILED (not checked). When Git cannot list the registered checkouts at the delete, the candidate is kept and reported as FAILED (a failed listing is never read as "none registered"), so when Git cannot list them at all the sweep keeps every candidate that is not a link, each reported as FAILED with what to do: fix Git for that repository, then run the sweep again. Such candidates are listed under their own heading, which says not to remove them by hand: a folder whose checkout status could not be established may hold a live checkout. The same holds when the report's own strict listing failed: its list then comes from the older reader, which cannot be trusted for names with an accent or a line-separator character, so the sweep keeps every candidate that is not a link, as not checked, in whichever direction a checkout and a candidate contain each other, and the preview says so. Limits: a record is evidence that something may be using the checkout, not
+proof that a process is; a checkout registered in the instant after the last comparison is not
+seen; `janitor --release` takes its lock only when a lane named the checkout at the first look,
+so a lane record written after its last read is not seen there (follow-up); a checkout that Git does not list is not looked up; and a folder that
+is renamed by another program in the instant between the last look and the delete cannot be
+stopped by any check made by path.
+
 In order:
 
 1. **Report mode** (default): lists scratch candidates under the
