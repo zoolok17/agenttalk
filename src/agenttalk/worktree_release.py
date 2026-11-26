@@ -652,6 +652,10 @@ def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
     named = []
     for lane_id, row in (_activity(cfg, target) or {}).items():
         source = f"lanes.json lane {lane_id}"
+        try:  # before the id names, peeks or claims anything: its token path must stay in the store
+            lanes.validate_lane_id(lane_id)
+        except lanes.LaneError as exc:
+            raise Refused(f"{source}: {exc}; the checkout was kept") from exc
         retained = row.get("occupancy_worktrees", [])
         if not isinstance(retained, list) or any(not isinstance(p, str) or not p.strip() for p in retained):
             raise Refused(f"{source}: could not read retained occupancy worktrees")

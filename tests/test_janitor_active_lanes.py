@@ -1122,3 +1122,30 @@ def test_a_failed_strict_list_at_discovery_keeps_everything_under_worktrees_as_n
     assert not [c for c in candidates if c.path.parent == repo / ".worktrees"], candidates
     assert any(path == repo / ".worktrees" for path, _why in errors), errors
     assert not report.registered_strict and (plain / "note.txt").read_text() == "kept", text
+
+
+
+@pytest.mark.parametrize("lane_id", ["/../../../../pwn", "done-lane"], ids=["unsafe-id", "valid-id"])
+@pytest.mark.parametrize("route", ["release", "sweep"])
+def test_a_finished_lane_whose_id_is_not_safe_is_refused_and_no_token_is_made_outside_the_store(
+    estate, route, lane_id
+):
+    """#858 round 19: a finished lane row keyed by an id that is not a safe lane id, and that names the checkout, used
+    to reach the occupancy claim raw: its token path went through `..` to a file outside `.agenttalk`, the claim read
+    free and the checkout was removed. Now that row is refused before it names, peeks or claims anything, and the
+    checkout is kept. A valid id is claimed as before, and its checkout goes."""
+    repo, wt, cfg = estate
+    lane = checkout(repo, "l1")
+    (repo / ".agenttalk" / "lane-occupancy" / "lane-").mkdir(parents=True)  # what the unsafe id's path goes through
+    (repo / ".agenttalk" / "state").mkdir()
+    rows = {"lanes": {lane_id: {"status": "delivered", "worktree_path": str(lane)}}}
+    (repo / ".agenttalk" / "state" / "lanes.json").write_text(json.dumps(rows))
+
+    code, text = run(cfg, lane) if route == "release" else (None, sweep(cfg)[1])
+
+    assert not list(repo.parent.glob("pwn*")), "a token was made outside the store"
+    if lane_id == "done-lane":
+        assert not lane.exists(), text
+        return
+    assert lane.exists() and "is not a safe identifier" in text, text
+    assert code == 1 if route == "release" else "REFUSED (kept)" in text, text
