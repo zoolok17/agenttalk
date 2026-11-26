@@ -1219,3 +1219,34 @@ def test_link_candidate_is_not_checked_or_counted(estate, tmp_path, monkeypatch)
 
     assert any(c.path == link and c.link for c in report.candidates) and asked == [], asked
     assert "could not check: 0" in preview, preview
+
+
+
+@pytest.mark.parametrize("form", ["fence-refused-record", "fence-error"])
+def test_a_fence_refusal_in_the_preview_stops_the_sweep_even_beside_a_failed_check(estate, monkeypatch, form):
+    """#909 round 2: one checkout of a candidate is refused by the store fence in the preview, the other's check
+    breaks. The fence refusal must not be lost under the failure: apply stops the sweep there, as for any fence
+    refusal, so no later candidate is looked at and nothing is pruned."""
+    repo, wt, cfg = estate
+    a, b = checkout(repo, "g", "a"), checkout(repo, "g", "b")
+    later = repo / ".worktrees" / "zz-later"  # an old plain folder after the candidate: it would be removed
+    later.mkdir()
+    os.utime(later, (1_000_000_000, 1_000_000_000))
+    error = (worktree_release.FenceRefused("the record names a path outside the fence (test)") if form ==
+             "fence-refused-record" else janitor.store_mod.StoreFenceError("refusing a path (test)"))
+    real_check, real_run, prunes = worktree_release.check_unused, janitor._run_git, []
+
+    def check(cfg_, targets):
+        if targets[0].name in ("a", "b"):
+            raise error if targets[0].name == "a" else OSError(5, "unreadable (test)")
+        return real_check(cfg_, targets)
+
+    monkeypatch.setattr(worktree_release, "check_unused", check)
+    report = janitor.build_report(cfg)
+    monkeypatch.setattr(janitor, "_run_git", lambda where, *args: prunes.append(args) if args[:2] == (
+        "worktree", "prune") else real_run(where, *args))
+
+    text = janitor.apply(cfg, report)
+
+    assert "the sweep stopped: the store fence refused a path" in text and report.apply_failed, text
+    assert prunes == [] and later.exists() and a.exists() and b.exists(), text

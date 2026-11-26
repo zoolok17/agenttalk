@@ -163,6 +163,7 @@ class JanitorReport:
     # the candidates that hold them. Not an ordinary keep: the report fails, and `apply` leaves those candidates.
     check_failures: dict[Path, str] = dataclasses.field(default_factory=dict)
     failed_candidates: dict[Path, list[Path]] = dataclasses.field(default_factory=dict)
+    fence_stops: dict[Path, str] = dataclasses.field(default_factory=dict)  # a fence refusal: apply stops there
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -775,13 +776,15 @@ def build_report(cfg: JanitorConfig, listing: tuple[list[Path] | None, str] | No
         if not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
     ]
     foreign = find_foreign_kept(cfg)
-    in_use, checked, failed_candidates = {}, {}, {}
+    in_use, checked, failed_candidates, fence_stops = {}, {}, {}, {}
     for c in candidates if known else []:
         targets = [] if c.link else _checkouts_under(c, registered, cfg)
         for w in targets:  # each checkout on its own, once (#909): an ordinary keep cannot hide another one's error
             if w not in checked:
                 checked[w] = _in_use_reason(cfg, [w])
-        if failed := [w for w in targets if checked[w] and checked[w][0] == "failed"]:
+        if fenced := [checked[w][1] for w in targets if checked[w] and checked[w][0] == "fence"]:
+            in_use[c.path] = fence_stops[c.path] = fenced[0]  # the fence wins over everything: the sweep stops
+        elif failed := [w for w in targets if checked[w] and checked[w][0] == "failed"]:
             failed_candidates[c.path] = failed  # a failure wins over an ordinary keep in the same candidate
         elif reasons := [checked[w][1] for w in targets if checked[w]]:
             in_use[c.path] = reasons[0]
@@ -791,7 +794,7 @@ def build_report(cfg: JanitorConfig, listing: tuple[list[Path] | None, str] | No
         ancestor_ids=ancestor_ids,
         in_use=in_use, registered_unknown="" if known else listing[1],
         check_failures={w: result[1] for w, result in checked.items() if result and result[0] == "failed"},
-        failed_candidates=failed_candidates,
+        failed_candidates=failed_candidates, fence_stops=fence_stops,
     )
 
 
@@ -818,19 +821,19 @@ def _checkouts_under(c: Candidate, registered: list[Path], cfg: JanitorConfig) -
 
 
 def _in_use_reason(cfg: JanitorConfig, targets: list[Path]) -> tuple[str, str] | None:
-    """("refused", why) when something uses these checkouts, ("failed", why) when the check broke with an unexpected
-    error (#909), or None. The same rules a release applies (`worktree_release`: active, pending and launch records,
-    retained occupancy) and the same strict reading of the paths those records name; nothing is changed. A record that
-    cannot be read or placed keeps them too (the reason says so), never read as idle. A listing: it takes no claim, so
-    `apply` checks again. Each checkout is read again for its own check: a preview only."""
+    """Why these checkouts must be kept because something uses them, or None. The same rules a release applies
+    (`worktree_release`: active, pending and launch records, retained occupancy) and the same strict reading of the
+    paths those records name; nothing is changed. A record that cannot be read or placed keeps them too (the reason says
+    so), never read as idle. A listing: it takes no claim, so `apply` checks again."""
     from . import worktree_release  # imported here: that module imports this one
 
+    # (kind, why), #909: "refused" (an ordinary keep), "fence" (the store fence refused: the sweep stops) or "failed"
     try:
         worktree_release.check_unused(cfg, targets)
     except worktree_release.Refused as exc:
-        return "refused", _in_use_text(exc)
+        return ("fence" if isinstance(exc, worktree_release.FenceRefused) else "refused"), _in_use_text(exc)
     except (OSError, ValueError, TypeError) as exc:
-        return "failed", _could_not_check(exc)
+        return ("fence" if isinstance(exc, store_mod.StoreFenceError) else "failed"), _could_not_check(exc)
     return None
 
 
@@ -884,9 +887,7 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
         shown.update(new)
         return [f"  KEPT {w}: {report.check_failures[w]}" for w in new]
 
-    if apply:  # the sweep's own lines follow; a failed preview check is shown here
-        lines += [f"  KEPT {w}: {why}" for w, why in report.check_failures.items()]
-    else:
+    if not apply:
         oldest = sorted(report.candidates, key=lambda c: c.mtime)[:15]
         for c in oldest:
             when = datetime.datetime.fromtimestamp(c.mtime).strftime("%Y-%m-%d")
@@ -901,6 +902,7 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
             lines += kept(c)
         if len(report.candidates) > 15 + len(later):
             lines.append(f"  ... and {len(report.candidates) - 15 - len(later)} more")
+    lines += [f"  KEPT {w}: {why}" for w, why in report.check_failures.items() if w not in shown]  # apply: all
     lines.append(f"could not check: {len(report.check_failures)}")
     if not apply:
         lines.append("re-run with --apply to preserve dirty removal candidates as WIP commits, "
@@ -1230,10 +1232,11 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
             # point leaves what is at the path unestablished, and the report must not advise removing it by hand.
             unchecked = True
             # A check the preview could not make stays a failure: a later read that passes does not clear it (#909).
+            fence_stop = report.fence_stops.get(c.path)  # the preview's fence refusal stops the sweep here
             failed_here = report.failed_candidates.get(c.path)
             reason = (f"the check of {failed_here[0]} before the sweep broke; it was kept and not checked: "
                       f"{report.check_failures[failed_here[0]]}" if failed_here else None)
-            reason = reason or _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+            reason = fence_stop or reason or _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
             if reason is None and report.registered_worktrees is None:
                 # No list of the registered checkouts: neither the ancestor protection nor the lookup of checkouts
                 # under a candidate can be done, in either direction of containment. A link is only unlinked and never
