@@ -2050,8 +2050,12 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
             # reason, like any list that could not be had (#901), and the rest of doctor runs on.
             listing, fence_refused = (None, f"the store fence refused a path: {exc}"), True
         candidates, access_errors = janitormod.find_candidates(cfg, listing)
-    except OSError:
-        return None
+    except OSError as exc:  # a check it could not finish is reported, never left out (#901)
+        return Check(name="scratch_hygiene", status="warn",
+                     details=f"the scratch folders and registered checkouts could not be checked "
+                             f"({janitormod._os_error_text(exc)})",
+                     fix="look at the failure named above; then run `agenttalk janitor` to report",
+                     data={"outside_worktrees": None, "outside_candidates": None, "scratch_root": None})
     registered, unknown_why = listing
     next_step = ("look at the registration the store fence refused (named above)" if fence_refused
                  else janitormod._listing_next_step(unknown_why) if registered is None else "")

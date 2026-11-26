@@ -463,9 +463,35 @@ def test_doctor_under_a_fence_says_unknown_when_the_fence_refuses_a_registered_c
     rc = main(["--root", str(repo), "doctor", "--json"])
 
     report = json.loads(capsys.readouterr().out)
-    (scratch,) = [c for c in report["checks"] if c["name"] == "scratch_hygiene"]
+    scratch = [c for c in report["checks"] if c["name"] == "scratch_hygiene"]
+    assert len(scratch) == 1, report  # the whole report when the check is missing (macOS CI, run 45812419994)
+    (scratch,) = scratch
     assert scratch["status"] == "warn" and scratch["data"]["outside_worktrees"] is None, scratch
+    assert "store fence refused" in scratch["details"], scratch  # the fence's reason, not some other failure
     assert rc == (2 if any(c["status"] == "error" for c in report["checks"]) else 0), report
+
+
+@pytest.mark.parametrize("step", ["config", "listing", "discovery"])
+def test_doctor_reports_a_scratch_check_it_could_not_finish_instead_of_leaving_it_out(estate, monkeypatch, step):
+    """A failure to read a folder (a disk that times out, a folder refused) anywhere in the scratch check used to
+    leave the check out of doctor without a word, so a list in doubt read as nothing to report. Now it is a warning
+    that names the failure, with the counts unknown."""
+    repo, _wt, _cfg = estate
+    owner, name = {"config": (janitor.JanitorConfig, "load"), "listing": (janitor, "_strict_listing"),
+                   "discovery": (janitor, "find_candidates")}[step]
+
+    def fail(*_args, **_kwargs):
+        raise TimeoutError("the disk did not answer (test)")
+
+    monkeypatch.setattr(owner, name, fail)
+
+    check = hygiene(repo)
+
+    assert check is not None and check.name == "scratch_hygiene" and check.status == "warn", check
+    assert "could not be checked" in check.details and "the disk did not answer (test)" in check.details, check
+    assert check.data["outside_worktrees"] is None and check.data["outside_candidates"] is None, check.data
+    assert "named above" in check.fix, check.fix
+    assert [c.status for c in doctor.run(repo).checks if c.name == "scratch_hygiene"] == ["warn"]
 
 
 # --- round 2: a Git timeout, or any other failure to run Git that is not an OSError, is an unknown list ----------
