@@ -459,12 +459,31 @@ def test_doctor_under_a_fence_says_unknown_when_the_fence_refuses_a_registered_c
     assert check.data["outside_worktrees"] is None
     assert "registration" in check.fix and "safe.directory" not in check.fix, check.fix
     assert list(outside.iterdir()) == []
+    record = []  # which way doctor's own scratch check went, shown only when the check is missing (macOS CI)
+
+    def spy(owner, name, real):
+        def wrapper(*args, **kwargs):
+            try:
+                out = real(*args, **kwargs)
+            except BaseException as exc:
+                record.append([name, "raised", f"{type(exc).__name__}: {exc}"])
+                raise
+            record.append([name, "returned", repr(out)])
+            return out
+
+        monkeypatch.setattr(owner, name, wrapper)
+
+    for owner, name in ((janitor, "_strict_listing"), (janitor, "find_candidates"), (doctor, "_check_scratch_hygiene")):
+        spy(owner, name, getattr(owner, name))
 
     rc = main(["--root", str(repo), "doctor", "--json"])
 
-    report = json.loads(capsys.readouterr().out)
-    scratch = [c for c in report["checks"] if c["name"] == "scratch_hygiene"]
-    assert len(scratch) == 1, report  # the whole report when the check is missing (macOS CI, run 45812419994)
+    printed = capsys.readouterr()
+    report = json.loads(printed.out) if printed.out.strip() else {"no report; stderr": printed.err}
+    scratch = [c for c in report.get("checks", []) if c["name"] == "scratch_hygiene"]
+    if len(scratch) != 1:  # pytest.fail: outside CI pytest cuts an assertion message to 8 lines
+        pytest.fail(json.dumps({"record": record, "registration still there": admin.is_dir(), "report": report},
+                               sort_keys=True, indent=2))
     (scratch,) = scratch
     assert scratch["status"] == "warn" and scratch["data"]["outside_worktrees"] is None, scratch
     assert "store fence refused" in scratch["details"], scratch  # the fence's reason, not some other failure
