@@ -704,7 +704,10 @@ def test_unregistered_path_with_lstat_error_keeps_branch(tmp_path, monkeypatch, 
 
 @pytest.mark.parametrize(
     "failure",
-    ["timeout", "unreaped-timeout", "reap-oserror", "wait-oserror", "fast", "timeout-text", "verify-timeout"],
+    [
+        "timeout", "unreaped-timeout", "reap-oserror", "wait-oserror", "count-fails", "fast", "timeout-text",
+        "verify-timeout",
+    ],
 )
 def test_assignment_add_timeout_keeps_checkout_and_branch(tmp_path, monkeypatch, capsys, failure):
     import contextlib
@@ -780,6 +783,15 @@ def test_assignment_add_timeout_keeps_checkout_and_branch(tmp_path, monkeypatch,
                 raise cli.GitWriteError("mutating git timed out in unrelated diagnostic text")
             if failure == "verify-timeout":
                 return 0, "", ""
+            if failure == "count-fails":  # #920: Git's Windows job, whose live count cannot be read after the time-out
+                from _git_job_fake import FakeWorld
+
+                from agenttalk import git_job
+
+                with pytest.MonkeyPatch.context() as patch:
+                    FakeWorld().install(patch, (("timeout",), ("return", "", "")))
+                    patch.setattr(git_job.GitJob, "count_after_stop", lambda job, deadline: 1 / 0)
+                    return real_write(root, argv, timeout=0.01)
             return real_write(root, argv, timeout=0.01)
         if argv[:2] == ["worktree", "remove"]:
             (target / "tracked.txt").unlink()
@@ -814,7 +826,7 @@ def test_assignment_add_timeout_keeps_checkout_and_branch(tmp_path, monkeypatch,
     assert cli.cmd_lane(args) == 2
     error = capsys.readouterr().err
     assert saved == []
-    if failure in {"timeout", "unreaped-timeout", "reap-oserror", "wait-oserror"}:
+    if failure in {"timeout", "unreaped-timeout", "reap-oserror", "wait-oserror", "count-fails"}:
         assert len(writes) == 1
         assert state == {"branch": True, "registered": True}
         assert (target / "tracked.txt").read_bytes() == b"base\n"

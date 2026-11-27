@@ -515,6 +515,43 @@ def test_no_wait_runs_past_the_deadline(monkeypatch, tmp_path):
     assert ("wait", 15.0) in [(s[0], round(s[1], 6)) for s in world.stamps]  # 25 s cut to what was left
 
 
+def failing_counts(monkeypatch, world, error):
+    """Every `count_after_stop` raises `error`; returns the length of the fake log at each call (to see the close come
+    after them)."""
+    calls = []
+
+    def count(self, deadline):
+        calls.append(len(world.log))
+        raise error
+
+    monkeypatch.setattr(git_job.GitJob, "count_after_stop", count)
+    return calls
+
+
+@pytest.mark.parametrize("script", [TIMEOUT_THEN_REAP, (("timeout",), ("timeout",))], ids=["reap_ok", "reap_times_out"])
+def test_a_count_that_keeps_failing_still_gives_the_warned_timeout_error(monkeypatch, tmp_path, script):
+    """#920: the live count raises an ordinary error after the time-out, every time it is asked. That is a count that
+    could not be read, so not 0: the write still ends in the warned GitWriteError caused by its own TimeoutExpired."""
+    world = make(monkeypatch, script)
+    calls = failing_counts(monkeypatch, world, OSError("the count could not be read (test)"))
+    error = timeout_error(tmp_path)
+    assert error.__cause__ is world.proc.raised[0]  # the write's own time-out, the very object
+    assert WARNING in str(error) and STOPPED not in str(error)
+    assert names(world).count("close") == 1 and world.log.index(("close", JOB)) >= max(calls)  # closed after the count
+
+
+def test_an_interruption_during_the_count_is_raised_as_that_same_object(monkeypatch, tmp_path):
+    """The control: an interruption from the count is still raised as itself, after the job is stopped again and
+    closed."""
+    first = KeyboardInterrupt("during the count")
+    world = make(monkeypatch)
+    failing_counts(monkeypatch, world, first)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        run_write(tmp_path)
+    assert raised.value is first
+    assert names(world).count("terminate") == 2 and world.log[-1] == ("close", JOB)
+
+
 @pytest.mark.parametrize("how", ["query_error", "query_none"])
 def test_a_failed_query_is_not_zero(monkeypatch, tmp_path, how):
     world = make(monkeypatch)

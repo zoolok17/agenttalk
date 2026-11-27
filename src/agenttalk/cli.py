@@ -3558,7 +3558,10 @@ def _job_confirmed(job, deadline) -> bool:
     nothing). A count that could not be read is not 0, and a failed stop followed by a 0 count is not a confirmation."""
     if job is None or deadline is None:  # no shared deadline exists (the clock call failed): nothing can be confirmed
         return False
-    count = job.count_after_stop(deadline)
+    try:
+        count = job.count_after_stop(deadline)
+    except Exception:  # a count that could not be read is not 0 (#920); an interruption still propagates
+        return False
     return job.stop_succeeded and count == 0
 
 

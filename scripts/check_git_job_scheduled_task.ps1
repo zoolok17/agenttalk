@@ -74,6 +74,7 @@ param(
     [string]$User = '',
     [string]$TaskName = 'agenttalk-git-job-check',
     [int]$TimeoutSeconds = 600,
+    [int]$StopWaitSeconds = 30,  # how long the cleanup waits for the task to show Ready after /End
     [string]$Log = '',
     [string]$RunId = '',
     [string]$ArgsFile = '',
@@ -192,17 +193,36 @@ function Resolve-Cleanup {
     # A run that was judged is not finished until its task is known to be gone. @{ code; text }. A task that is still
     # there after the delete, or that the scheduler could not be asked about (the absence is not established), is a
     # failed cleanup: the accepted evidence stays, but the exit code is not 0 (4 when the run itself was accepted,
-    # otherwise the run's own code, which wins) and the text says how to delete the task by hand.
-    param($Judged, [int]$DeleteExit, [bool]$StillExists, [bool]$Unreadable = $false, [string]$Name)
-    if (-not $StillExists -and -not $Unreadable) { return $Judged }
+    # otherwise the run's own code, which wins) and the text says how to delete the task by hand. So is a stop of the
+    # task that is not confirmed (-StopNotConfirmed, #920): that task was not deleted, and the text says what is left to do.
+    param($Judged, [int]$DeleteExit, [bool]$StillExists, [bool]$Unreadable = $false, [string]$Name, [string]$StopNotConfirmed = '')
     $how = "schtasks /Delete /TN $Name /F"
+    $left = if ($Unreadable) { "the scheduler could not be read, so it is not known whether the task is still there: look with schtasks /Query /TN $Name first; if it is, end it with schtasks /End /TN $Name, then delete it with $how" }
+        elseif ($StillExists) { "look with schtasks /Query /TN $Name, end it with schtasks /End /TN $Name, then delete it with $how" }
+        else { "the scheduler shows no task named $Name any more, so it cannot be ended by name: end any program it started that still runs (powershell.exe running this script with -Mode Task, and the Python it started)" }
+    $stop = if ($StopNotConfirmed) { " | TASK STOP NOT CONFIRMED ($StopNotConfirmed), and this script did not delete the task: $left; do not run this check again before it has ended (Ready is the scheduler's own state; programs the task started are not checked here)" } else { '' }
+    if ($stop) { return @{ code = $(if ($Judged.code -eq 0) { 4 } else { $Judged.code }); text = "$($Judged.text)$stop" } }
+    if (-not $StillExists -and -not $Unreadable) { return $Judged }
     $text = if ($StillExists) {
         "TASK NOT DELETED (schtasks /Delete returned $DeleteExit and the task is still there): delete it yourself with $how, and do not run this check again before it is gone"
     } else {
         "TASK NOT CONFIRMED DELETED (schtasks /Delete returned $DeleteExit and the scheduler could not be read to confirm that the task is gone): look with schtasks /Query /TN $Name, delete it yourself with $how if it is there, and do not run this check again before it is gone"
     }
     $code = if ($Judged.code -eq 0) { 4 } else { $Judged.code }
-    return @{ code = $code; text = "$($Judged.text) | $text" }
+    return @{ code = $code; text = "$($Judged.text) | $text$stop" }
+}
+
+function Get-StopProblem {
+    # After /End: '' when the stop is confirmed (the task shows Ready, and /End returned 0 or it was Ready before), else why not.
+    param($Before, [int]$EndExit)
+    $limit = (Get-Date).AddSeconds($StopWaitSeconds)
+    while (-not (($now = Get-TaskFacts).exists -and $now.status -eq 'Ready')) {
+        if ((Get-Date) -gt $limit) { return "after /End the task is '$($now.status)', not Ready (scheduler unreadable: $([bool]$now.unreadable))" }
+        Start-Sleep -Seconds 2
+    }
+    $wasReady = $Before.exists -and -not $Before.unreadable -and $Before.status -eq 'Ready'
+    if ($EndExit -ne 0 -and -not $wasReady) { return "schtasks /End returned $EndExit while the task was '$($Before.status)'" }
+    return ''
 }
 
 function Get-TaskCommand {
@@ -276,8 +296,10 @@ function Invoke-OneRun {
     }
     finally {
         if ($registered) {
-            [void](Invoke-Schtasks -Line "/End /TN $TaskName")  # a no-op when it is not running
-            $deleteExit = Invoke-Schtasks -Line "/Delete /TN $TaskName /F"
+            $beforeEnd = Get-TaskFacts  # the state just before /End
+            $stop = Get-StopProblem -Before $beforeEnd -EndExit (Invoke-Schtasks -Line "/End /TN $TaskName")
+            # Kept when its stop is not confirmed: /Delete ends no program, and the name is the way to stop it (#920).
+            $deleteExit = if ($stop) { 0 } else { Invoke-Schtasks -Line "/Delete /TN $TaskName /F" }
             $after = Get-TaskFacts
             $stillThere = [bool]$after.exists
             $unreadable = [bool]$after.unreadable  # the scheduler could not be asked: the task is NOT known to be gone
@@ -286,9 +308,10 @@ function Invoke-OneRun {
                 # The scheduler says the task is not there, but the delete command itself failed: it is not "deleted".
                 Write-Host "[$Label] task absent (delete command failed, schtasks returned $deleteExit; the scheduler confirms that the task is not there)"
             } else {
-                Write-Host "[$Label] task deleted: $gone"
+                Write-Host "[$Label] $(if ($stop) { 'task not deleted: its stop is not confirmed' } else { "task deleted: $gone" })"
             }
-            $judged = Resolve-Cleanup -Judged $judged -DeleteExit $deleteExit -StillExists $stillThere -Unreadable $unreadable -Name $TaskName
+            $judged = Resolve-Cleanup -Judged $judged -DeleteExit $deleteExit -StillExists $stillThere -Unreadable $unreadable -Name $TaskName -StopNotConfirmed $stop
+            if ($stop) { $gone = $false }  # no next run beside a task whose stop is not confirmed
             if (-not $gone) { Write-Host "[$Label] $($judged.text)" }
         }
     }
@@ -344,7 +367,7 @@ switch ($Mode) {
         if (-not $OutDir) { Write-Output 'Run needs -OutDir (where the logs are kept)'; exit 9 }
         if (-not $User) { $User = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
         # The task runs from another working folder: every path it is given must be absolute.
-        foreach ($name in 'OutDir', 'BaseTemp') {
+        foreach ($name in 'Repo', 'OutDir', 'BaseTemp') {
             $value = Get-Variable -Name $name -ValueOnly
             if ($value -and -not [IO.Path]::IsPathRooted($value)) {
                 Set-Variable -Name $name -Value (Join-Path (Get-Location).ProviderPath $value)
