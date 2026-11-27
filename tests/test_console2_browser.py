@@ -603,16 +603,20 @@ def test_check_waits_for_a_late_first_draw_instead_of_failing_on_a_missing_label
     first draw took longer, that one look found nothing and the test failed on a race, not on a real fault.
     The data here arrives 6 s late: the check must wait for the draw (bounded) and then pass."""
     url, profile = slow_first_draw_page
-    flags = _browser_launch_flags(platform.system())
-    result = subprocess.run(
-        ["node", str(CHECK), BROWSER, url, str(profile), json.dumps(flags)],
-        capture_output=True, text=True, encoding="utf-8", timeout=BROWSER_CHECK_TIMEOUT_S, cwd=REPO_ROOT,
-    )
-    assert result.returncode == 0, result.stderr
-    out = json.loads(result.stdout)
+    out = _check_late_first_draw(url, profile)
+    _assert_late_first_draw(out)
+    assert out["problems"] == [], out["problems"]  # no console error and no page exception while it waited
+
+
+def _assert_late_first_draw(out: dict) -> None:
     assert out["initial"]["connected"] is True
     assert out["watchedLabelInitialText"], out
-    assert out["problems"] == [], out["problems"]  # no console error and no page exception while it waited
+
+
+def _check_late_first_draw(url: str, profile: Path, run=subprocess.run) -> dict:
+    """The late-first-draw check, through the file's one retry for a buffer-space-only result (#226)."""
+    flags = _browser_launch_flags(platform.system())
+    return run_browser_check(url, profile, flags, run=run, behaviour=_assert_late_first_draw)
 
 
 
@@ -755,4 +759,21 @@ def test_the_retry_starts_its_cards_young_again_even_if_the_first_attempt_took_l
         srv.server_close()
     assert out["problems"] == []
     assert ages == [50, 50], ages  # not [50, 3950]
+
+
+# --- #226: the late-first-draw check goes through the same one-retry path (stand-in, no browser needed) ---
+
+LATE_GOOD = {"initial": {"connected": True}, "watchedLabelInitialText": "5s", "problems": []}
+
+
+def test_late_first_draw_check_retries_a_buffer_space_only_result_once(tmp_path) -> None:
+    run, calls = _standin({**LATE_GOOD, "problems": [BUFFER_SPACE_PROBLEM]}, LATE_GOOD)
+    out = _check_late_first_draw("http://x/v2", tmp_path / "profile", run=run)
+    assert out["problems"] == [] and len(calls) == 2
+
+
+def test_late_first_draw_check_still_fails_on_a_real_problem_without_a_retry(tmp_path) -> None:
+    run, calls = _standin({**LATE_GOOD, "problems": ['exception: "Uncaught TypeError"']}, LATE_GOOD)
+    out = _check_late_first_draw("http://x/v2", tmp_path / "profile", run=run)
+    assert len(calls) == 1 and out["problems"] == ['exception: "Uncaught TypeError"']
 
