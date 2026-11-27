@@ -10,6 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Git write that runs out of time keeps its warning when the stopped programs cannot be counted (#920).**
+  On Windows, after a time-out agenttalk counts what is still running in Git's job. If that count failed with an
+  ordinary error twice, the raw error came out instead of the time-out, and `lane assign` skipped its advice for a
+  half-made checkout. Now a count that fails is treated like one that could not be read: the time-out error and its
+  warning that a program may still be running are kept, and so is the recovery advice.
+- The maintainers' checks for #907 are stricter (#920): the scheduled-task check fails, and does not start its
+  second run, when it cannot confirm that a task was stopped, and it makes a relative `-Repo` absolute; the planted-fault
+  runner reads relative paths from where it was started, fails when no fault ran any test, and keeps only counts in its
+  results file, so no test name or failure text is written there. The source package now ships the scheduled-task check.
+
+## [0.106.0] - 2026-11-27
+
+This release warns when work starts without the agreed check, keeps personal details out of status reports unless you ask for them, and makes first installs and clean-ups safer. From this release, `agenttalk task` prints advisory warnings when a design, build or fix order has no answered challenge behind it, uses an exemption outside the fixed list, or has run past its agreed time or two fix rounds without a recorded decision; it never refuses the order. `agenttalk overview --drift` shows the same picture for the whole team. Status reports and capacity lines now leave out folder paths, the project ID and account details by default. The setup brief and the user manuals now install the same release as the README, the first `agenttalk doctor` run reads less like a failure, and the README says what to do when a Windows security policy refuses to start agenttalk. A seat that starts slowly is no longer refused. When Git cannot check a folder, clean-ups and the checks that close a piece of work now say "unknown" or stop with repair steps, instead of calling it clean, and clean-ups no longer remove a folder that another piece of work still uses.
+
+After upgrading, preview the skill update with `agenttalk install-skills --dry-run --force`, back up any local edits you want to keep, then run `agenttalk install-skills --force`. The plain command keeps files that differ, so it cannot refresh changed skills. This release changes several skills, including the challenge skill, so every seat needs the update. A script that reads the folder path or project ID from `agenttalk status --json` now needs `--show-personal`.
+
 ### Added
 
 - **Drift visibility: warnings when work is ordered without a challenge, and a read-only report (#923).**
@@ -169,16 +187,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text.
 
 ### Fixed
-
-- **A Git write that runs out of time keeps its warning when the stopped programs cannot be counted (#920).**
-  On Windows, after a time-out agenttalk counts what is still running in Git's job. If that count failed with an
-  ordinary error twice, the raw error came out instead of the time-out, and `lane assign` skipped its advice for a
-  half-made checkout. Now a count that fails is treated like one that could not be read: the time-out error and its
-  warning that a program may still be running are kept, and so is the recovery advice.
-- The maintainers' checks for #907 are stricter (#920): the scheduled-task check fails, and does not start its
-  second run, when it cannot confirm that a task was stopped, and it makes a relative `-Repo` absolute; the planted-fault
-  runner reads relative paths from where it was started, fails when no fault ran any test, and keeps only counts in its
-  results file, so no test name or failure text is written there. The source package now ships the scheduled-task check.
 
 - **A failed list of checkouts is now "unknown", not "zero", in the janitor and in `doctor` (#901).** When Git could not list the registered checkouts (Git missing or not runnable, a failed or cut-short answer, text that cannot be read), the report printed `registered worktrees: 0` as if it were a fact, and the sweep treated the folders of a failed list as free to remove (a link could still be unlinked, and an empty sweep still pruned). Now the report prints `registered worktrees: unknown (<Git's reason>)` and an unknown dirty count, still lists the folders it can safely find, and says what to do: fix Git for that repository, review the `safe.directory` setting for one you trust, or upgrade Git (the list needs Git 2.36 or newer, with `git worktree list --porcelain -z`). `janitor --apply` then keeps every folder, links included, commits nothing, prunes nothing and exits 1, even when there is nothing to remove; the count after the prune says `unknown` and fails the sweep when it cannot be read. Git's own words are shown on one line, cut, with control characters written out. `agenttalk doctor` warns that the checkouts could not be checked instead of staying silent, and in its JSON output `scratch_hygiene.data.outside_worktrees` is `null` (not `0`) in that case; a list that can be read gives the same number as before and no key is added or removed. The report, the sweep's first list, the store fence and doctor now share one reading of the list; nothing retries it or falls back to the older text form. A Git that fails to run in any way is an unknown list like the others (before, such a failure that was not a system error stopped the command with an internal error instead). The janitor sets no time limit on Git, so a Git that hangs still makes the janitor and `doctor` wait (#931). The report still exits 0 when it gives a useful partial report and no scan root had an access error; an access error gives 1, `--apply` with a failed item gives 1, and a refusal by the store fence before the work starts gives 2; a refusal during `--apply` (at the sweep's later checks, or at the count after the prune) fails the sweep with 1 and the report and its summary are still printed. The check made at the delete still looks only at the checkouts under a folder, so a checkout registered after the first list whose path contains the folder, or registered during the delete itself, is not seen.
 

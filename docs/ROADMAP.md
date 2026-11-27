@@ -3,7 +3,7 @@
 **Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-11-16 (UTC; §0 brought up to date, and ideas from Orca in §7.7 and in §0 NEW IDEAS; on 2026-11-13: a Current Plan section, §0; earlier, on 2026-10-20: a storage overview the operator asked for in §6.14; ideas from a shared-memory study in §7.4; ideas from a survey of AI self-improvement in §7.5; ideas from the research behind a video on AI self-improvement in §7.6; the Python practice and what it changes in §6.13; ideas from another single-agent harness in §7.3; conversations that grow too long added to §6.11; outside use of the same subscriptions in §6.12; the operator's order of 2026-10-12 in §6.11, the ideas round in §7.2)
 **Audience:** maintainers, operators, and agents deciding what to build next.
 **Horizon:** the plan the operator approved on 2026-10-07 for the next 4-6 weeks (§6): weeks 1-2 are committed, the team re-plans at the end of week 2, and weeks 5-6 are optional. Older items the plan does not carry are in a labelled "later" tier (§8). §5 records what v0.94.0 shipped and is kept for the record. §0 is the current plan; §6 is the plan of 2026-10-07.
-**Current shipped baseline:** v0.105.0 (2026-11-13). `CHANGELOG.md` remains the release-history source of truth.
+**Current shipped baseline:** v0.106.0 (2026-11-27). `CHANGELOG.md` remains the release-history source of truth.
 
 **Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§8).
 
@@ -190,7 +190,7 @@ By theme. Versions are in brackets; details are in `CHANGELOG.md`.
 
 ## 5. Shipped: the v0.94.0 Line (2026-09-28)
 
-*Kept for the record. What v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0, v0.100.0, v0.101.0, v0.101.1, v0.102.0, v0.103.0, v0.104.0 and v0.105.0 shipped is in `CHANGELOG.md`.*
+*Kept for the record. What v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0, v0.100.0, v0.101.0, v0.101.1, v0.102.0, v0.103.0, v0.104.0, v0.105.0 and v0.106.0 shipped is in `CHANGELOG.md`.*
 
 **Theme: a work board that moves itself, and seats that survive a busy store.** The first delivery of #207 and the console v2 preview it renders in both shipped in v0.94.0. The acceptance test is the operator's own walkthrough on live data (the script is in `docs/STEP-WORK-BOARD.md`); there is no scripted demo.
 
@@ -414,10 +414,10 @@ On 2026-10-14 the operator put all effort on one goal until the first outside te
   - a review request that reuses a task's id loses its thread (#516).
 
 **What changes in the plan.** Each larger item keeps its own challenge; the challenge on this list asked for it to stay small.
-1. **Released:** v0.105.0 (2026-11-13), following v0.104.0 (2026-10-22), v0.103.0 (2026-10-21) and v0.102.0's virtual-environment fix.
+1. **Released:** v0.106.0 (2026-11-27), following v0.105.0 (2026-11-13), v0.104.0 (2026-10-22), v0.103.0 (2026-10-21) and v0.102.0's virtual-environment fix.
 2. **Delivered in v0.103.0:**
    - the first-hour fixes above (#508 items 1-3, 5 and 6, and #513 with its documented validation limits), plus recovery advice for hung tools and restarting agents after a tool update (#497); #508 item 4 and automatic hang detection remain open;
-   - the first-run setup guide linked from the README, with its relationship to the lead guide and later command changes explained (#507). Its tested/install baseline remains v0.101.1; no new platform run is claimed.
+   - the first-run setup guide linked from the README, with its relationship to the lead guide and later command changes explained (#507). Its tested baseline remains v0.101.1, and no new platform run is claimed; since #922 it installs the release the README pins.
 3. **Still planned before the outside team starts:** an honest scan status for languages the scan cannot read (#496). This did not ship in v0.103.0.
 4. **The migration method moves up** from the optional weeks 5-6 (§6.7). v0.103.0 ships the migration playbook and lesson pack, and v0.104.0 lets a team share lesson packs with another team (#554); the planned skill and blind comparison remain outstanding. That skill is about 150 lines, carrying the rules above with no project or payment specifics (#153). It ships only if a blind test shows that it helps: two fresh agents port the same small old app, which hides four problems of the kinds above, one agent with the skill and one without.
 5. **Designed later, each with its own challenge:** #514, #515 and #516. Detecting a hung tool (#497) has no place in the plan yet; start-on-boot (#356) keeps its place in §6.7.
@@ -871,7 +871,7 @@ Do not ship broad workflow claims if any of these are true:
 
 ## 13. Recommendation
 
-1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0, v0.100.0, v0.101.0 (2026-10-12), v0.101.1 (2026-10-13), v0.102.0 (2026-10-16), v0.103.0 (2026-10-21), v0.104.0 (2026-10-22) and v0.105.0 (2026-11-13). #407 and #433 are merged (2026-10-10). Until the first outside team starts (about 2026-10-21), the focus is the Python practice and its remaining fixes (§6.13 separates delivered work from what remains). After that, the next steps are the operator's order of 2026-10-12 (§6.11); the rest of wave 1 and wave 2 (§6.3 and §6.4) and the end-of-week-2 re-plan (§6.5) follow, and the re-plan also weighs the §7.1 and §7.2 ideas.
+1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0, v0.100.0, v0.101.0 (2026-10-12), v0.101.1 (2026-10-13), v0.102.0 (2026-10-16), v0.103.0 (2026-10-21), v0.104.0 (2026-10-22), v0.105.0 (2026-11-13) and v0.106.0 (2026-11-27). #407 and #433 are merged (2026-10-10). Until the first outside team starts (about 2026-10-21), the focus is the Python practice and its remaining fixes (§6.13 separates delivered work from what remains). After that, the next steps are the operator's order of 2026-10-12 (§6.11); the rest of wave 1 and wave 2 (§6.3 and §6.4) and the end-of-week-2 re-plan (§6.5) follow, and the re-plan also weighs the §7.1 and §7.2 ideas.
 2. **Later, not in the approved plan (§8):** make the team self-healing (restart a dead seat, run the supervisor, stop a dead seat waiting out its heartbeat threshold, then the crash harness and guard-aware relaunch, then host-restart survival); fix the store at the mechanism (measure and shrink the publication critical section, reconcile stale obligations). Wrappers surviving store contention already shipped in 0.94.0 (#218).
 3. **Also later:** the remaining refocus items (context policy with knowledge and memory, §8). The first-class migration method (#153) has moved up: its first increment is in §6.13. Spec-kitty removal is done.
 4. **Each of these keeps its own challenge:** nothing in §8 starts without one.
