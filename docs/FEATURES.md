@@ -2,7 +2,7 @@
 
 This page lists agenttalk's features in plain words: what it does today (Part 1) and what the team plans to build (Part 2). The [roadmap](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md) holds the detail: the order of the work, who builds it, and why.
 
-**Which version this describes.** Everything in Part 1 is in release 0.105.0, from 2026-11-13. Release 0.106.0, from 2026-11-27, also adds drift visibility, which this page does not describe yet: `agenttalk task` prints advisory warnings when a design, build or fix order has no answered challenge and no listed exemption, or when its work has used the agreed time or two fix rounds without a recorded decision, and `agenttalk overview --drift` shows a read-only report. The [change log](https://github.com/zoolok17/agenttalk/blob/master/CHANGELOG.md) lists every change.
+**Which version this describes.** Everything in Part 1 is in release 0.106.0, from 2026-11-27. The [change log](https://github.com/zoolok17/agenttalk/blob/master/CHANGELOG.md) lists every change.
 
 **Words used on this page.**
 - A **seat** is one AI assistant with its own name on the team, for example a Claude Code or a Codex assistant.
@@ -28,7 +28,7 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - **Hand work to another assistant and get the answer back.** One assistant sends a message; the other picks it up, does the work and replies on the same thread. This replaces copying text from one chat window into another.
   Start with: `agenttalk send` and `agenttalk reply`, or the `/agenttalk.handoff` skill, which waits for the answer.
   Details: [user manual, section 5](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#5-bus-basics-send-reply-threads-sync-and-status).
-- **Work orders that must be answered.** The lead can send a work order that the receiving assistant must either do or decline in writing. The order stays open until a reply says it is done or declined. Only the team's lead, or the assistant the operator talks to, may send one.
+- **Work orders that must be answered.** The lead can send a work order that the receiving assistant must either do or decline in writing. The order stays open until a reply says it is done or declined. Only the team's lead, or the assistant the operator talks to, may send one. Before it stores an order, `agenttalk task` prints advisory warnings. For a design, build or fix order it warns when no answered challenge was recorded before it and no exemption from the fixed list is named (a listed exemption is fine), or when the order names an exemption outside the list. Separately, for any order that names a work item, it warns when the work has used its agreed time or two fix rounds and this order carries no decision (`narrow`, `stop` or `continue`) with a reason; a decision on an earlier order does not cover the next one. Nothing is refused and delivery does not change.
   Start with: `agenttalk task`.
   Details: [roles, skills and procedures](https://github.com/zoolok17/agenttalk/blob/master/docs/ROLES-SKILLS-PROCEDURES.md).
 - **Proposals and second opinions.** An assistant can propose a concrete plan and get back "accepted", "rejected" or a counter-proposal. It can also ask another assistant to attack its draft answer before it answers you.
@@ -70,7 +70,7 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 
 ### Reviews, approvals and safety checks
 
-- **Review by an assistant from another AI company.** A review request names the exact versions of the code to read. An approval must say how risky the change is, whether it blocks a release, which tests were named and which were run, and what risk remains. Pairing two AI companies is the point: a reviewer trained by another company has different blind spots.
+- **Review by an assistant from another AI company.** A review request names the exact versions of the code to read. An approval must say how risky the change is, whether it blocks a release, which tests were named and which were run, and what risk remains. Pairing two AI companies is the point: a reviewer trained by another company has different blind spots. A team with only one AI company has a written fallback, taken in this order: wait if the change can wait; otherwise a second team's reader from another company; otherwise a fresh reader of the same company who had no part in the change, backed by checks and tests that no model judges. That approval is labelled `review_independence=same-vendor`, is read again by another company when one is available, and is never enough for money, security, deletions, a release, the settings of the automatic checks or the rule itself. Nothing in the code enforces this. Details: [roles, skills and procedures, when only one vendor is available](https://github.com/zoolok17/agenttalk/blob/master/docs/ROLES-SKILLS-PROCEDURES.md).
   Start with: `agenttalk send --kind review-request`, answered with a reply of kind `review-result`.
   Details: [user manual, section 10](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#10-assurance-gates-reviews-and-release-use).
 - **Ask whether work should be done at all.** Before large work starts, an independent assistant checks whether it is needed and answers with one of: proceed, reshape, probe, replace, defer, stop or unassessed.
@@ -94,7 +94,7 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 
 ### Running assistants without a person watching
 
-- **Assistants that work through their messages unattended.** The wrapper hands an assistant (Claude Code or Codex) one incoming message per turn. It keeps the assistant's conversation between turns where it can, and starts a fresh one when it cannot.
+- **Assistants that work through their messages unattended.** The wrapper hands an assistant (Claude Code or Codex) one incoming message per turn. It keeps the assistant's conversation between turns where it can, and starts a fresh one when it cannot. A Claude assistant in a strict permission mode is told the full path of the program to run, and the wrapper prints the allow rule the team can add, so such an assistant can still reply by command.
   Start with: `agenttalk wrap --loop`.
   Details: [README, run a team unattended](https://github.com/zoolok17/agenttalk/blob/master/README.md#run-a-team-unattended).
 - **Waiting out a usage limit.** When a Claude assistant has used up its allowance, the wrapper keeps the message at the front of the queue instead of trying again and again and then losing it. It tries again at the reset time Claude gave; when no time is known, it waits until the assistant is restarted.
@@ -103,7 +103,7 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - **Waiting out a busy AI company.** When the AI company answers "too busy" or slows the assistant down, the wrapper keeps the message, tries again after 15 minutes, then after 30, then every 60 minutes, and says so.
   Start with: nothing to do; it is on by default.
   Details: [README, the cool-down](https://github.com/zoolok17/agenttalk/blob/master/README.md#when-the-ai-provider-is-overloaded-or-throttling-the-cool-down).
-- **Messages that keep failing are set aside.** A message that makes the assistant fail again and again is moved out of the way, so it does not block the rest. A person can read it, send it again or mark it handled. A reply that the wrapper refused to publish is kept the same way.
+- **Messages that keep failing are set aside.** A message that makes the assistant fail again and again is moved out of the way, so it does not block the rest. A person can read it, send it again or mark it handled. A set-aside message can no longer be sent again twice by accident: repeating it is refused unless the person adds `--again` and a reason, which are recorded. A reply that the wrapper refused to publish is kept the same way.
   Start with: `agenttalk dead-letter list` and `agenttalk reply-refusal list`.
   Details: [new-user manual, section 15](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENTTALK-NEW-USER-MANUAL.md#15-recovery-and-troubleshooting).
 - **Finding its place after a restart.** Save what an assistant was working on (its open threads, the state of its code and how full its conversation was) before its conversation is trimmed, and show it to the assistant again afterwards.
@@ -112,13 +112,13 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - **A fresh conversation on request.** Ask an assistant's wrapper to start the next turn in a new conversation, for example when the old one has grown so long that every turn is slow or costly. Nothing is stopped.
   Start with: `agenttalk session fresh`.
   Details: [README, command reference](https://github.com/zoolok17/agenttalk/blob/master/README.md#command-reference-by-category).
-- **Restarts after a crash (Windows only today).** An optional watcher, the supervisor, restarts an assistant after a crash, an outage or a stuck turn, and can restart one on request. It needs Windows and PowerShell 7.
+- **Restarts after a crash (Windows only today).** An optional watcher, the supervisor, restarts an assistant after a crash, an outage or a stuck turn, and can restart one on request. It needs Windows and PowerShell 7. If Windows cannot list the running programs, its commands stop and name the failing call instead of carrying on.
   Start with: `agenttalk supervise --init`, and `agenttalk request-restart` to restart one assistant.
   Details: [supervisor tutorial](https://github.com/zoolok17/agenttalk/blob/master/docs/supervisor-tutorial.md).
 - **A lead that keeps itself running.** A lead can run under the wrapper with the team's mailbox to itself. When nothing arrives, it checks the team at set intervals, and it spends a turn of the AI model only when something needs action.
   Start with: `agenttalk managed-lead-loop set`, then `agenttalk wrap --loop --lead-loop`.
   Details: [new-user manual, section 11](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENTTALK-NEW-USER-MANUAL.md#11-lead-loop-controller).
-- **How much allowance is left.** Each assistant can publish how much of its 5-hour and weekly allowance it has used and how full its conversation is. The lead sees the whole team's readings, and old readings are marked as stale.
+- **How much allowance is left.** Each assistant can publish how much of its 5-hour and weekly allowance it has used and how full its conversation is. The lead sees the whole team's readings, and old readings are marked as stale. For a Claude assistant run by the wrapper, the size of its current conversation is shown too, and starts again from nothing whenever it begins a new conversation. By default these readings leave out the account name and the operating-system login; `agenttalk capacity --show-personal` shows them.
   Start with: `agenttalk capacity refresh` and `agenttalk capacity show`.
   Details: [README, reading the capacity files](https://github.com/zoolok17/agenttalk/blob/master/README.md#reading-the-capacity-files).
 - **A journal of each turn.** Optionally record what each turn did, so it can be checked later.
@@ -130,7 +130,7 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 
 ### Separate work folders and cleanup
 
-- **A separate working folder for each piece of work (a lane).** Give one piece of work its own branch and its own folder (a git worktree), limited to the areas of the code it may change. Before delivery, a check says HOLD or GO; delivery records the evidence.
+- **A separate working folder for each piece of work (a lane).** Give one piece of work its own branch and its own folder (a git worktree), limited to the areas of the code it may change. Before delivery, a check says HOLD or GO; delivery records the evidence. A lane held after a change of the code areas or a reset point can have its stamps refreshed with `agenttalk lane restamp`, which keeps its folder and branch and records why; it approves nothing, and the check still decides. On Windows, when a Git write runs out of time, agenttalk tries to stop Git and the programs it started, and says so only once it has confirmed that nothing is left. If it cannot confirm that, it warns that a program may still be running and that you should wait before retrying or cleaning up.
   Start with: `agenttalk lane assign`, `agenttalk lane check` and `agenttalk lane deliver`.
   Details: [user manual, section 9](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#9-work-lanes-and-isolated-worktrees).
 - **Tidying up finished lanes.** Abandon a lane and remove its folder when it is clean and idle, list the active lanes, and find leftover lane folders.
@@ -142,7 +142,7 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - **A practice store for trying commands.** Make a throwaway store in your scratch folder and point one terminal at it, so experiments never touch the team's real records.
   Start with: `agenttalk scratch store`.
   Details: [new-user manual, trying commands](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENTTALK-NEW-USER-MANUAL.md#trying-commands-without-touching-the-live-store).
-- **Finding and clearing leftovers.** The janitor lists stray temporary folders and old working folders. When you ask it to clean up, it first saves any unfinished work in a working folder as a commit on that folder's own branch, then removes only what its rules allow.
+- **Finding and clearing leftovers.** The janitor lists stray temporary folders and old working folders. When you ask it to clean up, it first saves any unfinished work in a working folder as a commit on that folder's own branch, then removes only what its rules allow. It keeps a working folder that an active lane, a launch or a running session still uses, and says why. When Git cannot list the registered working folders, the report says "unknown" instead of zero, and `--apply` then removes nothing.
   Start with: `agenttalk janitor`, then `agenttalk janitor --apply`.
   Details: [scratch hygiene](https://github.com/zoolok17/agenttalk/blob/master/docs/ops/scratch-hygiene.md).
 
@@ -163,6 +163,9 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - **One screen with what needs attention.** A summary in plain words: what needs attention, who is waiting for whom, and how each assistant is doing. It only reads: it never changes the store or starts any work.
   Start with: `agenttalk overview`.
   Details: [README, command reference](https://github.com/zoolok17/agenttalk/blob/master/README.md#command-reference-by-category).
+- **Where work ran past what was agreed.** A read-only report of design, build and fix orders: how many had an answered challenge, an exemption or nothing, how many hours each work item has run (the time between order and answer, which includes waiting, so it is a sign and not effort) and how many fix rounds it took. It changes nothing.
+  Start with: `agenttalk overview --drift`, optionally with `--since` and a time.
+  Details: [change log, release 0.106.0](https://github.com/zoolok17/agenttalk/blob/master/CHANGELOG.md#01060---2026-11-27).
 - **The team console in your browser.** A web page on your own computer to watch the team: its messages, its threads and who owes what, for one project or several. It only accepts connections from the same computer.
   Start with: `agenttalk start`, which opens the console, or `agenttalk serve` and `agenttalk dashboard`.
   Details: [user manual, section 7](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#7-dashboard-and-lead-chat).
@@ -172,7 +175,7 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - **An attention list for the operator.** A ranked list of what needs a person: questions waiting for the operator, checks on HOLD, messages that were set aside, and similar. The operator can put items off or dismiss them, except the ones that block work.
   Start with: `agenttalk attention`.
   Details: [new-user manual, section 9](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENTTALK-NEW-USER-MANUAL.md#9-dashboard).
-- **A health check.** Check that the project is set up, the installed skills are current, Codex is set up to call agenttalk and the assistants are alive.
+- **A health check.** Check that the project is set up, the installed skills are current, Codex is set up to call agenttalk and the assistants are alive. Where Git cannot list the working folders, `doctor` says "unknown" instead of zero. By default `agenttalk status` leaves out personal paths, the project ID and account details; `--show-personal` shows them.
   Start with: `agenttalk doctor` and `agenttalk status`.
   Details: [user manual, section 12](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#12-troubleshooting).
 
@@ -202,7 +205,7 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - **Letting Codex use agenttalk.** Add the settings Codex needs to run agenttalk commands from inside its protected space (its sandbox).
   Start with: `agenttalk codex-config --enable`.
   Details: [README, let Codex call agenttalk](https://github.com/zoolok17/agenttalk/blob/master/README.md#let-codex-call-agenttalk).
-- **The lead's guides come with the install.** The lead's setup brief, the lead guide and the team playbook come inside the installed program, at the installed version, so a lead can read them without the internet.
+- **The lead's guides come with the install.** The lead's setup brief, the lead guide and the team playbook come inside the installed program, at the installed version, so a lead can read them without the internet. The setup brief also explains how to run a Claude assistant in a strict permission mode, and what such rules cannot catch.
   Start with: `agenttalk doctor`, which shows where the installed program is; the guides are in its `docs` folder.
   Details: [lead guide](https://github.com/zoolok17/agenttalk/blob/master/docs/LEAD-GUIDE.md).
 
@@ -313,7 +316,7 @@ Each planned feature has a stage:
   Stage: an idea that still waits for its challenge. See [roadmap §7.3](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#73-ideas-from-another-single-agent-harness-read-on-2026-10-16).
 - **Lessons for the lead too.** The lead would get matching lessons in front of each prompt, as the other seats already do.
   Stage: an idea that still waits for its challenge. See [roadmap §7.4](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#74-ideas-from-a-shared-memory-study-read-on-2026-10-20).
-- **A visible count of rounds.** Show how many rounds a piece of work has taken, and stop automatic retries after a set number.
+- **More on rounds, and a stop.** The count of tagged fix rounds already shows in the drift report (Part 1). Still planned: a count that covers all rounds, and stopping automatic retries after a set number.
   Stage: an idea that still waits for its challenge. See [roadmap §7.7](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#77-ideas-from-orca-read-on-2026-11-15).
 
 ### On hold
