@@ -382,9 +382,10 @@ def one_shot_query_error_page(tmp_path: Path):
 @pytest.fixture
 def slow_first_draw_page(tmp_path: Path):
     """The same page, but its data arrives 6 seconds late, longer than the check's fixed settle sleep."""
-    srv = _serve(_handler(api_delay_s=6.0))
+    handler = _handler(api_delay_s=6.0)
+    srv = _serve(handler)
     try:
-        yield f"http://127.0.0.1:{srv.server_address[1]}/v2", tmp_path / "profile"
+        yield _Page(f"http://127.0.0.1:{srv.server_address[1]}/v2", tmp_path / "profile", handler.restart_clock)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -602,8 +603,7 @@ def test_check_waits_for_a_late_first_draw_instead_of_failing_on_a_missing_label
     sleep a fixed 3.5 s after loading the page and then look for the watched label ONCE. On a runner whose
     first draw took longer, that one look found nothing and the test failed on a race, not on a real fault.
     The data here arrives 6 s late: the check must wait for the draw (bounded) and then pass."""
-    url, profile = slow_first_draw_page
-    out = _check_late_first_draw(url, profile)
+    out = _check_late_first_draw(slow_first_draw_page)
     _assert_late_first_draw(out)
     assert out["problems"] == [], out["problems"]  # no console error and no page exception while it waited
 
@@ -613,10 +613,12 @@ def _assert_late_first_draw(out: dict) -> None:
     assert out["watchedLabelInitialText"], out
 
 
-def _check_late_first_draw(url: str, profile: Path, run=subprocess.run) -> dict:
-    """The late-first-draw check, through the file's one retry for a buffer-space-only result (#226)."""
+def _check_late_first_draw(page: _Page, run=subprocess.run) -> dict:
+    """The late-first-draw check, through the file's one retry for a buffer-space-only result (#226);
+    the retry restarts the page's clock, so it waits for the slow data again."""
     flags = _browser_launch_flags(platform.system())
-    return run_browser_check(url, profile, flags, run=run, behaviour=_assert_late_first_draw)
+    return run_browser_check(*page, flags, run=run, behaviour=_assert_late_first_draw,
+                             before_retry=page.restart_clock)
 
 
 
@@ -768,12 +770,35 @@ LATE_GOOD = {"initial": {"connected": True}, "watchedLabelInitialText": "5s", "p
 
 def test_late_first_draw_check_retries_a_buffer_space_only_result_once(tmp_path) -> None:
     run, calls = _standin({**LATE_GOOD, "problems": [BUFFER_SPACE_PROBLEM]}, LATE_GOOD)
-    out = _check_late_first_draw("http://x/v2", tmp_path / "profile", run=run)
+    out = _check_late_first_draw(_Page("http://x/v2", tmp_path / "profile", lambda: None), run=run)
     assert out["problems"] == [] and len(calls) == 2
 
 
 def test_late_first_draw_check_still_fails_on_a_real_problem_without_a_retry(tmp_path) -> None:
     run, calls = _standin({**LATE_GOOD, "problems": ['exception: "Uncaught TypeError"']}, LATE_GOOD)
-    out = _check_late_first_draw("http://x/v2", tmp_path / "profile", run=run)
+    out = _check_late_first_draw(_Page("http://x/v2", tmp_path / "profile", lambda: None), run=run)
     assert len(calls) == 1 and out["problems"] == ['exception: "Uncaught TypeError"']
 
+
+
+def test_late_first_draw_retry_starts_from_a_fresh_page(monkeypatch, tmp_path) -> None:
+    """The retry must see the page as the first attempt did: the slow data waits 6 s again and the cards
+    start young again, not carry on from where the first attempt left them (#226 review)."""
+    now, waits, ages = {"t": 1000.0}, [], []
+    monkeypatch.setattr(time, "sleep", lambda s: (waits.append(s), now.__setitem__("t", now["t"] + s)))
+    handler = _handler(monotonic=lambda: now["t"], api_delay_s=6.0)
+    srv = _serve(handler)
+    url = f"http://127.0.0.1:{srv.server_address[1]}/v2"
+    try:
+        def run(command, **kwargs):
+            ages.append(_watched_card_age(url))
+            first = len(ages) == 1
+            now["t"] += 65.0 if first else 0.0  # the first attempt takes long to finish
+            measured = {**LATE_GOOD, "problems": [BUFFER_SPACE_PROBLEM] if first else []}
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(measured), stderr="")
+
+        _check_late_first_draw(_Page(url, tmp_path / "profile", handler.restart_clock), run=run)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert (ages, waits) == ([50, 50], [6.0, 6.0])
