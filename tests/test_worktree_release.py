@@ -2845,14 +2845,9 @@ class _FakePosixFolders:
         FakeOs.lstat = staticmethod(lstat)
         FakeOs.stat = staticmethod(lstat)
 
-        def token(value):  # `lanes._canonical_token` on POSIX: absolute, and every backslash becomes a slash
-            if os.fspath(value) not in outer.exists:
-                raise FileNotFoundError(2, "absent", os.fspath(value))
-            return posixpath.abspath(os.fspath(value)).replace("\\", "/")
-
         monkeypatch.setattr(worktree_release, "os", FakeOs())
         monkeypatch.setattr(worktree_release, "Path", pathlib.PurePosixPath)
-        monkeypatch.setattr(lanes, "canonical_host_path_checked", token)
+        monkeypatch.setattr(lanes, "os", FakeOs())
         self.purepath = pathlib.PurePosixPath
 
     def names(self, checkout, recorded):
@@ -2885,6 +2880,45 @@ _CHECKOUT_CASES = [
     ("/w/co", "/w/co2/gone", ["/w", "/w/co", "/w/co2"], False),  # a sibling that only starts with the same letters
     ("/w/co", "/w/co/gone", ["/w", "/w/co"], True),  # the ordinary name: unchanged
 ]
+
+
+@pytest.mark.parametrize("field", ["worktree_toplevel_canonical", "occupancy_worktrees"])
+def test_release_refuses_a_guarded_saved_path(tmp_path, monkeypatch, field):
+    import posixpath
+
+    from agenttalk import lanes
+
+    fake_os = types.SimpleNamespace(name="posix", path=posixpath)
+    monkeypatch.setattr(lanes, "os", fake_os)
+    damaged = tmp_path.as_posix() + "/old//checkout"
+    row = {field: [damaged] if field == "occupancy_worktrees" else damaged}
+    monkeypatch.setattr(worktree_release, "_activity", lambda cfg, target: {"earlier": row})
+    cfg = types.SimpleNamespace(repo=tmp_path)
+    with pytest.raises(worktree_release.Refused, match="older version.*real absolute folder"):
+        worktree_release._free_lanes(cfg, tmp_path, lambda *args: None)
+
+
+def test_healthy_retained_claim_names_checkout_beside_guarded_canonical(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE", raising=False)
+    world = _FakePosixFolders(monkeypatch, tmp_path, ["/w", "/w/target"])
+    row = {"worktree_toplevel_canonical": "/w/old//checkout", "occupancy_worktrees": ["/w/target"]}
+    monkeypatch.setattr(worktree_release, "_activity", lambda cfg, target: {"earlier": row})
+    cfg, target = types.SimpleNamespace(repo=world.purepath("/w/repo")), world.purepath("/w/target")
+    with pytest.raises(worktree_release.Refused, match="older version"):
+        worktree_release._free_lanes(cfg, target, lambda *args: None)
+    row.pop("worktree_toplevel_canonical")
+    assert worktree_release._free_lanes(cfg, target, lambda *args: None) == ["earlier"]
+
+
+def test_an_old_inside_backslash_claim_is_the_documented_limit(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # the stand-in paths are not real
+    world = _FakePosixFolders(monkeypatch, tmp_path, ["/w", "/w/a\\b", "/w/a", "/w/a/b"])
+    assert not world.names("/w/a\\b", "/w/a/b")  # an old claim collapsed the literal backslash
+    assert world.names("/w/a\\b", "/w/a\\b")  # a launch record keeps its raw path
+    monkeypatch.setattr(worktree_release, "_activity", lambda cfg, target: {
+        "old": {"status": "abandoned", "occupancy_worktrees": ["/w/a/b"]}})
+    cfg = types.SimpleNamespace(repo=world.purepath("/w/repo"))
+    assert worktree_release._free_lanes(cfg, world.purepath("/w/a\\b"), lambda *args: None) == []
 
 
 @pytest.mark.parametrize("checkout, recorded, folders, expected", _CHECKOUT_CASES)

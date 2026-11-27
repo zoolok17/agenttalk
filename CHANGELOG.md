@@ -191,6 +191,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Three journal tests now allow a slow writer to finish before checking its events, and check the close ended cleanly (#906).
 
+- **On Linux and macOS, backslashes in folder names stay part of the name when folders are compared (#910).**
+  Before this, a backslash could be mistaken for a separator, so different folders could look the same.
+  The Windows comparison token is unchanged. A saved canonical path containing doubled slashes after the start
+  is treated as possible damage, even if it was typed by hand, and the command asks for the real absolute folder.
+  A mismatched saved canonical path also gives repair advice. When damaged checkout paths are acknowledged as
+  missing, Git's registrations are checked first; an unreadable list or a registration of that lane's branch
+  stops the acknowledgement. The check also refuses when the store folder is not a Git repository.
+  A forced reassignment keeps a sound absolute earlier path and refuses an unsettled relative path. An older retained
+  claim with a backslash inside a name can still name the wrong folder. An older checkout name ending in a backslash
+  was saved with a trailing slash, which the guard cannot detect; a readable
+  launch record naming the real folder still protects it. A checkout detached by hand has no branch in Git's list
+  and is not detected by the acknowledgement's branch check.
+
 - **Close checks no longer report hidden submodule work as clean (#796).**
   Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.
 

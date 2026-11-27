@@ -3244,7 +3244,7 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _git(root, argv: list[str]) -> tuple[int, str]:
+def _git(root, argv: list[str], *, raw=False) -> tuple[int, str | bytes]:
     """Run a read-only git command in ``root``; (rc, stdout) or (-1, "") on any
     failure. argv is a fixed list (never shell); git is the only tool invoked."""
     import subprocess  # nosec B404  # local import keeps the dependency optional
@@ -3254,12 +3254,12 @@ def _git(root, argv: list[str]) -> tuple[int, str]:
         # install path), so partial-path (B607) is intentional here.
         p = subprocess.run(  # noqa: S603,S607  # nosec B603 B607
             ["git", "-C", str(root), *argv],
-            capture_output=True, text=True, timeout=15,
-            encoding="utf-8", errors="replace",
+            capture_output=True, text=not raw, timeout=15,
+            encoding=None if raw else "utf-8", errors=None if raw else "replace",
         )
-        return p.returncode, (p.stdout or "")
+        return p.returncode, (p.stdout or (b"" if raw else ""))
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return -1, ""
+        return -1, b"" if raw else ""
 
 
 class GitWriteError(RuntimeError):
@@ -5439,6 +5439,11 @@ def _lane_checkout_owned_by_another(
         for field in ("worktree_path", "worktree_toplevel_canonical"):
             saved = row.get(field)
             if isinstance(saved, str) and lane_mod.checkout_path_problem({field: saved}) is None:
+                if field == "worktree_toplevel_canonical" and lane_mod.old_backslash_path(saved, root=store.root):
+                    if not row.get("worktree_path") or lane_mod.checkout_path_problem(
+                            {"worktree_path": row.get("worktree_path")}) is not None:
+                        placed = False
+                    continue
                 claims.append((field, saved))
         retained = row.get("occupancy_worktrees")
         if retained is not None and not isinstance(retained, list):
@@ -5446,6 +5451,9 @@ def _lane_checkout_owned_by_another(
         for claim in retained or []:
             if not isinstance(claim, str) or not claim.strip() or "\x00" in claim:
                 return key, False  # a claim that cannot be read cannot be ruled out
+            if lane_mod.old_backslash_path(claim, root=store.root):
+                claim_unplaced = True
+                continue
             claims.append(("occupancy_worktrees", claim))
         for field, saved in claims:
             saved = saved.replace("{ROOT}", str(store.root))
@@ -5849,7 +5857,8 @@ def _verify_lane_worktree(
         or lane_mod.canonical_checkout_problem({"worktree_toplevel_canonical": stored_c}, root=store.root) is not None
     )
     if stored_c and not ambiguous and lane_mod.canonical_host_path(stored_c) != toplevel_c:
-        raise lane_mod.LaneError("stored worktree canonical path no longer matches git")
+        raise lane_mod.LaneError(f"stored worktree canonical path no longer matches git in lane {lane_id!r}; "
+                                 f"{lane_mod._CANONICAL_ADVICE.removeprefix('it must be an absolute path. ')}")
     repo_common = _common_git_dir(store.root)
     wt_common = _common_git_dir(wt)
     if repo_common != wt_common:
@@ -6301,6 +6310,42 @@ def _lane_worktree_idle(store, lane: dict) -> bool:
 
 def _worktree_list(root) -> list[dict]:
     return _worktree_records(root) or []
+
+
+def _worktree_records_strict(root):
+    """Read complete, unambiguous Git identities after fencing every registration."""
+    janitormod._fence_registrations(root)
+    rc, out = _git(root, ["worktree", "list", "--porcelain", "-z"], raw=True)
+    if rc != 0:
+        raise janitormod._listing_failure("git worktree list failed")
+    records = []
+    for index, fields in enumerate(janitormod._split_worktree_records_z(out)):
+        row = {}
+        for field in fields:
+            try:
+                key, _, value = field.decode("utf-8").partition(" ")
+            except UnicodeDecodeError:
+                raise janitormod._listing_failure("invalid UTF-8") from None
+            if key in {"worktree", "HEAD", "branch", "bare", "detached", "locked", "prunable"}:
+                if key in row or (key in {"bare", "detached"} and b" " in field):
+                    raise janitormod._listing_failure("duplicate identity field")
+                row[key] = value
+            elif not ("worktree" in row and ("bare" in row or
+                      "HEAD" in row and ("branch" in row or "detached" in row))):
+                raise janitormod._listing_failure("unknown field before identity")
+            else:
+                row[key] = value
+        path, head, bare = row.get("worktree", ""), row.get("HEAD", ""), "bare" in row
+        bad_bare = bare and (index != 0 or row["bare"] or any(k in row for k in ("HEAD", "branch", "detached")))
+        bad_branch = "branch" in row and (not row["branch"].startswith("refs/") or len(row["branch"]) <= 5)
+        bad_detached = "detached" in row and row["detached"]
+        bad_identity = (not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) or
+                        ("branch" in row) == ("detached" in row))
+        if not lane_mod.path_is_absolute(path) or bad_bare or not bare and (bad_identity or bad_branch or bad_detached):
+            raise janitormod._listing_failure("invalid checkout identity")
+        store_mod.check_folder_fence(Path(path))
+        records.append(row)
+    return records
 
 
 def _worktree_records(root) -> list[dict] | None:
@@ -7581,8 +7626,14 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 if issue is not None:
                     raise lane_mod.LaneError(
                         f"lanes.json lane {lane_id}: could not read current checkout path {issue[0]}; {issue[2]}")
-                old_checkout = (previous.get("worktree_toplevel_canonical") or previous.get("worktree_path")) \
-                    if isinstance(previous, dict) else None
+                raw = previous.get("worktree_path") if isinstance(previous, dict) else None
+                canonical = previous.get("worktree_toplevel_canonical") if isinstance(previous, dict) else None
+                old_checkout = raw if raw and lane_mod.path_is_absolute(raw) and not lane_mod.old_backslash_path(
+                    raw, root=store.root) else canonical
+                if not old_checkout and raw:
+                    raise lane_mod.LaneError(f"lanes.json lane {lane_id}: its saved checkout cannot be used and no "
+                                             "full canonical path settles it; set worktree_path to the checkout's real "
+                                             "absolute folder, then reassign")
                 retained = [*retained, *([old_checkout] if old_checkout else [])]
                 if any(not isinstance(item, str) or not item.strip() for item in retained):
                     raise lane_mod.LaneError("could not read retained occupancy worktrees")
@@ -8301,6 +8352,20 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                                 "nothing to acknowledge; `lane abandon` without the option removes a worktree "
                                 "normally. Nothing was changed.\n")
                         return 2
+                    if damaged_path:
+                        try:
+                            records = _worktree_records_strict(store.root)
+                        except (janitormod._UseCheckFailed, store_mod.StoreFenceError) as exc:
+                            raise lane_mod.LaneError(
+                                f"Git's list could not be checked ({pc.line(getattr(exc, 'why', str(exc)))}); "
+                                "nothing was acknowledged") from exc
+                        for record in records:
+                            if record.get("branch") == lane_mod.lane_ref(lane_id):
+                                marker = next((k for k in ("prunable", "locked") if k in record), "registered")
+                                raise lane_mod.LaneError(
+                                    f"Git registers its checkout at {pc.line(record['worktree'])!r} ({marker}); "
+                                    "inspect and save its work, then repair worktree_path or remove its registration "
+                                    "with git worktree remove or git worktree prune if gone; nothing was acknowledged")
                     # Launches are matched by the registry key just validated, never by a `lane_id` written inside
                     # the (possibly damaged) record, which can name another lane or none.
                     keyed = {**lane, "lane_id": lane_id}

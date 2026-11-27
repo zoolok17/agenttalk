@@ -1495,8 +1495,8 @@ def _listing_failure(why: str) -> "_UseCheckFailed":
     return failed
 
 
-def _parse_worktree_list_z(out) -> list[Path]:
-    """The paths of `git worktree list --porcelain -z`, read from the bytes Git wrote: NUL ends every field and an empty
+def _split_worktree_records_z(out):
+    """Records from `git worktree list --porcelain -z`: NUL ends each field and an empty
     field ends a record, so a path with a newline, U+2028 or any non-ASCII letter is one path, exactly as written.
     Anything that does not look like that output is not guessed at: `_UseCheckFailed`."""
     if isinstance(out, str):  # a stand-in that answers text
@@ -1506,7 +1506,7 @@ def _parse_worktree_list_z(out) -> list[Path]:
         # instead of LF" and the empty line between records becomes an empty field), so complete output ends NUL NUL.
         # Output cut after a field, even after a NUL, is cut short.
         raise _listing_failure("its output is not complete (the last record is not closed)")
-    paths, in_record = [], False
+    records, in_record = [], False
     for field in out.split(b"\0")[:-1]:
         if field == b"":
             in_record = False
@@ -1514,15 +1514,25 @@ def _parse_worktree_list_z(out) -> list[Path]:
             if in_record or len(field) == len(b"worktree "):
                 raise _listing_failure("its output could not be read reliably")
             try:
-                paths.append(Path(field[len(b"worktree "):].decode("utf-8")))
+                field[len(b"worktree "):].decode("utf-8")
             except UnicodeDecodeError:
                 raise _listing_failure("a checkout path in its output is not valid UTF-8") from None
+            records.append([field])
             in_record = True
         elif not in_record:
             raise _listing_failure("its output could not be read reliably")
-    if not paths:
+        else:
+            records[-1].append(field)
+    if not records:
         raise _listing_failure("its output names no checkout")
-    return paths
+    return records
+
+
+def _parse_worktree_list_z(out) -> list[Path]:
+    """The paths of `git worktree list --porcelain -z`, read from the bytes Git wrote: NUL ends every field and an empty
+    field ends a record, so a path with a newline, U+2028 or any non-ASCII letter is one path, exactly as written.
+    Anything that does not look like that output is not guessed at: `_UseCheckFailed`."""
+    return [Path(record[0][len(b"worktree "):].decode("utf-8")) for record in _split_worktree_records_z(out)]
 
 
 def _registered_worktrees_listed(repo: Path) -> list[Path]:

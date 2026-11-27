@@ -5,6 +5,7 @@ import ntpath
 import os
 import re
 import stat
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -14,6 +15,80 @@ import pytest
 from agenttalk import cli, ephemeral, lane_occupancy, lanes, supervisor
 from agenttalk.store import Store
 from agenttalk.wrapper import run as wrapper_run
+
+
+@pytest.mark.parametrize("saved", ["/p/co//wt", "{ROOT}/co//wt"])
+def test_old_doubled_slash_canonical_is_damage_with_repair_advice(tmp_path, monkeypatch, saved):
+    import posixpath
+
+    monkeypatch.setattr(lanes, "os", types.SimpleNamespace(name="posix", path=posixpath))
+    row = {"worktree_toplevel_canonical": saved}
+    problem = lanes.canonical_checkout_problem(row, root="/p")
+    assert problem is not None and "older version" in problem[1]
+    with pytest.raises(lanes.LaneError, match="real absolute folder"):
+        lanes.require_checkout_paths(row, lane_id="test", root="/p")
+
+
+@pytest.mark.parametrize(
+    "raw,retained,expected",
+    [
+        ("/p/target", [], ("other", True)),
+        ("/p/other", [], None),
+        ("", [], ("other", False)),
+        ("relative", [], ("other", False)),
+        ("bad\x00name", [], ("other", False)),
+        ("/p/other", ["/p/old//checkout"], ("other", False)),
+        ("/p/target", ["/p/old//checkout"], ("other", True)),
+        ("/p/other", ["/p/old//checkout", "/p/target"], ("other", True)),
+        ("/p/other", ["/p/target"], ("other", True)),
+        ("", ["/p/target"], ("other", True)),
+    ],
+)
+def test_guarded_paths_do_not_hide_healthy_claims(monkeypatch, raw, retained, expected):
+    import posixpath
+
+    fake_os = types.SimpleNamespace(name="posix", path=posixpath)
+    monkeypatch.setattr(lanes, "os", fake_os)
+    monkeypatch.setattr(cli, "_strict_real", lambda path: str(path))
+    monkeypatch.setattr(cli.os.path, "samefile", lambda a, b: False)
+    row = {"worktree_path": raw, "worktree_toplevel_canonical": "/p/old//checkout",
+           "occupancy_worktrees": retained}
+    assert cli._lane_checkout_owned_by_another(types.SimpleNamespace(root="/p"), "mine", "/p/target",
+                                                rows={"other": row}) == expected
+
+
+@pytest.mark.parametrize("raw,canonical,claim,expected", [
+    ("/p/other", "/p/other", "{ROOT}/old//checkout", ("other", False)),
+    ("", "/p/other", "/p/old//checkout", ("other", False)),
+    ("relative", "/p/other", "/p/old//checkout", ("other", False)),
+    ("bad\x00name", "/p/other", "/p/old//checkout", ("other", False)),
+    ("/p/other", "/p/target", "/p/old//checkout", ("other", True)),
+])
+def test_guarded_retained_claim_cannot_be_dismissed(monkeypatch, raw, canonical, claim, expected):
+    import posixpath
+
+    monkeypatch.setattr(lanes, "os", types.SimpleNamespace(name="posix", path=posixpath))
+    monkeypatch.setattr(cli, "_strict_real", lambda path: str(path))
+    monkeypatch.setattr(cli.os.path, "samefile", lambda a, b: False)
+    row = {"worktree_path": raw, "worktree_toplevel_canonical": canonical, "occupancy_worktrees": [claim]}
+    assert cli._lane_checkout_owned_by_another(types.SimpleNamespace(root="/p"), "mine", "/p/target",
+                                                rows={"other": row}) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [("/p/real", "worktree_path"), ("/p/missing", None), ("", None)])
+def test_surviving_entry_never_probes_a_guarded_canonical(monkeypatch, raw, expected):
+    import posixpath
+
+    def lstat(path):
+        assert "//" not in path
+        if path != "/p/real":
+            raise FileNotFoundError(path)
+        return types.SimpleNamespace(st_mode=stat.S_IFDIR)
+
+    monkeypatch.setattr(lanes, "os", types.SimpleNamespace(name="posix", path=posixpath, lstat=lstat))
+    row = {"worktree_path": raw, "worktree_toplevel_canonical": "/p/co//wt"}
+    found = lanes.surviving_checkout_entry(row, root="/p")
+    assert (found[0] if found else None) == expected
 
 
 def _committed_unpublished_delivery(
@@ -304,6 +379,7 @@ def test_committed_delivery_with_damaged_path_requires_existing_valid_final(tmp_
 def damaged_lane(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
     monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
     store = Store(tmp_path)
     store.init(["lead", "dev"])
     store.set_role("lead", "lead")
@@ -1020,6 +1096,17 @@ def test_retired_damaged_lane_assignment_advises_a_new_id(damaged_lane, capsys):
     assert "use a new lane id" in advice
     assert "--acknowledge-missing-worktree" not in advice
     assert lanes.lanes_path(store).read_bytes() == before
+
+
+def test_healthy_missing_checkout_acknowledgement_does_not_read_git_list(tmp_path, damaged_lane, monkeypatch):
+    store = damaged_lane("worktree_path", str(tmp_path / "gone"))
+    _update_row(store, "damaged", worktree_toplevel_canonical=str(store.root / "gone"))
+    monkeypatch.setattr(cli, "_worktree_records_strict", lambda *_: pytest.fail("Git list must not be read"))
+    real_git = cli._git
+    monkeypatch.setattr(cli, "_git", lambda root, argv, **kw: pytest.fail("Git list must not be read")
+                        if argv[:2] == ["worktree", "list"] else real_git(root, argv, **kw))
+    assert cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged",
+                     "--acknowledge-missing-worktree"]) == 0
 
 
 def test_acknowledgement_help_names_damaged_paths(capsys):
@@ -2005,10 +2092,96 @@ def test_acknowledgement_refuses_a_relative_canonical_in_either_position(keyed, 
 
 def test_acknowledgement_still_retires_an_empty_path_with_an_absolute_absent_canonical(keyed, capsys):
     store = keyed(worktree_path="", worktree_toplevel_canonical=str(keyed.root / "gone-absolute"))
+    subprocess.run(["git", "-C", str(store.root), "init", "-q"], check=True)
     assert _run(store, "lane", "abandon", "--id", BAD, ACK_HINT) == 0
     row = lanes.load_lanes(store)["lanes"][BAD]
     assert row["status"] == lanes.STATUS_ABANDONED and row["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
     assert row["lane_id"] == OTHER  # the saved record is not rewritten
+
+
+@pytest.mark.parametrize("case", ["registered", "prunable", "locked", "truncated", "duplicate", "nonzero",
+                                 "empty", "relative", "bad-head", "empty-branch", "both", "bare-head",
+                                 "bare-value", "bare-empty-value", "detached-empty-value", "duplicate-prunable",
+                                 "unknown-first", "invalid-utf8"])
+def test_damaged_acknowledgement_refuses_registered_or_unreliable_listing(keyed, monkeypatch, capsys, case):
+    store = keyed(worktree_path="", worktree_toplevel_canonical=str(keyed.root / "absent"))
+    before = lanes.lanes_path(store).read_bytes()
+    real_git = cli._git
+    marker = {"prunable": b"prunable missing\0", "locked": b"locked reason\0"}.get(case, b"")
+    record = (b"worktree " + str(keyed.root / "checkout").encode() + b"\0HEAD " + b"a" * 40
+              + b"\0branch refs/heads/lane/bad\0" + marker)
+    if case == "duplicate":
+        record += b"branch refs/heads/lane/other\0"
+    if case == "relative":
+        record = record.replace(str(keyed.root / "checkout").encode(), b"relative")
+    if case == "bad-head":
+        record = record.replace(b"a" * 40, b"xyz")
+    if case == "empty-branch":
+        record = record.replace(b"refs/heads/lane/bad", b"")
+    if case == "both":
+        record += b"detached\0"
+    if case == "bare-head":
+        record += b"bare\0"
+    if case == "bare-value":
+        record = b"worktree " + str(keyed.root).encode() + b"\0bare unexpected\0"
+    if case == "bare-empty-value":
+        record = b"worktree " + str(keyed.root).encode() + b"\0bare \0"
+    if case == "detached-empty-value":
+        record = record.replace(b"branch refs/heads/lane/bad", b"detached ")
+    if case == "duplicate-prunable":
+        record += b"prunable\0prunable\0"
+    if case == "unknown-first":
+        record = record.replace(b"\0HEAD ", b"\0unknown test\0HEAD ")
+    if case == "invalid-utf8":
+        record = record.replace(b"checkout", b"\xff")
+    listing = record if case == "truncated" else record + b"\0"
+    if case == "empty":
+        listing = b""
+
+    def git(root, argv, **kwargs):
+        if argv == ["worktree", "list", "--porcelain", "-z"]:
+            return (1, b"") if case == "nonzero" else (0, listing)
+        return real_git(root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git", git)
+    monkeypatch.setattr(cli.janitormod, "_fence_registrations", lambda root: None)
+    assert _run(store, "lane", "abandon", "--id", BAD, ACK_HINT) == 2
+    error = capsys.readouterr().err.lower()
+    assert "nothing was acknowledged" in error and "sweep" not in error
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
+def test_strict_listing_keeps_unknown_fields_after_the_checkout_identity(tmp_path, monkeypatch):
+    listing = (b"worktree " + str(tmp_path).encode() + b"\0HEAD " + b"a" * 40
+               + b"\0branch refs/heads/main\0future extension\0\0")
+    order = []
+    monkeypatch.setattr(cli.janitormod, "_fence_registrations", lambda root: order.append("fence"))
+
+    def git(root, argv, *, raw=False):
+        order.append("git")
+        assert raw and argv == ["worktree", "list", "--porcelain", "-z"]
+        return 0, listing
+
+    monkeypatch.setattr(cli, "_git", git)
+    records = cli._worktree_records_strict(tmp_path)
+    assert order == ["fence", "git"]
+    assert records[0]["future"] == "extension"
+
+
+@pytest.mark.parametrize("error", [cli.janitormod._UseCheckFailed("unreadable registration"),
+                                   cli.store_mod.StoreFenceError("outside the fence")])
+def test_acknowledgement_stops_before_git_when_registration_fence_fails(keyed, monkeypatch, capsys, error):
+    store = keyed(worktree_path="", worktree_toplevel_canonical=str(keyed.root / "absent"))
+    before = lanes.lanes_path(store).read_bytes()
+
+    def refuse(root):
+        raise error
+
+    monkeypatch.setattr(cli.janitormod, "_fence_registrations", refuse)
+    monkeypatch.setattr(cli, "_git", lambda *args, **kwargs: pytest.fail("Git must not be called"))
+    assert _run(store, "lane", "abandon", "--id", BAD, ACK_HINT) == 2
+    assert "nothing was acknowledged" in capsys.readouterr().err
+    assert lanes.lanes_path(store).read_bytes() == before
 
 
 def test_the_pathless_launch_check_does_not_select_a_path_again(keyed, monkeypatch):
@@ -2796,6 +2969,71 @@ def _real_lane_row(tmp_path):
     )
 
 
+@pytest.mark.parametrize("state", ["ordinary", "locked", "prunable", "prunable-absent", "detached"])
+def test_damaged_acknowledgement_checks_real_git_records(tmp_path, capsys, state):
+    from test_lanes import _git_rc
+
+    store, lane_id, row, worktree = _real_lane_row(tmp_path)
+    if state == "locked":
+        assert _git_rc(store.root, "worktree", "lock", str(worktree)).returncode == 0
+    elif state in {"prunable", "prunable-absent"}:
+        (worktree / ".git").unlink()
+        if state == "prunable-absent":
+            import shutil
+
+            assert worktree.resolve().is_relative_to(tmp_path.resolve())
+            shutil.rmtree(worktree)
+    elif state == "detached":
+        assert _git_rc(worktree, "checkout", "--detach").returncode == 0
+    rc, listing = cli._git(store.root, ["worktree", "list", "--porcelain", "-z"], raw=True)
+    assert rc == 0 and worktree in cli.janitormod._parse_worktree_list_z(listing)
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id].update(worktree_path="", worktree_toplevel_canonical="")
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+    code = _run(store, "lane", "abandon", "--id", lane_id, ACK_HINT)
+    output = capsys.readouterr()
+    if state == "detached":  # the documented limit: a detached checkout names no branch
+        assert code == 0, output.err
+    else:
+        marker = "prunable" if state == "prunable-absent" else state.replace("ordinary", "registered")
+        assert code == 2 and worktree.as_posix() in output.err and marker in output.err
+        assert lanes.lanes_path(store).read_bytes() == before
+
+
+def test_janitor_listing_still_accepts_a_real_bare_main_repository(tmp_path):
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    rc, listing = cli._git(bare, ["worktree", "list", "--porcelain", "-z"], raw=True)
+    assert rc == 0 and cli.janitormod._parse_worktree_list_z(listing) == [bare]
+    assert cli._worktree_records_strict(bare)[0]["bare"] == ""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="literal backslash names need a POSIX file system")
+def test_old_inside_backslash_canonical_is_refused_with_repair_advice(tmp_path):
+    from test_lanes import _assign_worktree, _commit, _repo, _run_raw
+
+    root = tmp_path / "a\\b" / "repo"
+    root.mkdir(parents=True)
+    root, base = _repo(root)
+    row = _assign_worktree(root, base, "legacy")
+    _commit(Path(row["worktree_path"]), "src/core/a.py", "base\nlegacy change\n")
+    current = row["worktree_toplevel_canonical"]
+    row["worktree_toplevel_canonical"] = current.replace("\\", "/")
+    with pytest.raises(lanes.LaneError, match="worktree_toplevel_canonical.*real absolute folder"):
+        cli._verify_lane_worktree(Store(root), row, lane_id="legacy")
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    data["lanes"]["legacy"]["worktree_toplevel_canonical"] = row["worktree_toplevel_canonical"]
+    lanes.save_lanes(store, data)
+    assert _run_raw(["lane", "deliver", "--id", "legacy", "--from", "dev"], root) == 2
+    data["lanes"]["legacy"]["worktree_toplevel_canonical"] = current
+    lanes.save_lanes(store, data)
+    row["worktree_toplevel_canonical"] = current
+    assert cli._verify_lane_worktree(Store(root), row, lane_id="legacy")["head"]
+    assert _run_raw(["lane", "deliver", "--id", "legacy", "--from", "dev"], root) == 0
+
+
 @pytest.mark.parametrize("cwd", RETRY_FOLDERS)
 @pytest.mark.parametrize("canonical", LEGACY_CANONICALS)
 def test_the_committed_snapshot_path_does_not_read_an_ambiguous_canonical_against_the_cwd(
@@ -2822,8 +3060,10 @@ def test_the_normal_path_still_refuses_an_ambiguous_canonical(tmp_path, canonica
 def test_an_absolute_canonical_that_really_differs_is_refused_on_the_committed_snapshot_path_too(tmp_path):
     store, lane_id, row, worktree = _real_lane_row(tmp_path)
     row["worktree_toplevel_canonical"] = str(tmp_path / "some-other-folder")
-    with pytest.raises(lanes.LaneError, match="no longer matches git"):
+    with pytest.raises(lanes.LaneError, match="no longer matches git") as caught:
         cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    assert "worktree_toplevel_canonical" in str(caught.value) and "real absolute folder" in str(caught.value)
+    assert "it must be an absolute path" not in str(caught.value)
     row["worktree_toplevel_canonical"] = lanes.canonical_host_path(worktree)  # the right absolute one still passes
     assert cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)["head"]
 
@@ -4713,6 +4953,98 @@ def _reassign_without_a_checkout(root: Path, base: str, lane_id: str = "other") 
         "--domain", "core", "--base", base, "--target", _branch(root), "--path", "src/other", "--force",
         "--advisory", "--no-worktree", "--worktree-waiver-reason", "review fixture retained generation",
     ]) == 0
+
+
+def test_forced_reassignment_retains_the_original_absolute_raw_path(tmp_path):
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    row = _assign_worktree(root, base, "first")
+    assert not row.get("occupancy_worktrees")
+    store = Store(root)
+    raw = str(root / "a-different-absolute-spelling")
+    _update_row(store, "first", worktree_path=raw)
+    _reassign_without_a_checkout(root, base, "first")
+    assert lanes.load_lanes(store)["lanes"]["first"]["occupancy_worktrees"] == [raw]
+    assert row["worktree_toplevel_canonical"] != raw
+
+
+@pytest.mark.parametrize("case", ["relative-with-canonical", "relative-without-canonical", "no-checkout",
+                                  "no-checkout-existing", "retired", "damaged", "retired-hidden-damage"])
+def test_reassignment_preserves_or_refuses_the_previous_checkout(tmp_path, capsys, case):
+    from test_lanes import _assign_worktree, _branch, _repo
+
+    root, base = _repo(tmp_path)
+    row = _assign_worktree(root, base, "first")
+    store = Store(root)
+    canonical = row["worktree_toplevel_canonical"]
+    fields = {
+        "relative-with-canonical": {"worktree_path": "relative", "worktree_toplevel_canonical": canonical},
+        "relative-without-canonical": {"worktree_path": "relative", "worktree_toplevel_canonical": None},
+        "no-checkout": {"worktree_path": None, "worktree_toplevel_canonical": None},
+        "no-checkout-existing": {"worktree_path": None, "worktree_toplevel_canonical": None,
+                                 "occupancy_worktrees": [str(root / "earlier")]},
+        "retired": {"worktree_path": "", "worktree_toplevel_canonical": "", "status": lanes.STATUS_ABANDONED,
+                    "worktree_state": lanes.STATUS_CLEANUP_ACKNOWLEDGED},
+        "damaged": {"worktree_path": "bad\x00path", "worktree_toplevel_canonical": canonical},
+        "retired-hidden-damage": {"worktree_path": "", "worktree_toplevel_canonical": 42,
+                                  "status": lanes.STATUS_ABANDONED,
+                                  "worktree_state": lanes.STATUS_CLEANUP_ACKNOWLEDGED},
+    }[case]
+    _update_row(store, "first", **fields)
+    code = cli.main(["--root", str(root), "lane", "assign", "--id", "first", "--from", "lead", "--assignee", "dev2",
+                     "--domain", "core", "--base", base, "--target", _branch(root), "--path", "src/other", "--force",
+                     "--advisory", "--no-worktree", "--worktree-waiver-reason", "test"])
+    text = capsys.readouterr().err
+    if case in {"relative-without-canonical", "damaged", "retired", "retired-hidden-damage"}:
+        assert code != 0 and ("real absolute folder" in text or "NUL" in text or "retired" in text), text
+    else:
+        assert code == 0, text
+        claims = lanes.load_lanes(store)["lanes"]["first"].get("occupancy_worktrees", [])
+        expected = ([canonical] if case == "relative-with-canonical" else
+                    [str(root / "earlier")] if case == "no-checkout-existing" else [])
+        assert claims == expected
+
+
+@pytest.mark.parametrize("case", ["doubled_slash_canonical"])
+def test_forced_reassignment_with_a_damaged_earlier_field_is_refused_as_before(tmp_path, monkeypatch, capsys, case):
+    import posixpath
+    from test_lanes import _assign_worktree, _branch, _repo
+
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "first")
+    _update_row(Store(root), "first", worktree_toplevel_canonical="/p/co//wt")
+    monkeypatch.setattr(lanes, "os", types.SimpleNamespace(name="posix", path=posixpath))
+    assert "older version" in lanes.canonical_checkout_problem({"worktree_toplevel_canonical": "/p/co//wt"}, root="")[1]
+    code = cli.main(["--root", str(root), "lane", "assign", "--id", "first", "--from", "lead", "--assignee", "dev2",
+                     "--domain", "core", "--base", base, "--target", _branch(root), "--path", "src/other", "--force",
+                     "--advisory", "--no-worktree", "--worktree-waiver-reason", "test"])
+    assert code == 2 and "worktree_toplevel_canonical" in capsys.readouterr().err
+
+
+def test_a_raw_path_with_a_doubled_slash_is_not_kept_as_the_claim(tmp_path, monkeypatch):
+    import posixpath
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "first")
+    _update_row(Store(root), "first", worktree_path="/p/co//wt", worktree_toplevel_canonical="/p/canonical")
+    monkeypatch.setattr(lanes, "os", types.SimpleNamespace(name="posix", path=posixpath))
+    _reassign_without_a_checkout(root, base, "first")
+    assert lanes.load_lanes(Store(root))["lanes"]["first"]["occupancy_worktrees"] == ["/p/canonical"]
+
+
+def test_guarded_absolute_raw_without_canonical_is_not_called_relative(tmp_path, monkeypatch, capsys):
+    import posixpath
+    from test_lanes import _assign_worktree, _branch, _repo
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "first")
+    _update_row(Store(root), "first", worktree_path="/p/co//wt", worktree_toplevel_canonical=None)
+    monkeypatch.setattr(lanes, "os", types.SimpleNamespace(name="posix", path=posixpath))
+    code = cli.main(["--root", str(root), "lane", "assign", "--id", "first", "--from", "lead", "--assignee", "dev2",
+                     "--domain", "core", "--base", base, "--target", _branch(root), "--force", "--advisory",
+                     "--no-worktree", "--worktree-waiver-reason", "test"])
+    assert code == 2 and "relative path" not in capsys.readouterr().err
 
 
 def _retained_claim_case(tmp_path, monkeypatch, command):
