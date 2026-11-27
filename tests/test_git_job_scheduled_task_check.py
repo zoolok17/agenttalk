@@ -409,7 +409,9 @@ def test_a_stop_of_the_task_that_is_not_confirmed_fails_the_run_and_the_next_run
     tmp_path, shell, state, end_exit, after_end, code, second
 ):
     """#920: the stop is confirmed only when the task shows Ready after /End, and /End returned 0 or the task was
-    already Ready before it. Otherwise an accepted run fails with 4, an earlier code is kept, and the next run waits."""
+    already Ready before it. Otherwise an accepted run fails with 4, an earlier code is kept, and the next run waits.
+    A task whose stop is not confirmed is kept, not deleted: /Delete does not end a running program, and the task's
+    name is the only way left to stop it by hand; the text says how to look, end it, and then delete it."""
     done, _, calls = run_with_a_stand_in_scheduler(
         tmp_path, shell, runs="Both", state=state, seconds=1, end_exit=end_exit, after_end=after_end
     )
@@ -417,6 +419,11 @@ def test_a_stop_of_the_task_that_is_not_confirmed_fails_the_run_and_the_next_run
     assert done.returncode == code, text
     assert len([call for call in calls if call.startswith("/Create")]) == (2 if second else 1), calls
     assert ("TASK STOP NOT CONFIRMED" in done.stdout) is not second, text
+    assert len([call for call in calls if call.startswith("/Delete")]) == (2 if second else 0), calls
+    if not second:
+        assert "task kept" in done.stdout, text
+        for step in ("/Query", "/End", "/Delete"):
+            assert f"schtasks {step} /TN stub-task" in done.stdout, text
 
 
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
@@ -485,12 +492,12 @@ def test_a_failed_deletion_of_the_task_is_not_a_success(tmp_path, shell):
 def test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running(tmp_path, shell):
     """The wait of `-Mode Run`, end to end: the log is finished, but the scheduler keeps showing the task as Running
     until the time limit. The limit must not turn that into an acceptance: exit code 2, no accepted copy, and the task
-    is still deleted."""
+    is kept, as its stop is not confirmed (#920)."""
     done, out, _ = run_with_a_stand_in_scheduler(tmp_path, shell, state="Running", seconds=1)
     assert done.returncode == 2, done.stdout + done.stderr
     assert "NO COMPLETION EVIDENCE FROM THE SCHEDULER" in done.stdout
     assert not (out / "interactive-accepted.log").exists()
-    assert "task deleted: True" in done.stdout
+    assert "task kept: its stop is not confirmed" in done.stdout
 
 
 # --- a scheduler that cannot be read is not a task that is gone (round 14) -------------------------------------
@@ -534,9 +541,9 @@ COMBINED = [
         id="rejected-run-and-the-scheduler-is-unreadable",
     ),
     pytest.param(
-        {"state": "Running", "seconds": 1, "delete_fails": True},
+        {"state": "Running", "seconds": 1},  # its stop is not confirmed: kept, not deleted (#920)
         2,
-        "TASK NOT DELETED",
+        "TASK STOP NOT CONFIRMED",
         id="no-completion-evidence-and-the-task-is-still-there",
     ),
 ]

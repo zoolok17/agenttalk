@@ -194,10 +194,10 @@ function Resolve-Cleanup {
     # there after the delete, or that the scheduler could not be asked about (the absence is not established), is a
     # failed cleanup: the accepted evidence stays, but the exit code is not 0 (4 when the run itself was accepted,
     # otherwise the run's own code, which wins) and the text says how to delete the task by hand. So is a stop of the
-    # task that is not confirmed (-StopNotConfirmed, #920), even when the delete worked.
+    # task that is not confirmed (-StopNotConfirmed, #920): that task was kept, and the text says how to end and delete it.
     param($Judged, [int]$DeleteExit, [bool]$StillExists, [bool]$Unreadable = $false, [string]$Name, [string]$StopNotConfirmed = '')
-    $stop = if ($StopNotConfirmed) { " | TASK STOP NOT CONFIRMED ($StopNotConfirmed): look with schtasks /Query /TN $Name, end it with schtasks /End /TN $Name, and do not run this check again before it has ended (Ready is the scheduler's own state; programs the task started are not checked here)" } else { '' }
-    if ($stop -and -not $StillExists -and -not $Unreadable) { return @{ code = $(if ($Judged.code -eq 0) { 4 } else { $Judged.code }); text = "$($Judged.text)$stop" } }
+    $stop = if ($StopNotConfirmed) { " | TASK STOP NOT CONFIRMED ($StopNotConfirmed), so the task was kept: look with schtasks /Query /TN $Name, end it with schtasks /End /TN $Name, then delete it with schtasks /Delete /TN $Name /F, and do not run this check again before it is gone (Ready is the scheduler's own state; programs the task started are not checked here)" } else { '' }
+    if ($stop) { return @{ code = $(if ($Judged.code -eq 0) { 4 } else { $Judged.code }); text = "$($Judged.text)$stop" } }
     if (-not $StillExists -and -not $Unreadable) { return $Judged }
     $how = "schtasks /Delete /TN $Name /F"
     $text = if ($StillExists) {
@@ -295,12 +295,13 @@ function Invoke-OneRun {
         if ($registered) {
             $beforeEnd = Get-TaskFacts  # the state just before /End
             $stop = Get-StopProblem -Before $beforeEnd -EndExit (Invoke-Schtasks -Line "/End /TN $TaskName")
-            $deleteExit = Invoke-Schtasks -Line "/Delete /TN $TaskName /F"
+            # Kept when its stop is not confirmed: /Delete ends no program, and the name is the way to stop it (#920).
+            $deleteExit = if ($stop) { 0 } else { Invoke-Schtasks -Line "/Delete /TN $TaskName /F" }
             $after = Get-TaskFacts
             $stillThere = [bool]$after.exists
             $unreadable = [bool]$after.unreadable  # the scheduler could not be asked: the task is NOT known to be gone
             $gone = -not $stillThere -and -not $unreadable
-            if ($gone -and $deleteExit -ne 0) {
+            if ($stop) { Write-Host "[$Label] task kept: its stop is not confirmed" } elseif ($gone -and $deleteExit -ne 0) {
                 # The scheduler says the task is not there, but the delete command itself failed: it is not "deleted".
                 Write-Host "[$Label] task absent (delete command failed, schtasks returned $deleteExit; the scheduler confirms that the task is not there)"
             } else {
