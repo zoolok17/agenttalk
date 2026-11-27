@@ -704,7 +704,6 @@ def test_janitor_lists_and_asks_git_nothing_outside_the_fence(
         return real_iterdir(path)
 
     monkeypatch.setattr(janitor, "_safe_iterdir", listing)
-    monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside, worktree])
     monkeypatch.setattr(janitor, "_registered_worktrees_listed", lambda repo: [inside, worktree])  # discovery's list
     monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: asked.append(Path(path)) or False)
     assert cli.main(["--root", str(inside), "janitor", *mode]) == 2
@@ -1512,9 +1511,9 @@ def test_ordinary_in_fence_checkouts_are_still_probed_under_the_fence(
 def test_the_report_probes_only_a_strict_list_under_a_fence(
     fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fence_set: bool,
 ) -> None:
-    """`build_report` can be called without the command around it. When the strict list failed it falls back to the old
-    reader for the counts and the preview; under a fence it must not probe those paths (they were never the ones the
-    fence checked). Without a fence the old best-effort probe is unchanged."""
+    """`build_report` can be called without the command around it. When the strict list failed there is no list: no
+    checkout is probed, under a fence or without one (#901; there used to be a best-effort fallback that was probed
+    when no fence was set)."""
     from agenttalk import janitor
 
     fence, _, _ = fenced
@@ -1530,8 +1529,8 @@ def test_the_report_probes_only_a_strict_list_under_a_fence(
 
     report = janitor.build_report(cfg)
 
-    assert not report.registered_strict
-    assert [Path(os.path.realpath(path)) for path in asked] == ([] if fence_set else [Path(os.path.realpath(done))])
+    assert report.registered_worktrees is None and report.registered_unknown
+    assert asked == []
 
 
 @pytest.mark.parametrize("mode", [
@@ -2443,7 +2442,6 @@ def test_janitor_checks_the_worktrees_folder_first(
     listed: list[Path] = []
     real_iterdir = janitor._safe_iterdir
     monkeypatch.setattr(janitor, "_safe_iterdir", lambda path: listed.append(Path(path)) or real_iterdir(path))
-    monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside])
     monkeypatch.setattr(janitor, "_registered_worktrees_listed", lambda repo: [inside])  # discovery's list
     monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: False)
     monkeypatch.setattr(janitor, "_run_git", lambda *args, **kwargs: (0, "", ""))   # no real git, on any code
@@ -2640,6 +2638,76 @@ def test_a_record_that_names_an_in_fence_link_to_an_outside_folder_keeps_the_che
 
     text = capsys.readouterr().out
     assert (done / ".git").exists() and "names a path outside the fence" in text, text
+
+
+# --- #901 fix round 1: the first listing fails under the fence, and a later one would name an outside checkout ------
+
+
+def _first_listing_fails_then_names_outside(monkeypatch: pytest.MonkeyPatch, outside: Path) -> dict[str, int]:
+    """Git's list of registered checkouts FAILS at the first reading (a non-zero exit, some partial output) and, from
+    the second reading on, succeeds and names `outside` as well. The two readers are counted apart (the sweep's and
+    release's own). The injection sits at the output of Git, below the readers, so what the code does with a failed
+    first reading is what is tested: a refusal at once makes exactly one reading and none by release."""
+    from agenttalk import janitor, worktree_release
+
+    calls = {"sweep": 0, "release": 0}
+    real_run, real_read = janitor._run_git_checked, worktree_release._read_git
+
+    def run(repo, *args, raw=False):
+        if args[:4] == _LIST_ARGS:
+            calls["sweep"] += 1
+            if calls["sweep"] == 1:
+                partial = b"worktree " + os.fsencode(str(repo)) + b"\0HEAD abc\0\0"
+                return 1, partial if raw else partial.decode(), b"fatal: the first list failed (test)" if raw else (
+                    "fatal: the first list failed (test)"
+                )
+        rc, out, err = real_run(repo, *args, raw=raw)
+        if args[:4] == _LIST_ARGS and rc == 0 and isinstance(out, bytes):
+            out += _stranger_record(outside)[0]
+        return rc, out, err
+
+    def read(repo, *args):
+        out = real_read(repo, *args)
+        if args[:4] == _LIST_ARGS:
+            calls["release"] += 1
+            out += _stranger_record(outside)[1]
+        return out
+
+    monkeypatch.setattr(janitor, "_run_git_checked", run)
+    monkeypatch.setattr(worktree_release, "_read_git", read)
+    return calls
+
+
+@pytest.mark.parametrize("mode", _JANITOR_MODES)
+def test_a_first_listing_that_fails_under_the_fence_is_refused_at_once_even_if_a_later_one_would_succeed(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],
+) -> None:
+    """The plan's combined case, on the fenced route in every mode: the first reading fails and the next would succeed
+    with a checkout outside the fence. The command refuses at the first failure: exactly one reading is made (none by
+    release), nothing outside is looked at, probed or written (its index is byte for byte the same), nothing is released
+    or swept, and the refusal report holds the one line about the list, not the outside path."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    done = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, done, fence / "scratch")
+    clone = _outside_clone(tmp_path)
+    index = clone / ".git" / "index"
+    before_index, before_clone = index.read_bytes(), _snapshot(clone / ".git")
+    calls = _first_listing_fails_then_names_outside(monkeypatch, clone)
+    looked = _watch_looks_at(monkeypatch, clone)
+    asked = _spy_on_probes(monkeypatch)
+
+    rc = cli.main(["--root", str(repo), "janitor", *_janitor_args(mode, done)])
+
+    # The harm first, so that a failure names what was actually done outside: a look, a status probe, a write.
+    assert looked == [] and asked == [], (looked, asked)  # no metadata read, no status asked
+    assert index.read_bytes() == before_index and _snapshot(clone / ".git") == before_clone  # and nothing written
+    assert rc == 2
+    assert calls == {"sweep": 1, "release": 0}, calls  # refused at the first failure: no second reading of any kind
+    assert (done / ".git").exists() and (done / "source.txt").exists()  # nothing released or swept
+    lines = report.read_text(encoding="utf-8").split("\n")[:-1]
+    assert len(lines) == 1 and "registered checkouts" in lines[0] and lines[0].endswith(_UNPLACED), lines
+    assert str(clone) not in lines[0]
 
 
 # --- #858 fix round 17: no look at a record-named path outside the fence on ANY in-use route, advice code included ----
@@ -3914,8 +3982,8 @@ def test_the_registration_check_fences_each_git_file_before_it_looks_through_a_l
 def test_under_the_store_fence_a_failed_strict_list_is_not_replaced_by_the_old_git_list(
     fenced, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The report keeps a best-effort list of checkouts for its counts when the strict list fails. Under the store
-    fence it does not ask Git for it: that list was never fenced, and Git's listing looks at every registration."""
+    """When the strict list fails, the report does not ask Git for another list: that one was never fenced, and Git's
+    listing looks at every registration. The list is UNKNOWN (#901), with the strict list's reason, never `[]`."""
     from agenttalk import janitor
 
     fence, _, _ = fenced
@@ -3927,7 +3995,43 @@ def test_under_the_store_fence_a_failed_strict_list_is_not_replaced_by_the_old_g
     report = janitor.build_report(cfg, (None, "the strict list failed (test)"))
 
     assert asked == [], asked
-    assert report.registered_worktrees == [] and not report.registered_strict
+    assert report.registered_worktrees is None and report.registered_unknown == "the strict list failed (test)"
+
+
+def test_a_registration_made_outside_during_the_prune_makes_the_count_after_it_unknown_and_keeps_the_report(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """After the prune, the sweep reads the strict list again for its count. If Git got a registration of a folder
+    outside the fence in the meantime, the fence refuses that reading (before Git is asked). The count is then
+    UNKNOWN and the sweep fails (exit 1); the refusal does not end the command before the report of what was done
+    is printed, and Git is not asked for its list with the outside registration in place."""
+    from agenttalk import janitor
+
+    fence, _, _ = fenced
+    fence = fence.resolve()
+    repo, _ = _swept_checkout(fence)
+    outside = (tmp_path / "zz-late-after-prune").resolve()  # beside the fence, inside this test's own folder
+    outside.mkdir()
+    admin = repo / ".git" / "worktrees" / "late-registration"
+    real_run = janitor._run_git
+
+    def run(repo_arg, *args, **kwargs):
+        result = real_run(repo_arg, *args, **kwargs)
+        if args[:2] == ("worktree", "prune"):
+            _write_late_registration(admin, outside)  # just after the real prune
+        return result
+
+    monkeypatch.setattr(janitor, "_run_git", run)
+    asked = _git_asked_for_every_registration(monkeypatch, admin)
+
+    rc = cli.main(["--root", str(repo), "janitor", "--apply"])
+
+    text = capsys.readouterr().out
+    assert admin.is_dir(), "the registration was never made, so nothing was tested"
+    assert asked == [], f"Git was asked about every registration, the outside one too: {asked}"
+    assert rc == 1, text
+    assert "registered worktrees after prune: unknown" in text and "removed summary:" in text, text
+    assert str(outside) in text, text
 
 
 def test_the_guard_notes_an_outside_path_handed_to_a_git_runner_as_an_argument(
@@ -4208,4 +4312,5 @@ def test_under_the_store_fence_a_unc_record_is_kept_and_never_looked_at_on_relea
         assert rc == 0, text
         # The sweep went on: the steps after the refusal really ran, and none of them looked at the path.
         assert prunes, "the prune was not called: the sweep stopped"
-        assert {"_ancestor_change_reason", "get_registered_worktrees"} <= set(after), after
+        # The count after the prune is read from the strict list (#901), not from the old text reader.
+        assert {"_ancestor_change_reason", "_registered_worktrees_listed"} <= set(after), after

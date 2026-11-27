@@ -34,6 +34,7 @@ from agenttalk import supervisor_lifecycle
 from agenttalk.store import (
     STORE_SCHEMA_CAPABILITIES,
     Store,
+    StoreFenceError,
     find_root,
     find_stores_upward,
     store_fence_allows,
@@ -2040,21 +2041,39 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
     """
     try:
         cfg = janitormod.JanitorConfig.load(project_root)
-        candidates, access_errors = janitormod.find_candidates(cfg)
-        registered = janitormod.get_registered_worktrees(project_root)
-    except OSError:
-        return None
-    outside_worktrees = [
+        # One strict list of the registered checkouts, shared by discovery and the outside-checkout count (#901).
+        fence_refused = False
+        try:
+            listing = janitormod._strict_listing(project_root)
+        except StoreFenceError as exc:
+            # Under a store fence a registered checkout the fence refuses: the list is UNKNOWN, with the fence's
+            # reason, like any list that could not be had (#901), and the rest of doctor runs on.
+            listing, fence_refused = (None, f"the store fence refused a path: {exc}"), True
+        candidates, access_errors = janitormod.find_candidates(cfg, listing)
+    except OSError as exc:  # a check it could not finish is reported, never left out (#901)
+        return Check(name="scratch_hygiene", status="warn",
+                     details=f"the scratch folders and registered checkouts could not be checked "
+                             f"({janitormod._os_error_text(exc)})",
+                     fix="look at the failure named above; then run `agenttalk janitor` to report",
+                     data={"outside_worktrees": None, "outside_candidates": None, "scratch_root": None})
+    registered, unknown_why = listing
+    next_step = ("look at the registration the store fence refused (named above)" if fence_refused
+                 else janitormod._listing_next_step(unknown_why) if registered is None else "")
+    # A list that could not be had is UNKNOWN, not "none outside": the count is None (JSON null), never 0.
+    outside_worktrees = None if registered is None else [
         w for w in registered
         if w != project_root and cfg.scratch_root not in w.parents
     ]
     # "scratch-stale" candidates already live under the scratch root (just
     # past keep_days) - not sprawl outside it, so they don't count here.
     outside_candidates = [c for c in candidates if c.reason != "scratch-stale"]
-    if not outside_worktrees and not outside_candidates and not access_errors:
+    if outside_worktrees is not None and not outside_worktrees and not outside_candidates and not access_errors:
         return None
     parts = []
-    if outside_worktrees:
+    if outside_worktrees is None:
+        parts.append(f"the registered checkouts could not be checked ({unknown_why}), so none outside the scratch "
+                     "root were looked for")
+    elif outside_worktrees:
         parts.append(f"{len(outside_worktrees)} registered worktree(s) outside the scratch root")
     if outside_candidates:
         parts.append(f"{len(outside_candidates)} scratch-family candidate(s) outside the scratch root")
@@ -2067,8 +2086,9 @@ def _check_scratch_hygiene(project_root: Path) -> Check | None:
         name="scratch_hygiene",
         status="warn",
         details="; ".join(parts) + f" (scratch root: {cfg.scratch_root})",
-        fix="run `agenttalk janitor` to report, `agenttalk janitor --apply` to clean up",
-        data={"outside_worktrees": len(outside_worktrees),
+        fix=("run `agenttalk janitor` to report, `agenttalk janitor --apply` to clean up" if registered is not None
+             else f"{next_step}; then run `agenttalk janitor` to report"),
+        data={"outside_worktrees": None if outside_worktrees is None else len(outside_worktrees),
               "outside_candidates": len(outside_candidates),
               "scratch_root": str(cfg.scratch_root)},
     )

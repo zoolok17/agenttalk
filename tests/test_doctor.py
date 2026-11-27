@@ -2699,6 +2699,8 @@ def test_check_scratch_hygiene_uses_configured_tmp_root_never_the_real_one(tmp_p
         json.dumps({"agents": ["a", "b"], "scratch": {"tmp_root": str(fake_tmp_root)}}),
         encoding="utf-8",
     )
+    # A real repository, so that Git's list of checkouts is known: without one it is unknown, and that warns (#901).
+    subprocess.run(["git", "init", "-q", str(proj)], check=True, capture_output=True)
     check = doctor._check_scratch_hygiene(proj)
     assert check is None  # nothing to warn about in an empty, controlled tree
 

@@ -72,7 +72,7 @@ def test_apply_keeps_entire_candidate_before_any_destructive_step(tmp_path, monk
     monkeypatch.setattr(janitor, "remove_plainly", lambda _: mutations.append("remove") or ("removed", None))
     monkeypatch.setattr(janitor, "wip_commit_dirty_worktree", lambda *args, **kwargs: pytest.fail("no WIP is allowed"))
     monkeypatch.setattr(janitor, "_run_git", lambda *args: "")
-    monkeypatch.setattr(janitor, "get_registered_worktrees", lambda _: worktrees)
+    monkeypatch.setattr(janitor, "_strict_listing", lambda _: (worktrees, ""))
 
     def run(argv, **kwargs):
         calls.append(argv)

@@ -12,8 +12,8 @@ that cannot be undone.
 
 **Written for:** the AI assistant (Claude Code or Codex) that a person has told to
 "read this brief and set up agenttalk".
-**Covers:** agenttalk **v0.101.1**, a released version, on Windows, Linux and macOS. A newer release,
-v0.105.0, exists; the last section lists what changed after v0.101.1.
+**Covers:** agenttalk as the README installs it, on Windows, Linux and macOS. The steps were checked on
+**v0.101.1**, a released version; the last section lists what changed after it.
 **Leaves out on purpose:** the supervisor (it needs Windows today) and the managed
 model gateway.
 **How it relates to the lead guide:** this brief is for the first setup of a team, without the
@@ -44,7 +44,7 @@ item is explained in the step named after it.
   which were not, is listed in the last section, "What this brief was checked against". Run
   `agenttalk --version` first. If it does not say `0.101.1`, run
   `agenttalk <command> --help` before you trust a flag.
-- **Newer versions.** The README installs v0.105.0, which includes the later fixes listed below.
+- **Newer versions.** The README installs a release newer than v0.101.1, with the later fixes noted below.
   This brief was checked against v0.101.1. Where something here changed later, a sentence that
   starts "Since 0.101.1" says so. Those sentences come from reading the code and the changelog,
   not from a new run.
@@ -172,12 +172,13 @@ On Debian or Ubuntu, install the venv package first: `sudo apt install python3-v
 
 Choose a folder for the environment that is **outside** the project's code and
 outside the team folder you will make in step 2c. Then install the released version.
-agenttalk is installed from its GitHub release tag, not from the Python package index.
+agenttalk is installed from its GitHub release tag, not from the Python package index. In the commands
+below, `<tag>` stands for the tag in the install line of the README that linked you here; copy it from there.
 
 ```powershell
 # Windows (checked)
 python -m venv "<env>"
-& "<env>\Scripts\python.exe" -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.101.1"
+& "<env>\Scripts\python.exe" -m pip install "git+https://github.com/zoolok17/agenttalk.git@<tag>"
 $env:AGENTTALK_PY = "<env>\Scripts\python.exe"
 & $env:AGENTTALK_PY -m agenttalk --version
 ```
@@ -185,12 +186,12 @@ $env:AGENTTALK_PY = "<env>\Scripts\python.exe"
 ```sh
 # Linux (checked) and macOS (not yet checked)
 python3 -m venv --copies "<env>"
-"<env>/bin/python" -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.101.1"
+"<env>/bin/python" -m pip install "git+https://github.com/zoolok17/agenttalk.git@<tag>"
 export AGENTTALK_PY="<env>/bin/python"
 "$AGENTTALK_PY" -m agenttalk --version
 ```
 
-Expected last line: `agenttalk 0.101.1`. Write `<env>` as an absolute path (for example
+Expected last line: `agenttalk` and the version in `<tag>`, without the `v`. Write `<env>` as an absolute path (for example
 `/home/you/tools/agenttalk-env`), because the start script runs from other folders.
 
 **Why `--copies` on Linux and macOS.** In 0.101.1, a wrapped seat on Linux or macOS
