@@ -2,7 +2,7 @@
 
 This page lists agenttalk's features in plain words: what it does today (Part 1) and what the team plans to build (Part 2). The [roadmap](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md) holds the detail: the order of the work, who builds it, and why.
 
-**Which version this describes.** Everything in Part 1 is in release 0.105.0, from 2026-11-13. Since that release, the main version of the code (master) has received fixes and changes of wording only, which this page leaves out. No new feature is waiting for the next release. The [change log](https://github.com/zoolok17/agenttalk/blob/master/CHANGELOG.md) lists every change.
+**Which version this describes.** Everything in Part 1 is in release 0.105.0, from 2026-11-13. Release 0.106.0, from 2026-11-27, also adds drift visibility, which this page does not describe yet: `agenttalk task` prints advisory warnings when a design, build or fix order has no answered challenge and no listed exemption, or when its work has used the agreed time or two fix rounds without a recorded decision, and `agenttalk overview --drift` shows a read-only report. The [change log](https://github.com/zoolok17/agenttalk/blob/master/CHANGELOG.md) lists every change.
 
 **Words used on this page.**
 - A **seat** is one AI assistant with its own name on the team, for example a Claude Code or a Codex assistant.

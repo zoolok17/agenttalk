@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.106.0] - 2026-11-27
+
+This release warns when work starts without the agreed check, keeps personal details out of status reports unless you ask for them, and makes first installs and clean-ups safer. From this release, `agenttalk task` prints advisory warnings when a design, build or fix order has no answered challenge behind it, uses an exemption outside the fixed list, or has run past its agreed time or two fix rounds without a recorded decision; it never refuses the order. `agenttalk overview --drift` shows the same picture for the whole team. Status reports and capacity lines now leave out folder paths, the project ID and account details by default. The setup brief and the user manuals now install the same release as the README, the first `agenttalk doctor` run reads less like a failure, and the README says what to do when a Windows security policy refuses to start agenttalk. A seat that starts slowly is no longer refused. When Git cannot check a folder, clean-ups and the checks that close a piece of work now say "unknown" or stop with repair steps, instead of calling it clean, and clean-ups no longer remove a folder that another piece of work still uses.
+
+After upgrading, preview the skill update with `agenttalk install-skills --dry-run --force`, back up any local edits you want to keep, then run `agenttalk install-skills --force`. The plain command keeps files that differ, so it cannot refresh changed skills. This release changes several skills, including the challenge skill, so every seat needs the update. A script that reads the folder path or project ID from `agenttalk status --json` now needs `--show-personal`.
+
 ### Added
 
 - **Drift visibility: warnings when work is ordered without a challenge, and a read-only report (#923).**
