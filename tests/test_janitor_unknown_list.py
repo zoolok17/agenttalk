@@ -433,6 +433,7 @@ def test_doctor_under_a_fence_says_unknown_when_the_fence_refuses_a_registered_c
     repo = fence / "repo"
     repo.mkdir(parents=True)
     git(repo, "init", "-b", "main")
+    git(repo, "config", "maintenance.auto", "false")  # Git's upkeep after a commit would prune the registration below
     git(repo, "config", "user.name", "Test Author")
     git(repo, "config", "user.email", "test@example.invalid")
     git(repo, "commit", "-q", "--allow-empty", "-m", "base")
@@ -448,6 +449,9 @@ def test_doctor_under_a_fence_says_unknown_when_the_fence_refuses_a_registered_c
     (admin / "gitdir").write_text(f"{outside / '.git'}\n", encoding="utf-8")
     (admin / "HEAD").write_text("ref: refs/heads/late-registration\n", encoding="utf-8")
     (admin / "commondir").write_text("../..\n", encoding="utf-8")
+    # A commit that waits for its upkeep: on macOS it runs in the background and can land at any moment (CI, #901).
+    git(repo, "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false", "commit", "--allow-empty", "-m", "x")
+    assert (admin / "gitdir").is_file(), "Git's automatic upkeep removed the registration"
     monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
     monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(tmp_path / "fence-report.txt"))
 
