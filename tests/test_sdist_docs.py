@@ -38,6 +38,17 @@ def test_every_docs_file_a_test_opens_is_in_the_sdist() -> None:
     assert missing == [], f"add to [tool.hatch.build.targets.sdist] include in pyproject.toml: {missing}"
 
 
+def test_the_scheduled_task_check_that_a_shipped_test_runs_is_in_the_sdist() -> None:
+    """tests/test_git_job_scheduled_task_check.py runs scripts/check_git_job_scheduled_task.ps1 (#920). The script must
+    exist (inside an unpacked sdist that lacks it, a scan of the files present could not see the gap) and be shipped."""
+    tomllib = pytest.importorskip("tomllib")  # Python 3.11+
+    pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    include = [entry.strip("/") for entry in pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]]
+    script = "scripts/check_git_job_scheduled_task.ps1"
+    assert (REPO / script).is_file(), f"a shipped test runs {script}, which is missing"
+    assert any(script == entry or script.startswith(entry + "/") for entry in include), f"ship {script} in the sdist"
+
+
 def _local_links(name: str) -> set[str]:
     """Relative link targets in a Markdown file, as written (no address, no anchor)."""
     text = (REPO / name).read_text(encoding="utf-8")

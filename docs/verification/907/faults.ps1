@@ -14,10 +14,10 @@
   an edit in such a file), so nothing of yours is lost; it leaves every file as it was committed, and says so only after it
   has checked every file byte for byte against the original (it writes the saved original back if git checkout did not).
 
-  What is kept for each fault: the pytest summary, the id of each failing test (every one, none left out), and for every one of
-  those the first line of its failure (an assertion, or an exception raised at call time, which is flagged: a fault that
-  fails a test by an exception is a weaker catch than one that fails an assertion). Paths in those lines are replaced
-  by <path>.
+  What is kept for each fault: its id, whether it was planted and compiled, how many tests ran, passed, failed, errored
+  and were skipped, and how many failures came from an assertion or an exception (a weaker catch). Nothing that pytest
+  prints is kept: no test name and no failure text. To see which tests failed and why, run the fault's tests locally.
+  A run in which no selected fault ran any test exits 1: nothing was tested.
 
   Paths: every path is a parameter or relative to the repository. The results file holds no path, user name or
   temporary folder.
@@ -42,6 +42,11 @@ $ErrorActionPreference = 'Continue'
 if (-not $Repo) { $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path }
 if (-not $Out) { $Out = Join-Path $PSScriptRoot 'faults-results.txt' }
 if (-not $BaseTemp) { $BaseTemp = Join-Path ([IO.Path]::GetTempPath()) ('faults907-' + [guid]::NewGuid().ToString('N').Substring(0, 8)) }
+# Each path is read from where the runner was started, before it changes folder: .NET file reads use the process folder.
+$start = (Get-Location).ProviderPath
+$Repo = (Resolve-Path -LiteralPath $(if ([IO.Path]::IsPathRooted($Repo)) { $Repo } else { Join-Path $start $Repo }) -ErrorAction Stop).ProviderPath
+if (-not [IO.Path]::IsPathRooted($Out)) { $Out = Join-Path $start $Out }
+if (-not [IO.Path]::IsPathRooted($BaseTemp)) { $BaseTemp = Join-Path $start $BaseTemp }
 
 # a run that is polite to the machine; nothing of the environment is printed
 $me = Get-Process -Id $PID
@@ -176,7 +181,7 @@ $faults = @(
       "    [IO.File]::WriteAllText(`$Path, (`$Values | ConvertTo-Json), (New-Object Text.UTF8Encoding(`$true)))",
       "    (`$Values | ConvertTo-Json) | Set-Content -LiteralPath `$Path -Encoding ascii")) },
   @{ id = 'F39-a-failed-deletion-of-the-task-ignored'; tests = $sched; edits = @(, @($SCRIPT,
-      "            `$judged = Resolve-Cleanup -Judged `$judged -DeleteExit `$deleteExit -StillExists `$stillThere -Unreadable `$unreadable -Name `$TaskName`n", "")) },
+      "            `$judged = Resolve-Cleanup -Judged `$judged -DeleteExit `$deleteExit -StillExists `$stillThere -Unreadable `$unreadable -Name `$TaskName -StopNotConfirmed `$stop`n", "")) },
   @{ id = 'F40-fault-runner-checks-only-the-product-files'; tests = $runner; edits = @(, @($RUNNERFILE,
       "ForEach-Object { `$_[0] } | Sort-Object -Unique)",
       "ForEach-Object { `$_[0] } | Where-Object { `$_ -like 'src/*' } | Sort-Object -Unique)")) },
@@ -197,8 +202,8 @@ $faults = @(
       "    if ([bool]`$before.unreadable) {", "    if (`$false) {")) },
   @{ id = 'F47-a-failed-cleanup-overrides-the-runs-own-code'; tests = $sched; edits = @(, @($SCRIPT,
       "    `$code = if (`$Judged.code -eq 0) { 4 } else { `$Judged.code }", "    `$code = 4")) },
-  @{ id = 'F48-fault-runner-keeps-only-four-rows-per-fault'; tests = $runner; edits = @(, @($RUNNERFILE,
-      "    foreach (`$row in `$rows) {", "    foreach (`$row in (`$rows | Select-Object -First 4)) {")) },
+  @{ id = 'F48-fault-runner-writes-pytests-summary-line-again'; tests = $runner; edits = @(, @($RUNNERFILE,
+      "    `$lines += `$line`n", "    `$lines += `"`$line -- `$(`$log | Select-Object -Last 1)`"`n")) },
   @{ id = 'F49-task-not-found-recognised-by-the-error-category-again'; tests = $sched; edits = @(, @($SCRIPT,
       "        if (`$_.FullyQualifiedErrorId -ne `$TaskNotFoundId) { `$none.unreadable = `$true }",
       "        if (`$_.CategoryInfo.Category -ne 'ObjectNotFound') { `$none.unreadable = `$true }")) },
@@ -212,7 +217,9 @@ $faults = @(
   @{ id = 'F53-fault-runner-does-not-check-that-a-file-was-put-back'; tests = $runner; edits = @(, @($RUNNERFILE,
       "      if (-not (Test-SameBytes `$p `$originals[`$p])) {", "      if (`$false) {")) },
   @{ id = 'F54-a-failed-delete-with-the-task-absent-says-deleted'; tests = $sched; edits = @(, @($SCRIPT,
-      "            if (`$gone -and `$deleteExit -ne 0) {", "            if (`$false) {")) }
+      "            if (`$gone -and `$deleteExit -ne 0) {", "            if (`$false) {")) },
+  @{ id = 'F55-the-exit-code-of-end-ignored-again'; tests = $sched; edits = @(, @($SCRIPT,
+      "    if (`$EndExit -ne 0 -and -not `$wasReady) {", "    if (`$false) {")) }
 )
 
 # Preflight: every file that any selected fault changes (and restores with git checkout) must be tracked and clean.
@@ -234,22 +241,20 @@ $status = @(git status --porcelain -- @targets 2>&1)
 if ($LASTEXITCODE -ne 0) { throw "Refusing to start: git status failed (exit $LASTEXITCODE), so uncommitted edits in the files a fault changes cannot be ruled out: $($status -join ' ')" }
 if ($status.Count -gt 0) { throw "Refusing to start: these files, which a fault changes and restores with git checkout, have uncommitted edits: $($targets -join ', '). Commit or stash them first." }
 
-function Get-FailureLines($XmlPath) {
-  # One row per failing test: its id and the first line of its failure, with every path replaced.
-  $rows = @()
-  if (-not (Test-Path -LiteralPath $XmlPath)) { return $rows }
-  $doc = [xml](Get-Content -LiteralPath $XmlPath -Raw)
-  foreach ($case in @($doc.testsuites.testsuite.testcase)) {
-    $bad = if ($case.failure) { $case.failure } elseif ($case.error) { $case.error } else { $null }
-    if ($null -eq $bad) { continue }
-    $message = ([string]$bad.message -split "`n")[0]
-    $message = [regex]::Replace($message, '[A-Za-z]:[\\/][^\s''"<>|]+', '<path>')
-    if ($message.Length -gt 200) { $message = $message.Substring(0, 200) + '...' }
-    $kind = if ($message -match '^(assert|AssertionError|Failed:)') { 'assertion' } else { 'exception' }
-    $id = (([string]$case.classname) -replace '\.', '/') + '.py::' + $case.name
-    $rows += [pscustomobject]@{ id = $id; kind = $kind; message = $message }
+function Get-Counts($XmlPath) {  # numbers only, from pytest's JUnit file: no test name or failure text; else unreadable
+  $none = @{ readable = $false }
+  if (-not (Test-Path -LiteralPath $XmlPath)) { return $none }
+  try { $suite = @(([xml](Get-Content -LiteralPath $XmlPath -Raw)).testsuites.testsuite)[0]; if ($null -eq $suite) { return $none } } catch { return $none }
+  $n = @{ readable = $true; assertion = 0; exception = 0 }
+  foreach ($key in 'tests', 'failures', 'errors', 'skipped') {
+    $value = 0
+    if (-not [int]::TryParse([string]$suite.GetAttribute($key), [ref]$value)) { return $none }
+    $n[$key] = $value
   }
-  return $rows
+  foreach ($case in @($suite.testcase | Where-Object { $_.failure })) {
+    if ([string]$case.failure.message -match '^(assert|AssertionError|Failed:)') { $n.assertion++ } else { $n.exception++ }
+  }
+  return $n
 }
 
 function Test-SameBytes([string]$Path, [byte[]]$Expected) {
@@ -258,7 +263,8 @@ function Test-SameBytes([string]$Path, [byte[]]$Expected) {
   return [Linq.Enumerable]::SequenceEqual([byte[]]$now, [byte[]]$Expected)
 }
 $notRestored = @()
-$lines = @("planted faults of #907: one result line each (caught = at least one test failed; every failing test is kept with the first line of its failure)")
+$lines = @("planted faults of #907: one result line each (caught = at least one test failed; only counts are kept, no pytest text)")
+$ran = 0  # the faults whose tests actually ran
 foreach ($f in $faults) {
   if ($Only -and $f.id -ne $Only) { continue }
   $files = @{}
@@ -287,21 +293,15 @@ foreach ($f in $faults) {
     if (-not $compiled) { $lines += "$($f.id): DOES NOT COMPILE"; continue }
     $xml = Join-Path ([IO.Path]::GetTempPath()) ("faults907-" + [guid]::NewGuid().ToString('N') + ".xml")
     $log = & $Python -m pytest @($f.tests) -q --no-header --tb=no -rfE -p no:cacheprovider "--basetemp=$BaseTemp" "--junitxml=$xml" 2>&1
-    $rows = @(Get-FailureLines $xml)
+    $c = Get-Counts $xml
     if (Test-Path -LiteralPath $xml) { Remove-Item -LiteralPath $xml }
-    $failed = @($log | Where-Object { $_ -match '^(FAILED|ERROR) ' })
-    $errors = @($failed | Where-Object { $_ -match '^ERROR ' }).Count
-    $exceptions = @($rows | Where-Object { $_.kind -eq 'exception' }).Count
-    $summary = ($log | Where-Object { $_ -match ' (passed|failed|error)' } | Select-Object -Last 1)
-    $verdict = if ($failed.Count -gt 0 -and $errors -eq 0) { 'CAUGHT' } elseif ($errors -gt 0) { 'ERROR (not a catch)' } else { 'NOT CAUGHT' }
-    if ($verdict -eq 'CAUGHT') {
-      $verdict += if ($exceptions -eq 0) { " (all $($rows.Count) by an assertion)" } else { " ($exceptions of $($rows.Count) by an exception at call time, $($rows.Count - $exceptions) by an assertion)" }
+    $verdict = if (-not $c.readable) { 'NO RESULT' } elseif ($c.tests - $c.skipped -le 0) { 'NO TESTS RAN' } elseif ($c.errors -gt 0) { 'ERROR (not a catch)' } elseif ($c.failures -gt 0) { 'CAUGHT' } else { 'NOT CAUGHT' }
+    $line = "$($f.id): $verdict"  # only the runner's own fault id, fixed words and numbers
+    if ($c.readable) {
+      $line += " -- ran $($c.tests), passed $($c.tests - $c.failures - $c.errors - $c.skipped), failed $($c.failures), errors $($c.errors), skipped $($c.skipped); failed by assertion $($c.assertion), by exception $($c.exception)"
+      if ($c.tests - $c.skipped -gt 0) { $ran++ }
     }
-    $lines += "$($f.id): $verdict -- $summary"
-    foreach ($row in $rows) {
-      $lines += "    $($row.id)"
-      $lines += "        [$($row.kind)] $($row.message)"
-    }
+    $lines += $line
   } finally {
     foreach ($p in $files.Keys) {
       git checkout -- ($p.Substring($Repo.Length).TrimStart('\', '/')) 2>&1 | Out-Null
@@ -318,6 +318,11 @@ if ($notRestored.Count -gt 0) {
   $lines += "NOT PUT BACK: $($notRestored -join ', ') could not be restored to the original bytes; check them with git diff before anything else"
   Set-Content -LiteralPath $Out -Value $lines -Encoding utf8
   throw "A planted fault could not be taken out of: $($notRestored -join ', ')"
+}
+if ($ran -eq 0) {
+  $lines += 'no selected fault was actually run: nothing was tested'
+  Set-Content -LiteralPath $Out -Value $lines -Encoding utf8
+  exit 1
 }
 $lines += 'done; every source file was put back (checked byte for byte against the original)'
 Set-Content -LiteralPath $Out -Value $lines -Encoding utf8
