@@ -43,6 +43,7 @@ import datetime
 import fnmatch
 import ntpath
 import os
+import re
 import shutil
 import stat
 import subprocess  # nosec B404 - every call site below uses a resolved-path argv list, shell disabled
@@ -138,7 +139,9 @@ class Candidate:
 @dataclasses.dataclass
 class JanitorReport:
     candidates: list[Candidate]
-    registered_worktrees: list[Path]
+    # The registered checkouts, or None when Git's list of them is UNKNOWN (it could not be had or read reliably, or
+    # it was not asked for: `registered_unknown` says why). Never `[]` for "could not tell": unknown decides nothing.
+    registered_worktrees: list[Path] | None
     dirty_worktrees: list[Path]
     foreign_kept: list[Path]
     # Discovery locations that could not even be LISTED or TRUSTED (an
@@ -153,10 +156,9 @@ class JanitorReport:
     # Candidates that a lane, launch or supervisor record still names (or whose use could not be checked), with the
     # reason. A preview only: `apply` reads the records again (#858).
     in_use: dict[Path, str] = dataclasses.field(default_factory=dict)
-    # False when Git's strict listing of the checkouts failed while the report was made, so `registered_worktrees` is
-    # the best-effort reader's answer: it may hold wrong paths (a name with an accent or U+2028) or miss a checkout.
-    # No safety decision may rest on it: `apply` keeps every folder that is not a link, as not checked (#858).
-    registered_strict: bool = True
+    # Why `registered_worktrees` is None: Git's reason on one line, or NOT_CHECKED when the scan stopped before the list
+    # was asked for. `apply` keeps every folder, links too, and prunes nothing (#901).
+    registered_unknown: str = ""
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -201,6 +203,13 @@ def _is_link_stat(st: os.stat_result) -> bool:
 def _os_error_text(exc: OSError) -> str:
     """The system's own words for an OSError, without its filename fields."""
     return exc.strerror or str(exc) or type(exc).__name__
+
+
+def _exception_text(exc: Exception) -> str:
+    """The words for any caught failure: an OSError by the system's own words (`_os_error_text`), anything else (a
+    subprocess timeout, another `SubprocessError`) by its own text, or its type's name when it has none. `strerror`
+    belongs to an OSError only: reading it from another exception is an AttributeError at the worst moment."""
+    return _os_error_text(exc) if isinstance(exc, OSError) else (str(exc) or type(exc).__name__)
 
 
 def _ancestor_ids(cfg: JanitorConfig) -> tuple[dict[Path, tuple[int, int] | None], list[tuple[Path, str]]]:
@@ -297,14 +306,11 @@ def _run_git(repo: Path, *args: str) -> str:
 
 
 def get_registered_worktrees(repo: Path) -> list[Path]:
-    """Best-effort: returns `[]` if git is unresolvable or the command
-    fails, the same as "no worktrees registered" to THIS function's own
-    callers (a dirty-worktree count and doctor's outside-scratch-root
-    warning, neither of which removes anything on the strength of this
-    result alone). Candidate discovery does NOT use this function: it goes by
-    `_registered_worktrees_listed`, which is strict and tells a failure from "none". Under a store fence, Git's
-    registration files are fenced first (`_fence_registrations`); when that refuses or fails, Git is not asked and the
-    answer is `[]`, as for a failed listing."""
+    """The old best-effort reader, kept only as the text reader that the strict one replaced: it returns `[]` when git
+    is unresolvable or fails, and it reads Git's text with the console's encoding. Nothing in the janitor or doctor
+    decides, counts or warns on it any more (#901): they go by `_strict_listing`, which tells a failure from "none".
+    Under a store fence, Git's registration files are fenced first (`_fence_registrations`); when that refuses or
+    fails, Git is not asked and the answer is `[]`, as for a failed listing."""
     try:
         _fence_registrations(repo)
     except (store_mod.StoreFenceError, _UseCheckFailed):
@@ -750,26 +756,23 @@ def build_report(cfg: JanitorConfig, listing: tuple[list[Path] | None, str] | No
     to exactly the paths that were checked, not to a second reading that could differ."""
     ancestor_ids, ancestor_errors = _ancestor_ids(cfg)
     if ancestor_errors:
-        return JanitorReport([], [], [], [], ancestor_errors)
+        # Discovery never ran and the list was never asked for: that is "not checked", not an empty list.
+        return JanitorReport([], None, [], [], ancestor_errors, registered_unknown=NOT_CHECKED)
     if listing is None:
         listing = _strict_listing(cfg.repo)  # the same reading as the comparison at the delete, and as discovery's
     candidates, access_errors = find_candidates(cfg, listing)
-    strict = listing[0] is not None
-    # When it failed: best effort, for the counts and the preview only. Discovery has refused what it cannot trust, and
-    # the old reader turns a name with an accent or U+2028 into a path that does not exist. `apply` decides nothing
-    # on it.
-    # Under a store fence, only a strict list is probed: the old reader's paths were never the ones the fence checked.
-    may_probe = strict or not os.environ.get(store_mod.STORE_FENCE_ENV)
-    # Under a fence the old reader is not asked either: the strict list failed, and Git's listing looks at every
-    # registration, so the report counts none (it says the list could not be read).
-    registered = listing[0] if strict else (get_registered_worktrees(cfg.repo) if may_probe else [])
+    # The one list for the whole report, or unknown. No fallback to another reader: with no list, nothing is counted,
+    # probed or concluded from it (dirty checkouts, what lies inside a candidate, what uses it), and `apply` removes
+    # nothing. Under a store fence the list was fenced at its source, so every path probed below is a checked one.
+    registered = listing[0]
+    known = registered is not None
     dirty = [
-        w for w in registered
-        if may_probe and not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
+        w for w in (registered or [])
+        if not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
     ]
     foreign = find_foreign_kept(cfg)
     in_use = {}
-    for c in candidates:
+    for c in candidates if known else []:
         targets = [] if c.link else _checkouts_under(c, registered, cfg)
         if targets:
             reason = _in_use_reason(cfg, targets)
@@ -779,7 +782,7 @@ def build_report(cfg: JanitorConfig, listing: tuple[list[Path] | None, str] | No
         candidates=candidates, registered_worktrees=registered,
         dirty_worktrees=dirty, foreign_kept=foreign, access_errors=access_errors,
         ancestor_ids=ancestor_ids,
-        in_use=in_use, registered_strict=strict,
+        in_use=in_use, registered_unknown="" if known else listing[1],
     )
 
 
@@ -822,20 +825,29 @@ def _in_use_reason(cfg: JanitorConfig, targets: list[Path]) -> str | None:
 
 
 def _use_check_failure(exc: Exception) -> str:
-    return f"could not check whether anything is using it: {_os_error_text(exc) if isinstance(exc, OSError) else exc}"
+    return f"could not check whether anything is using it: {_exception_text(exc)}"
 
 
 def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> str:
+    if report.registered_worktrees is None:
+        # An unknown list is never printed as a count: not 0, not the best-effort reader's number.
+        if report.registered_unknown == NOT_CHECKED:
+            registered_text = dirty_text = NOT_CHECKED
+        else:
+            registered_text, dirty_text = f"unknown ({report.registered_unknown})", "unknown"
+    else:
+        registered_text, dirty_text = str(len(report.registered_worktrees)), str(len(report.dirty_worktrees))
     lines = [
         f"agenttalk janitor  repo={cfg.repo}  tmp={cfg.tmp_root}  "
         f"scratch={cfg.scratch_root}  mode={'APPLY' if apply else 'REPORT'}",
-        f"candidates: {len(report.candidates)}   "
-        f"registered worktrees: {len(report.registered_worktrees)}",
-        f"dirty registered worktrees: {len(report.dirty_worktrees)}",
+        f"candidates: {len(report.candidates)}   registered worktrees: {registered_text}",
+        f"dirty registered worktrees: {dirty_text}",
     ]
-    if not report.registered_strict:
-        lines.append("Git could not list the registered checkouts reliably, so the counts above may be wrong and "
-                     "`--apply` keeps every folder as not checked: fix Git for this repository, then run it again.")
+    if report.registered_worktrees is None and report.registered_unknown != NOT_CHECKED:
+        lines.append(
+            "Which folders hold a checkout, or are in use, was not checked, so `--apply` keeps every folder (links "
+            f"included) and prunes nothing: {_listing_next_step(report.registered_unknown)}, then run it again."
+        )
     if report.dirty_worktrees:
         lines.append(
             "DIRTY includes checkouts that could not be fully checked; hidden tracked files are kept for inspection."
@@ -1153,7 +1165,9 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     """Run apply mode: WIP-commit dirty worktrees, remove candidates, prune.
     Returns the report text (same shape as report mode, plus the apply
     summary)."""
-    report.apply_failed = bool(report.access_errors)
+    # An unknown list of registered checkouts is a failed sweep even with nothing to remove, so that it cannot look like
+    # a successful one (#901).
+    report.apply_failed = bool(report.access_errors) or report.registered_worktrees is None
     lines = format_report(report, cfg, apply=True).splitlines()
 
     def refuse_ancestry(reason: str) -> str:
@@ -1187,11 +1201,12 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
             # point leaves what is at the path unestablished, and the report must not advise removing it by hand.
             unchecked = True
             reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
-            if reason is None and not c.link and not report.registered_strict:
-                # The report's list of checkouts is the best-effort reader's: it can name a checkout by a path that
-                # does not exist, so neither the ancestor protection nor the lookup of checkouts under a candidate
-                # could be trusted. Nothing is decided on it, in either direction of containment.
-                reason = str(_listing_failure("the listing the report was made from failed or could not be read"))
+            if reason is None and report.registered_worktrees is None:
+                # No list of the registered checkouts: neither the ancestor protection nor the lookup of checkouts
+                # under a candidate can be done, in either direction of containment. A link is only unlinked and never
+                # entered, but removing anything on an unknown list is a decision made blind: nothing is removed,
+                # unlinked or committed (#901; #858 had exempted links).
+                reason = _listing_message(report.registered_unknown, when="start")
             if reason is not None:
                 result = "FAILED"
             else:
@@ -1363,9 +1378,26 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         lines.append(f"FAILED: worktree prune skipped: {prune_blocked}")
     else:
         reason = _ancestor_change_reason(report.ancestor_ids)
-        if reason is None:
+        if reason is None and report.registered_worktrees is None:
+            # Git forgets a checkout whose folder is gone: pruning on an unknown list decides that blind too.
+            lines.append(
+                f"FAILED: worktree prune skipped: the registered checkouts are unknown ({report.registered_unknown})"
+            )
+        elif reason is None:
             _run_git(cfg.repo, "worktree", "prune")
-            lines.append(f"registered worktrees after prune: {len(get_registered_worktrees(cfg.repo))}")
+            try:
+                after, why = _strict_listing(cfg.repo)  # the same strict reading: a failed one is unknown, not a 0
+                next_step = _listing_next_step(why) if after is None else ""
+            except store_mod.StoreFenceError as exc:
+                # A registration outside the fence appeared after the prune: the count is unknown, and the report of
+                # what the sweep did is still printed, with the refusal in it.
+                after, why = None, f"the store fence refused a path: {exc}"
+                next_step = "look at that registration before you run the sweep again"
+            if after is None:
+                report.apply_failed = True
+                lines.append(f"registered worktrees after prune: unknown ({why}); {next_step}")
+            else:
+                lines.append(f"registered worktrees after prune: {len(after)}")
         else:
             report.apply_failed = True
             lines.append(f"FAILED: worktree prune skipped: {reason}")
@@ -1389,12 +1421,41 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     return "\n".join(store_mod.report_line(line) for line in lines)
 
 
+NOT_CHECKED = "not checked"  # a report's `registered_unknown` when the list was never asked for
+# `why` of a Git that does not know `-z` for `worktree list` (before Git 2.36): the next step is then an upgrade.
+_OLD_GIT = "this Git does not know the `-z` form of `git worktree list` that janitor needs (Git 2.36 or newer)"
+_UNKNOWN_SWITCH = re.compile(r"unknown (switch|option)\W{0,3}z\b", re.IGNORECASE)
+
+
+def _one_line(text: str, limit: int = 200) -> str:
+    """Git's own words as one short line that cannot start a line of its own or hide a character: a control character,
+    a line or paragraph separator or an invisible mark is written out (`\\x1b`, `\\u2028`); it is cut to `limit`."""
+    flat = " ".join(store_mod.escape_controls(text).split())
+    return flat if len(flat) <= limit else flat[:limit] + "..."
+
+
+def _listing_next_step(why: str) -> str:
+    """What to do about a list of the registered checkouts that could not be had, in words that name the strict form
+    janitor reads (`git worktree list --porcelain -z`), not the plain one: it may work where this one does not."""
+    if why.startswith(_OLD_GIT):
+        return "upgrade Git to 2.36 or newer, which can list the checkouts in the form janitor needs"
+    return ("fix Git for this repository: `git worktree list --porcelain -z` (Git 2.36 or newer) must work there; "
+            "if it reports dubious ownership for a repository you trust, review the `safe.directory` setting")
+
+
+def _listing_message(why: str, *, when: str) -> str:
+    """One failure text for every place that needs the list of checkouts and could not have it. `when` is where it
+    was needed: "start" (the first list, for the whole sweep) or "delete" (the second look made at the removal)."""
+    before = " to compare them before the delete" if when == "delete" else ""
+    head = "could not list the registered checkouts" + before
+    kept = "it was kept" if when == "delete" else "it was kept and nothing was removed"
+    return (f"{head} ({why}); {kept}. Git could not list this repository's checkouts, so nothing shows that this "
+            f"folder holds none, or lies inside one: {_listing_next_step(why)}, then run the sweep again")
+
+
 def _listing_failure(why: str) -> "_UseCheckFailed":
-    failed = _UseCheckFailed(
-        f"could not list the registered checkouts to compare them before the delete ({why}); it was kept. "
-        "Git could not list this repository's checkouts, so nothing shows that this folder holds none: fix Git "
-        "for it (`git worktree list` must work there), then run the sweep again")
-    failed.why = why  # discovery reports this plain reason, without the advice about the delete
+    failed = _UseCheckFailed(_listing_message(why, when="delete"))
+    failed.why = why  # discovery and the report show this plain reason, each with its own words around it
     return failed
 
 
@@ -1430,16 +1491,25 @@ def _parse_worktree_list_z(out) -> list[Path]:
 
 def _registered_worktrees_listed(repo: Path) -> list[Path]:
     """Git's list of registered worktrees, or `_UseCheckFailed` when it could not be had or read reliably.
-    `get_registered_worktrees` answers `[]` for a failed listing on purpose (its callers remove nothing on that answer),
-    and reads text with the console's encoding; a comparison that reads either as "none registered" would miss a
-    checkout that appeared since the first look. This one reads bytes with NUL boundaries (`-z`). Under a fence, Git's
-    own registration files are fenced first (`_fence_registrations`): Git's listing looks at every path they name."""
+    The text reader (`get_registered_worktrees`) answers `[]` for a failed listing and reads text with the console's
+    encoding; a list that reads either as "none registered" would hide a checkout. This one reads bytes with NUL
+    boundaries (`-z`), and every caller, the first list and the later ones, goes by it. Its reason is one line:
+    Git's own words are cut and any control character is written out. Under a fence, Git's own registration files
+    are fenced first (`_fence_registrations`): Git's listing looks at every path they name."""
     _fence_registrations(repo)
-    rc, out, err = _run_git_checked(repo, "worktree", "list", "--porcelain", "-z", raw=True)
+    try:
+        rc, out, err = _run_git_checked(repo, "worktree", "list", "--porcelain", "-z", raw=True)
+    except (OSError, subprocess.SubprocessError) as exc:  # Git is there but could not be run
+        raise _listing_failure(f"git could not be run: {_one_line(_exception_text(exc))}") from exc
     if rc is None or rc != 0:
         if isinstance(err, bytes):
             err = err.decode("utf-8", "replace")
-        why = "git is not resolvable" if rc is None else f"git worktree list failed, rc={rc}: {err.strip()[:200]}"
+        if rc is None:
+            why = "git is not resolvable"
+        elif rc == 129 and _UNKNOWN_SWITCH.search(err):  # Git's usage error for an option it does not have
+            why = f"{_OLD_GIT} (rc={rc})"
+        else:
+            why = f"git worktree list failed, rc={rc}: {_one_line(err)}"
         raise _listing_failure(why)
     paths = _parse_worktree_list_z(out)
     # Fenced at the source: under AGENTTALK_STORE_FENCE every reading of the registered checkouts, the first and every

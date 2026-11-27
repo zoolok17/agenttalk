@@ -1565,7 +1565,11 @@ def test_p7_own_worktree_with_missing_admin_entry_survives(tmp_path):
         repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
         foreign=[], default_branches=["master", "main"],
     )
-    assert wt not in set(janitor.get_registered_worktrees(repo))  # git no longer lists it
+    listed = janitor.get_registered_worktrees(repo)
+    # The reader answers [] when it fails, so a bare "not in" would pass for a broken reader: the main checkout must
+    # be there, and only the pruned one gone.
+    assert any(janitor._same_worktree(path, repo) for path in listed), listed
+    assert wt not in set(listed)  # git no longer lists it
     candidates, access_errors = janitor.find_candidates(cfg)
     assert wt not in {c.path for c in candidates}
     assert any(p == wt for p, _reason in access_errors)

@@ -2187,7 +2187,7 @@ def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
         patch.setattr(janitor, "_ancestor_change_reason", lambda *args: None)
         patch.setattr(janitor, "_path_change_reason", lambda *args: name)
         patch.setattr(janitor, "_run_git", lambda *args: None)
-        patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+        patch.setattr(janitor, "_strict_listing", lambda *args: ([], ""))
         checked(janitor.apply(cfg, report))
 
     # Exercise successful removal summaries and the separate prune-refusal line.
@@ -2202,7 +2202,7 @@ def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
         patch.setattr(janitor, "_path_change_reason", lambda *args: None)
         patch.setattr(janitor, "remove_plainly", lambda *args: ("removed", None))
         patch.setattr(janitor, "_run_git", lambda *args: None)
-        patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+        patch.setattr(janitor, "_strict_listing", lambda *args: ([], ""))
         checked(janitor.apply(cfg, clean))
 
     # The WIP/refused path is a separate source of user-controlled report text.
@@ -2232,7 +2232,7 @@ def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
         patch.setattr(janitor.subprocess, "run", index_read)
         patch.setattr(janitor, "wip_commit_dirty_worktree", lambda *args, **kwargs: janitor.WipCommitResult(name, True))
         patch.setattr(janitor, "_run_git", lambda *args: None)
-        patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+        patch.setattr(janitor, "_strict_listing", lambda *args: ([], ""))
         # A candidate equal to its worktree reaches the WIP decision.
         report.candidates = [janitor.Candidate(path, 0, "repo-dir")]
         patch.setattr(janitor, "_contains_worktree", lambda a, b: a == b)
