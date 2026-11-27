@@ -500,12 +500,12 @@ def test_a_failed_deletion_of_the_task_is_not_a_success(tmp_path, shell):
 def test_a_finished_log_is_not_accepted_when_the_wait_ends_with_the_task_still_running(tmp_path, shell):
     """The wait of `-Mode Run`, end to end: the log is finished, but the scheduler keeps showing the task as Running
     until the time limit. The limit must not turn that into an acceptance: exit code 2, no accepted copy, and the task
-    is kept, as its stop is not confirmed (#920)."""
+    is not deleted, as its stop is not confirmed (#920)."""
     done, out, _ = run_with_a_stand_in_scheduler(tmp_path, shell, state="Running", seconds=1)
     assert done.returncode == 2, done.stdout + done.stderr
     assert "NO COMPLETION EVIDENCE FROM THE SCHEDULER" in done.stdout
     assert not (out / "interactive-accepted.log").exists()
-    assert "task kept: its stop is not confirmed" in done.stdout
+    assert "task not deleted: its stop is not confirmed" in done.stdout
 
 
 # --- a scheduler that cannot be read is not a task that is gone (round 14) -------------------------------------
