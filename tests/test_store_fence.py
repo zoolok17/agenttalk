@@ -4314,3 +4314,40 @@ def test_under_the_store_fence_a_unc_record_is_kept_and_never_looked_at_on_relea
         assert prunes, "the prune was not called: the sweep stopped"
         # The count after the prune is read from the strict list (#901), not from the old text reader.
         assert {"_ancestor_change_reason", "_registered_worktrees_listed"} <= set(after), after
+
+
+
+@pytest.mark.parametrize("row", ["gitdir", "commondir", "dot-git"])
+def test_a_registration_text_with_a_nul_is_an_ordinary_listing_failure(fenced, row):
+    """#928: one of Git's registration texts (a registration's gitdir, a checkout's commondir or its .git file) names
+    a path with a NUL in it. Python cannot look at such a path, so the list is not reliable: every reader gives the
+    usual listing failure (release keeps the checkout, the command gives the fence's refusal), never a raw error."""
+    from agenttalk import janitor, worktree_release
+
+    fence, _, report = fenced
+    repo, done = _swept_checkout(fence.resolve())
+    git_dir = Path((done / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip())
+    damaged = {"gitdir": repo / ".git" / "worktrees" / "nul-entry" / "gitdir", "commondir": git_dir / "commondir",
+               "dot-git": done / ".git"}[row]
+    if row == "gitdir":
+        _write_late_registration(damaged.parent, done)
+    data = {"gitdir": str(done / ".git").encode(), "commondir": b"../.."}.get(row, damaged.read_bytes().rstrip())
+    with damaged.open("r+b") as file:  # in place: Git for Windows hides a checkout's .git file (no replacing it)
+        file.write(data + b"\0x\n")
+        file.truncate()
+    listed = repo if row == "gitdir" else done
+
+    paths, why = janitor._strict_listing(listed)
+
+    assert paths is None and "NUL" in why and damaged.name in why and damaged.parent.name in why, why
+    assert janitor.get_registered_worktrees(listed) == []
+    if row != "gitdir":
+        return
+    code, text = worktree_release.release(janitor.JanitorConfig.load(repo), done)
+    assert code == 1 and "could not be checked" in text and "NUL" in text and "nothing released" in text, text
+    assert "embedded null" not in text, text
+    for mode in ([], ["--apply"], ["--release", str(done)]):
+        assert cli.main(["--root", str(repo), "janitor", *mode]) == 2
+    assert (done / ".git").exists() and (done / "source.txt").exists()
+    lines = report.read_text(encoding="utf-8").split("\n")[:-1]
+    assert len(lines) == 3 and all("registered checkouts" in x and x.endswith(_UNPLACED) for x in lines), lines
