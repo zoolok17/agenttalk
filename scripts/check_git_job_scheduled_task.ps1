@@ -194,12 +194,15 @@ function Resolve-Cleanup {
     # there after the delete, or that the scheduler could not be asked about (the absence is not established), is a
     # failed cleanup: the accepted evidence stays, but the exit code is not 0 (4 when the run itself was accepted,
     # otherwise the run's own code, which wins) and the text says how to delete the task by hand. So is a stop of the
-    # task that is not confirmed (-StopNotConfirmed, #920): that task was kept, and the text says how to end and delete it.
+    # task that is not confirmed (-StopNotConfirmed, #920): that task was not deleted, and the text says what is left to do.
     param($Judged, [int]$DeleteExit, [bool]$StillExists, [bool]$Unreadable = $false, [string]$Name, [string]$StopNotConfirmed = '')
-    $stop = if ($StopNotConfirmed) { " | TASK STOP NOT CONFIRMED ($StopNotConfirmed), so the task was kept: look with schtasks /Query /TN $Name, end it with schtasks /End /TN $Name, then delete it with schtasks /Delete /TN $Name /F, and do not run this check again before it is gone (Ready is the scheduler's own state; programs the task started are not checked here)" } else { '' }
+    $how = "schtasks /Delete /TN $Name /F"
+    $left = if ($Unreadable) { "the scheduler could not be read, so it is not known whether the task is still there: look with schtasks /Query /TN $Name first; if it is, end it with schtasks /End /TN $Name, then delete it with $how" }
+        elseif ($StillExists) { "look with schtasks /Query /TN $Name, end it with schtasks /End /TN $Name, then delete it with $how" }
+        else { "the scheduler shows no task named $Name any more, so it cannot be ended by name: end any program it started that still runs (powershell.exe running this script with -Mode Task, and the Python it started)" }
+    $stop = if ($StopNotConfirmed) { " | TASK STOP NOT CONFIRMED ($StopNotConfirmed), and this script did not delete the task: $left; do not run this check again before it has ended (Ready is the scheduler's own state; programs the task started are not checked here)" } else { '' }
     if ($stop) { return @{ code = $(if ($Judged.code -eq 0) { 4 } else { $Judged.code }); text = "$($Judged.text)$stop" } }
     if (-not $StillExists -and -not $Unreadable) { return $Judged }
-    $how = "schtasks /Delete /TN $Name /F"
     $text = if ($StillExists) {
         "TASK NOT DELETED (schtasks /Delete returned $DeleteExit and the task is still there): delete it yourself with $how, and do not run this check again before it is gone"
     } else {
@@ -301,11 +304,11 @@ function Invoke-OneRun {
             $stillThere = [bool]$after.exists
             $unreadable = [bool]$after.unreadable  # the scheduler could not be asked: the task is NOT known to be gone
             $gone = -not $stillThere -and -not $unreadable
-            if ($stop) { Write-Host "[$Label] task kept: its stop is not confirmed" } elseif ($gone -and $deleteExit -ne 0) {
+            if ($gone -and $deleteExit -ne 0) {
                 # The scheduler says the task is not there, but the delete command itself failed: it is not "deleted".
                 Write-Host "[$Label] task absent (delete command failed, schtasks returned $deleteExit; the scheduler confirms that the task is not there)"
             } else {
-                Write-Host "[$Label] task deleted: $gone"
+                Write-Host "[$Label] $(if ($stop) { 'task not deleted: its stop is not confirmed' } else { "task deleted: $gone" })"
             }
             $judged = Resolve-Cleanup -Judged $judged -DeleteExit $deleteExit -StillExists $stillThere -Unreadable $unreadable -Name $TaskName -StopNotConfirmed $stop
             if ($stop) { $gone = $false }  # no next run beside a task whose stop is not confirmed

@@ -288,6 +288,7 @@ function Get-TaskFacts {
     $state = if ($script:stub.ended -and $env:STUB_STATE_AFTER_END) { $env:STUB_STATE_AFTER_END }
              elseif ($env:STUB_TASK_STATE) { $env:STUB_TASK_STATE } else { 'Ready' }
     if ($state -eq 'unreadable') { return @{ exists = $false; unreadable = $true; status = 'unknown' } }
+    if ($state -eq 'absent') { return @{ exists = $false; unreadable = $false; status = 'unknown' } }
     return @{ exists = $true; unreadable = $false; status = $state; logon = 'a stand-in'; result = '0' }
 }
 function Invoke-Schtasks {
@@ -400,6 +401,8 @@ STOP_CASES = [
     pytest.param("Running", 1, "Ready", 2, False, id="D-end-failed-then-ready"),
     pytest.param("Ready", 1, "Ready", 0, True, id="E-control-already-finished"),
     pytest.param("Running", 0, "Ready", 2, True, id="F-control-a-good-stop"),
+    pytest.param("Running", 1, "absent", 2, False, id="G-end-failed-task-gone"),
+    pytest.param("Running", 1, "unreadable", 2, False, id="H-end-failed-scheduler-unreadable"),
 ]
 
 
@@ -421,9 +424,14 @@ def test_a_stop_of_the_task_that_is_not_confirmed_fails_the_run_and_the_next_run
     assert ("TASK STOP NOT CONFIRMED" in done.stdout) is not second, text
     assert len([call for call in calls if call.startswith("/Delete")]) == (2 if second else 0), calls
     if not second:
-        assert "task kept" in done.stdout, text
-        for step in ("/Query", "/End", "/Delete"):
-            assert f"schtasks {step} /TN stub-task" in done.stdout, text
+        assert "task not deleted" in done.stdout and "this script did not delete the task" in done.stdout, text
+        steps = [f"schtasks {step} /TN stub-task" for step in ("/Query", "/End", "/Delete")]
+        if after_end == "absent":  # no task is left to end by name
+            assert "no task named stub-task any more" in done.stdout, text
+            assert not any(step in done.stdout for step in steps), text
+        else:
+            assert all(step in done.stdout for step in steps), text
+            assert ("could not be read" in done.stdout) is (after_end == "unreadable"), text
 
 
 @pytest.mark.parametrize("shell", SHELLS, ids=lambda path: Path(path).stem.lower())
