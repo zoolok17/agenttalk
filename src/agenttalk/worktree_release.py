@@ -989,6 +989,7 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
         default = _fresh_default(cfg.repo, origin)
         _unchanged(ids)
         paths = [Path(target).absolute()] if target is not None else list(_registered(cfg.repo))
+        failed = 0  # the report's checks that broke with an unexpected error (#909)
         for path in paths:
             try:
                 _unchanged(ids)
@@ -1014,9 +1015,14 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:
+                if target is None and not isinstance(exc, Refused):  # a check that broke: not an ordinary keep
+                    failed += 1
+                    exc = janitor._could_not_check(exc)
                 lines.append(f"KEPT {path}: {exc}")
                 if target is not None:
                     return 1, "\n".join(store_mod.report_line(line) for line in lines)
-        return 0, "\n".join(store_mod.report_line(line) for line in lines)
+        if failed:
+            lines.append(f"could not check: {failed}")
+        return (1 if failed else 0), "\n".join(store_mod.report_line(line) for line in lines)
     except (Refused, OSError, ValueError, TypeError) as exc:
         return 1, store_mod.report_line(f"FAILED: {exc}; nothing released")

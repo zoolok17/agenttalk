@@ -59,7 +59,7 @@ def test_the_sweep_keeps_a_clean_checkout_that_a_record_still_names(estate, kind
 
     report = janitor.build_report(cfg)
     preview = janitor.format_report(report, cfg, apply=False)
-    assert f"REFUSED (kept) {lane}" in preview, preview
+    assert f"KEPT {lane}" in preview and "REFUSED" not in preview, preview  # #909: the preview says KEPT
     applied = janitor.apply(cfg, report)
 
     assert f"REFUSED (kept) {lane}" in applied, applied
@@ -160,7 +160,7 @@ def test_a_damaged_record_keeps_every_checkout_and_says_it_could_not_be_read(est
     preview = janitor.format_report(report, cfg, apply=False)
     applied = janitor.apply(cfg, report)
 
-    assert f"REFUSED (kept) {lane}" in preview and "could not read" in preview, preview
+    assert f"KEPT {lane}" in preview and "could not read" in preview and "could not check: 0" in preview, preview
     assert lane.exists() and f"REFUSED (kept) {lane}" in applied and "could not read" in applied, applied
 
 
@@ -209,7 +209,7 @@ def test_a_record_that_appears_after_the_preview_is_found_by_apply(estate):
     repo, wt, cfg = estate
     lane = checkout(repo, "l1")
     report = janitor.build_report(cfg)
-    assert "REFUSED" not in janitor.format_report(report, cfg, apply=False)
+    assert f"KEPT {lane}" not in janitor.format_report(report, cfg, apply=False)  # nothing kept it yet
     _write_record(repo, "active-lane", lane)
 
     text = janitor.apply(cfg, report)
@@ -297,8 +297,8 @@ def test_one_lane_that_names_two_checkouts_of_a_parent_does_not_refuse_itself(es
 def test_a_failed_check_is_a_failure_and_a_kept_checkout_is_not(estate, monkeypatch):
     repo, wt, cfg = estate
     lane = checkout(repo, "l1")
+    report = janitor.build_report(cfg)  # the preview check passes; apply's own check then breaks (#909)
     monkeypatch.setattr(worktree_release, "_activity", lambda *args: (_ for _ in ()).throw(OSError(5, "unreadable")))
-    report = janitor.build_report(cfg)
 
     text = janitor.apply(cfg, report)
 
@@ -315,7 +315,7 @@ def test_the_command_keeps_an_active_checkout_and_exits_clean(estate, capsys):
     assert main(["--root", str(repo), "janitor", "--apply"]) == 0
     applied = capsys.readouterr().out
 
-    assert f"REFUSED (kept) {lane}" in preview and f"REFUSED (kept) {lane}" in applied, (preview, applied)
+    assert f"KEPT {lane}" in preview and f"REFUSED (kept) {lane}" in applied, (preview, applied)
     assert lane.exists()
 
 
@@ -471,7 +471,7 @@ def test_the_preview_lists_every_kept_checkout_even_past_the_display_limit(estat
     preview = janitor.format_report(report, cfg, apply=False)
 
     assert len(report.candidates) == 17
-    assert f"REFUSED (kept) {busy}" in preview, preview
+    assert f"KEPT {busy}" in preview, preview
     assert "and 1 more" in preview, preview  # 17 candidates: 15 listed by age, the kept one named, one left over
 
 
@@ -839,8 +839,8 @@ def test_every_refusal_for_an_active_use_says_what_to_do_next(estate, kind):
     preview = janitor.format_report(report, cfg, apply=False)
     applied = janitor.apply(cfg, report)
 
-    for text in (preview, applied):
-        line = next(line for line in text.splitlines() if f"REFUSED (kept) {lane}" in line)
+    for text, kept in ((preview, "KEPT"), (applied, "REFUSED (kept)")):
+        line = next(line for line in text.splitlines() if f"{kept} {lane}" in line)
         assert "leave it until what uses it has finished" in line and "then run the sweep again" in line, line
     assert lane.exists()
 
@@ -853,8 +853,8 @@ def test_a_held_lane_session_refusal_says_what_to_do_next(estate):
         report = janitor.build_report(cfg)
         preview = janitor.format_report(report, cfg, apply=False)
         applied = janitor.apply(cfg, report)
-    for text in (preview, applied):
-        line = next(line for line in text.splitlines() if f"REFUSED (kept) {lane}" in line)
+    for text, kept in ((preview, "KEPT"), (applied, "REFUSED (kept)")):
+        line = next(line for line in text.splitlines() if f"{kept} {lane}" in line)
         assert "then run the sweep again" in line, line
 
 
@@ -1123,6 +1123,133 @@ def test_a_failed_strict_list_at_discovery_keeps_everything_under_worktrees_as_n
     assert any(path == repo / ".worktrees" for path, _why in errors), errors
     assert report.registered_worktrees is None and (plain / "note.txt").read_text() == "kept", text
 
+
+
+# --- #909: a check that breaks is "could not check", counted, and fails the report; apply leaves the candidate ------
+
+BROKEN = OSError(5, "denied\x1b[31m\nFAILED forged")
+
+
+def break_checks_of(monkeypatch, *names):
+    """`check_unused` raises BROKEN for any checkout named in `names`; the others are checked as usual. Returns the
+    list of checkouts each call was asked about."""
+    real, asked = worktree_release.check_unused, []
+
+    def check(cfg, targets):
+        asked.append([t.name for t in targets])
+        if any(t.name in names for t in targets):
+            raise BROKEN
+        return real(cfg, targets)
+
+    monkeypatch.setattr(worktree_release, "check_unused", check)
+    return asked
+
+
+def a_crowd_of_old_folders(repo, count=16):
+    """Plain, old candidates that fill the 15 lines the preview lists by age."""
+    for number in range(count):
+        folder = repo / ".worktrees" / f"plain-{number:02d}"
+        folder.mkdir(parents=True)
+        os.utime(folder, (1_000_000_000 + number, 1_000_000_000 + number))
+
+
+def test_report_counts_and_lists_failed_checks(estate, monkeypatch, capsys):
+    """Two candidates, each with an active checkout and one whose check breaks (in both orders), past the display
+    limit: each failed checkout gets one typed line, the count is two, the report fails, and neither candidate is
+    shown as one that would go. A checkout under two candidates is counted once."""
+    repo, wt, cfg = estate
+    a_crowd_of_old_folders(repo)
+    active_a, failed_b = checkout(repo, "g1", "a"), checkout(repo, "g1", "b")
+    failed_c, active_d = checkout(repo, "g2", "c"), checkout(repo, "g2", "d")
+    _write_record(repo, "active-lane", active_a)
+    _write_record(repo, "active-lane", active_d)
+    break_checks_of(monkeypatch, "b", "c")
+    real_under = janitor._checkouts_under
+    monkeypatch.setattr(janitor, "_checkouts_under", lambda c, *rest: real_under(c, *rest) + (
+        [failed_c] if c.path.name == "g1" else []))  # c lies under both candidates
+
+    code = main(["--root", str(repo), "janitor"])
+
+    out = capsys.readouterr().out
+    assert code == 1, out
+    for failed in (failed_b, failed_c):
+        assert out.count(f"KEPT {failed}: could not check (OSError): ") == 1, out
+    assert "could not check: 2" in out and "\x1b" not in out and "\nFAILED forged" not in out, out
+    for group in ("g1", "g2"):
+        assert not [line for line in out.splitlines() if line.endswith(group) and "KEPT" not in line], out
+
+
+@pytest.mark.parametrize("where", ["the-loop", "the-early-return"])
+def test_apply_keeps_preview_failure_even_if_later_check_would_pass(estate, monkeypatch, where):
+    """The preview's check broke; by the time apply runs it would pass. Apply must still leave that candidate (and a
+    candidate holding an active checkout beside a failed one): no commit, no removal; it shows the failure lines, the
+    count and the not-checked heading, and fails. An unaffected candidate is still swept."""
+    repo, wt, cfg = estate
+    failed = checkout(repo, "x")
+    (failed / "source.txt").write_text("unsaved\n")
+    active, mixed_failed = checkout(repo, "g", "a"), checkout(repo, "g", "b")
+    _write_record(repo, "active-lane", active)
+    plain = repo / ".worktrees" / "plain"
+    plain.mkdir()
+    os.utime(plain, (1_000_000_000, 1_000_000_000))
+    asked = break_checks_of(monkeypatch, "x", "b")
+    report = janitor.build_report(cfg)
+    monkeypatch.setattr(worktree_release, "check_unused", lambda *args: None)  # a later check would pass
+    if where == "the-early-return":
+        monkeypatch.setattr(janitor, "_ancestor_change_reason", lambda ids: "a scanned root changed (test)")
+
+    text = janitor.apply(cfg, report)
+
+    assert asked and failed.exists() and mixed_failed.exists() and active.exists(), text
+    assert (failed / "source.txt").read_text() == "unsaved\n" and "WIP committed" not in text, text
+    assert f"KEPT {failed}: could not check (OSError): " in text and "could not check: 2" in text, text
+    assert report.apply_failed, text
+    if where == "the-loop":
+        assert "kept, not removed, and not checked" in text and not plain.exists(), text
+
+
+def test_link_candidate_is_not_checked_or_counted(estate, tmp_path, monkeypatch):
+    repo, wt, cfg = estate
+    link = repo / ".probe-link"
+    directory_link(link, wt)  # a link that leads to a checkout: only the link would go, nothing is followed
+    asked = break_checks_of(monkeypatch, "done", ".probe-link")
+    report = janitor.build_report(cfg)
+
+    preview = janitor.format_report(report, cfg, apply=False)
+
+    assert any(c.path == link and c.link for c in report.candidates) and asked == [], asked
+    assert "could not check: 0" in preview, preview
+
+
+
+@pytest.mark.parametrize("form", ["fence-refused-record", "fence-error"])
+def test_a_fence_refusal_in_the_preview_stops_the_sweep_even_beside_a_failed_check(estate, monkeypatch, form):
+    """#909 round 2: one checkout of a candidate is refused by the store fence in the preview, the other's check
+    breaks. The fence refusal must not be lost under the failure: apply stops the sweep there, as for any fence
+    refusal, so no later candidate is looked at and nothing is pruned."""
+    repo, wt, cfg = estate
+    a, b = checkout(repo, "g", "a"), checkout(repo, "g", "b")
+    later = repo / ".worktrees" / "zz-later"  # an old plain folder after the candidate: it would be removed
+    later.mkdir()
+    os.utime(later, (1_000_000_000, 1_000_000_000))
+    error = (worktree_release.FenceRefused("the record names a path outside the fence (test)") if form ==
+             "fence-refused-record" else janitor.store_mod.StoreFenceError("refusing a path (test)"))
+    real_check, real_run, prunes = worktree_release.check_unused, janitor._run_git, []
+
+    def check(cfg_, targets):
+        if targets[0].name in ("a", "b"):
+            raise error if targets[0].name == "a" else OSError(5, "unreadable (test)")
+        return real_check(cfg_, targets)
+
+    monkeypatch.setattr(worktree_release, "check_unused", check)
+    report = janitor.build_report(cfg)
+    monkeypatch.setattr(janitor, "_run_git", lambda where, *args: prunes.append(args) if args[:2] == (
+        "worktree", "prune") else real_run(where, *args))
+
+    text = janitor.apply(cfg, report)
+
+    assert "the sweep stopped: the store fence refused a path" in text and report.apply_failed, text
+    assert prunes == [] and later.exists() and a.exists() and b.exists(), text
 
 
 @pytest.mark.parametrize("lane_id", ["/../../../../pwn", "done-lane"], ids=["unsafe-id", "valid-id"])

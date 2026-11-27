@@ -3631,7 +3631,7 @@ def _sweep_with_step_spies(
     real_apply = janitor.apply
 
     def apply(*args, **kwargs):
-        state["refused"] = False  # the report that came first reads the records too; only what apply does is counted
+        state["preview"], state["refused"] = state["refused"], False  # the preview reads the records too (#909: kept)
         return real_apply(*args, **kwargs)
 
     monkeypatch.setattr(janitor, "apply", apply)
@@ -3698,7 +3698,7 @@ def test_a_refusal_by_the_fence_stops_the_sweep_however_it_reaches_apply(
     rc = cli.main(["--root", str(repo), "janitor", "--apply"])
 
     text = capsys.readouterr().out
-    assert calls["sweep"] >= 2 and state["refused"], "the refusal never happened, so nothing was tested"
+    assert calls["sweep"] >= 2 and (state["refused"] or state["preview"]), "the refusal never happened: nothing tested"
     assert prunes == [], "git worktree prune ran after the fence refused a path"
     assert after == [], f"steps that ran after the refusal: {after}"
     assert rc == 1, text
