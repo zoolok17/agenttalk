@@ -1221,6 +1221,41 @@ def test_link_candidate_is_not_checked_or_counted(estate, tmp_path, monkeypatch)
     assert "could not check: 0" in preview, preview
 
 
+def fail(error):
+    raise error
+
+
+def raises(error, real=worktree_release.check_unused):  # #941: x's check raises `error`, others run as usual
+    return lambda cfg, targets: fail(error) if targets[0].name == "x" else real(cfg, targets)
+
+
+@pytest.mark.parametrize("args", [[], ["--apply"]], ids=["report", "apply"])
+@pytest.mark.parametrize("error, code", [(RuntimeError("broke (test)"), 1), (KeyboardInterrupt(), 130)])
+def test_941_any_ordinary_error_of_the_check_is_could_not_check(estate, monkeypatch, capsys, args, error, code):
+    """#941: an ordinary error (RuntimeError) is "could not check" like an OSError; an interruption stops the run."""
+    repo, wt, cfg = estate
+    broken = checkout(repo, "x")
+    monkeypatch.setattr(worktree_release, "check_unused", raises(error))
+    out = (main(["--root", str(repo), "janitor", *args]), capsys.readouterr().out)
+    assert out[0] == code and broken.exists(), out
+    assert ("could not check: 1" in out[1] and f"KEPT {broken}: could not check (RuntimeError): broke (test)" in out[1]
+            ) is (code == 1), out
+
+
+@pytest.mark.parametrize("step", ["claim", "last-look"])
+def test_941_apply_keeps_a_checkout_whose_own_check_breaks_with_any_ordinary_error(estate, monkeypatch, step):
+    repo, wt, cfg = estate
+    broken = checkout(repo, "x")
+    report = janitor.build_report(cfg)
+    class Guard(contextlib.nullcontext):  # apply's own checks: the lanes' claims, and the last look at the removal
+        def __init__(self, *args, **kwargs):
+            super().__init__() if step == "last-look" else fail(LookupError("broke (test)"))
+        final_window = contextlib.nullcontext
+        reread = staticmethod(lambda: fail(LookupError("broke (test)")))
+    monkeypatch.setattr(worktree_release, "RemovalGuard", Guard)
+    text = janitor.apply(cfg, report)
+    assert broken.exists() and report.apply_failed and "using it: broke (test)" in text, text
+
 
 @pytest.mark.parametrize("form", ["fence-refused-record", "fence-error"])
 def test_a_fence_refusal_in_the_preview_stops_the_sweep_even_beside_a_failed_check(estate, monkeypatch, form):

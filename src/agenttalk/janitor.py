@@ -832,7 +832,7 @@ def _in_use_reason(cfg: JanitorConfig, targets: list[Path]) -> tuple[str, str] |
         worktree_release.check_unused(cfg, targets)
     except worktree_release.Refused as exc:
         return ("fence" if isinstance(exc, worktree_release.FenceRefused) else "refused"), _in_use_text(exc)
-    except (OSError, ValueError, TypeError) as exc:
+    except Exception as exc:  # any ordinary error is "could not check"; an interruption still stops the run (#941)
         return ("fence" if isinstance(exc, store_mod.StoreFenceError) else "failed"), _could_not_check(exc)
     return None
 
@@ -1278,7 +1278,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                             raise failure from exc
                         except worktree_release.Refused as exc:
                             keep = _in_use_text(exc)
-                        except (OSError, ValueError, TypeError) as exc:
+                        except Exception as exc:  # any ordinary error: could not check (#941)
                             raise _UseCheckFailed(_use_check_failure(exc)) from exc
                     for w in worktrees:
                         if keep:
@@ -1374,7 +1374,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         result, reason, unchecked = "FAILED", str(exc), True
                         if exc.fence:
                             fence_stop = reason
-                    except (OSError, ValueError, TypeError) as exc:
+                    except Exception as exc:  # any ordinary error at the last look: could not check (#941)
                         result, reason, unchecked = "FAILED", _use_check_failure(exc), True
                     if keep:
                         lines.append(f"  REFUSED (kept) {c.path}: {keep}")

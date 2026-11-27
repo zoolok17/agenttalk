@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where it said `REFUSED (kept)` (the sweep still says `REFUSED (kept)`); scripts matching the old preview wording
   need `KEPT`. A record that cannot be read still keeps its checkout as an ordinary refusal and does not exit 1.
 
+- **Any unexpected error in that check is now "could not check", not a crash (#941).** Before, only some kinds of error
+  were shown that way; any other stopped the whole janitor run with an internal error. Now every such error keeps the
+  checkout, is listed and counted as above, and exits 1. An interruption (Ctrl+C) still stops the run.
+
 - Under a store fence, a Git registration file (a checkout's `gitdir`, its `.git` file or `commondir`) that names a path with a NUL character now gives the janitor's usual "could not list the registered checkouts" failure, and the checkout is kept, instead of being trusted or ending in an internal error (#928).
 
 - **On Linux and macOS, backslashes in folder names stay part of the name when folders are compared (#910).**
