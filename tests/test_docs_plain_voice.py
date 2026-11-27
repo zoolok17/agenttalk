@@ -92,9 +92,9 @@ def test_a_manual_points_to_the_readme_install_steps_only_and_stops_before_its_p
     assert f'start at "{README_INSTALL_START}" and stop before the line "{README_PROJECT_SETUP}"' in section
     assert "Do not follow the README's project setup after that line" in section
     assert "a second `init` without `--force` keeps the team list of the first" in section
-    # the setup brief is a different route with its own version: if it is named, it is named as that, never linked
+    # the setup brief is a different route to the same release: if it is named, it is named as that, never linked
     assert "LEAD-SETUP-BRIEF" not in section
-    assert "different route, with its own version" in section
+    assert "different route to the same release" in section
     # the pointer never again sends the reader through the whole section
     assert "with the steps in the README's [Get started]" not in section
 

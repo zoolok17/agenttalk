@@ -10,6 +10,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A janitor check that breaks is now shown as a failure, not as an ordinary kept checkout (#909).** When the
+  check of whether a checkout is in use failed with an unexpected error (a folder that cannot be read, for example),
+  `janitor` and `janitor --release-report` showed it like a checkout that is simply in use and exited 0. Now they
+  say `KEPT <path>: could not check (<error type>): <detail>`, count such checkouts in `could not check: N`, and exit
+  1; `janitor --apply` keeps every candidate holding such a checkout, commits and removes nothing there, lists it as
+  not checked and exits 1, even if a later check would pass. The plain report now says `KEPT` for an ordinary keep,
+  where it said `REFUSED (kept)` (the sweep still says `REFUSED (kept)`); scripts matching the old preview wording
+  need `KEPT`. A record that cannot be read still keeps its checkout as an ordinary refusal and does not exit 1.
+
+- Under a store fence, a Git registration file (a checkout's `gitdir`, its `.git` file or `commondir`) that names a path with a NUL character now gives the janitor's usual "could not list the registered checkouts" failure, and the checkout is kept, instead of being trusted or ending in an internal error (#928).
+
+- **On Linux and macOS, backslashes in folder names stay part of the name when folders are compared (#910).**
+  Before this, a backslash could be mistaken for a separator, so different folders could look the same.
+  The Windows comparison token is unchanged. A saved canonical path containing doubled slashes after the start
+  is treated as possible damage, even if it was typed by hand, and the command asks for the real absolute folder.
+  A mismatched saved canonical path also gives repair advice. When damaged checkout paths are acknowledged as
+  missing, Git's registrations are checked first; an unreadable list or a registration of that lane's branch
+  stops the acknowledgement. The check also refuses when the store folder is not a Git repository.
+  A forced reassignment keeps a sound absolute earlier path and refuses an unsettled relative path. An older retained
+  claim with a backslash inside a name can still name the wrong folder. An older checkout name ending in a backslash
+  was saved with a trailing slash, which the guard cannot detect; a readable
+  launch record naming the real folder still protects it. A checkout detached by hand has no branch in Git's list
+  and is not detected by the acknowledgement's branch check.
+  Release keeps a checkout if an older saved claim may name it with slashes; inspect the lane before freeing it.
+
+## [0.106.0] - 2026-11-27
+
+This release warns when work starts without the agreed check, keeps personal details out of status reports unless you ask for them, and makes first installs and clean-ups safer. From this release, `agenttalk task` prints advisory warnings when a design, build or fix order has no answered challenge behind it, uses an exemption outside the fixed list, or has run past its agreed time or two fix rounds without a recorded decision; it never refuses the order. `agenttalk overview --drift` shows the same picture for the whole team. Status reports and capacity lines now leave out folder paths, the project ID and account details by default. The setup brief and the user manuals now install the same release as the README, the first `agenttalk doctor` run reads less like a failure, and the README says what to do when a Windows security policy refuses to start agenttalk. A seat that starts slowly is no longer refused. When Git cannot check a folder, clean-ups and the checks that close a piece of work now say "unknown" or stop with repair steps, instead of calling it clean, and clean-ups no longer remove a folder that another piece of work still uses.
+
+After upgrading, preview the skill update with `agenttalk install-skills --dry-run --force`, back up any local edits you want to keep, then run `agenttalk install-skills --force`. The plain command keeps files that differ, so it cannot refresh changed skills. This release changes several skills, including the challenge skill, so every seat needs the update. A script that reads the folder path or project ID from `agenttalk status --json` now needs `--show-personal`.
+
 ### Added
 
 - **Drift visibility: warnings when work is ordered without a challenge, and a read-only report (#923).**
@@ -170,15 +203,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A janitor check that breaks is now shown as a failure, not as an ordinary kept checkout (#909).** When the
-  check of whether a checkout is in use failed with an unexpected error (a folder that cannot be read, for example),
-  `janitor` and `janitor --release-report` showed it like a checkout that is simply in use and exited 0. Now they
-  say `KEPT <path>: could not check (<error type>): <detail>`, count such checkouts in `could not check: N`, and exit
-  1; `janitor --apply` keeps every candidate holding such a checkout, commits and removes nothing there, lists it as
-  not checked and exits 1, even if a later check would pass. The plain report now says `KEPT` for an ordinary keep,
-  where it said `REFUSED (kept)` (the sweep still says `REFUSED (kept)`); scripts matching the old preview wording
-  need `KEPT`. A record that cannot be read still keeps its checkout as an ordinary refusal and does not exit 1.
-
 - **A failed list of checkouts is now "unknown", not "zero", in the janitor and in `doctor` (#901).** When Git could not list the registered checkouts (Git missing or not runnable, a failed or cut-short answer, text that cannot be read), the report printed `registered worktrees: 0` as if it were a fact, and the sweep treated the folders of a failed list as free to remove (a link could still be unlinked, and an empty sweep still pruned). Now the report prints `registered worktrees: unknown (<Git's reason>)` and an unknown dirty count, still lists the folders it can safely find, and says what to do: fix Git for that repository, review the `safe.directory` setting for one you trust, or upgrade Git (the list needs Git 2.36 or newer, with `git worktree list --porcelain -z`). `janitor --apply` then keeps every folder, links included, commits nothing, prunes nothing and exits 1, even when there is nothing to remove; the count after the prune says `unknown` and fails the sweep when it cannot be read. Git's own words are shown on one line, cut, with control characters written out. `agenttalk doctor` warns that the checkouts could not be checked instead of staying silent, and in its JSON output `scratch_hygiene.data.outside_worktrees` is `null` (not `0`) in that case; a list that can be read gives the same number as before and no key is added or removed. The report, the sweep's first list, the store fence and doctor now share one reading of the list; nothing retries it or falls back to the older text form. A Git that fails to run in any way is an unknown list like the others (before, such a failure that was not a system error stopped the command with an internal error instead). The janitor sets no time limit on Git, so a Git that hangs still makes the janitor and `doctor` wait (#931). The report still exits 0 when it gives a useful partial report and no scan root had an access error; an access error gives 1, `--apply` with a failed item gives 1, and a refusal by the store fence before the work starts gives 2; a refusal during `--apply` (at the sweep's later checks, or at the count after the prune) fails the sweep with 1 and the report and its summary are still printed. The check made at the delete still looks only at the checkouts under a folder, so a checkout registered after the first list whose path contains the folder, or registered during the delete itself, is not seen.
 
 - **The setup brief installs the release the README installs, and the README says what to do when Windows refuses
@@ -186,25 +210,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its tag from the README, and its record of the v0.101.1 checks is unchanged. If a policy such as Device Guard refuses
   `agenttalk.exe` or `pip.exe` (exit code 4551), the README now says to keep using the `python -m` forms.
 
-- Under a store fence, a Git registration file (a checkout's `gitdir`, its `.git` file or `commondir`) that names a path with a NUL character now gives the janitor's usual "could not list the registered checkouts" failure, and the checkout is kept, instead of being trusted or ending in an internal error (#928).
 - **Windows process-list failures now stop supervisor operations (#905).**
   Selecting or validating the PowerShell host, preparing or committing its scheduled task, and claiming the supervisor now stop with exit 3 and name the failing Windows call if Windows cannot list processes, even where the list is not needed.
 
 - Three journal tests now allow a slow writer to finish before checking its events, and check the close ended cleanly (#906).
-
-- **On Linux and macOS, backslashes in folder names stay part of the name when folders are compared (#910).**
-  Before this, a backslash could be mistaken for a separator, so different folders could look the same.
-  The Windows comparison token is unchanged. A saved canonical path containing doubled slashes after the start
-  is treated as possible damage, even if it was typed by hand, and the command asks for the real absolute folder.
-  A mismatched saved canonical path also gives repair advice. When damaged checkout paths are acknowledged as
-  missing, Git's registrations are checked first; an unreadable list or a registration of that lane's branch
-  stops the acknowledgement. The check also refuses when the store folder is not a Git repository.
-  A forced reassignment keeps a sound absolute earlier path and refuses an unsettled relative path. An older retained
-  claim with a backslash inside a name can still name the wrong folder. An older checkout name ending in a backslash
-  was saved with a trailing slash, which the guard cannot detect; a readable
-  launch record naming the real folder still protects it. A checkout detached by hand has no branch in Git's list
-  and is not detected by the acknowledgement's branch check.
-  Release keeps a checkout if an older saved claim may name it with slashes; inspect the lane before freeing it.
 
 - **Close checks no longer report hidden submodule work as clean (#796).**
   Ordinary closes hold and acceptance closes are refused when submodule work cannot be checked; close now explains the hold.

@@ -16,10 +16,10 @@ EXEMPT_IDS = ("failing-repro-fix", "review-ordered-fix", "checklist-release", "r
 VERDICTS = ("proceed", "reshape", "probe", "replace", "defer", "stop")
 DECISIONS = ("narrow", "stop", "continue")
 FIX_ROUNDS = 2
-# UNSET until the release checklist fills it with the release's UTC instant. While it is None the
+# The release's UTC instant, filled in by the release checklist for 0.106.0. While it is None the
 # report calls every order unknown and no work item is treated as older work: nothing becomes a
 # historical boundary by accident.
-ACTIVATION: str | None = None
+ACTIVATION: str | None = "2026-11-27T08:41:33Z"
 _AMOUNT = re.compile(r"(\d+(?:\.\d+)?)h")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _BAD = ("pending", "unusable", "late", "unverifiable")

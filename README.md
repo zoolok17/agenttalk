@@ -162,7 +162,7 @@ assistant that talks to you.
 
 ## Get started
 
-New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/v0.105.0/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
+New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/v0.106.0/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
 agenttalk: it sets up a first team without the supervisor and tells you what only a person can decide.
 Once agenttalk is installed, the brief and the other guides for leads are on your machine too. After the steps below, which set `AGENTTALK_PY`,
 `& $env:AGENTTALK_PY -m agenttalk doctor` in PowerShell, or `"$AGENTTALK_PY" -m agenttalk doctor` on Linux and macOS, prints the installed `module path`, and the brief is `docs/LEAD-SETUP-BRIEF.md` under it.
@@ -178,7 +178,7 @@ Windows (PowerShell):
 ```powershell
 python -m venv agenttalk-env
 $env:AGENTTALK_PY = (Resolve-Path .\agenttalk-env\Scripts\python.exe).Path
-& $env:AGENTTALK_PY -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
+& $env:AGENTTALK_PY -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.106.0"
 & $env:AGENTTALK_PY -m agenttalk install-skills
 ```
 
@@ -193,7 +193,7 @@ On Debian or Ubuntu, install the venv package first: `sudo apt install python3-v
 ```sh
 python3 -m venv agenttalk-env
 export AGENTTALK_PY="$(pwd)/agenttalk-env/bin/python"
-"$AGENTTALK_PY" -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
+"$AGENTTALK_PY" -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.106.0"
 "$AGENTTALK_PY" -m agenttalk install-skills
 ```
 
@@ -476,7 +476,7 @@ Follow [Get started](#get-started) to create a private Python environment and in
 Use that same Python in every terminal. The examples below shorten the command to `agenttalk`; write
 `& $env:AGENTTALK_PY -m agenttalk` in PowerShell or `"$AGENTTALK_PY" -m agenttalk` on Linux and macOS.
 
-The install command pins a released tag (`@v0.105.0` in Get started), rather than a branch: commands and the message
+The install command pins a released tag (`@v0.106.0` in Get started), rather than a branch: commands and the message
 format can change between releases, and a tag keeps every agent in a project on the same version.
 
 The `install-skills` command installs the skills, the instructions each agent CLI
@@ -2033,7 +2033,7 @@ automation to depend on):
 
 agenttalk follows [Semantic Versioning](https://semver.org/) and keeps
 a [Keep a Changelog](https://keepachangelog.com/)-formatted
-`CHANGELOG.md`. Install a specific tag (`@v0.105.0`, or whatever the
+`CHANGELOG.md`. Install a specific tag (`@v0.106.0`, or whatever the
 current release is) rather than a branch, since the CLI surface and
 message schema can change between releases. `agenttalk dev-gate
 --profile release` is the release-evidence gate itself: it builds the
