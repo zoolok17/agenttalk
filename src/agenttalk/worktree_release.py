@@ -1022,7 +1022,9 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                         _fence_git_registrations(cfg.repo)  # the removal reads every registration too
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
-            except (Refused, OSError, ValueError, TypeError) as exc:
+            except Exception as exc:  # the report: any ordinary error of its checks is "could not check" (#941)
+                if target is not None and not isinstance(exc, (Refused, OSError, ValueError, TypeError)):
+                    raise  # a release (which may have removed something) keeps its own error types
                 if target is None and not isinstance(exc, Refused):  # a check that broke: not an ordinary keep
                     failed += 1
                     exc = janitor._could_not_check(exc)

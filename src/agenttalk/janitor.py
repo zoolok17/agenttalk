@@ -1360,8 +1360,8 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                             if keep is None and guard:
                                 guard.reread()  # the very last look, after the comparison above
                             if keep is None:
+                                unchecked = False  # every check completed; a failure from now on is the delete's own
                                 result, reason = remove_plainly(c.path)
-                                unchecked = False  # every check completed; a failure now is the delete's own
                     except (worktree_release.FenceRefused, store_mod.StoreFenceError) as exc:
                         # The fence refused a path after the preflight (a checkout registered outside the fence in the
                         # meantime, or a record path that leads outside): nothing after this touches Git or the disk
@@ -1375,6 +1375,8 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                         if exc.fence:
                             fence_stop = reason
                     except Exception as exc:  # any ordinary error at the last look: could not check (#941)
+                        if not unchecked and not isinstance(exc, (OSError, ValueError, TypeError)):
+                            raise  # from the removal itself, which may have begun: never reported as kept (as before)
                         result, reason, unchecked = "FAILED", _use_check_failure(exc), True
                     if keep:
                         lines.append(f"  REFUSED (kept) {c.path}: {keep}")

@@ -1257,6 +1257,41 @@ def test_941_apply_keeps_a_checkout_whose_own_check_breaks_with_any_ordinary_err
     assert broken.exists() and report.apply_failed and "using it: broke (test)" in text, text
 
 
+def test_941_an_error_of_the_removal_itself_is_never_reported_as_kept(estate, monkeypatch):
+    """#941 round 2: the removal deleted a file and then broke. That is not "kept, not removed, and not checked":
+    the error is not taken for one of the checks, and it stops the sweep, as before #941."""
+    repo, wt, cfg = estate
+    broken, real = checkout(repo, "x"), janitor.remove_plainly
+    report = janitor.build_report(cfg)
+
+    def partly(path):
+        if path.name != "x":
+            return real(path)
+        (path / "source.txt").unlink()
+        raise RuntimeError("the removal broke (test)")
+
+    monkeypatch.setattr(janitor, "remove_plainly", partly)
+    with pytest.raises(RuntimeError, match="the removal broke"):
+        janitor.apply(cfg, report)
+    assert not (broken / "source.txt").exists()
+
+
+@pytest.mark.parametrize("error", [RuntimeError("broke (test)"), KeyboardInterrupt()], ids=["error", "interrupt"])
+def test_941_the_release_reports_own_check_is_could_not_check_too(estate, monkeypatch, error):
+    """#941 round 2: --release-report makes its own check: any ordinary error there is "could not check" (kept,
+    counted, exit 1); an interruption still stops it."""
+    repo, wt, cfg = estate
+    broken = checkout(repo, "x")
+    monkeypatch.setattr(worktree_release, "check_unused", raises(error))
+    if isinstance(error, KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt):
+            worktree_release.release(cfg, None)
+        return
+    code, text = worktree_release.release(cfg, None)
+    assert code == 1 and broken.exists() and "could not check: 1" in text, text
+    assert f"KEPT {broken}: could not check (RuntimeError): broke (test)" in text, text
+
+
 @pytest.mark.parametrize("form", ["fence-refused-record", "fence-error"])
 def test_a_fence_refusal_in_the_preview_stops_the_sweep_even_beside_a_failed_check(estate, monkeypatch, form):
     """#909 round 2: one checkout of a candidate is refused by the store fence in the preview, the other's check
