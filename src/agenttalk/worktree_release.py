@@ -41,10 +41,8 @@ def _git(repo: Path, *args: str, exact: bool = False, data: bytes | None = None)
     return is not turned into a line end, so a path read from it keeps every character.
     ``data`` is sent to Git's input as bytes (text mode would turn each line end into CRLF on Windows)."""
     exact = exact or data is not None
-    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
-                 "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
-        if os.environ.get(name):
-            raise Refused(f"{name} overrides Git's repository; clear it before release")
+    if name := janitor.index_safety.git_repository_override():  # present counts, even empty (#942)
+        raise Refused(f"{name} overrides Git's repository; clear it before release")
     executable = shutil.which("git")
     if executable is None:
         raise Refused("git is not available")

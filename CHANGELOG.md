@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lane and janitor commands no longer act on another repository when a Git variable points elsewhere (#942).** With `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` or `GIT_ALTERNATE_OBJECT_DIRECTORIES` set (even empty), `lane abandon --delete-branch` could delete a branch there and `janitor --apply` could prune there. Now every `lane` and `janitor` command stops first with exit 2, names the variable and changes nothing.
+  Git sets `GIT_DIR` for commands run from its hooks, so these commands now refuse inside a Git hook: run them outside the hook, or clear the variable. Commands that do not run Git (`send`, `reply` and the like) still work in hooks; release and the missing-checkout acknowledgement now refuse such a variable when it is empty too.
 - **A janitor check that breaks is now shown as a failure, not as an ordinary kept checkout (#909).** When the
   check of whether a checkout is in use failed with an unexpected error (a folder that cannot be read, for example),
   `janitor` and `janitor --release-report` showed it like a checkout that is simply in use and exited 0. Now they
