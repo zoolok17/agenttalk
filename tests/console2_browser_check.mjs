@@ -27,6 +27,17 @@ export const PER_REQUEST_CAP_MS = 10000;
 // The overall startup budget (DevTools up AND a page target found) - ONE shared elapsed-time
 // clock, not two independent ones (see makeDeadline/F2 below).
 export const STARTUP_BUDGET_MS = 90000;
+// #944: a start-up step the browser never answers had no limit and once held a macOS run for all 240 s with no
+// output. This ends it with a named error; the test's retry looks for the marker and nothing else.
+export const NO_ANSWER_MARK = 'BROWSER_NO_ANSWER';
+export const NO_ANSWER_LIMIT_MS = 30000;
+export function withNoAnswerLimit(promise, ms, what, { setT = setTimeout, clearT = clearTimeout } = {}) {
+  let timer;
+  const limit = new Promise((_, reject) => {
+    timer = setT(() => reject(new Error(`${NO_ANSWER_MARK}: the browser did not answer within ${ms} ms (${what})`)), ms);
+  });
+  return Promise.race([promise, limit]).finally(() => clearT(timer));
+}
 // #315: how long to wait for the page's first draw (thread and watched label) after the fixed settle sleep.
 export const FIRST_DRAW_BUDGET_MS = 20000;
 
@@ -349,15 +360,16 @@ try {
     return `DevToolsActivePort: ${activePort}; stderr:\n${childStderr}`;
   };
   // File discovery, version and page readiness all draw from this one budget.
-  session = await startDevToolsSession({
+  session = await withNoAnswerLimit(startDevToolsSession({
     readActivePort: makeReadActivePort(fs.promises, profile), fetchJson: makeFetchJson(fetch),
     fetchText: makeFetchText(fetch), checkExited: checkChildExited,
     deadline: makeDeadline(STARTUP_BUDGET_MS), sleep, getDiagnostics,
-  });
+  }), STARTUP_BUDGET_MS + NO_ANSWER_LIMIT_MS, 'finding the DevTools endpoint');
   const { page } = session;
   keepAliveTargetId = page.id;
   ws = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+  await withNoAnswerLimit(new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; }),
+    NO_ANSWER_LIMIT_MS, 'opening the DevTools socket');
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.id && pending.has(msg.id)) {
@@ -369,7 +381,8 @@ try {
       problems.push('log: ' + msg.params.entry.text);
     }
   };
-  await send('Runtime.enable');
+  await withNoAnswerLimit(send('Runtime.enable'), NO_ANSWER_LIMIT_MS, 'the first DevTools command');
+  process.stderr.write('console2 browser check: the browser answered\n');
   await send('Log.enable');
   await send('Page.enable');
   // B8/F6: a headless target starts backgrounded (document.hidden/visibilityState report hidden)

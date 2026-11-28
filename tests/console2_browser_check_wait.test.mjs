@@ -8,7 +8,7 @@ import { createRunner } from './console2_harness.mjs';
 import {
   FatalExitError, makeDeadline, waitForDeadline, waitForPageTarget,
   parseDevToolsActivePort, browserLaunchArgs, assertOwnEndpoint, NotThisBrowserError,
-  startDevToolsSession, PER_REQUEST_CAP_MS,
+  startDevToolsSession, PER_REQUEST_CAP_MS, withNoAnswerLimit, NO_ANSWER_MARK,
 } from './console2_browser_check.mjs';
 
 const { test, run } = createRunner('console2 browser check: deadline/page-target waits');
@@ -415,6 +415,17 @@ test('C5: an ordinary file read error is retried', async () => {
   assert.equal(session.page.id, page.id);
   assert.equal(reads, 2);
   assert.equal(clock.now(), 150);
+});
+
+// #944: a start-up step the browser never answers ends with a named error (a fake timer: no real time passes).
+test('withNoAnswerLimit: a step that never settles rejects with the marker; one that settles passes through', async () => {
+  let fire;
+  const timers = { setT: (fn) => { fire = fn; return 1; }, clearT: () => {} };
+  const stuck = withNoAnswerLimit(new Promise(() => {}), 1000, 'opening the socket', timers);
+  fire();
+  await assert.rejects(stuck, (e) => e.message.startsWith(NO_ANSWER_MARK) && e.message.includes('opening the socket'));
+  assert.equal(await withNoAnswerLimit(Promise.resolve('up'), 1000, 'x', timers), 'up');
+  await assert.rejects(withNoAnswerLimit(Promise.reject(new Error('boom')), 1000, 'x', timers), /boom/);
 });
 
 run();
