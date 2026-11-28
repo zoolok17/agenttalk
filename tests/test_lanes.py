@@ -10032,3 +10032,41 @@ def test_the_merge_effects_comparison_lists_every_path_under_its_own_name(
     _m671_check(root, head, capsys)
     diffs = [a for a in seen if a[:1] == ["diff"]]
     assert sum("--no-renames" in a for a in diffs) == 1 and sum("-M" in a for a in diffs) == 1
+
+
+# --- #942: a Git variable that points Git at another repository is refused before Git is asked anything ----------
+OVERRIDES = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+             "GIT_ALTERNATE_OBJECT_DIRECTORIES"]
+
+
+@pytest.mark.parametrize("name, empty", [*((name, False) for name in OVERRIDES), ("GIT_DIR", True)],
+                         ids=[*OVERRIDES, "empty-GIT_DIR"])
+def test_lane_abandon_refuses_a_git_repository_override(tmp_path, monkeypatch, capsys, name, empty):
+    """#942: with a variable naming a second repository (or empty), `lane abandon --delete-branch` deleted the lane
+    branch THERE and said so. Now it stops with exit 2 and the variable's name; both branches stay, the row too."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    other = tmp_path / "other"
+    other.mkdir()
+    for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "o"], ["branch", "lane/x"]):
+        _git(other, "-c", "user.name=t", "-c", "user.email=t@t", *args)
+    assert _run(["lane", "assign", "--id", "x", "--from", "lead", "--assignee", "dev", "--domain", "core",
+                 "--base", base, "--target", _branch(root)], root) == 0
+    _git(root, "branch", "lane/x", base)
+    with monkeypatch.context() as patched:
+        patched.setenv(name, "" if empty else str(other / ".git"))
+        code = _run_raw(["lane", "abandon", "--id", "x", "--target", _branch(root), "--delete-branch"], root)
+    err = capsys.readouterr().err
+    assert code == 2 and f"{name} is set" in err and "nothing was read or changed" in err and "hooks" in err, err
+    assert _lane_branch_present(root, "x") and _git_rc(other, "rev-parse", "--verify", "lane/x").returncode == 0
+    assert lanes.load_lanes(Store(root))["lanes"]["x"]["status"] == lanes.STATUS_ACTIVE
+
+
+def test_git_write_starts_no_git_while_an_override_is_present(tmp_path, monkeypatch):
+    """#942, the second line of defence: every lane write goes through `_git_write`, which never starts Git then."""
+    started = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: started.append(args) or SimpleNamespace(
+        communicate=lambda timeout=None: ("", ""), returncode=0))
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere" / ".git"))
+    rc, out, err = cli._git_write(tmp_path, ["branch", "-D", "--", "lane/x"])
+    assert (rc, out, started) == (1, "", []) and "GIT_DIR is set" in err, (rc, err, started)
