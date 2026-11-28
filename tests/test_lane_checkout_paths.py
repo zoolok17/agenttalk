@@ -3055,7 +3055,7 @@ def test_old_inside_backslash_canonical_is_refused_with_repair_advice(tmp_path):
     data = lanes.load_lanes(store)
     data["lanes"]["legacy"]["worktree_toplevel_canonical"] = row["worktree_toplevel_canonical"]
     lanes.save_lanes(store, data)
-    assert _run_raw(["lane", "deliver", "--id", "legacy", "--from", "dev"], root) == 2
+    assert _run_raw(["lane", "deliver", "--id", "legacy", "--from", "dev"], root) == 3
     data["lanes"]["legacy"]["worktree_toplevel_canonical"] = current
     lanes.save_lanes(store, data)
     row["worktree_toplevel_canonical"] = current
