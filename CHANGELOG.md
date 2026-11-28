@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A mismatched saved canonical path also gives repair advice. When damaged checkout paths are acknowledged as
   missing, Git's registrations are checked first; an unreadable list or a registration of that lane's branch
   stops the acknowledgement. The check also refuses when the store folder is not a Git repository.
+  It also refuses if the Git environment could redirect the repository check.
   A forced reassignment keeps a sound absolute earlier path and refuses an unsettled relative path. An older retained
   claim with a backslash inside a name can still name the wrong folder. An older checkout name ending in a backslash
   was saved with a trailing slash, which the guard cannot detect; a readable

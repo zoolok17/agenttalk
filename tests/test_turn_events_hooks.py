@@ -939,9 +939,10 @@ def test_a_writer_that_never_returns_leaves_the_loop_exactly_as_it_was(tmp_path)
     off = _scenario(tmp_path / "off", observe=False)
     files = Blocking()
     sink = te.TurnEventSink(
-        tmp_path / "journal", "beta", files=files, close_seconds=RecordingBudget(close_seconds), queue_max=4
+        tmp_path / "journal", "beta", files=files, start_seconds=30,
+        close_seconds=RecordingBudget(close_seconds), queue_max=4
     )
-    assert sink.start() is True
+    assert sink.start() is True, sink.off_reason
     calls = []  # how long each call into the journal held the loop up
     real_emit = sink.emit
 
@@ -1001,8 +1002,8 @@ def test_a_writer_that_never_returns_leaves_the_loop_exactly_as_it_was(tmp_path)
 def test_a_poisoned_run_leaves_no_prompt_path_environment_or_exception_text(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTTALK_TEST_SECRET", "SENTINEL-ENV-VALUE")
     root = tmp_path / "SENTINEL-PATH-DIR"
-    sink = te.TurnEventSink(root, "beta")
-    assert sink.start() is True
+    sink = te.TurnEventSink(root, "beta", start_seconds=30)
+    assert sink.start() is True, sink.off_reason
     calls = {"n": 0}
 
     def spawn(argv, stdin):

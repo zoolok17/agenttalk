@@ -3001,6 +3001,35 @@ def test_damaged_acknowledgement_checks_real_git_records(tmp_path, capsys, state
         assert lanes.lanes_path(store).read_bytes() == before
 
 
+@pytest.mark.parametrize("name", ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+                                 "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"])
+@pytest.mark.parametrize("nonempty", [True, False])
+def test_damaged_acknowledgement_refuses_git_repository_overrides(tmp_path, monkeypatch, capsys, name, nonempty):
+    store, lane_id, _row, worktree = _real_lane_row(tmp_path)
+    other = tmp_path / "other-repo"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id].update(worktree_path="", worktree_toplevel_canonical="")
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+    assert worktree.is_dir()
+    monkeypatch.setenv(name, str(other / ".git") if nonempty else "")
+    if name == "GIT_DIR" and nonempty:
+        rc, listing = cli._git(store.root, ["worktree", "list", "--porcelain", "-z"], raw=True)
+        assert rc == 0 and lanes.lane_ref(lane_id).encode() not in listing
+    real_git, calls = cli._git, []
+    def git(root, argv, **kwargs):
+        calls.append(argv)
+        return real_git(root, argv, **kwargs)
+    monkeypatch.setattr(cli, "_git", git)
+    assert _run(store, "lane", "abandon", "--id", lane_id, ACK_HINT) == 2
+    assert (name in capsys.readouterr().err) == nonempty
+    assert bool(calls) != nonempty
+    assert lanes.lanes_path(store).read_bytes() == before
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
+
+
 def test_janitor_listing_still_accepts_a_real_bare_main_repository(tmp_path):
     bare = tmp_path / "bare.git"
     subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
@@ -3026,7 +3055,7 @@ def test_old_inside_backslash_canonical_is_refused_with_repair_advice(tmp_path):
     data = lanes.load_lanes(store)
     data["lanes"]["legacy"]["worktree_toplevel_canonical"] = row["worktree_toplevel_canonical"]
     lanes.save_lanes(store, data)
-    assert _run_raw(["lane", "deliver", "--id", "legacy", "--from", "dev"], root) == 2
+    assert _run_raw(["lane", "deliver", "--id", "legacy", "--from", "dev"], root) == 3
     data["lanes"]["legacy"]["worktree_toplevel_canonical"] = current
     lanes.save_lanes(store, data)
     row["worktree_toplevel_canonical"] = current
