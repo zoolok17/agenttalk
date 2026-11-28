@@ -1599,22 +1599,23 @@ def test_drain_limit_pages_visible_messages_with_control_interleaving(
     store_root: Path,
     capsys: pytest.CaptureFixture,
 ) -> None:
-    store.send(sender="alpha", recipient="beta", body="before", kind="composing")
+    before = store.send(sender="alpha", recipient="beta", body="before", kind="composing")
     first = store.send(sender="alpha", recipient="beta", body="one", kind="message")
-    store.send(sender="alpha", recipient="beta", body="between", kind="composing")
+    between = store.send(sender="alpha", recipient="beta", body="between", kind="composing")
     second = store.send(sender="alpha", recipient="beta", body="two", kind="message")
     trailing = store.send(sender="alpha", recipient="beta", body="after", kind="composing")
 
     assert _run(["drain", "--for", "beta", "-n", "1"], store_root) == 0
     first_page = capsys.readouterr().out
-    assert "one" in first_page and "two" not in first_page
-    assert "before" not in first_page and "between" not in first_page
+    # a page also prints the message id, whose random end can spell a short body word (#795): absence is by id
+    assert "one" in first_page and first.id in first_page and second.id not in first_page
+    assert before.id not in first_page and between.id not in first_page
     assert store.cursor("beta") == first.id
 
     assert _run(["drain", "--for", "beta", "--limit", "1"], store_root) == 0
     second_page = capsys.readouterr().out
-    assert "two" in second_page and "one" not in second_page
-    assert "between" not in second_page and "after" not in second_page
+    assert "two" in second_page and second.id in second_page and first.id not in second_page
+    assert between.id not in second_page and trailing.id not in second_page
     assert store.cursor("beta") == second.id
 
     assert _run(["drain", "--for", "beta", "--quiet"], store_root) == 0
@@ -1655,12 +1656,12 @@ def test_recv_limit_peeks_one_message_without_advancing(
     capsys: pytest.CaptureFixture,
 ) -> None:
     store.send(sender="alpha", recipient="beta", body="one", kind="message")
-    store.send(sender="alpha", recipient="beta", body="two", kind="message")
+    second = store.send(sender="alpha", recipient="beta", body="two", kind="message")
 
     assert _run(["recv", "--for", "beta", "--limit", "1"], store_root) == 0
 
     output = capsys.readouterr().out
-    assert "one" in output and "two" not in output
+    assert "one" in output and second.id not in output  # by id: the printed id can spell "two" (#795)
     assert store.cursor("beta") == ""
 
 
