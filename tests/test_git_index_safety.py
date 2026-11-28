@@ -426,3 +426,14 @@ def test_git_repository_override_counts_a_present_empty_variable():
         safety.GIT_REPOSITORY_OVERRIDES)
     text = safety.git_override_text("GIT_WORK_TREE")
     assert "GIT_WORK_TREE is set" in text and "nothing was read or changed" in text and "hooks" in text, text
+
+
+@pytest.mark.parametrize("value", ["elsewhere", ""])  # #942: the two readers themselves, set and present-but-empty
+def test_the_git_readers_start_no_git_while_an_override_is_present(monkeypatch, tmp_path, value):
+    started, text = [], janitor.index_safety.git_override_text("GIT_DIR")
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: started.append(args) or subprocess.CompletedProcess(
+        args, 0, "", ""))
+    monkeypatch.setenv("GIT_DIR", value)
+    assert [cli._git(tmp_path, ["status"], raw=raw) for raw in (False, True)] == [(-1, ""), (-1, b"")], started
+    assert [janitor._run_git_checked(tmp_path, "status", raw=raw) for raw in (False, True)] == [
+        (1, "", text), (1, b"", text)] and started == [], started
