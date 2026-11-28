@@ -512,6 +512,10 @@ def test_the_wrap_command_accepts_the_flag():
 
 
 def test_the_wired_wrapper_journals_a_turn_end_to_end(tmp_path, monkeypatch):
+    real_sink = te.TurnEventSink
+    monkeypatch.setattr(
+        te, "TurnEventSink", lambda *args, **kwargs: real_sink(*args, start_seconds=30, **kwargs)
+    )
     seen: dict[str, Any] = {}
 
     def fake_run_loop(store, agent, drive, **kw):
