@@ -73,8 +73,8 @@ def _label(store, mode, runtime=None, *, now=None, tokens=None):
 
 
 def _live_sink(store, **kw) -> te.TurnEventSink:
-    sink = te.TurnEventSink(te.default_turn_events_root(store.root), "beta", **kw)
-    assert sink.start() is True
+    sink = te.TurnEventSink(te.default_turn_events_root(store.root), "beta", start_seconds=30, **kw)
+    assert sink.start() is True, sink.off_reason
     _wait_for_status(sink)
     return sink
 
