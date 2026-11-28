@@ -413,3 +413,27 @@ def test_status_bypasses_a_plausible_cached_clean_answer(tmp_path, monkeypatch, 
     else:
         result = janitor.wip_commit_dirty_worktree(tmp_path, default_branches=["main"])
         assert result.refused and "still dirty after commit" in result.message
+
+
+def test_git_repository_override_counts_a_present_empty_variable():
+    """#942: any of the six variables that point Git at another repository, present even when empty, is named;
+    nothing else is. The text names the variable only, never its value."""
+    from agenttalk import git_index_safety as safety
+
+    assert safety.git_repository_override({"GIT_DIR": ""}) == "GIT_DIR"
+    assert safety.git_repository_override({}) is None and safety.git_repository_override({"GIT_DIRX": "1"}) is None
+    assert [safety.git_repository_override({name: "x"}) for name in safety.GIT_REPOSITORY_OVERRIDES] == list(
+        safety.GIT_REPOSITORY_OVERRIDES)
+    text = safety.git_override_text("GIT_WORK_TREE")
+    assert "GIT_WORK_TREE is set" in text and "nothing was read or changed" in text and "hooks" in text, text
+
+
+@pytest.mark.parametrize("value", ["elsewhere", ""])  # #942: the two readers themselves, set and present-but-empty
+def test_the_git_readers_start_no_git_while_an_override_is_present(monkeypatch, tmp_path, value):
+    started, text = [], janitor.index_safety.git_override_text("GIT_DIR")
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: started.append(args) or subprocess.CompletedProcess(
+        args, 0, "", ""))
+    monkeypatch.setenv("GIT_DIR", value)
+    assert [cli._git(tmp_path, ["status"], raw=raw) for raw in (False, True)] == [(-1, ""), (-1, b"")], started
+    assert [janitor._run_git_checked(tmp_path, "status", raw=raw) for raw in (False, True)] == [
+        (1, "", text), (1, b"", text)] and started == [], started

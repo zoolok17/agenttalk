@@ -20,6 +20,22 @@ SUBMODULE = (
 )
 SUBMODULE_UNKNOWN = "could not check whether this checkout contains a materialized submodule"
 SUBMODULE_NOT_CLEAN = "a submodule is not verifiably clean; inspect its files and Git index"
+# The variables that make Git work on another repository (or index) than the one agenttalk names with `-C` (#942).
+GIT_REPOSITORY_OVERRIDES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+                            "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")
+
+
+def git_repository_override(environ=os.environ) -> str | None:
+    """The first of them that is present (even when empty: Git then fails or reads another place), or None."""
+    return next((name for name in GIT_REPOSITORY_OVERRIDES if name in environ), None)
+
+
+def git_override_text(name: str) -> str:  # why nothing was done; it names the variable only, never its value
+    return (f"{name} is set, so Git would work on the repository it names instead of the store's own; nothing was "
+            f"read or changed. Git sets it for commands run from its hooks: run agenttalk outside the hook, or clear "
+            f"{name}, then try again")
+
+
 STATUS_ARGS = [
     "-c",
     "core.fsmonitor=false",

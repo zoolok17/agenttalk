@@ -3015,17 +3015,13 @@ def test_damaged_acknowledgement_refuses_git_repository_overrides(tmp_path, monk
     before = lanes.lanes_path(store).read_bytes()
     assert worktree.is_dir()
     monkeypatch.setenv(name, str(other / ".git") if nonempty else "")
-    if name == "GIT_DIR" and nonempty:
-        rc, listing = cli._git(store.root, ["worktree", "list", "--porcelain", "-z"], raw=True)
-        assert rc == 0 and lanes.lane_ref(lane_id).encode() not in listing
     real_git, calls = cli._git, []
     def git(root, argv, **kwargs):
         calls.append(argv)
         return real_git(root, argv, **kwargs)
     monkeypatch.setattr(cli, "_git", git)
     assert _run(store, "lane", "abandon", "--id", lane_id, ACK_HINT) == 2
-    assert (name in capsys.readouterr().err) == nonempty
-    assert bool(calls) != nonempty
+    assert name in capsys.readouterr().err and not calls  # set or empty, refused before Git is asked (#942)
     assert lanes.lanes_path(store).read_bytes() == before
     assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
 

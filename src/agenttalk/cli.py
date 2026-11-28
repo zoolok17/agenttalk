@@ -3247,6 +3247,8 @@ def _iso_now() -> str:
 def _git(root, argv: list[str], *, raw=False) -> tuple[int, str | bytes]:
     """Run a read-only git command in ``root``; (rc, stdout) or (-1, "") on any
     failure. argv is a fixed list (never shell); git is the only tool invoked."""
+    if index_safety.git_repository_override():  # the store's own repository or nothing: "could not run" (#942)
+        return -1, b"" if raw else ""
     import subprocess  # nosec B404  # local import keeps the dependency optional
     try:
         # Fixed git argv in the repo root; never shell, never operator input as a
@@ -3306,6 +3308,8 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     not stopped and may still be running. Either way a partial checkout or a Git lock may still need
     recovery.
     """
+    if name := index_safety.git_repository_override():  # a second line of defence: Git is never started (#942)
+        return 1, "", index_safety.git_override_text(name)
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
     execution_argv = argv
@@ -6317,10 +6321,8 @@ def _worktree_list(root) -> list[dict]:
 
 def _worktree_records_strict(root):
     """Read complete, unambiguous Git identities after fencing every registration."""
-    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
-                 "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
-        if os.environ.get(name):
-            raise janitormod._listing_failure(f"{name} overrides Git's repository; clear it first")
+    if name := index_safety.git_repository_override():  # present counts, even empty (#942)
+        raise janitormod._listing_failure(f"{name} overrides Git's repository; clear it first")
     janitormod._fence_registrations(root)
     rc, out = _git(root, ["worktree", "list", "--porcelain", "-z"], raw=True)
     if rc != 0:
@@ -7522,6 +7524,9 @@ def cmd_lane(args: argparse.Namespace) -> int:
 
 def _cmd_lane(args: argparse.Namespace) -> int:
     action = getattr(args, "lane_cmd", None)
+    if name := index_safety.git_repository_override():  # before any read, lock or save (#942)
+        sys.stderr.write(f"agenttalk lane {action}: {index_safety.git_override_text(name)}\n")
+        return 2
     if action == "abandon" and getattr(args, "acknowledge_missing_worktree", False) and getattr(
             args, "delete_branch", False):
         # Refused first, before the store is opened or its configuration read: nothing is read or written (#643).
@@ -13707,6 +13712,9 @@ def _scratch_store(args: argparse.Namespace, root: Path) -> int:
 
 def cmd_janitor(args: argparse.Namespace) -> int:
     """Report (default) or clean up (--apply) scratch sprawl (#148)."""
+    if name := index_safety.git_repository_override():  # first, before the store fence and any read (#942)
+        sys.stderr.write(f"agenttalk janitor: {index_safety.git_override_text(name)}\n")
+        return 2
     root = Path(args.root).absolute() if getattr(args, "root", None) else find_root(resolve_links=False)
     store_mod.check_store_fence(root)          # before its config is read
     cfg = janitormod.JanitorConfig.load(root)
