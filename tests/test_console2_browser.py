@@ -58,6 +58,9 @@ BROWSER_CHECK_TIMEOUT_S = 240
 # tests. It is the machine, not the page, so it alone earns one more try; any other problem never does.
 BUFFER_SPACE_PROBLEM = "log: Failed to load resource: net::ERR_NO_BUFFER_SPACE"
 
+# #944: the node check's words when the browser never answered a start-up step; it alone earns one retry.
+NO_ANSWER_MARK = "BROWSER_NO_ANSWER"
+
 
 def _only_buffer_space_problems(problems: list[str]) -> bool:
     return bool(problems) and all(problem == BUFFER_SPACE_PROBLEM for problem in problems)
@@ -89,6 +92,12 @@ def run_browser_check(url: str, profile: Path, flags: list[str], *, browser: str
             ["node", str(CHECK), browser, url, str(attempt_profile), json.dumps(flags), *extra_args],
             capture_output=True, text=True, encoding="utf-8", timeout=BROWSER_CHECK_TIMEOUT_S, cwd=REPO_ROOT,
         )
+        if attempt == 1 and result.returncode != 0 and NO_ANSWER_MARK in result.stderr:
+            print("console2 browser check: the browser never answered a start-up step; "
+                  "retrying once in a fresh profile (#944)")
+            if before_retry is not None:
+                before_retry()
+            continue
         # A browser binary that exists but fails to start is a hard FAILURE, never a skip -
         # result.stderr carries the launched process's own stderr on that path (see the .mjs).
         assert result.returncode == 0, result.stderr
@@ -634,6 +643,8 @@ def _standin(*answers):
         answer = answers[len(calls) - 1]
         if isinstance(answer, int):  # a check that exits with an error
             return subprocess.CompletedProcess(command, answer, stdout="", stderr="the check broke")
+        if isinstance(answer, str):  # a check that exits with an error and says this
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr=answer)
         measured = answer if isinstance(answer, dict) else {"problems": answer}
         return subprocess.CompletedProcess(command, 0, stdout=json.dumps(measured), stderr="")
 
@@ -672,6 +683,20 @@ def test_any_other_console_problem_fails_at_once_without_a_retry(problems, tmp_p
     out, calls = _check_with(problems, [], tmp_path=tmp_path)
     assert len(calls) == 1 and out["problems"] == problems
     assert "retrying" not in capsys.readouterr().out
+
+
+# #944: a macOS run where the browser never answered ran the whole 240 s with no output at all.
+def test_a_browser_that_never_answered_is_retried_once_in_a_fresh_profile(tmp_path, capsys) -> None:
+    out, calls = _check_with(f"{NO_ANSWER_MARK}: opening the DevTools socket", [], tmp_path=tmp_path)
+    assert out["problems"] == [] and len(calls) == 2 and calls[1][4].endswith("profile-retry")
+    assert "never answered" in capsys.readouterr().out
+
+
+def test_a_browser_that_never_answers_twice_fails_without_a_third_try(tmp_path) -> None:
+    run, calls = _standin(NO_ANSWER_MARK, NO_ANSWER_MARK)
+    with pytest.raises(AssertionError, match=NO_ANSWER_MARK):
+        run_browser_check("http://x/v2", tmp_path / "profile", [], browser="browser", run=run)
+    assert len(calls) == 2
 
 
 def test_a_check_that_exits_with_an_error_is_never_retried(tmp_path) -> None:
