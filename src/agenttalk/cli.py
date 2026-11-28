@@ -13714,6 +13714,9 @@ def _scratch_store(args: argparse.Namespace, root: Path) -> int:
 
 def cmd_janitor(args: argparse.Namespace) -> int:
     """Report (default) or clean up (--apply) scratch sprawl (#148)."""
+    if name := index_safety.git_repository_override():  # first, before the store fence and any read (#942)
+        sys.stderr.write(f"agenttalk janitor: {index_safety.git_override_text(name)}\n")
+        return 2
     root = Path(args.root).absolute() if getattr(args, "root", None) else find_root(resolve_links=False)
     store_mod.check_store_fence(root)          # before its config is read
     cfg = janitormod.JanitorConfig.load(root)

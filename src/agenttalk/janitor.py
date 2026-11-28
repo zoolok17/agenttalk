@@ -292,6 +292,8 @@ def _run_git_checked(repo: Path, *args: str, raw: bool = False) -> tuple[int | N
     a live, dirty, untracked-file-holding worktree be removed with no
     refusal printed anywhere. `raw=True` returns the bytes Git wrote (no decoding with the console's encoding, no
     newline translation) for a caller that must keep paths exactly as Git wrote them."""
+    if name := index_safety.git_repository_override():  # never another repository: Git is not started (#942)
+        return 1, b"" if raw else "", index_safety.git_override_text(name)
     git = shutil.which("git")
     if git is None:
         return None, "", "git is not resolvable"

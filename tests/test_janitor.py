@@ -2520,3 +2520,24 @@ def test_410_r2_absent_root_is_recorded(tmp_path, appears):
     assert t["task"].exists() == appears
     if appears:
         assert "changed identity" in text
+
+
+def test_janitor_apply_refuses_a_git_repository_override(tmp_path, monkeypatch, capsys):
+    """#942: with GIT_DIR naming another repository, `janitor --apply` pruned THAT repository's registrations. Now it
+    stops with exit 2 before any read; the other repository's stale registration (its folder gone) is still there."""
+    from agenttalk.cli import main
+
+    repo, other = tmp_path / "repo", tmp_path / "other"
+    _init_repo(repo)
+    _init_repo(other)
+    (repo / ".agenttalk").mkdir()  # the scan roots inside this test's folder, which the test run's own fence allows
+    (repo / ".agenttalk" / "config.json").write_text(json.dumps({"scratch": {"root": str(tmp_path / "scratch"),
+                                                                           "tmp_root": str(tmp_path / "temp")}}))
+    _git(other, "worktree", "add", "-q", "-b", "gone", str(tmp_path / "gone"), "master")
+    shutil.rmtree(tmp_path / "gone")  # a stale registration: `git worktree prune` would delete it
+    with monkeypatch.context() as patched:
+        patched.setenv("GIT_DIR", str(other / ".git"))
+        code = main(["--root", str(repo), "janitor", "--apply"])
+    err = capsys.readouterr().err
+    assert code == 2 and "agenttalk janitor: GIT_DIR is set" in err and "nothing was read or changed" in err, err
+    assert (other / ".git" / "worktrees" / "gone").is_dir()
