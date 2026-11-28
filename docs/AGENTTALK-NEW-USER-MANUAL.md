@@ -55,7 +55,8 @@ On Linux or macOS the only in-use check is a lane's token, held by a running `wr
 confirm yourself that every other user has stopped.
 
 On the daily tick, read `agenttalk janitor --release-report` for eligible checkouts
-and their sizes. It fetches remote facts but deletes nothing. It is a list to read,
+and their sizes. It fetches remote facts but deletes nothing. Exit 1 means a check could
+not be made: read its `could not check` lines. It is a list to read,
 not a to-do list: even a newly created checkout at the remote tip can qualify. See
 [scratch hygiene](ops/scratch-hygiene.md#release-a-merged-checkout) for the allowed
 folders, cache list, Windows locks and filesystem limits.

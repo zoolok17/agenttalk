@@ -456,12 +456,6 @@ def _placed(path: Path) -> str:
             missing.append(name)
             current = parent
     token = lanes.canonical_host_path_checked(current)
-    if os.name != "nt":
-        # The shared token turns a literal backslash of a POSIX name into "/": `co\\` and `co/` become one token, and a
-        # name that ends in a backslash gets a trailing "/", so nothing placed below it starts with `token + "/"` and
-        # a missing child was judged unrelated. Here the exact POSIX path is compared, as master does with its path
-        # ancestry. The shared function has just resolved this same part and made its checks, so this cannot differ.
-        token = os.path.realpath(current, strict=True)
     if missing:
         if not stat.S_ISDIR(os.stat(current).st_mode):
             raise NotADirectoryError(errno.ENOTDIR, "cannot be placed: the part that exists is not a folder", current)
@@ -565,6 +559,10 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
         # dictionary order, or an acknowledged retirement must not hide it). Only the canonical field has it.
         canonical = lanes.canonical_checkout_problem(value, root=repo)
         if canonical is not None:
+            if "older version" in canonical[1]:
+                recovery = lanes.checkout_path_recovery(lane_id=lane_id or "", lane=value, owner=owner, root=repo)
+                raise Refused(f"{source}: activity path {canonical[0]} {canonical[1]}; "
+                              f"set it to the checkout's real absolute folder; {recovery}")
             if "NUL" in canonical[1] or "surrogate" in canonical[1]:
                 # keep the shared reason: it is not a relative path, it is not a path at all
                 raise Refused(f"{source}: activity path {canonical[0]} {canonical[1]}; record an absolute path first")
@@ -649,6 +647,12 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
 def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
     """Every lane that names this checkout, whatever its status (a session can outlive its lane's delivery), after
     ``claim(store, lane_id)`` has found the lane's occupancy token free."""
+    def old_match(path):
+        try:
+            return os.name != "nt" and path.replace("{ROOT}", str(cfg.repo)) == _placed(target).replace("\\", "/")
+        except (OSError, ValueError) as exc:
+            raise Refused(f"could not establish where the checkout is ({_why(exc)}); the checkout was kept") from exc
+
     named = []
     for lane_id, row in (_activity(cfg, target) or {}).items():
         source = f"lanes.json lane {lane_id}"
@@ -659,8 +663,12 @@ def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
         retained = row.get("occupancy_worktrees", [])
         if not isinstance(retained, list) or any(not isinstance(p, str) or not p.strip() for p in retained):
             raise Refused(f"{source}: could not read retained occupancy worktrees")
+        if any(lanes.old_backslash_path(p, root=cfg.repo) for p in retained):
+            raise Refused(f"{source}: a retained occupancy worktree was saved by an older version for a folder whose "
+                          "name ends in a backslash; set it to the checkout's real absolute folder")
         if _names_checkout(row, target, cfg.repo, lane_id=lane_id, source=source, lane=True) or any(
                 _names_checkout({"worktree_path": p}, target, cfg.repo, lane_id=lane_id, source=source, lane=True)
+                or old_match(p)
                 for p in retained):
             named.append(lane_id)
     for lane_id in named:
@@ -989,6 +997,7 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
         default = _fresh_default(cfg.repo, origin)
         _unchanged(ids)
         paths = [Path(target).absolute()] if target is not None else list(_registered(cfg.repo))
+        failed = 0  # the report's checks that broke with an unexpected error (#909)
         for path in paths:
             try:
                 _unchanged(ids)
@@ -1014,9 +1023,14 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:
+                if target is None and not isinstance(exc, Refused):  # a check that broke: not an ordinary keep
+                    failed += 1
+                    exc = janitor._could_not_check(exc)
                 lines.append(f"KEPT {path}: {exc}")
                 if target is not None:
                     return 1, "\n".join(store_mod.report_line(line) for line in lines)
-        return 0, "\n".join(store_mod.report_line(line) for line in lines)
+        if failed:
+            lines.append(f"could not check: {failed}")
+        return (1 if failed else 0), "\n".join(store_mod.report_line(line) for line in lines)
     except (Refused, OSError, ValueError, TypeError) as exc:
         return 1, store_mod.report_line(f"FAILED: {exc}; nothing released")

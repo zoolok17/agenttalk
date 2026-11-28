@@ -12,6 +12,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A janitor check that breaks is now shown as a failure, not as an ordinary kept checkout (#909).** When the
+  check of whether a checkout is in use failed with an unexpected error (a folder that cannot be read, for example),
+  `janitor` and `janitor --release-report` showed it like a checkout that is simply in use and exited 0. Now they
+  say `KEPT <path>: could not check (<error type>): <detail>`, count such checkouts in `could not check: N`, and exit
+  1; `janitor --apply` keeps every candidate holding such a checkout, commits and removes nothing there, lists it as
+  not checked and exits 1, even if a later check would pass. The plain report now says `KEPT` for an ordinary keep,
+  where it said `REFUSED (kept)` (the sweep still says `REFUSED (kept)`); scripts matching the old preview wording
+  need `KEPT`. A record that cannot be read still keeps its checkout as an ordinary refusal and does not exit 1.
+
+- Under a store fence, a Git registration file (a checkout's `gitdir`, its `.git` file or `commondir`) that names a path with a NUL character now gives the janitor's usual "could not list the registered checkouts" failure, and the checkout is kept, instead of being trusted or ending in an internal error (#928).
+
+- **On Linux and macOS, backslashes in folder names stay part of the name when folders are compared (#910).**
+  Before this, a backslash could be mistaken for a separator, so different folders could look the same.
+  The Windows comparison token is unchanged. A saved canonical path containing doubled slashes after the start
+  is treated as possible damage, even if it was typed by hand, and the command asks for the real absolute folder.
+  A mismatched saved canonical path also gives repair advice. When damaged checkout paths are acknowledged as
+  missing, Git's registrations are checked first; an unreadable list or a registration of that lane's branch
+  stops the acknowledgement. The check also refuses when the store folder is not a Git repository.
+  It also refuses if the Git environment could redirect the repository check.
+  A forced reassignment keeps a sound absolute earlier path and refuses an unsettled relative path. An older retained
+  claim with a backslash inside a name can still name the wrong folder. An older checkout name ending in a backslash
+  was saved with a trailing slash, which the guard cannot detect; a readable
+  launch record naming the real folder still protects it. A checkout detached by hand has no branch in Git's list
+  and is not detected by the acknowledgement's branch check.
+  Release keeps a checkout if an older saved claim may name it with slashes; inspect the lane before freeing it.
+
 - **A Git write that runs out of time keeps its warning when the stopped programs cannot be counted (#920).**
   On Windows, after a time-out agenttalk counts what is still running in Git's job. If that count failed with an
   ordinary error twice, the raw error came out instead of the time-out, and `lane assign` skipped its advice for a

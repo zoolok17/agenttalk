@@ -2845,14 +2845,9 @@ class _FakePosixFolders:
         FakeOs.lstat = staticmethod(lstat)
         FakeOs.stat = staticmethod(lstat)
 
-        def token(value):  # `lanes._canonical_token` on POSIX: absolute, and every backslash becomes a slash
-            if os.fspath(value) not in outer.exists:
-                raise FileNotFoundError(2, "absent", os.fspath(value))
-            return posixpath.abspath(os.fspath(value)).replace("\\", "/")
-
         monkeypatch.setattr(worktree_release, "os", FakeOs())
         monkeypatch.setattr(worktree_release, "Path", pathlib.PurePosixPath)
-        monkeypatch.setattr(lanes, "canonical_host_path_checked", token)
+        monkeypatch.setattr(lanes, "os", FakeOs())
         self.purepath = pathlib.PurePosixPath
 
     def names(self, checkout, recorded):
@@ -2885,6 +2880,58 @@ _CHECKOUT_CASES = [
     ("/w/co", "/w/co2/gone", ["/w", "/w/co", "/w/co2"], False),  # a sibling that only starts with the same letters
     ("/w/co", "/w/co/gone", ["/w", "/w/co"], True),  # the ordinary name: unchanged
 ]
+
+
+@pytest.mark.parametrize("field", ["worktree_toplevel_canonical", "occupancy_worktrees"])
+def test_release_refuses_a_guarded_saved_path(tmp_path, monkeypatch, field):
+    import posixpath
+
+    from agenttalk import lanes
+
+    fake_os = types.SimpleNamespace(name="posix", path=posixpath)
+    monkeypatch.setattr(lanes, "os", fake_os)
+    damaged = tmp_path.as_posix() + "/old//checkout"
+    row = {field: [damaged] if field == "occupancy_worktrees" else damaged}
+    monkeypatch.setattr(worktree_release, "_activity", lambda cfg, target: {"earlier": row})
+    cfg = types.SimpleNamespace(repo=tmp_path)
+    with pytest.raises(worktree_release.Refused, match="older version.*real absolute folder"):
+        worktree_release._free_lanes(cfg, tmp_path, lambda *args: None)
+
+
+def test_healthy_retained_claim_names_checkout_beside_guarded_canonical(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE", raising=False)
+    world = _FakePosixFolders(monkeypatch, tmp_path, ["/w", "/w/target"])
+    row = {"worktree_toplevel_canonical": "/w/old//checkout", "occupancy_worktrees": ["/w/target"]}
+    monkeypatch.setattr(worktree_release, "_activity", lambda cfg, target: {"earlier": row})
+    cfg, target = types.SimpleNamespace(repo=world.purepath("/w/repo")), world.purepath("/w/target")
+    with pytest.raises(worktree_release.Refused, match="older version"):
+        worktree_release._free_lanes(cfg, target, lambda *args: None)
+    row.pop("worktree_toplevel_canonical")
+    assert worktree_release._free_lanes(cfg, target, lambda *args: None) == ["earlier"]
+
+
+def test_an_old_inside_backslash_claim_keeps_the_checkout(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")  # the stand-in paths are not real
+    world = _FakePosixFolders(monkeypatch, tmp_path, ["/w", "/w/a\\b", "/w/a", "/w/a/b", "/w/else"])
+    assert not world.names("/w/a\\b", "/w/a/b")  # an old claim collapsed the literal backslash
+    assert world.names("/w/a\\b", "/w/a\\b")  # a launch record keeps its raw path
+    row = {"status": "abandoned", "worktree_path": "/w/else", "occupancy_worktrees": ["/w/a/b"]}
+    monkeypatch.setattr(worktree_release, "_activity", lambda cfg, target: {"old": row})
+    cfg = types.SimpleNamespace(repo=world.purepath("/w/repo"))
+    target = world.purepath("/w/a\\b")
+    def busy(*args):
+        return lane_occupancy.IN_USE
+    with pytest.raises(worktree_release.Refused, match="lane 'old' is in use"):
+        worktree_release._free_lanes(cfg, target, busy)
+    row["occupancy_worktrees"] = ["/w/a\\b"]  # the current spelling still keeps it
+    with pytest.raises(worktree_release.Refused, match="lane 'old' is in use"):
+        worktree_release._free_lanes(cfg, target, busy)
+    row["occupancy_worktrees"] = ["/w/else"]
+    assert worktree_release._free_lanes(cfg, target, busy) == []
+    row["occupancy_worktrees"] = ["/w/a\\/b".replace("\\", "/")]
+    assert row["occupancy_worktrees"] == ["/w/a//b"]  # the old fold did not normalize again
+    with pytest.raises(worktree_release.Refused, match="older version"):
+        worktree_release._free_lanes(cfg, target, busy)
 
 
 @pytest.mark.parametrize("checkout, recorded, folders, expected", _CHECKOUT_CASES)
@@ -3088,3 +3135,58 @@ def test_an_ended_lane_named_only_at_the_last_read_with_a_free_token_is_claimed_
         assert seen.get("token") is not None, "the newly named lane's token was free during the removal"
     finally:
         _unlink(gone)
+
+
+# --- #909: a check that breaks is "could not check", counted, and the report fails --------------------------------
+
+UNEXPECTED = [OSError(5, "denied\x1b[31m\nFAILED forged"), ValueError("a bad value"), TypeError("a bad type")]
+
+
+def _break_for_the_checkout(monkeypatch, cfg, name, error):
+    """`worktree_release.<name>` raises `error` for every checkout but the main repository."""
+    real = getattr(worktree_release, name)
+
+    def broken(cfg_, target, *rest):
+        first = target[0] if isinstance(target, list) else target
+        if not janitor._same_worktree(Path(first), cfg.repo):
+            raise error
+        return real(cfg_, target, *rest)
+
+    monkeypatch.setattr(worktree_release, name, broken)
+
+
+@pytest.mark.parametrize("error", UNEXPECTED, ids=["OSError", "ValueError", "TypeError"])
+@pytest.mark.parametrize("name", ["check_unused", "_check_worktree"])
+def test_release_report_unexpected_check_errors(estate, monkeypatch, name, error):
+    """The release preview used to print a broken check as an ordinary KEPT and exit 0. Now it says it could not check,
+    with the error's type and a one-line detail, counts it once and exits 1; the checkout is not touched."""
+    repo, wt, cfg = estate
+    _break_for_the_checkout(monkeypatch, cfg, name, error)
+
+    code, text = run(cfg, None)
+
+    assert code == 1, text
+    assert f"KEPT {wt}: could not check ({type(error).__name__}): " in text, text
+    assert "could not check: 1" in text and "WOULD RELEASE" not in text, text
+    assert "\x1b" not in text and "\nFAILED forged" not in text, text
+    assert (wt / "source.txt").exists()
+
+
+def test_release_report_keeps_an_ordinary_refusal_uncounted(estate, monkeypatch):
+    repo, wt, cfg = estate
+    _break_for_the_checkout(monkeypatch, cfg, "check_unused", worktree_release.Refused("lane one is active (test)"))
+
+    code, text = run(cfg, None)
+
+    assert code == 0, text
+    assert f"KEPT {wt}: lane one is active (test)" in text and "could not check" not in text, text
+
+
+def test_release_of_one_checkout_keeps_its_old_wording_when_a_check_breaks(estate, monkeypatch):
+    repo, wt, cfg = estate
+    _break_for_the_checkout(monkeypatch, cfg, "_check_worktree", OSError(5, "denied"))
+
+    code, text = run(cfg, wt)
+
+    assert code == 1 and f"KEPT {wt}: " in text and "denied" in text, text
+    assert "could not check" not in text and (wt / "source.txt").exists(), text

@@ -1168,8 +1168,10 @@ background “free space” job.
    keeps. Known cache directories are disposable, so never store evidence there.
    A registered checkout that an active or pending lane, a launch or supervisor record,
    or a held lane session still names is kept too, by the same activity rules as
-   `janitor --release` (#858); the report says `REFUSED (kept)` with the reason, and a
-   record that cannot be read or placed keeps the checkout as well. A folder holding
+   `janitor --release` (#858); the report says `KEPT` with the reason (the sweep says
+   `REFUSED (kept)`), and a record that cannot be read or placed keeps the checkout as well.
+   A check that breaks says `could not check (<type>): ...`, is counted in `could not check: N`,
+   keeps its candidate in the sweep too, and makes the run exit 1 (#909). A folder holding
    several checkouts is kept whole when any one of them is in use. This reads records
    only: it does not prove that no process is running, and it does not protect a checkout
    that Git does not list. Stopping other writers first (step 3) is still the rule.

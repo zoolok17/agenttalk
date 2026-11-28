@@ -163,6 +163,11 @@ def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
     return None
 
 
+def old_backslash_path(value: str, *, root) -> bool:
+    """An older POSIX token may have turned a trailing backslash into a separator."""
+    return os.name != "nt" and "//" in value.replace("{ROOT}", str(root))[1:]
+
+
 def canonical_checkout_problem(lane: dict, *, root) -> tuple[str, str] | None:
     """The one lexical rule for a saved `worktree_toplevel_canonical`: it must be an absolute path.
 
@@ -182,6 +187,9 @@ def canonical_checkout_problem(lane: dict, *, root) -> tuple[str, str] | None:
     if not _can_be_stored(value):  # the same refusal and repair advice as a NUL: nothing is saved with it
         return "worktree_toplevel_canonical", _UNSTORABLE
     expanded = value.replace("{ROOT}", str(root))
+    if old_backslash_path(value, root=root):
+        return ("worktree_toplevel_canonical",
+                "was saved by an older version for a folder whose name ends in a backslash")
     absolute = _windows_path_is_absolute(expanded) if os.name == "nt" else os.path.isabs(expanded)
     return None if absolute else ("worktree_toplevel_canonical", "is a relative path")
 
@@ -248,6 +256,8 @@ def surviving_checkout_entry(lane: dict | None, *, root=None) -> tuple[str, str,
     for field in ("worktree_path", "worktree_toplevel_canonical"):
         value = lane.get(field)
         if not isinstance(value, str) or checkout_path_problem({field: value}) is not None:
+            continue
+        if field == "worktree_toplevel_canonical" and canonical_checkout_problem({field: value}, root=root) is not None:
             continue
         if "{ROOT}" in value:
             if root is None:
@@ -481,19 +491,21 @@ def lane_ref(lane_id: str) -> str:
     return f"refs/heads/{lane_branch(lane_id)}"
 
 
-def _canonical_token(resolved: str) -> str:
-    """The shared last step of both canonical forms: absolute + Windows normcase + normalized separators."""
-    path = os.path.abspath(resolved)
-    if os.name == "nt":
-        path = os.path.normcase(path)
-    return path.replace("\\", "/")
+def _canonical_token(resolved: str, *, windows=None, pathmod=None) -> str:
+    """Make an absolute token, normalizing case and separators on Windows only."""
+    if windows is None:
+        windows = os.name == "nt"
+    if pathmod is None:
+        pathmod = os.path
+    path = pathmod.abspath(resolved)
+    return pathmod.normcase(path).replace("\\", "/") if windows else path
 
 
 def canonical_host_path(value: str | os.PathLike[str]) -> str:
     """Canonical host path token for persisted worktree provenance.
 
-    The compare key is deliberately host-local: absolute + realpath + Windows
-    normcase + normalized separators. It is not a URL or a repo-relative path.
+    The compare key is host-local: absolute + realpath, with case and separators
+    normalized on Windows only. It is not a URL or a repo-relative path.
     """
     return _canonical_token(os.path.realpath(os.fspath(value)))
 
