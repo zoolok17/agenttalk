@@ -6321,10 +6321,8 @@ def _worktree_list(root) -> list[dict]:
 
 def _worktree_records_strict(root):
     """Read complete, unambiguous Git identities after fencing every registration."""
-    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
-                 "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
-        if os.environ.get(name):
-            raise janitormod._listing_failure(f"{name} overrides Git's repository; clear it first")
+    if name := index_safety.git_repository_override():  # present counts, even empty (#942)
+        raise janitormod._listing_failure(f"{name} overrides Git's repository; clear it first")
     janitormod._fence_registrations(root)
     rc, out = _git(root, ["worktree", "list", "--porcelain", "-z"], raw=True)
     if rc != 0:
